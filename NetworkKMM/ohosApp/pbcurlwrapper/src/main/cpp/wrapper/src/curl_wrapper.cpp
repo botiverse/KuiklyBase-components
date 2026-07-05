@@ -18,6 +18,7 @@
 #include "curl_wrapper.h"
 #include <algorithm>
 #include <cctype>
+#include <mutex>
 #include <string>
 #include "curl/curl.h"
 #include "log/curl_log.h"
@@ -28,6 +29,41 @@ using namespace std;
 
 bool curlGlobalInited = false;
 bool curlGlobalCleanuped = false;
+
+// Connection pooling across the per-request easy handles: a process-wide
+// share handle pools connections, DNS entries, and TLS sessions, so a fresh
+// easy handle per request no longer means a fresh TCP+TLS handshake each
+// time. Guarded by per-lock-kind mutexes as libcurl requires.
+static CURLSH *gCurlShare = nullptr;
+static std::mutex gShareInitMutex;
+static std::mutex gShareDataMutexes[CURL_LOCK_DATA_LAST];
+
+static void ShareLockCallback(CURL *handle, curl_lock_data data, curl_lock_access access, void *userptr) {
+    if (data >= 0 && data < CURL_LOCK_DATA_LAST) {
+        gShareDataMutexes[data].lock();
+    }
+}
+
+static void ShareUnlockCallback(CURL *handle, curl_lock_data data, void *userptr) {
+    if (data >= 0 && data < CURL_LOCK_DATA_LAST) {
+        gShareDataMutexes[data].unlock();
+    }
+}
+
+static CURLSH *GetCurlShare() {
+    std::lock_guard<std::mutex> guard(gShareInitMutex);
+    if (gCurlShare == nullptr) {
+        gCurlShare = curl_share_init();
+        if (gCurlShare != nullptr) {
+            curl_share_setopt(gCurlShare, CURLSHOPT_LOCKFUNC, ShareLockCallback);
+            curl_share_setopt(gCurlShare, CURLSHOPT_UNLOCKFUNC, ShareUnlockCallback);
+            curl_share_setopt(gCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+            curl_share_setopt(gCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+            curl_share_setopt(gCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+        }
+    }
+    return gCurlShare;
+}
 // 为了和 libcurl 错误码区分, 这里加一个偏移量
 static const int gDefaultZipErrorCodeOffset = 150;
 
@@ -241,6 +277,12 @@ class CurlClient {
         if (timeout > 0) {
             curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout);
         }
+        // Pool connections/DNS/TLS sessions across per-request easy handles.
+        CURLSH *share = GetCurlShare();
+        if (share != nullptr) {
+            curl_easy_setopt(curl_, CURLOPT_SHARE, share);
+        }
+
         // SSL: verify the server certificate chain and hostname (raft.2). The
         // trust anchors are the OHOS system CA store — libcurl/OpenSSL are built
         // with their default CA bundle/path compiled to /etc/ssl/certs (see
