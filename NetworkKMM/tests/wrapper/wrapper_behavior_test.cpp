@@ -115,6 +115,38 @@ int main(int argc, char **argv) {
     CHECK(second.connectTimeMs == 0,
           "second request reuses pooled connection (connectTimeMs == 0)");
 
+    // 8. Upstream issue #28: request headers must not be duplicated on the
+    //    wire. Send one custom header and count its occurrences in the echo.
+    {
+        Captured echo;
+        StringPair pair{};
+        pair.first = const_cast<char *>("X-Slock-Probe");
+        pair.second = const_cast<char *>("once");
+        StringDic headers{};
+        headers.size = 1;
+        headers.stringPairs = &pair;
+
+        CurlRequest request{};
+        std::string url = base + "/echo-headers";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        auto *callback = new CurlCallback{&echo, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-test");
+        StartRequest(handle, request, callback);
+        DeleteCurlClient(handle);
+
+        size_t count = 0, pos = 0;
+        while ((pos = echo.data.find("X-Slock-Probe", pos)) != std::string::npos) {
+            count++;
+            pos += 1;
+        }
+        CHECK(echo.httpCode == 200, "/echo-headers succeeds");
+        CHECK(count == 1, "custom request header sent exactly once (upstream #28)");
+    }
+
     if (gFailures > 0) {
         std::fprintf(stderr, "\n%d failure(s)\n", gFailures);
         return 1;

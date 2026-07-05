@@ -42,6 +42,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "/ok")
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif self.path == "/echo-headers":
+            # Echo every received header name:value pair, one per line, so the
+            # test can assert each request header arrives exactly once
+            # (upstream issue #28 reported duplicated headers on the wire).
+            lines = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
+            self._send(200, lines.encode())
         elif self.path == "/gzip":
             raw = b'{"gzipped":true,"padding":"' + b"x" * 256 + b'"}'
             body = gzip.compress(raw)
