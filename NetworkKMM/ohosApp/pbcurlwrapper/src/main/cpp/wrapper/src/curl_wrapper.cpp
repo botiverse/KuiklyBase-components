@@ -18,6 +18,8 @@
 #include "curl_wrapper.h"
 #include <algorithm>
 #include <cctype>
+#include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include "curl/curl.h"
@@ -108,7 +110,9 @@ class CurlClient {
         std::string line(contents, realsize);
         // 检测是否为HTTP状态行（如"HTTP/1.1 200 OK"）
         if (line.find("HTTP/") == 0) {
-            int32_t httpCode = 0;
+            // CURLINFO_RESPONSE_CODE writes a long (8 bytes on LP64) — an
+            // int32_t here lets curl overwrite adjacent stack memory.
+            long httpCode = 0;
             if (client->curl_ != nullptr) {
                 curl_easy_getinfo(client->curl_, CURLINFO_RESPONSE_CODE, &httpCode);
             }
@@ -353,8 +357,10 @@ class CurlClient {
 
         char *ip = nullptr;
         curl_easy_getinfo(curl_, CURLINFO_PRIMARY_IP, &ip);
+        // ip is nullptr when the connection never established — appending a
+        // null char* to std::string is undefined behavior.
         logI(log_tag_, "ret code:" + std::to_string(errorCode) + ", errorMsg:" + curl_error_msg_
-            + ",ip:" + ip + ", dataLen:" + std::to_string(content_data_.length()) + ", redirect url:"
+            + ",ip:" + (ip != nullptr ? ip : "") + ", dataLen:" + std::to_string(content_data_.length()) + ", redirect url:"
             + redirect_url_ + "\nheader:\n" + headers_);
         logD(log_tag_, "data:\n" + content_data_);
 
@@ -458,7 +464,9 @@ class CurlClient {
     }
 
  public:
-    bool cancel_flag_;
+    // Must be initialized: ProgressCallback reads it on every transfer tick,
+    // and an indeterminate value aborts the request (CURLE_ABORTED_BY_CALLBACK).
+    bool cancel_flag_ = false;
 
  private:
     std::string log_tag_;
@@ -468,7 +476,7 @@ class CurlClient {
     std::string headers_;
     std::string redirect_url_;
     std::string content_data_;
-    CurlResponse *curl_response_;
+    CurlResponse *curl_response_ = nullptr;  // destructor deletes it — must not start wild
     bool gzip_accept_encoding_ = false;
     bool gzip_content_encoding_ = false;
 };

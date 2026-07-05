@@ -19,6 +19,8 @@
 #include <sys/stat.h>
 #include <iostream>
 #include <fstream>
+#include <cstdint>
+#include <vector>
 #include "zlib.h"
 
 int GzipDecompress(const std::string &input, std::string &output, const std::string &tag) {
