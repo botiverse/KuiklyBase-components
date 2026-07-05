@@ -316,8 +316,14 @@ class CurlClient {
             + redirect_url_ + "\nheader:\n" + headers_);
         logD(log_tag_, "data:\n" + content_data_);
 
+        // The HTTP status is reported separately from the CURLcode: a completed
+        // transfer with a 401/500 must not look like a success to callers.
+        long httpCode = 0;
+        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &httpCode);
+
         curl_response_ = new CurlResponse();
         curl_response_->code = errorCode;
+        curl_response_->httpCode = httpCode;
         curl_response_->headerLen = headers_.length();
         curl_response_->headers = const_cast<char *>(reinterpret_cast<const char *>(headers_.c_str()));
         curl_response_->redirectUrl = const_cast<char *>(reinterpret_cast<const char *>(redirect_url_.c_str()));

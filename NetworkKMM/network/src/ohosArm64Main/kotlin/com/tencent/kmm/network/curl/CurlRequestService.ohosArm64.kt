@@ -272,6 +272,7 @@ object CurlRequestServiceHM : ICurlRequestService {
     private fun handleCurlNativeResponse(result: CurlResponse, logTag: String): CurlNativeResponse {
         val response = CurlNativeResponse(
             code = result.code,
+            httpCode = result.httpCode.toInt(),
             errorMsg = result.errorMsg?.toKString() ?: "",
             headers = result.headers?.toKString() ?: "",
             redirectUrl = result.redirectUrl?.toKString() ?: "",
@@ -383,7 +384,18 @@ object CurlRequestServiceHM : ICurlRequestService {
         response: VBTransportBaseResponse
     ) {
         val data = convertDataWithContentType(nativeResponse.data, request)
-        response.errorCode = nativeResponse.code
+        // The wrapper's code is the CURLcode (0 = transfer completed), NOT the
+        // HTTP status. A completed transfer used to be blanket-mapped to 200
+        // upstream, which swallowed 401/403/5xx bodies as successes — auth
+        // middleware never saw a 401, so token refresh never fired. The wrapper
+        // now reports the HTTP status explicitly (CURLINFO_RESPONSE_CODE);
+        // surface it whenever the transfer itself completed.
+        response.errorCode =
+            if (nativeResponse.code == 0 && nativeResponse.httpCode in 100..599) {
+                nativeResponse.httpCode
+            } else {
+                nativeResponse.code
+            }
         response.errorMessage = nativeResponse.errorMsg
         response.header = convertHeaderMap(nativeResponse.headers)
         // 处理重定向情况
