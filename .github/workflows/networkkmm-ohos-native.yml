@@ -1,0 +1,130 @@
+name: Build NetworkKMM OHOS native
+
+# Reproducibly cross-compiles the NetworkKMM OHOS native runtime
+# (OpenSSL + curl + pbcurlwrapper, with TLS certificate verification) from
+# source inside artin's harmonyos-ci-image, so the shipped libcurl.a /
+# libopenssl.so / libpbcurlwrapper.so always match the checked-in sources
+# instead of being hand-built. See NetworkKMM/scripts/build-ohos-native.sh.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_binaries:
+        description: "Commit the refreshed native binaries back to the branch"
+        type: boolean
+        default: false
+  # Only mainline pushes here — PR branches are covered by the pull_request
+  # trigger below, so a PR runs the build once, not twice.
+  push:
+    branches:
+      - master
+    paths:
+      - "NetworkKMM/scripts/build-ohos-native.sh"
+      - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - ".github/workflows/networkkmm-ohos-native.yml"
+  pull_request:
+    paths:
+      - "NetworkKMM/scripts/build-ohos-native.sh"
+      - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - ".github/workflows/networkkmm-ohos-native.yml"
+
+jobs:
+  build-native:
+    name: Cross-compile OHOS native (OpenSSL + curl + wrapper)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve HarmonyOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          if [[ ! -d "$ohos_sdk_home/native/sysroot" ]]; then
+            echo "HarmonyOS SDK sysroot not found at $ohos_sdk_home/native/sysroot" >&2
+            exit 1
+          fi
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure cmake
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v cmake >/dev/null 2>&1; then
+            echo "cmake present: $(cmake --version | head -1)"
+            exit 0
+          fi
+          # Prefer the OHOS SDK's bundled cmake (matches ohos.toolchain.cmake).
+          sdk_cmake_bin="$OHOS_SDK_HOME/native/build-tools/cmake/bin"
+          if [[ -x "$sdk_cmake_bin/cmake" ]]; then
+            echo "$sdk_cmake_bin" >> "$GITHUB_PATH"
+            echo "Using OHOS SDK cmake at $sdk_cmake_bin"
+            exit 0
+          fi
+          # Fallback: install from the distro.
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update
+            apt-get install -y --no-install-recommends cmake
+          else
+            echo "cmake not found: no SDK cmake at $sdk_cmake_bin and no apt-get" >&2
+            exit 1
+          fi
+
+      - name: Build native runtime from source
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash NetworkKMM/scripts/build-ohos-native.sh
+
+      - name: Verify TLS is wired (verification on + CA path compiled in)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cpp="NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/wrapper/src/curl_wrapper.cpp"
+          grep -q "CURLOPT_SSL_VERIFYPEER, 1L" "$cpp"
+          grep -q "CURLOPT_SSL_VERIFYHOST, 2L" "$cpp"
+          # Trust anchors come from the OHOS system CA store: curl/OpenSSL are
+          # built with their default CA bundle/path compiled to /etc/ssl/certs.
+          script="NetworkKMM/scripts/build-ohos-native.sh"
+          grep -q "CURL_CA_PATH=/etc/ssl/certs" "$script"
+          grep -q -- "--openssldir=/etc/ssl" "$script"
+          echo "TLS verification + system CA path: OK"
+
+      - name: Upload native artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: networkkmm-ohos-native
+          if-no-files-found: error
+          path: |
+            NetworkKMM/network/libs/libpbcurlwrapper.so
+            NetworkKMM/network/libs/libopenssl.so
+            NetworkKMM/network/libs/libc++_shared.so
+            NetworkKMM/ohosApp/entry/libs/arm64-v8a/libpbcurlwrapper.so
+            NetworkKMM/ohosApp/entry/libs/arm64-v8a/libopenssl.so
+            NetworkKMM/ohosApp/entry/libs/arm64-v8a/libc++_shared.so
+            NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libcurl.a
+            NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
+
+      - name: Commit refreshed binaries back
+        if: github.event_name == 'workflow_dispatch' && inputs.commit_binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add \
+            NetworkKMM/network/libs \
+            NetworkKMM/ohosApp/entry/libs/arm64-v8a \
+            NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a
+          if git diff --cached --quiet; then
+            echo "No binary changes to commit."
+          else
+            git commit -m "ci: refresh NetworkKMM OHOS native binaries [skip ci]"
+            git push
+          fi

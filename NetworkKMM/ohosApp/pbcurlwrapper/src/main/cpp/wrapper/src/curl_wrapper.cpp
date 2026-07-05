@@ -241,9 +241,13 @@ class CurlClient {
         if (timeout > 0) {
             curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout);
         }
-        // SSL
-        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
-        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
+        // SSL: verify the server certificate chain and hostname (raft.2). The
+        // trust anchors are the OHOS system CA store — libcurl/OpenSSL are built
+        // with their default CA bundle/path compiled to /etc/ssl/certs (see
+        // scripts/build-ohos-native.sh), which is where OpenHarmony ships the
+        // system certificates, so no CA file needs to be bundled or set here.
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 2L);
         // 使用curl的内部重定向逻辑
         curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);
 
