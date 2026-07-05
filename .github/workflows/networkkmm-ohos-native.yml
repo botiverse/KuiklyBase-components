@@ -32,11 +32,18 @@ jobs:
   build-native:
     name: Cross-compile OHOS native (OpenSSL + curl + wrapper)
     runs-on: ubuntu-latest
+    # contents:write lets the commit_binaries dispatch push refreshed .so back.
+    permissions:
+      contents: write
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Trust the checkout dir (container git ownership)
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Resolve HarmonyOS SDK
         shell: bash
