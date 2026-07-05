@@ -45,6 +45,7 @@ import com.tencent.kmm.network.export.VBTransportPostRequest
 import com.tencent.kmm.network.export.VBTransportPostResponse
 import com.tencent.kmm.network.export.VBTransportRequest
 import com.tencent.kmm.network.export.VBTransportResponse
+import com.tencent.kmm.network.export.VBTransportResultCode
 import com.tencent.kmm.network.export.VBTransportStringRequest
 import com.tencent.kmm.network.export.VBTransportStringResponse
 import kotlinx.cinterop.ByteVar
@@ -306,6 +307,26 @@ object CurlRequestServiceHM : ICurlRequestService {
     }
 
     private fun startRequest(
+        request: VBTransportBaseRequest,
+        responseCallback: (response: VBTransportBaseResponse) -> Unit,
+        logTag: String
+    ) {
+        // Never let an exception escape to the transport scope: the caller
+        // contract is "always exactly one callback" (upstream issue #31 —
+        // escaped exceptions crashed the app when the network was down).
+        try {
+            startRequestUnsafe(request, responseCallback, logTag)
+        } catch (throwable: Throwable) {
+            logI("[$logTag] startRequest failed: ${throwable.message ?: throwable::class.simpleName}")
+            val failure = CurlNativeResponse(
+                code = VBTransportResultCode.CODE_NETWORK_ERROR,
+                errorMsg = throwable.message ?: "native request failed"
+            )
+            buildResponseAndCallback(request, failure, responseCallback)
+        }
+    }
+
+    private fun startRequestUnsafe(
         request: VBTransportBaseRequest,
         responseCallback: (response: VBTransportBaseResponse) -> Unit,
         logTag: String

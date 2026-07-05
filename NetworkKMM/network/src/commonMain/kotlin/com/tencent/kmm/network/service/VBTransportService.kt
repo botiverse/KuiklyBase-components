@@ -38,15 +38,28 @@ import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
 import com.tencent.kmm.network.internal.VBTransportManager
 import com.tencent.kmm.network.internal.VBTransportState
 import com.tencent.kmm.network.internal.VBTransportTask
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
 object VBTransportService {
 
-    private val networkScope: CoroutineScope = CoroutineScope(Dispatchers.IO)
+    // SupervisorJob: one request's uncaught failure must not cancel the scope
+    // (which would silently kill every in-flight AND future request). The
+    // handler turns escaped exceptions into logs instead of process crashes on
+    // Kotlin/Native (upstream issue #31: app crashed outright when offline).
+    private val networkScope: CoroutineScope =
+        CoroutineScope(
+            SupervisorJob() +
+                Dispatchers.IO +
+                CoroutineExceptionHandler { _, throwable ->
+                    VBPBLog.e("VBTransportService", "uncaught transport exception: ${throwable.message ?: throwable::class.simpleName}")
+                }
+        )
     private val taskManager = VBTransportManager
 
     // 发送字节数组Post类型网络请求
