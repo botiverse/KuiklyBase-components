@@ -1,5 +1,22 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.2 (OHOS TLS certificate verification)
+
+Enables real TLS trust on OHOS. The wrapper now sets
+`CURLOPT_SSL_VERIFYPEER=1` / `CURLOPT_SSL_VERIFYHOST=2`, so the server
+certificate chain and hostname are verified — closing the MITM hole that
+raft.1 shipped with.
+
+- Trust anchors come from the **OHOS system CA store**: `build-ohos-native.sh`
+  builds OpenSSL with `--openssldir=/etc/ssl` and curl with
+  `CURL_CA_BUNDLE=/etc/ssl/certs/cacert.pem` / `CURL_CA_PATH=/etc/ssl/certs`, so
+  the default trust path is compiled to where OpenHarmony ships its system
+  certificates. The wrapper only sets `VERIFYPEER`/`VERIFYHOST` — no CA file is
+  bundled or set at runtime (approach follows the reference OHOS curl build).
+- The native build is now driven by CI
+  (`.github/workflows/networkkmm-ohos-native.yml`) using the
+  `harmonyos-ci-image`, so the shipped `.so`/`.a` always match the sources.
+
 ## 0.1.0-raft.1 (OHOS native crash fix)
 
 Fixes the OHOS SIGSEGV in `libpbcurlwrapper.so` `StartRequest` (fault address

@@ -87,9 +87,12 @@ tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
 echo "==> Building OpenSSL (static libs)"
 (
   cd "openssl-${OPENSSL_VERSION}"
+  # --openssldir=/etc/ssl points OpenSSL's default trust dir at the OHOS system
+  # CA store (/etc/ssl/certs) so verification works on-device with no bundled CA.
   ./Configure linux-aarch64 \
     no-shared no-tests no-apps no-docs \
     --prefix="$OPENSSL_PREFIX" \
+    --openssldir=/etc/ssl \
     CC="$LLVM_BIN/clang" \
     AR="$LLVM_BIN/llvm-ar" \
     RANLIB="$LLVM_BIN/llvm-ranlib" \
@@ -148,6 +151,8 @@ cmake -S "curl-${CURL_VERSION}" -B curl-build \
   -DCURL_ZLIB=OFF \
   -DCURL_DISABLE_WEBSOCKETS=OFF \
   -DENABLE_THREADED_RESOLVER=OFF \
+  -DCURL_CA_BUNDLE=/etc/ssl/certs/cacert.pem \
+  -DCURL_CA_PATH=/etc/ssl/certs \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON
 cmake --build curl-build -j"$(nproc)"
 CURL_STATIC_LIB="$(find curl-build/lib -name 'libcurl.a' | head -n1)"
@@ -187,12 +192,17 @@ done
 
 # WebSocket readiness: the definitive check is whether the built libcurl.a
 # exports the curl_ws_* API, so the planned curl-ws realtime transport won't
-# require another native rebuild.
+# require another native rebuild. Match any DEFINED symbol type (the API can be
+# emitted as a weak symbol 'W', not just text 'T'), not a hard-coded "T " prefix.
 echo "==> Checking libcurl WebSocket support"
-if "$LLVM_BIN/llvm-nm" "$CURL_STATIC_LIB" 2>/dev/null | grep -q "T curl_ws_send"; then
+# A DEFINED symbol has a type letter other than 'U' (undefined). --defined-only
+# isn't supported by every llvm-nm build, so filter out the ' U ' lines instead.
+if "$LLVM_BIN/llvm-nm" "$CURL_STATIC_LIB" 2>/dev/null | grep -w "curl_ws_send" | grep -qv ' U '; then
   echo "libcurl WebSocket: ENABLED (curl_ws_send/curl_ws_recv present)"
 else
   echo "libcurl WebSocket: MISSING — curl-ws realtime would need a rebuild" >&2
+  echo "  curl_ws symbols found:" >&2
+  "$LLVM_BIN/llvm-nm" "$CURL_STATIC_LIB" 2>/dev/null | grep -i "curl_ws" >&2 || echo "  (none)" >&2
   exit 1
 fi
 
