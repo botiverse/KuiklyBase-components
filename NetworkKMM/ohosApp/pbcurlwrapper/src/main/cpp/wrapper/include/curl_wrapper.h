@@ -71,7 +71,8 @@ typedef struct {
 
 // Curl 响应信息
 typedef struct {
-    int code;
+    int code;          // CURLcode: 0 = transfer completed (NOT the HTTP status)
+    long httpCode;     // HTTP response status (CURLINFO_RESPONSE_CODE), 0 if unavailable
     const char *errorMsg;
     int errorMsgLen;
     const char *headers;

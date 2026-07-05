@@ -20,6 +20,7 @@ import com.tencent.kmm.network.export.VBTransportElapseStatistics
 
 data class CurlNativeResponse(
     var code: Int = 0,
+    var httpCode: Int = 0,
     var errorMsg: String = "",
     var headers: String = "",
     var data: ByteArray? = null,

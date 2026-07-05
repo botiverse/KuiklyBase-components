@@ -1,5 +1,23 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.3 (OHOS: surface real HTTP status codes)
+
+Critical fix: on OHOS the wrapper only returned the CURLcode (0 = transfer
+completed), not the HTTP status, and `statusCodeFromErrorCode` blanket-mapped
+a completed transfer to 200. Every 401/403/5xx response was therefore
+reported as a 200 whose body was the error JSON — Slock's auth middleware
+never saw a 401, token refresh never fired, and an expired session bricked
+the app ("no messages yet" everywhere) until re-login.
+
+- `CurlResponse` gains an explicit `httpCode` field (CURLINFO_RESPONSE_CODE)
+  set by the wrapper; the ohosArm64 `updateResponse` reports it whenever the
+  transfer itself completed. Transport errors keep the CURLcode semantics.
+- ⚠️ **ABI change**: `CurlResponse` layout changed — the native libraries MUST
+  be rebuilt from source for this version (CI: networkkmm-ohos-native
+  workflow with commit_binaries) BEFORE publishing. A raft.3 klib running
+  against a raft.2 libpbcurlwrapper.so will misread the response struct.
+- Android/iOS paths untouched (their transports already report HTTP statuses).
+
 ## 0.1.0-raft.2 (OHOS TLS certificate verification)
 
 Enables real TLS trust on OHOS. The wrapper now sets
