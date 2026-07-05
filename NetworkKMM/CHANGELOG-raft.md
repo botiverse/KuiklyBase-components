@@ -1,5 +1,35 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.4 (connection pooling on all three platforms)
+
+- **Android/iOS**: previously a NEW ktor HttpClient was constructed for every
+  request (and never closed): no connection reuse, no TLS session cache, plus
+  an engine leak. Both platforms now share one lazily-created client with the
+  HttpTimeout plugin installed; per-request timeouts move to ktor's
+  request-level `timeout {}` block.
+- **OHOS**: each request creates a fresh curl easy handle, which meant a fresh
+  TCP + TLS handshake every time. The wrapper now attaches every easy handle
+  to a process-wide `curl_share` (CURL_LOCK_DATA_CONNECT / DNS / SSL_SESSION,
+  mutex-guarded), pooling connections, DNS entries, and TLS sessions across
+  requests. No header/ABI change, but the native `.so` must be rebuilt to
+  pick up the pooling (CI commit_binaries before publish).
+
+Prerequisite for migrating Slock's Android/iOS HTTP onto NetworkKMM without
+a connection-pooling regression (Slock task #12 step 2).
+
+Also in this version — behavior-contract tests for the wrapper
+(`tests/wrapper/`, run in CI on every PR: host build of the same sources
+against a local server; locks status passthrough, error bodies, timeouts,
+redirects, POST bodies, and share pooling). Writing them immediately
+flushed out three latent wrapper bugs, all fixed here:
+- `cancel_flag_` was never initialized — an indeterminate value makes
+  ProgressCallback abort transfers (CURLE_ABORTED_BY_CALLBACK) at random.
+- `curl_response_` started as a wild pointer — the destructor deletes it,
+  so a client destroyed before its first response freed garbage.
+- HeaderCallback passed an `int32_t*` to CURLINFO_RESPONSE_CODE, which
+  writes a `long` — 4 bytes of stack corrupted on every response header
+  on LP64 platforms.
+
 ## 0.1.0-raft.3 (OHOS: surface real HTTP status codes)
 
 Critical fix: on OHOS the wrapper only returned the CURLcode (0 = transfer

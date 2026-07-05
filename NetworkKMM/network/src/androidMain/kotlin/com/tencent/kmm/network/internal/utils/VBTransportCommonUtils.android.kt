@@ -43,12 +43,13 @@ actual fun ByteArray.mergeFromChunks(chunks: List<ByteArray>) {
     }
 }
 
-actual fun getHttpClient(kmmRequest: VBTransportBaseRequest): Any? = HttpClient(Android) {
-    if (kmmRequest.totalTimeout > 0) {
-        install(HttpTimeout) {
-            requestTimeoutMillis = kmmRequest.totalTimeout
-            connectTimeoutMillis = kmmRequest.totalTimeout
-            socketTimeoutMillis = kmmRequest.totalTimeout
-        }
+// One client per process: connection pooling, TLS session reuse, and no
+// per-request engine construction. Timeouts are applied per request through
+// the HttpTimeout plugin (see IVBTransportService triggerRequest).
+private val sharedHttpClient: HttpClient by lazy {
+    HttpClient(Android) {
+        install(HttpTimeout)
     }
 }
+
+actual fun getHttpClient(kmmRequest: VBTransportBaseRequest): Any? = sharedHttpClient

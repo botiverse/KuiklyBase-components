@@ -42,6 +42,7 @@ import com.tencent.kmm.network.internal.utils.getHttpClient
 import com.tencent.kmm.network.internal.utils.readKnownSize
 import com.tencent.kmm.network.internal.utils.readUnknownSize
 import io.ktor.client.HttpClient
+import io.ktor.client.plugins.timeout
 import io.ktor.client.request.HttpRequestBuilder
 import io.ktor.client.request.header
 import io.ktor.client.request.request
@@ -74,6 +75,13 @@ class IOSTransportImpl : IVBTransportService {
                 val client = getHttpClient(request) as HttpClient
                 val response = client.request(request.url) {
                     method = HttpMethod(request.method.name)
+                    if (request.totalTimeout > 0) {
+                        timeout {
+                            requestTimeoutMillis = request.totalTimeout
+                            connectTimeoutMillis = request.totalTimeout
+                            socketTimeoutMillis = request.totalTimeout
+                        }
+                    }
                     constructRequest(request)
                 }
 

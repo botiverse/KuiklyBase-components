@@ -29,6 +29,28 @@ on:
       - ".github/workflows/networkkmm-ohos-native.yml"
 
 jobs:
+  # Behavior-contract tests: the wrapper built for the HOST (same sources,
+  # system libcurl/zlib) against a local server. Locks down status passthrough
+  # (the raft.3 bug class), error bodies, timeouts, redirects, POST bodies,
+  # and share-handle connection pooling on every PR.
+  wrapper-behavior-tests:
+    name: Wrapper behavior tests (host build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev zlib1g-dev
+
+      - name: Run behavior tests
+        shell: bash
+        run: bash NetworkKMM/tests/wrapper/run_tests.sh
+
   build-native:
     name: Cross-compile OHOS native (OpenSSL + curl + wrapper)
     runs-on: ubuntu-latest
