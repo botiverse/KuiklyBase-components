@@ -51,13 +51,13 @@ actual fun ByteArray.mergeFromChunks(chunks: List<ByteArray>) {
     }
 }
 
-actual fun getHttpClient(kmmRequest: VBTransportBaseRequest): Any? = HttpClient(Darwin) {
-    val timeout = kmmRequest.totalTimeout
-    if (timeout > 0) {
-        install(HttpTimeout) {
-            connectTimeoutMillis = timeout
-            socketTimeoutMillis = timeout
-            requestTimeoutMillis = timeout
-        }
+// One client per process: connection pooling, TLS session reuse, and no
+// per-request engine construction. Timeouts are applied per request through
+// the HttpTimeout plugin (see IVBTransportService triggerRequest).
+private val sharedHttpClient: HttpClient by lazy {
+    HttpClient(Darwin) {
+        install(HttpTimeout)
     }
 }
+
+actual fun getHttpClient(kmmRequest: VBTransportBaseRequest): Any? = sharedHttpClient

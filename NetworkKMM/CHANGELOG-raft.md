@@ -1,5 +1,17 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.4 (Android/iOS: shared pooled HttpClient)
+
+Android and iOS previously constructed a NEW ktor HttpClient for every
+request (and never closed it): no connection reuse, no TLS session cache,
+plus an engine leak. Both platforms now share one lazily-created client
+with the HttpTimeout plugin installed, and per-request timeouts are applied
+through ktor's request-level `timeout {}` block. Behavior is otherwise
+unchanged; no native/ABI changes (OHOS untouched).
+
+This is the prerequisite for migrating Slock's Android/iOS HTTP onto
+NetworkKMM without a connection-pooling regression (Slock task #12 step 2).
+
 ## 0.1.0-raft.3 (OHOS: surface real HTTP status codes)
 
 Critical fix: on OHOS the wrapper only returned the CURLcode (0 = transfer
