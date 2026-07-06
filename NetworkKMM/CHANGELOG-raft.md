@@ -1,5 +1,21 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.6 (streaming completeness — response headers + OHOS native)
+
+- **Response headers at stream start**: `NetworkClient.downloadStream` now
+  reports the status code, Content-Length and headers via `onResponseStart`
+  the moment they are known — before the first chunk — so callers can show
+  determinate download progress. Android/iOS fire it right after ktor returns
+  the response; the buffering fallback fires it once the body is read.
+- **OHOS native streaming (fork #8 phase 2)**: the libcurl wrapper previously
+  buffered the whole response into a std::string. A parallel `StartStreamRequest`
+  entry now streams each libcurl write straight to Kotlin via `onChunk` (no
+  buffering), fires `onResponseStart` when headers are ready and delivers a
+  body-less completion — so OHOS matches Android/iOS instead of falling back to
+  the full-buffer path. Streaming requests negotiate identity (not gzip), since
+  chunks are not incrementally inflated. The native `.so` is rebuilt to carry
+  the new `StartStreamRequest` symbol.
+
 ## 0.1.0-raft.5 (gzip on OHOS + streaming download)
 
 - **gzip on OHOS**: the libcurl wrapper only negotiates and decompresses gzip
