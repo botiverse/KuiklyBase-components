@@ -25,11 +25,20 @@ add_library(pbcurlwrapper SHARED
     wrapper/src/utils/curl_utils.h
     )
 # 下方的 libcurl.a 来自tvk工程
+set(PB_LIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../libs/arm64-v8a)
+# libcurl.a is static and is built with zlib/brotli/zstd content-encoding
+# support (build-ohos-native.sh), so its codec dependencies are linked here as
+# static archives after libcurl.a. brotlidec depends on brotlicommon, so it
+# must precede it in link order. These replace the old system libz.so link,
+# which was vestigial while libcurl had CURL_ZLIB=OFF.
 target_link_libraries(pbcurlwrapper PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../libs/arm64-v8a/libopenssl.so
+        ${PB_LIBS_DIR}/libopenssl.so
         libhilog_ndk.z.so
-        libz.so
         "-Wl,-Bsymbolic,--gc-sections,--whole-archive"
-        ${CMAKE_CURRENT_SOURCE_DIR}/../../../libs/arm64-v8a/libcurl.a
+        ${PB_LIBS_DIR}/libcurl.a
         "-Wl,--no-whole-archive"
+        ${PB_LIBS_DIR}/libz.a
+        ${PB_LIBS_DIR}/libbrotlidec.a
+        ${PB_LIBS_DIR}/libbrotlicommon.a
+        ${PB_LIBS_DIR}/libzstd.a
 )

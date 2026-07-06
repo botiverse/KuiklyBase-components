@@ -1,5 +1,25 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.7 (OHOS libcurl content-encoding codecs — gzip/deflate/br/zstd)
+
+- **All content-encoding codecs on OHOS**: the OHOS libcurl was built with
+  `CURL_ZLIB=OFF`/`CURL_BROTLI=OFF`/`CURL_ZSTD=OFF`, so it only understood
+  `identity` and failed any compressed response with `CURLE_BAD_CONTENT_ENCODING`
+  (61) — e.g. a Cloudflare-fronted API serving Brotli, which blocked login. As a
+  general-purpose network service it must decode any standard encoding, so
+  `build-ohos-native.sh` now cross-compiles zlib 1.3.1 + brotli 1.1.0 + zstd 1.5.6
+  and links them into `libcurl.a`/`libpbcurlwrapper.so`. The build fails loudly
+  (nm symbol check) if any decoder is missing, so a codec can't silently regress
+  to identity again.
+- **Transparent decode in the wrapper**: the wrapper now lets libcurl advertise
+  and decode every built-in codec (`CURLOPT_ACCEPT_ENCODING` empty = all). A
+  caller-supplied `Accept-Encoding` is routed through libcurl's decoder instead
+  of a raw header (no duplicate header, and `identity` is still honoured).
+  Streaming still forces `identity` so `Content-Length` matches the bytes
+  delivered to `onChunk` (determinate progress). The raft.5 half-manual gzip pass
+  is removed — libcurl decompresses in place.
+- Native `.so` rebuilt; the cinterop header is unchanged.
+
 ## 0.1.0-raft.6 (streaming completeness — response headers + OHOS native)
 
 - **Response headers at stream start**: `NetworkClient.downloadStream` now
