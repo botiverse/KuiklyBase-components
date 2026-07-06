@@ -254,7 +254,7 @@ object CurlRequestServiceHM : ICurlRequestService {
         request: VBTransportBaseRequest
     ): Map<String, String> {
         // 如果没有显式指定 Content-Type,需要添加默认 Content-Type
-        val tmpHeaders = request.header.takeIf {
+        var tmpHeaders = request.header.takeIf {
             it.keys.any { key -> key.equals("Content-Type", ignoreCase = true) }
         } ?: run {
             val contentType = when (request) {
@@ -265,6 +265,13 @@ object CurlRequestServiceHM : ICurlRequestService {
                 else -> "application/octet-stream"
             }
             request.header + mapOf("Content-Type" to contentType)
+        }
+        // 默认开启 gzip: libcurl wrapper 只有在请求带 Accept-Encoding: gzip 时才
+        // 协商并解压 gzip,否则退回 identity 拿到未压缩响应。A/iOS 的引擎透明处理
+        // gzip、不看这个 header,所以只在 OHOS 这一层补默认值即可。调用方若已显式
+        // 指定 Accept-Encoding,则尊重其选择,不覆盖。
+        if (tmpHeaders.keys.none { it.equals("Accept-Encoding", ignoreCase = true) }) {
+            tmpHeaders = tmpHeaders + mapOf("Accept-Encoding" to "gzip")
         }
         request.header = tmpHeaders.toMutableMap()
         return tmpHeaders
