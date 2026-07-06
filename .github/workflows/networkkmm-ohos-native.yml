@@ -20,12 +20,22 @@ on:
       - master
     paths:
       - "NetworkKMM/scripts/build-ohos-native.sh"
+      - "NetworkKMM/settings.gradle.kts"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - "NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/curl/**"
+      - "NetworkKMM/network/src/ohosArm64Main/kotlin/com/tencent/kmm/network/curl/**"
+      - "NetworkKMM/network/src/nativeInterop/cinterop/**"
+      - "NetworkKMM/network-host-native-tests/**"
       - ".github/workflows/networkkmm-ohos-native.yml"
   pull_request:
     paths:
       - "NetworkKMM/scripts/build-ohos-native.sh"
+      - "NetworkKMM/settings.gradle.kts"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - "NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/curl/**"
+      - "NetworkKMM/network/src/ohosArm64Main/kotlin/com/tencent/kmm/network/curl/**"
+      - "NetworkKMM/network/src/nativeInterop/cinterop/**"
+      - "NetworkKMM/network-host-native-tests/**"
       - ".github/workflows/networkkmm-ohos-native.yml"
 
 jobs:
@@ -45,11 +55,25 @@ jobs:
         shell: bash
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev zlib1g-dev
+          sudo apt-get install -y --no-install-recommends libcurl4-openssl-dev zlib1g-dev brotli zstd
 
       - name: Run behavior tests
         shell: bash
+        env:
+          WRAPPER_REQUIRE_ALL_CODECS: "1"
         run: bash NetworkKMM/tests/wrapper/run_tests.sh
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Run Kotlin/Native host codec tests
+        shell: bash
+        run: |
+          cd NetworkKMM
+          ./gradlew :network-host-native-tests:linuxX64Test --console=plain --no-daemon
 
   build-native:
     name: Cross-compile OHOS native (OpenSSL + curl + wrapper)

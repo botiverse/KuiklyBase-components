@@ -280,29 +280,7 @@ object CurlRequestServiceHM : ICurlRequestService {
     }
 
     private fun handleCurlNativeResponse(result: CurlResponse, logTag: String): CurlNativeResponse {
-        val response = CurlNativeResponse(
-            code = result.code,
-            httpCode = result.httpCode.toInt(),
-            errorMsg = result.errorMsg?.toKString() ?: "",
-            headers = result.headers?.toKString() ?: "",
-            redirectUrl = result.redirectUrl?.toKString() ?: "",
-            elapse = VBTransportElapseStatistics(
-                nameLookupTimeMs = result.elapse.nameLookupTimeMs,
-                connectTimeMs = result.elapse.connectTimeMs,
-                sslCostTimeMs = result.elapse.sslCostTimeMs,
-                preTransferTime = result.elapse.preTransferTime,
-                startTransferTimeMs = result.elapse.startTransferTimeMs,
-                redirectTime = result.elapse.redirectTime,
-                recvTime = result.elapse.recvTime,
-                totalTimeMs = result.elapse.totalTimeMs
-            ),
-            data = result.data?.let { data ->
-                memScoped {
-                    val size = result.dataLen
-                    if (size > 0) data.readBytes(size) else ByteArray(0)
-                }
-            }
-        )
+        val response = result.toCurlNativeResponse()
 //        VBPBLog.i(logTag, "[$logTag] libcurl request callback, code:${response.code}," +
 //                " errorMsg:${response.errorMsg}, dataSize:${result.dataLen}, " +
 //                "nameLookupTimeMs:${response.elapse.nameLookupTimeMs}, connectTimeMs:" +
@@ -572,6 +550,40 @@ object CurlRequestServiceHM : ICurlRequestService {
 
     private fun logI(content: String) {
         VBPBLog.i(VBPBLog.HMCURLIMPL, content)
+    }
+
+    private fun CurlResponse.toCurlNativeResponse(): CurlNativeResponse {
+        return CurlResponseCodec.decode(
+            CurlResponseFields(
+                code = code,
+                httpCode = httpCode.toInt(),
+                errorMsg = errorMsg.toKStringOrNull(errorMsgLen),
+                errorMsgLen = errorMsgLen,
+                headers = headers.toKStringOrNull(headerLen),
+                headerLen = headerLen,
+                redirectUrl = redirectUrl?.toKString(),
+                data = data.readBytesOrNull(dataLen),
+                dataLen = dataLen,
+                elapse = VBTransportElapseStatistics(
+                    nameLookupTimeMs = elapse.nameLookupTimeMs,
+                    connectTimeMs = elapse.connectTimeMs,
+                    sslCostTimeMs = elapse.sslCostTimeMs,
+                    preTransferTime = elapse.preTransferTime,
+                    startTransferTimeMs = elapse.startTransferTimeMs,
+                    redirectTime = elapse.redirectTime,
+                    recvTime = elapse.recvTime,
+                    totalTimeMs = elapse.totalTimeMs
+                )
+            )
+        )
+    }
+
+    private fun CPointer<ByteVar>?.toKStringOrNull(length: Int): String? {
+        return if (this == null || length <= 0) null else toKString()
+    }
+
+    private fun CPointer<ByteVar>?.readBytesOrNull(length: Int): ByteArray? {
+        return this?.let { if (length > 0) it.readBytes(length) else ByteArray(0) }
     }
 }
 

@@ -2,7 +2,8 @@
 # Build pbcurlwrapper for the HOST (same sources, system libcurl/zlib) and run
 # the behavior-contract tests against a local server. Locks down the wrapper's
 # observable contract on every PR — status passthrough (the raft.3 bug class),
-# error bodies, timeouts, redirects, POST bodies, and share-handle pooling.
+# error bodies, timeouts, redirects, POST bodies, content-encoding decode, and
+# share-handle pooling.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
