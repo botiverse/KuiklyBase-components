@@ -270,10 +270,14 @@ object CurlRequestServiceHM : ICurlRequestService {
     }
 
     private fun handleCurlNativeResponse(result: CurlResponse, logTag: String): CurlNativeResponse {
+        logI("[$logTag] libcurl native response meta, code:${result.code}, " +
+                "errorMsgPtr:${result.errorMsg}, errorMsgLen:${result.errorMsgLen}, " +
+                "headersPtr:${result.headers}, headerLen:${result.headerLen}, " +
+                "redirectUrlPtr:${result.redirectUrl}, dataPtr:${result.data}, dataLen:${result.dataLen}")
         val response = CurlNativeResponse(
             code = result.code,
-            errorMsg = result.errorMsg?.toKString() ?: "",
-            headers = result.headers?.toKString() ?: "",
+            errorMsg = result.errorMsg.toKStringOrEmpty(result.errorMsgLen, "errorMsg", logTag),
+            headers = result.headers.toKStringOrEmpty(result.headerLen, "headers", logTag),
             redirectUrl = result.redirectUrl?.toKString() ?: "",
             elapse = VBTransportElapseStatistics(
                 nameLookupTimeMs = result.elapse.nameLookupTimeMs,
@@ -315,8 +319,15 @@ object CurlRequestServiceHM : ICurlRequestService {
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
             var nativeResponse = CurlNativeResponse()
             val callback = object : ICurlCallback {
-                override fun onResponse(result: CurlResponse) {
-                    nativeResponse = handleCurlNativeResponse(result, logTag)
+                override fun onResponse(result: CurlResponse?) {
+                    nativeResponse = result?.let {
+                        handleCurlNativeResponse(it, logTag)
+                    } ?: CurlNativeResponse(
+                        code = -1,
+                        errorMsg = "NetworkKMM OHOS native callback returned null CurlResponse"
+                    ).also {
+                        logI("[$logTag] libcurl native callback returned null CurlResponse")
+                    }
                 }
             }
 
@@ -457,10 +468,27 @@ object CurlRequestServiceHM : ICurlRequestService {
     private fun logI(content: String) {
         VBPBLog.i(VBPBLog.HMCURLIMPL, content)
     }
+
+    private fun CPointer<ByteVar>?.toKStringOrEmpty(
+        length: Int,
+        fieldName: String,
+        logTag: String
+    ): String {
+        if (this == null) {
+            logI("[$logTag] libcurl native response $fieldName is null, length:$length")
+            return ""
+        }
+        if (length <= 0) {
+            logI("[$logTag] libcurl native response $fieldName has no bytes, " +
+                    "ptr:$this, length:$length")
+            return ""
+        }
+        return toKString()
+    }
 }
 
 interface ICurlCallback {
-    fun onResponse(result: CurlResponse)
+    fun onResponse(result: CurlResponse?)
 }
 
 // 图片加载回调 kotlin->c
@@ -477,8 +505,8 @@ class CurlCallbackWrapper(private val curlCallback: ICurlCallback) {
         callBlackNative.callback = callbackPtr
     }
 
-    private fun onResponse(result: CPointer<CurlResponse>) =
-        curlCallback.onResponse(result.pointed)
+    private fun onResponse(result: CPointer<CurlResponse>?) =
+        curlCallback.onResponse(result?.pointed)
 
     fun getCallbackNativePtr(): CPointer<CurlCallback> = callBlackNative.ptr
 

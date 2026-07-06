@@ -18,6 +18,7 @@
 #include "curl_wrapper.h"
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
 #include <string>
 #include "curl/curl.h"
 #include "log/curl_log.h"
@@ -308,15 +309,19 @@ class CurlClient {
         char *ip = nullptr;
         curl_easy_getinfo(curl_, CURLINFO_PRIMARY_IP, &ip);
         logI(log_tag_, "ret code:" + std::to_string(errorCode) + ", errorMsg:" + curl_error_msg_
-            + ",ip:" + ip + ", dataLen:" + std::to_string(content_data_.length()) + ", redirect url:"
+            + ",ip:" + SafeCString(ip) + ", dataLen:" + std::to_string(content_data_.length()) + ", redirect url:"
             + redirect_url_ + "\nheader:\n" + headers_);
         logD(log_tag_, "data:\n" + content_data_);
 
         curl_response_ = new CurlResponse();
         curl_response_->code = errorCode;
         curl_response_->headerLen = headers_.length();
-        curl_response_->headers = const_cast<char *>(reinterpret_cast<const char *>(headers_.c_str()));
-        curl_response_->redirectUrl = const_cast<char *>(reinterpret_cast<const char *>(redirect_url_.c_str()));
+        curl_response_->headers = headers_.empty()
+            ? nullptr
+            : const_cast<char *>(reinterpret_cast<const char *>(headers_.c_str()));
+        curl_response_->redirectUrl = redirect_url_.empty()
+            ? nullptr
+            : const_cast<char *>(reinterpret_cast<const char *>(redirect_url_.c_str()));
         curl_response_->dataLen = 0;
         curl_response_->data = nullptr;
         // 失败场景不赋值响应数据,防止某些不规范调用的业务方即使在失败场景也按成功请求时一样去处理data,造成问题
@@ -324,10 +329,18 @@ class CurlClient {
             curl_response_->dataLen = content_data_.length();
             curl_response_->data = const_cast<char *>(reinterpret_cast<const char *>(content_data_.c_str()));
         }
-        curl_response_->errorMsg = curl_error_msg_;
         curl_response_->errorMsgLen = strlen(curl_error_msg_);
+        curl_response_->errorMsg = curl_response_->errorMsgLen == 0 ? nullptr : curl_error_msg_;
         HandleElapseStatisticsInfo(curl_response_);
 
+        logI(log_tag_, "CurlResponse meta code:" + std::to_string(curl_response_->code)
+            + ", errorMsgPtr:" + PtrDebug(curl_response_->errorMsg)
+            + ", errorMsgLen:" + std::to_string(curl_response_->errorMsgLen)
+            + ", headersPtr:" + PtrDebug(curl_response_->headers)
+            + ", headerLen:" + std::to_string(curl_response_->headerLen)
+            + ", redirectUrlPtr:" + PtrDebug(curl_response_->redirectUrl)
+            + ", dataPtr:" + PtrDebug(curl_response_->data)
+            + ", dataLen:" + std::to_string(curl_response_->dataLen));
         logI(log_tag_, "libcurl callback.");
         shared_ptr<CurlCallback> fetchCallbackBlockPtr(callback);
         fetchCallbackBlockPtr->callback(fetchCallbackBlockPtr->callbackRef, curl_response_);
@@ -359,6 +372,14 @@ class CurlClient {
         int ret = GzipDecompress(content_data_, content_data_, log_tag_);
         gzip_content_encoding_ = false;
         return ret;
+    }
+
+    static std::string SafeCString(const char *value) {
+        return value == nullptr ? "" : std::string(value);
+    }
+
+    static std::string PtrDebug(const void *ptr) {
+        return ptr == nullptr ? "null" : std::to_string(reinterpret_cast<uintptr_t>(ptr));
     }
 
     void HandleElapseStatisticsInfo(CurlResponse *curlResponse) {
