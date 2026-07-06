@@ -1,5 +1,27 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.5 (gzip on OHOS + streaming download)
+
+- **gzip on OHOS**: the libcurl wrapper only negotiates and decompresses gzip
+  when the request carries `Accept-Encoding: gzip`; otherwise it falls back to
+  `identity` and receives an uncompressed response. The OHOS `buildRequestHeader`
+  path now defaults that header (next to the existing default Content-Type), so
+  gzip is unified across platforms (Android/iOS already handle it transparently
+  in their engines). Kotlin-only — the wrapper already decompresses — no native
+  `.so` rebuild. An explicit caller `Accept-Encoding` is respected.
+- **Streaming download (fork #8, Android/iOS)**: `NetworkClient.downloadStream(
+  request, onChunk, onComplete)` delivers the response body chunk-by-chunk off
+  ktor's response `ByteReadChannel` (16 KiB reads) instead of buffering the whole
+  payload; `onComplete` carries status/headers/error only. Request middlewares
+  and the current auth token are applied up front (no mid-stream refresh/retry —
+  a stream cannot be replayed); the returned `NetworkCall` cancels it. Wired
+  through `IVBTransportService.requestStream` (interface default falls back to the
+  full-buffer `request()` and hands the whole body over as one chunk, so every
+  platform works immediately), `VBTransportTask.streamRequest`, and
+  `VBTransportService.streamRequest`. OHOS keeps the buffering fallback until its
+  libcurl write callback streams chunks into Kotlin (a later native-rebuild
+  change).
+
 ## 0.1.0-raft.4 (connection pooling on all three platforms)
 
 - **Android/iOS**: previously a NEW ktor HttpClient was constructed for every
