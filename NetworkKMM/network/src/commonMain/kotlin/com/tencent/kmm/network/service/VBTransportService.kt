@@ -195,6 +195,7 @@ object VBTransportService {
     // whose semantics ("whole request done") do not fit an open download.
     fun streamRequest(
         request: VBTransportRequest,
+        onResponseStart: (statusCode: Int, headers: Map<String, List<String>>) -> Unit,
         onChunk: (chunk: ByteArray) -> Unit,
         handler: VBTransportHandler?
     ) {
@@ -202,7 +203,7 @@ object VBTransportService {
         networkScope.launch(track = true) {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
-            task.streamRequest(request, onChunk) { response ->
+            task.streamRequest(request, onResponseStart, onChunk) { response ->
                 if (task.getState() != VBTransportState.Done) {
                     task.setState(VBTransportState.Done)
                     handler?.let { it(response) }

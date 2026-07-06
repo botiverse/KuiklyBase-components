@@ -69,19 +69,23 @@ interface IVBTransportService {
     )
 
     /**
-     * 流式下载 (fork #8): 响应体逐块回调 [onChunk], 不在内存里缓冲整包; 结束时以
-     * [onComplete] 交付状态/头/错误 (其 data 置 null, body 已通过 chunk 交付)。
+     * 流式下载 (fork #8): 响应头一就绪即以 [onResponseStart] 交付状态码+响应头
+     * (用于确定进度: Content-Length), 响应体逐块回调 [onChunk] 不缓冲整包, 结束
+     * 时以 [onComplete] 交付状态/头/错误 (其 data 置 null, body 已通过 chunk 交付)。
      *
-     * 默认实现回退到 [request] 的全量缓冲, 再把整包作为单个 chunk 交付——语义正确
-     * 但不省内存。引擎本身支持流式的平台 (Android/iOS 的 ktor ByteReadChannel)
-     * 覆写此方法交付真正的逐块数据。
+     * 默认实现回退到 [request] 的全量缓冲: 拿到整包后先 onResponseStart, 再把整包
+     * 作为单个 chunk 交付——语义正确但不省内存, 且 onResponseStart 直到响应读完才
+     * 触发。引擎本身支持流式的平台 (Android/iOS 的 ktor ByteReadChannel) 覆写此方法
+     * 在响应头就绪时立即 onResponseStart, 再交付真正的逐块数据。
      */
     fun requestStream(
         kmmRequest: VBTransportRequest,
+        onResponseStart: (statusCode: Int, headers: Map<String, List<String>>) -> Unit,
         onChunk: (chunk: ByteArray) -> Unit,
         onComplete: (response: VBTransportResponse) -> Unit
     ) {
         request(kmmRequest) { response ->
+            onResponseStart(response.errorCode, response.header)
             when (val body = response.data) {
                 is ByteArray -> if (body.isNotEmpty()) onChunk(body)
                 is String -> if (body.isNotEmpty()) onChunk(body.encodeToByteArray())

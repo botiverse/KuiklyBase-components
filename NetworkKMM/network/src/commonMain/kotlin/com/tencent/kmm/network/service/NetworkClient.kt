@@ -212,6 +212,7 @@ class NetworkClient(
      */
     fun downloadStream(
         request: NetworkRequest,
+        onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit = { _, _, _ -> },
         onChunk: (chunk: ByteArray) -> Unit,
         onComplete: (NetworkResponse) -> Unit
     ): NetworkCall {
@@ -237,7 +238,16 @@ class NetworkClient(
                 totalTimeout = prepared.policy.timeoutMillis
             }
             call.addCancelHandler { VBTransportService.cancel(vbRequest.requestId) }
-            VBTransportService.streamRequest(vbRequest, onChunk) { response ->
+            VBTransportService.streamRequest(
+                vbRequest,
+                onResponseStart = { rawStatus, headers ->
+                    // rawStatus follows the transport's errorCode convention
+                    // (0 == OK); expose the real HTTP status to callers.
+                    val httpStatus = statusCodeFromErrorCode(rawStatus) ?: rawStatus
+                    onResponseStart(httpStatus, contentLengthFromHeaders(headers), headers)
+                },
+                onChunk = onChunk
+            ) { response ->
                 val networkResponse = response.toNetworkResponse(prepared)
                 call.complete(networkResponse)
                 onComplete(networkResponse)

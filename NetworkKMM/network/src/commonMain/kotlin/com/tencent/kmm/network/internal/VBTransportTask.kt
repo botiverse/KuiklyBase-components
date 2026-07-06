@@ -235,10 +235,12 @@ class VBTransportTask(
         }
     }
 
-    // fork #8: streaming download — response body delivered chunk-by-chunk via
-    // [onChunk], [handler] receives the body-less completion (status/headers/error).
+    // fork #8: streaming download — response headers via [onResponseStart] as
+    // soon as they are ready, body chunk-by-chunk via [onChunk], [handler]
+    // receives the body-less completion (status/headers/error).
     fun streamRequest(
         request: VBTransportRequest,
+        onResponseStart: (statusCode: Int, headers: Map<String, List<String>>) -> Unit,
         onChunk: (chunk: ByteArray) -> Unit,
         handler: VBTransportHandler?
     ) {
@@ -251,7 +253,7 @@ class VBTransportTask(
             return
         }
         state = VBTransportState.Running
-        getIVBTransportService().requestStream(request, onChunk) { response ->
+        getIVBTransportService().requestStream(request, onResponseStart, onChunk) { response ->
             handleResponse(request, response, wrapResponse(handler))
         }
     }
