@@ -66,9 +66,6 @@ static CURLSH *GetCurlShare() {
     }
     return gCurlShare;
 }
-// 为了和 libcurl 错误码区分, 这里加一个偏移量
-static const int gDefaultZipErrorCodeOffset = 150;
-
 class CurlClient {
  public:
     explicit CurlClient(std::string logTag) {
@@ -162,15 +159,10 @@ class CurlClient {
             trim(key);
             trim(value);
 
-            // 统一转换为小写（避免大小写敏感问题）
-            std::transform(key.begin(), key.end(), key.begin(), ::tolower);
-            // 检测 Content-Encoding: gzip
-            if (key == "content-encoding") {
-                std::transform(value.begin(), value.end(), value.begin(), ::tolower);
-                if (value.find("gzip") != std::string::npos) {
-                    client->gzip_content_encoding_ = true;
-                }
-            }
+            // Content-Encoding is no longer decoded manually: libcurl (built with
+            // zlib/brotli/zstd) transparently decodes the body via
+            // CURLOPT_ACCEPT_ENCODING, so the write callback already receives the
+            // decompressed bytes. Header lines are still recorded verbatim below.
         }
         client->headers_ += line + "\n";  // 保留原始头部信息
     }
@@ -287,8 +279,14 @@ class CurlClient {
             std::string value = std::string(header.second);
             // 比较时转换为小写（避免大小写敏感问题）
             std::transform(tmpKey.begin(), tmpKey.end(), tmpKey.begin(), ::tolower);
-            if (tmpKey == "accept-encoding" && value == "gzip") {
-                gzip_accept_encoding_ = true;
+            // Route a caller-supplied Accept-Encoding through CURLOPT_ACCEPT_ENCODING
+            // (libcurl's content-decoder) instead of a raw header, so libcurl
+            // transparently decodes the response and we never emit a duplicate
+            // Accept-Encoding header. Unset defaults to "" below = all codecs
+            // libcurl was built with (gzip/deflate/br/zstd).
+            if (tmpKey == "accept-encoding") {
+                accept_encoding_ = value;
+                continue;
             }
             std::string header_opt = key + ": " + value;
             logI(log_tag_, "request header[" + std::to_string(i) + "]: " + header_opt);
@@ -307,17 +305,17 @@ class CurlClient {
         if (header_list_) {
             curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, header_list_);
         }
-        // 设置解码支持格式 true:支持gzip解码 false:默认
-        if (gzip_accept_encoding_) {
-            // 支持gzip，优先服务器发送gzip数据，如果服务器无法提供gzip其他格式同样支持，优先级低于gzip
-            logI(log_tag_, "libcurl set gzip accept encoding.");
-            curl_easy_setopt(curl_, CURLOPT_ACCEPT_ENCODING, "gzip");
-        } else {
-            // 默认原数据请求，其他编码格式也支持，优先级低于原数据请求
-            // 由于该项设置开启后只能修改参数或通过初始化和销毁关闭；避免调用时开启gzip再关闭gzip，gzip配置未更新，故加上
-            logI(log_tag_, "libcurl set identity accept encoding.");
-            curl_easy_setopt(curl_, CURLOPT_ACCEPT_ENCODING, "identity");
-        }
+        // Content-encoding negotiation + transparent decoding. libcurl is built
+        // with zlib/brotli/zstd (build-ohos-native.sh), so "" advertises every
+        // supported codec (gzip, deflate, br, zstd) and decodes the response body
+        // in-place. A caller can pin a value (e.g. "identity") via the request's
+        // Accept-Encoding header, captured above. Streaming forces identity so the
+        // Content-Length header matches the bytes delivered to onChunk (determinate
+        // progress) — libcurl would otherwise report the compressed length.
+        const char *accept_encoding = stream_mode_ ? "identity" : accept_encoding_.c_str();
+        logI(log_tag_, std::string("libcurl accept-encoding: ") +
+            (accept_encoding[0] == '\0' ? "<all supported>" : accept_encoding));
+        curl_easy_setopt(curl_, CURLOPT_ACCEPT_ENCODING, accept_encoding);
         // 超时配置
         if (timeout > 0) {
             curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout);
@@ -386,23 +384,11 @@ class CurlClient {
         // 响应数据 body 处理
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, DataWriteCallback);
         curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &content_data_);
-        // curl 请求处理
+        // curl 请求处理. libcurl transparently decodes the body per the negotiated
+        // Content-Encoding (zlib/brotli/zstd), so content_data_ is already the
+        // decompressed payload — no manual gzip pass.
         CURLcode res = curl_easy_perform(curl_);
-
-        // 处理 gzip 响应数据
         int errorCode = res;
-        if (res == CURLE_OK) {
-            // 请求成功才执行 gzip 解压
-            int upzipCode = HandleGzipDataIfNeed();
-            if (upzipCode != Z_OK) {
-                // gzip 解压失败, 更新错误码. 为了和 libcurl 错误码区分, 这里加一个偏移量
-                errorCode = upzipCode + gDefaultZipErrorCodeOffset;
-                // 更新错误描述信息
-                memset(curl_error_msg_, 0, sizeof(curl_error_msg_));
-                std::string error_msg = "gzip unzip failed";
-                std::memcpy(curl_error_msg_, error_msg.c_str(), error_msg.length());
-            }
-        }
 
         char *ip = nullptr;
         curl_easy_getinfo(curl_, CURLINFO_PRIMARY_IP, &ip);
@@ -446,6 +432,7 @@ class CurlClient {
     void StartStreamRequest(CurlRequest request, CurlStreamCallback *callback) {
         stream_callback_ = callback;
         stream_started_ = false;
+        stream_mode_ = true;
         std::string method;
         if (!ConfigureRequest(request, method)) {
             // Always deliver exactly one terminal callback (upstream #31 contract).
@@ -509,15 +496,6 @@ class CurlClient {
         }
     }
 
-    int HandleGzipDataIfNeed() {
-        if (!gzip_content_encoding_) {
-            return Z_OK;
-        }
-
-        int ret = GzipDecompress(content_data_, content_data_, log_tag_);
-        gzip_content_encoding_ = false;
-        return ret;
-    }
 
     void HandleElapseStatisticsInfo(CurlResponse *curlResponse) {
         if (curl_ == nullptr || curlResponse == nullptr) {
@@ -577,11 +555,15 @@ class CurlClient {
     std::string redirect_url_;
     std::string content_data_;
     CurlResponse *curl_response_ = nullptr;  // destructor deletes it — must not start wild
-    bool gzip_accept_encoding_ = false;
-    bool gzip_content_encoding_ = false;
+    // Caller-pinned Accept-Encoding (from the request header); empty = advertise
+    // all codecs libcurl supports and let it decode transparently.
+    std::string accept_encoding_;
     // fork #8 streaming: set for the lifetime of a StartStreamRequest call.
     CurlStreamCallback *stream_callback_ = nullptr;
     bool stream_started_ = false;
+    // Streaming forces Accept-Encoding: identity so Content-Length matches the
+    // bytes delivered to onChunk (determinate progress, no transparent decode).
+    bool stream_mode_ = false;
 };
 
 void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback) {
