@@ -89,6 +89,16 @@ typedef struct {
     void (*callback)(void *callbackRef, CurlResponse *response);
 } CurlCallback;
 
+// Curl 流式响应回调 (fork #8): 响应头就绪时 onResponseStart 交付状态码+头; 响应体
+// 每到一块调 onChunk (不缓冲整包); 结束时 onComplete 交付状态/错误 (CurlResponse
+// 的 data 为 null, body 已通过 onChunk 交付)。
+typedef struct {
+    void *callbackRef;
+    void (*onResponseStart)(void *callbackRef, long httpCode, const char *headers, int headerLen);
+    void (*onChunk)(void *callbackRef, const char *data, int len);
+    void (*onComplete)(void *callbackRef, CurlResponse *response);
+} CurlStreamCallback;
+
 // CurClient 对象指针
 typedef void* CurClientHandle;
 
@@ -103,6 +113,9 @@ void Cancel(CurClientHandle handle);
 
 // Curl 发送请求
 void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback);
+
+// Curl 流式发送请求 (fork #8): 响应体逐块通过 callback->onChunk 交付, 不缓冲整包。
+void StartStreamRequest(CurClientHandle handle, CurlRequest request, CurlStreamCallback *callback);
 
 #ifdef __cplusplus
 }

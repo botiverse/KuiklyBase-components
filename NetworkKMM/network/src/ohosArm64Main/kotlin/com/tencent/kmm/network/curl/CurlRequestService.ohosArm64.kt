@@ -29,7 +29,9 @@ import com.tencent.qqlive.kmm.native.libcurl.CurlCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlRequest
 import com.tencent.qqlive.kmm.native.libcurl.CurlResponse
 import com.tencent.qqlive.kmm.native.libcurl.DeleteCurlClient
+import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
 import com.tencent.qqlive.kmm.native.libcurl.StartRequest
+import com.tencent.qqlive.kmm.native.libcurl.StartStreamRequest
 import com.tencent.qqlive.kmm.native.libcurl.StringDic
 import com.tencent.qqlive.kmm.native.libcurl.StringPair
 import com.tencent.qqlive.kmm.native.libcurl.setCurlLogImpl
@@ -405,6 +407,80 @@ object CurlRequestServiceHM : ICurlRequestService {
         }
     }
 
+    // fork #8: 流式下载 — body 逐块通过 [onChunk] 交付, 不缓冲整包; 响应头就绪时
+    // [onResponseStart], 结束时 [onComplete] (body-less)。异常不外逸 (upstream #31)。
+    fun streamRequest(
+        request: VBTransportRequest,
+        onResponseStart: (statusCode: Int, headers: Map<String, List<String>>) -> Unit,
+        onChunk: (chunk: ByteArray) -> Unit,
+        onComplete: (response: VBTransportResponse) -> Unit,
+        logTag: String
+    ) {
+        try {
+            streamRequestUnsafe(request, onResponseStart, onChunk, onComplete, logTag)
+        } catch (throwable: Throwable) {
+            logI("[$logTag] streamRequest failed: ${throwable.message ?: throwable::class.simpleName}")
+            onComplete(
+                VBTransportResponse().apply {
+                    this.request = request
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = throwable.message ?: "native stream request failed"
+                }
+            )
+        }
+    }
+
+    private fun streamRequestUnsafe(
+        request: VBTransportRequest,
+        onResponseStart: (statusCode: Int, headers: Map<String, List<String>>) -> Unit,
+        onChunk: (chunk: ByteArray) -> Unit,
+        onComplete: (response: VBTransportResponse) -> Unit,
+        logTag: String
+    ) {
+        memScoped {
+            // Streaming decodes identity only, so do NOT default Accept-Encoding:
+            // gzip here (chunks would arrive compressed and undecodable).
+            val headers = toStringDic(buildStreamRequestHeader(request), memScope)
+            val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
+            val handler = object : IStreamHandler {
+                override fun onResponseStart(httpCode: Long, headers: String) {
+                    onResponseStart(httpCode.toInt(), convertHeaderMap(headers))
+                }
+
+                override fun onChunk(chunk: ByteArray) {
+                    onChunk(chunk)
+                }
+
+                override fun onComplete(result: CurlResponse) {
+                    val nativeResponse = handleCurlNativeResponse(result, logTag)
+                    onComplete(
+                        VBTransportResponse().apply {
+                            updateResponse(request.logTag, nativeResponse, request, this)
+                        }
+                    )
+                }
+            }
+            val wrapper = CurlStreamCallbackWrapper(handler)
+            val handle = CreateCurlClient(logTag)
+            taskMap[request.requestId] = handle
+            logI("[$logTag] stream transport task add, id:${request.requestId}, handle:${handle}")
+            StartStreamRequest(handle, curlRequest, wrapper.getCallbackNativePtr())
+            DeleteCurlClient(handle)
+            taskMap.remove(request.requestId)
+            wrapper.release()
+        }
+    }
+
+    // Like buildRequestHeader but never defaults Accept-Encoding: gzip — streaming
+    // does not incrementally decompress, so the download must be identity.
+    private fun buildStreamRequestHeader(request: VBTransportBaseRequest): Map<String, String> {
+        val tmpHeaders = request.header.takeIf {
+            it.keys.any { key -> key.equals("Content-Type", ignoreCase = true) }
+        } ?: (request.header + mapOf("Content-Type" to "application/octet-stream"))
+        request.header = tmpHeaders.toMutableMap()
+        return tmpHeaders
+    }
+
     private fun updateResponse(
         logTag: String,
         nativeResponse: CurlNativeResponse,
@@ -531,6 +607,49 @@ internal fun createStableRef(
     callbackRef: COpaquePointer?, result: CPointer<CurlResponse>?
 ) {
     callbackRef?.asStableRef<(CPointer<CurlResponse>?) -> Unit>()?.get()?.invoke(result)
+}
+
+// fork #8 streaming callbacks kotlin->c. One StableRef to the handler backs all
+// three C function pointers; each recovers the handler and dispatches.
+interface IStreamHandler {
+    fun onResponseStart(httpCode: Long, headers: String)
+    fun onChunk(chunk: ByteArray)
+    fun onComplete(result: CurlResponse)
+}
+
+class CurlStreamCallbackWrapper(handler: IStreamHandler) {
+    private val stableRef: StableRef<IStreamHandler> = StableRef.create(handler)
+    private val native: CurlStreamCallback = nativeHeap.alloc()
+
+    init {
+        native.callbackRef = stableRef.asCPointer()
+        native.onResponseStart = staticCFunction(::streamOnResponseStart)
+        native.onChunk = staticCFunction(::streamOnChunk)
+        native.onComplete = staticCFunction(::streamOnComplete)
+    }
+
+    fun getCallbackNativePtr(): CPointer<CurlStreamCallback> = native.ptr
+
+    fun release() {
+        stableRef.dispose()
+        nativeHeap.free(native.rawPtr)
+    }
+}
+
+internal fun streamOnResponseStart(
+    callbackRef: COpaquePointer?, httpCode: Long, headers: CPointer<ByteVar>?, headerLen: Int
+) {
+    callbackRef?.asStableRef<IStreamHandler>()?.get()?.onResponseStart(httpCode, headers?.toKString() ?: "")
+}
+
+internal fun streamOnChunk(callbackRef: COpaquePointer?, data: CPointer<ByteVar>?, len: Int) {
+    if (data == null || len <= 0) return
+    callbackRef?.asStableRef<IStreamHandler>()?.get()?.onChunk(data.readBytes(len))
+}
+
+internal fun streamOnComplete(callbackRef: COpaquePointer?, result: CPointer<CurlResponse>?) {
+    val res = result ?: return
+    callbackRef?.asStableRef<IStreamHandler>()?.get()?.onComplete(res.pointed)
 }
 
 actual fun getCurlRequestService(): ICurlRequestService = CurlRequestServiceHM
