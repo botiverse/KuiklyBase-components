@@ -182,6 +182,44 @@ class CurlClient {
         return realsize;
     }
 
+    // fork #8: streaming write callback. userp is the CurlClient. Each libcurl
+    // body write is handed straight to Kotlin via onChunk (no buffering). The
+    // first write is where the response headers are complete, so onResponseStart
+    // is delivered there exactly once. Streaming requests do not negotiate gzip
+    // (identity only), so chunks are the raw response bytes.
+    static size_t StreamWriteCallback(char *contents, size_t size, size_t nmemb, void *userp) {
+        size_t realsize = size * nmemb;
+        CurlClient *client = static_cast<CurlClient *>(userp);
+        if (client == nullptr || client->stream_callback_ == nullptr) {
+            logE(gDefaultTag, "StreamWriteCallback, client/callback is nullptr!!!");
+            return realsize;
+        }
+        if (client->cancel_flag_) {
+            logI(client->log_tag_, "StreamWriteCallback cancel by user.");
+            return 0;  // abort the transfer
+        }
+        client->DeliverStreamResponseStart();
+        if (realsize > 0 && client->stream_callback_->onChunk != nullptr) {
+            client->stream_callback_->onChunk(
+                client->stream_callback_->callbackRef, reinterpret_cast<char *>(contents), static_cast<int>(realsize));
+        }
+        return realsize;
+    }
+
+    // Deliver onResponseStart exactly once, when the response headers are ready.
+    void DeliverStreamResponseStart() {
+        if (stream_started_ || stream_callback_ == nullptr) {
+            return;
+        }
+        stream_started_ = true;
+        long httpCode = 0;
+        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &httpCode);
+        if (stream_callback_->onResponseStart != nullptr) {
+            stream_callback_->onResponseStart(
+                stream_callback_->callbackRef, httpCode, headers_.c_str(), static_cast<int>(headers_.length()));
+        }
+    }
+
     static int ProgressCallback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal,
                                 curl_off_t ulnow) {
         CurlClient *client = static_cast<CurlClient *>(clientp);
@@ -207,15 +245,18 @@ class CurlClient {
     }
 
  public:
-    void StartRequest(CurlRequest request, CurlCallback *callback) {
+    // Common curl option setup shared by StartRequest and StartStreamRequest
+    // (fork #8). Everything except the write callback + perform is configured
+    // here; the caller sets its own CURLOPT_WRITEFUNCTION and performs.
+    bool ConfigureRequest(CurlRequest &request, std::string &method) {
         if (!curl_) {
             logE(log_tag_, "curl_easy_init() failed.");
-            return;
+            return false;
         }
 
         if (request.url == nullptr) {
             logE(log_tag_, "request url is nullptr!!!");
-            return;
+            return false;
         }
 
         // 请求信息
@@ -230,7 +271,7 @@ class CurlClient {
         int size = headers->size;
         int postBodyLen = request.postBodyLen;
         const char *postBody = request.postBody;
-        std::string method = request.method == nullptr ? "" : request.method;
+        method = request.method == nullptr ? "" : request.method;
         if (method.empty()) {
             method = postBodyLen > 0 && postBody != nullptr ? "POST" : "GET";
         }
@@ -334,6 +375,14 @@ class CurlClient {
         // 响应头处理
         curl_easy_setopt(curl_, CURLOPT_HEADERFUNCTION, HeaderCallback);
         curl_easy_setopt(curl_, CURLOPT_HEADERDATA, this);
+        return true;
+    }
+
+    void StartRequest(CurlRequest request, CurlCallback *callback) {
+        std::string method;
+        if (!ConfigureRequest(request, method)) {
+            return;
+        }
         // 响应数据 body 处理
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, DataWriteCallback);
         curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &content_data_);
@@ -389,6 +438,57 @@ class CurlClient {
         logI(log_tag_, "libcurl callback.");
         shared_ptr<CurlCallback> fetchCallbackBlockPtr(callback);
         fetchCallbackBlockPtr->callback(fetchCallbackBlockPtr->callbackRef, curl_response_);
+    }
+
+    // fork #8: streaming download. The body is streamed to Kotlin chunk-by-chunk
+    // through StreamWriteCallback (no buffering); onResponseStart fires when the
+    // headers are ready, onComplete at the end with a body-less CurlResponse.
+    void StartStreamRequest(CurlRequest request, CurlStreamCallback *callback) {
+        stream_callback_ = callback;
+        stream_started_ = false;
+        std::string method;
+        if (!ConfigureRequest(request, method)) {
+            // Always deliver exactly one terminal callback (upstream #31 contract).
+            DeliverStreamResponseStart();
+            BuildStreamCompletion(CURLE_FAILED_INIT);
+            return;
+        }
+        // 流式 body: 逐块回调, 不缓冲整包
+        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, StreamWriteCallback);
+        curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
+        CURLcode res = curl_easy_perform(curl_);
+        // A body-less response (or a failure before any write) still owes the
+        // caller an onResponseStart before onComplete.
+        DeliverStreamResponseStart();
+        BuildStreamCompletion(res);
+    }
+
+    // Builds a body-less CurlResponse (body already delivered via onChunk) and
+    // invokes onComplete exactly once.
+    void BuildStreamCompletion(int res) {
+        int errorCode = res;
+        long httpCode = 0;
+        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &httpCode);
+        char *ip = nullptr;
+        curl_easy_getinfo(curl_, CURLINFO_PRIMARY_IP, &ip);
+        logI(log_tag_, "stream ret code:" + std::to_string(errorCode) + ", httpCode:" + std::to_string(httpCode)
+            + ", ip:" + (ip != nullptr ? ip : "") + ", redirect url:" + redirect_url_);
+
+        curl_response_ = new CurlResponse();
+        curl_response_->code = errorCode;
+        curl_response_->httpCode = httpCode;
+        curl_response_->headerLen = headers_.length();
+        curl_response_->headers = const_cast<char *>(reinterpret_cast<const char *>(headers_.c_str()));
+        curl_response_->redirectUrl = const_cast<char *>(reinterpret_cast<const char *>(redirect_url_.c_str()));
+        curl_response_->dataLen = 0;
+        curl_response_->data = nullptr;
+        curl_response_->errorMsg = curl_error_msg_;
+        curl_response_->errorMsgLen = strlen(curl_error_msg_);
+        HandleElapseStatisticsInfo(curl_response_);
+
+        if (stream_callback_ != nullptr && stream_callback_->onComplete != nullptr) {
+            stream_callback_->onComplete(stream_callback_->callbackRef, curl_response_);
+        }
     }
 
  private:
@@ -479,6 +579,9 @@ class CurlClient {
     CurlResponse *curl_response_ = nullptr;  // destructor deletes it — must not start wild
     bool gzip_accept_encoding_ = false;
     bool gzip_content_encoding_ = false;
+    // fork #8 streaming: set for the lifetime of a StartStreamRequest call.
+    CurlStreamCallback *stream_callback_ = nullptr;
+    bool stream_started_ = false;
 };
 
 void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback) {
@@ -487,6 +590,14 @@ void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *cal
         return;
     }
     reinterpret_cast<CurlClient *>(handle)->StartRequest(request, callback);
+}
+
+void StartStreamRequest(CurClientHandle handle, CurlRequest request, CurlStreamCallback *callback) {
+    if (handle == nullptr) {
+        logE(gDefaultTag, "client is nullptr!!!");
+        return;
+    }
+    reinterpret_cast<CurlClient *>(handle)->StartStreamRequest(request, callback);
 }
 
 CurClientHandle CreateCurlClient(const char *logTag) {

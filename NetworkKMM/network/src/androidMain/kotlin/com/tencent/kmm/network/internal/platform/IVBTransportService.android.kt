@@ -184,6 +184,7 @@ object AndroidTransportImpl : IVBTransportService {
     // whole payload. onComplete carries status/headers/error only.
     override fun requestStream(
         kmmRequest: VBTransportRequest,
+        onResponseStart: (statusCode: Int, headers: Map<String, List<String>>) -> Unit,
         onChunk: (chunk: ByteArray) -> Unit,
         onComplete: (response: VBTransportResponse) -> Unit
     ) {
@@ -209,6 +210,9 @@ object AndroidTransportImpl : IVBTransportService {
                     errorCode = response.status.value
                     errMsg = response.status.description
                 }
+
+                val responseHeaders = response.headers.entries().associate { it.key to it.value }
+                onResponseStart(errorCode, responseHeaders)
 
                 val channel = response.bodyAsChannel()
                 while (!channel.isClosedForRead) {

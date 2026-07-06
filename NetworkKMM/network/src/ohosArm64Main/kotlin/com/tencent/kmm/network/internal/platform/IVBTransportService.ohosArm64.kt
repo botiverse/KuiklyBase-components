@@ -17,6 +17,7 @@
 package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.curl.CurlRequestService
+import com.tencent.kmm.network.curl.CurlRequestServiceHM
 import com.tencent.kmm.network.export.VBTransportBytesRequest
 import com.tencent.kmm.network.export.VBTransportBytesResponse
 import com.tencent.kmm.network.export.VBTransportGetRequest
@@ -78,6 +79,17 @@ object HmTransportImpl : IVBTransportService {
 
         // 使用 libcurl 进行请求
         CurlRequestService.sendRequest(kmmRequest, kmmResponseCallback, logTag)
+    }
+
+    // fork #8: OHOS 原生流式下载 — libcurl 的 write 回调逐块回传, 不缓冲整包。
+    override fun requestStream(
+        kmmRequest: VBTransportRequest,
+        onResponseStart: (statusCode: Int, headers: Map<String, List<String>>) -> Unit,
+        onChunk: (chunk: ByteArray) -> Unit,
+        onComplete: (response: VBTransportResponse) -> Unit
+    ) {
+        val logTag = kmmRequest.logTag + "_" + kmmRequest.requestId
+        CurlRequestServiceHM.streamRequest(kmmRequest, onResponseStart, onChunk, onComplete, logTag)
     }
 
     override fun cancel(requestId: Int) {
