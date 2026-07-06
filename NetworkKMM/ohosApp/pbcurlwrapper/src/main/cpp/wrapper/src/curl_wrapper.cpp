@@ -333,14 +333,16 @@ class CurlClient {
         curl_response_->errorMsg = curl_response_->errorMsgLen == 0 ? nullptr : curl_error_msg_;
         HandleElapseStatisticsInfo(curl_response_);
 
-        logI(log_tag_, "CurlResponse meta code:" + std::to_string(curl_response_->code)
-            + ", errorMsgPtr:" + PtrDebug(curl_response_->errorMsg)
-            + ", errorMsgLen:" + std::to_string(curl_response_->errorMsgLen)
-            + ", headersPtr:" + PtrDebug(curl_response_->headers)
-            + ", headerLen:" + std::to_string(curl_response_->headerLen)
-            + ", redirectUrlPtr:" + PtrDebug(curl_response_->redirectUrl)
-            + ", dataPtr:" + PtrDebug(curl_response_->data)
-            + ", dataLen:" + std::to_string(curl_response_->dataLen));
+        if (ShouldLogCurlResponseMeta(curl_response_)) {
+            logI(log_tag_, "CurlResponse meta code:" + std::to_string(curl_response_->code)
+                + ", errorMsgPtr:" + PtrDebug(curl_response_->errorMsg)
+                + ", errorMsgLen:" + std::to_string(curl_response_->errorMsgLen)
+                + ", headersPtr:" + PtrDebug(curl_response_->headers)
+                + ", headerLen:" + std::to_string(curl_response_->headerLen)
+                + ", redirectUrlPtr:" + PtrDebug(curl_response_->redirectUrl)
+                + ", dataPtr:" + PtrDebug(curl_response_->data)
+                + ", dataLen:" + std::to_string(curl_response_->dataLen));
+        }
         logI(log_tag_, "libcurl callback.");
         shared_ptr<CurlCallback> fetchCallbackBlockPtr(callback);
         fetchCallbackBlockPtr->callback(fetchCallbackBlockPtr->callbackRef, curl_response_);
@@ -380,6 +382,19 @@ class CurlClient {
 
     static std::string PtrDebug(const void *ptr) {
         return ptr == nullptr ? "null" : std::to_string(reinterpret_cast<uintptr_t>(ptr));
+    }
+
+    static bool ShouldLogCurlResponseMeta(const CurlResponse *response) {
+        if (response == nullptr) {
+            return true;
+        }
+        return response->code != CURLE_OK
+            || response->errorMsgLen < 0
+            || response->headerLen < 0
+            || response->dataLen < 0
+            || (response->errorMsg == nullptr && response->errorMsgLen > 0)
+            || (response->headers == nullptr && response->headerLen > 0)
+            || (response->data == nullptr && response->dataLen > 0);
     }
 
     void HandleElapseStatisticsInfo(CurlResponse *curlResponse) {

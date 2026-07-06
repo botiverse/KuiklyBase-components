@@ -82,6 +82,7 @@ private const val CURL_LOG_LEVEL_DEBUG = 0
 private const val CURL_LOG_LEVEL_INFO = 1
 private const val CURL_LOG_LEVEL_WARN = 2
 private const val CURL_LOG_LEVEL_ERROR = 3
+private const val ENABLE_CURL_RESPONSE_META_LOG = false
 
 fun curlLogImpl(level: Int, tag: CPointer<ByteVar>?, content: CPointer<ByteVar>?): Int {
     when (level) {
@@ -270,10 +271,12 @@ object CurlRequestServiceHM : ICurlRequestService {
     }
 
     private fun handleCurlNativeResponse(result: CurlResponse, logTag: String): CurlNativeResponse {
-        logI("[$logTag] libcurl native response meta, code:${result.code}, " +
-                "errorMsgPtr:${result.errorMsg}, errorMsgLen:${result.errorMsgLen}, " +
-                "headersPtr:${result.headers}, headerLen:${result.headerLen}, " +
-                "redirectUrlPtr:${result.redirectUrl}, dataPtr:${result.data}, dataLen:${result.dataLen}")
+        if (ENABLE_CURL_RESPONSE_META_LOG || result.shouldLogResponseMeta()) {
+            logI("[$logTag] libcurl native response meta, code:${result.code}, " +
+                    "errorMsgPtr:${result.errorMsg}, errorMsgLen:${result.errorMsgLen}, " +
+                    "headersPtr:${result.headers}, headerLen:${result.headerLen}, " +
+                    "redirectUrlPtr:${result.redirectUrl}, dataPtr:${result.data}, dataLen:${result.dataLen}")
+        }
         val response = CurlNativeResponse(
             code = result.code,
             errorMsg = result.errorMsg.toKStringOrEmpty(result.errorMsgLen, "errorMsg", logTag),
@@ -475,15 +478,26 @@ object CurlRequestServiceHM : ICurlRequestService {
         logTag: String
     ): String {
         if (this == null) {
-            logI("[$logTag] libcurl native response $fieldName is null, length:$length")
+            if (length > 0) {
+                logI("[$logTag] libcurl native response $fieldName has bytes but pointer is null, " +
+                        "length:$length")
+            }
             return ""
         }
         if (length <= 0) {
-            logI("[$logTag] libcurl native response $fieldName has no bytes, " +
-                    "ptr:$this, length:$length")
             return ""
         }
         return toKString()
+    }
+
+    private fun CurlResponse.shouldLogResponseMeta(): Boolean {
+        return code != 0 ||
+                errorMsgLen < 0 ||
+                headerLen < 0 ||
+                dataLen < 0 ||
+                (errorMsg == null && errorMsgLen > 0) ||
+                (headers == null && headerLen > 0) ||
+                (data == null && dataLen > 0)
     }
 }
 
