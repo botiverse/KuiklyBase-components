@@ -197,6 +197,56 @@ class NetworkClient(
         return deferred.await()
     }
 
+    /**
+     * Streaming download (fork #8): the response body is delivered to [onChunk]
+     * as it arrives — never buffered whole — and [onComplete] receives the
+     * body-less [NetworkResponse] (status/headers/error/timing). Request
+     * middlewares and the current auth token are applied up front; there is no
+     * mid-stream auth refresh or retry (a stream cannot be replayed once chunks
+     * are handed out). Cancel via the returned [NetworkCall].
+     *
+     * On Android/iOS this streams straight off ktor's response channel. On
+     * platforms whose engine cannot stream, the transport falls back to
+     * buffering the full body and delivering it as a single chunk — same
+     * result, no memory saving — until native streaming lands there.
+     */
+    fun downloadStream(
+        request: NetworkRequest,
+        onChunk: (chunk: ByteArray) -> Unit,
+        onComplete: (NetworkResponse) -> Unit
+    ): NetworkCall {
+        val call = NetworkCall(request)
+        val policy = selectPolicy(request)
+        val job = scope.launch(dispatcherFor(policy.dispatcher)) {
+            var prepared = request.copyMutable()
+            config.requestMiddlewares.forEach { middleware ->
+                prepared = middleware.prepare(prepared)
+            }
+            prepared.policy = policy
+            applyCurrentAuthToken(prepared)
+            if (call.isCancelled) {
+                val cancelled = cancelledResponse(prepared)
+                call.complete(cancelled)
+                onComplete(cancelled)
+                return@launch
+            }
+            val vbRequest = VBTransportRequest().apply {
+                method = prepared.method
+                url = prepared.resolvedUrl()
+                header.putAll(prepared.headers)
+                totalTimeout = prepared.policy.timeoutMillis
+            }
+            call.addCancelHandler { VBTransportService.cancel(vbRequest.requestId) }
+            VBTransportService.streamRequest(vbRequest, onChunk) { response ->
+                val networkResponse = response.toNetworkResponse(prepared)
+                call.complete(networkResponse)
+                onComplete(networkResponse)
+            }
+        }
+        call.attachJob(job)
+        return call
+    }
+
     private suspend fun executeInternal(
         request: NetworkRequest,
         call: NetworkCall,

@@ -235,6 +235,27 @@ class VBTransportTask(
         }
     }
 
+    // fork #8: streaming download — response body delivered chunk-by-chunk via
+    // [onChunk], [handler] receives the body-less completion (status/headers/error).
+    fun streamRequest(
+        request: VBTransportRequest,
+        onChunk: (chunk: ByteArray) -> Unit,
+        handler: VBTransportHandler?
+    ) {
+        if (isCanceledOrRemoved()) {
+            val response = VBTransportResponse()
+            response.errorCode = VBTransportResultCode.CODE_CANCELED
+            response.errorMessage = "Request has been canceled"
+            logI("streamRequest() task is canceled before")
+            handler?.invoke(response)
+            return
+        }
+        state = VBTransportState.Running
+        getIVBTransportService().requestStream(request, onChunk) { response ->
+            handleResponse(request, response, wrapResponse(handler))
+        }
+    }
+
     fun getState(): VBTransportState = this.state
 
     fun setState(state: VBTransportState) {
