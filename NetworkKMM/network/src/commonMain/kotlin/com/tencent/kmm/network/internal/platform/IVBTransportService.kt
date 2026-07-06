@@ -69,6 +69,30 @@ interface IVBTransportService {
     )
 
     /**
+     * 流式下载 (fork #8): 响应体逐块回调 [onChunk], 不在内存里缓冲整包; 结束时以
+     * [onComplete] 交付状态/头/错误 (其 data 置 null, body 已通过 chunk 交付)。
+     *
+     * 默认实现回退到 [request] 的全量缓冲, 再把整包作为单个 chunk 交付——语义正确
+     * 但不省内存。引擎本身支持流式的平台 (Android/iOS 的 ktor ByteReadChannel)
+     * 覆写此方法交付真正的逐块数据。
+     */
+    fun requestStream(
+        kmmRequest: VBTransportRequest,
+        onChunk: (chunk: ByteArray) -> Unit,
+        onComplete: (response: VBTransportResponse) -> Unit
+    ) {
+        request(kmmRequest) { response ->
+            when (val body = response.data) {
+                is ByteArray -> if (body.isNotEmpty()) onChunk(body)
+                is String -> if (body.isNotEmpty()) onChunk(body.encodeToByteArray())
+                else -> Unit
+            }
+            response.data = null
+            onComplete(response)
+        }
+    }
+
+    /**
      * 取消网络请求
      */
     fun cancel(requestId: Int)

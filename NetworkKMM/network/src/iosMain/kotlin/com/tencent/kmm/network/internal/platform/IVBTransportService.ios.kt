@@ -53,6 +53,8 @@ import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentLength
 import io.ktor.http.contentType
+import io.ktor.utils.io.core.isEmpty
+import io.ktor.utils.io.core.readBytes
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -64,6 +66,9 @@ private val iOSTransportImpl: IVBTransportService = IOSTransportImpl()
 private val scope = CoroutineScope(Dispatchers.IO)
 private val taskMap: MutableMap<Int, Job> = mutableMapOf()
 private const val TAG = "IOSTransportImpl"
+
+// Upper bound per streamed chunk read off the response channel (fork #8).
+private const val STREAM_CHUNK_BYTES = 16L * 1024L
 
 class IOSTransportImpl : IVBTransportService {
     private fun startRequest(
@@ -178,6 +183,80 @@ class IOSTransportImpl : IVBTransportService {
                 "id:${kmmRequest.requestId}, url:${kmmRequest.url}, " +
                 "header:${kmmRequest.header}")
         startRequest(kmmRequest, wrapRequestCallback(kmmResponseCallback))
+    }
+
+    // fork #8: stream the response body in chunks straight off ktor's
+    // ByteReadChannel instead of readKnownSize/readUnknownSize buffering the
+    // whole payload. onComplete carries status/headers/error only.
+    override fun requestStream(
+        kmmRequest: VBTransportRequest,
+        onChunk: (chunk: ByteArray) -> Unit,
+        onComplete: (response: VBTransportResponse) -> Unit
+    ) {
+        VBPBLog.i(VBPBLog.HMTRANSPORTIMPL, "${kmmRequest.logTag} stream ${kmmRequest.method} request, " +
+                "id:${kmmRequest.requestId}, url:${kmmRequest.url}")
+        val job = scope.launch {
+            try {
+                val client = getHttpClient(kmmRequest) as HttpClient
+                val response = client.request(kmmRequest.url) {
+                    method = HttpMethod(kmmRequest.method.name)
+                    if (kmmRequest.totalTimeout > 0) {
+                        timeout {
+                            requestTimeoutMillis = kmmRequest.totalTimeout
+                            connectTimeoutMillis = kmmRequest.totalTimeout
+                            socketTimeoutMillis = kmmRequest.totalTimeout
+                        }
+                    }
+                    constructRequest(kmmRequest)
+                }
+
+                var errMsg = ""
+                val errorCode = when (response.status) {
+                    HttpStatusCode.OK -> 0
+                    else -> {
+                        errMsg = response.status.description
+                        response.status.value
+                    }
+                }
+
+                val channel = response.bodyAsChannel()
+                while (!channel.isClosedForRead) {
+                    val packet = channel.readRemaining(STREAM_CHUNK_BYTES)
+                    while (!packet.isEmpty) {
+                        val bytes = packet.readBytes()
+                        if (bytes.isNotEmpty()) {
+                            onChunk(bytes)
+                        }
+                    }
+                }
+
+                taskMap.remove(kmmRequest.requestId)
+                onComplete(
+                    VBTransportResponse().apply {
+                        this.errorCode = errorCode
+                        this.errorMessage = errMsg
+                        this.header = response.headers.entries().associate { it.key to it.value }
+                        this.data = null
+                        this.request = kmmRequest
+                    }
+                )
+            } catch (throwable: Throwable) {
+                if (throwable is CancellationException) {
+                    taskMap.remove(kmmRequest.requestId)
+                    throw throwable
+                }
+                taskMap.remove(kmmRequest.requestId)
+                onComplete(
+                    VBTransportResponse().apply {
+                        this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                        this.errorMessage = throwable.message?.takeIf { it.isNotBlank() } ?: throwable.toString()
+                        this.data = null
+                        this.request = kmmRequest
+                    }
+                )
+            }
+        }
+        taskMap[kmmRequest.requestId] = job
     }
 
     private fun HttpRequestBuilder.constructRequest(kmmRequest: VBTransportBaseRequest) {

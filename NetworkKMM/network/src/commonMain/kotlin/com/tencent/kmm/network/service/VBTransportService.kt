@@ -189,6 +189,28 @@ object VBTransportService {
         }
     }
 
+    // fork #8: streaming download. Chunks are delivered via [onChunk] as they
+    // arrive; [handler] receives the body-less completion. No force-timeout
+    // task is scheduled — a long stream is expected to outlive totalTimeout,
+    // whose semantics ("whole request done") do not fit an open download.
+    fun streamRequest(
+        request: VBTransportRequest,
+        onChunk: (chunk: ByteArray) -> Unit,
+        handler: VBTransportHandler?
+    ) {
+        request.requestId = VBPBRequestIdGenerator.getRequestId()
+        networkScope.launch(track = true) {
+            val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
+            taskManager.onTaskBegin(task)
+            task.streamRequest(request, onChunk) { response ->
+                if (task.getState() != VBTransportState.Done) {
+                    task.setState(VBTransportState.Done)
+                    handler?.let { it(response) }
+                }
+            }
+        }
+    }
+
     private fun startTimeoutCheckTask(
         timeout: Long,
         requestId: Int,
