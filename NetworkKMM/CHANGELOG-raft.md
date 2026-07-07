@@ -1,5 +1,17 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.8 (Android multipart Content-Type fix)
+
+- **Android multipart uploads**: the ktor Android transport overrode the request
+  `Content-Type` with `application/octet-stream` for any non-JSON body, dropping
+  the caller's `multipart/form-data; boundary=...` header — the server's multer
+  saw no multipart and returned `No files provided`. It also set the header twice
+  (ktor's `header()` and `contentType()` both append), producing a duplicate
+  Content-Type. The transport now only defaults the `Content-Type` when the
+  request has no explicit one (`hasExplicitContentType`); multipart requests keep
+  their raw header with the exact boundary, sent once. Android-only (ktor); the
+  OHOS native `.so` is unchanged from raft.7.
+
 ## 0.1.0-raft.7 (OHOS libcurl content-encoding codecs — gzip/deflate/br/zstd)
 
 - **All content-encoding codecs on OHOS**: the OHOS libcurl was built with
