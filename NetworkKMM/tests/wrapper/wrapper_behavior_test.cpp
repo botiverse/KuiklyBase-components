@@ -5,7 +5,9 @@
 // refresh never fired).
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <string>
+#include <curl/curl.h>
 #include "curl_wrapper.h"
 
 static int gFailures = 0;
@@ -65,6 +67,32 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     StartRequest(handle, request, callback);
     DeleteCurlClient(handle);
     return captured;
+}
+
+static bool HasCurlFeature(long feature) {
+    curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
+    return info != nullptr && (info->features & feature) != 0;
+}
+
+static bool RequireAllContentCodecs() {
+    const char *value = std::getenv("WRAPPER_REQUIRE_ALL_CODECS");
+    return value != nullptr && std::strcmp(value, "0") != 0 && std::strcmp(value, "") != 0;
+}
+
+static void CheckDecodedContentEncoding(const std::string &base,
+                                        const char *path,
+                                        const char *label,
+                                        bool supported) {
+    if (!supported) {
+        std::fprintf(stderr, "skip: %s decode (host libcurl lacks codec)\n", label);
+        return;
+    }
+    Captured encoded = Fetch(base + path);
+    std::string prefix = std::string(label) + " response";
+    CHECK(encoded.code == 0, (prefix + " CURLcode is 0").c_str());
+    CHECK(encoded.httpCode == 200, (prefix + " httpCode is 200").c_str());
+    CHECK(encoded.data.find("\"encoded\":true") != std::string::npos,
+          (prefix + " decoded body delivered").c_str());
 }
 
 int main(int argc, char **argv) {
@@ -146,6 +174,30 @@ int main(int argc, char **argv) {
         CHECK(echo.httpCode == 200, "/echo-headers succeeds");
         CHECK(count == 1, "custom request header sent exactly once (upstream #28)");
     }
+
+#ifdef CURL_VERSION_LIBZ
+    bool supportsGzip = HasCurlFeature(CURL_VERSION_LIBZ);
+#else
+    bool supportsGzip = true;
+#endif
+#ifdef CURL_VERSION_BROTLI
+    bool supportsBrotli = HasCurlFeature(CURL_VERSION_BROTLI);
+#else
+    bool supportsBrotli = false;
+#endif
+#ifdef CURL_VERSION_ZSTD
+    bool supportsZstd = HasCurlFeature(CURL_VERSION_ZSTD);
+#else
+    bool supportsZstd = false;
+#endif
+    if (RequireAllContentCodecs()) {
+        CHECK(supportsGzip, "host libcurl advertises gzip/zlib decode support");
+        CHECK(supportsBrotli, "host libcurl advertises brotli decode support");
+        CHECK(supportsZstd, "host libcurl advertises zstd decode support");
+    }
+    CheckDecodedContentEncoding(base, "/gzip", "gzip", supportsGzip);
+    CheckDecodedContentEncoding(base, "/br", "brotli", supportsBrotli);
+    CheckDecodedContentEncoding(base, "/zstd", "zstd", supportsZstd);
 
     if (gFailures > 0) {
         std::fprintf(stderr, "\n%d failure(s)\n", gFailures);

@@ -2,14 +2,24 @@
 """Local behavior-contract server for the pbcurlwrapper tests.
 
 Endpoints mirror the failure classes the wrapper must surface faithfully:
-status passthrough (the raft.3 bug), error bodies, timeouts, redirects, gzip.
+status passthrough (the raft.3 bug), error bodies, timeouts, redirects, and
+content-encoding decode.
 """
 import gzip
+import shutil
+import subprocess
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AUTH_BODY = b'{"error":"Invalid or expired token","code":"auth_required"}'
+ENCODED_BODY = b'{"encoded":true,"padding":"' + b"x" * 256 + b'"}'
+
+
+def compress_with(command, data):
+    if shutil.which(command) is None:
+        raise RuntimeError(f"{command} is not installed")
+    return subprocess.check_output([command, "-c"], input=data)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -49,9 +59,14 @@ class Handler(BaseHTTPRequestHandler):
             lines = "\n".join(f"{k}: {v}" for k, v in self.headers.items())
             self._send(200, lines.encode())
         elif self.path == "/gzip":
-            raw = b'{"gzipped":true,"padding":"' + b"x" * 256 + b'"}'
-            body = gzip.compress(raw)
+            body = gzip.compress(ENCODED_BODY)
             self._send(200, body, {"Content-Encoding": "gzip"})
+        elif self.path == "/br":
+            body = compress_with("brotli", ENCODED_BODY)
+            self._send(200, body, {"Content-Encoding": "br"})
+        elif self.path == "/zstd":
+            body = compress_with("zstd", ENCODED_BODY)
+            self._send(200, body, {"Content-Encoding": "zstd"})
         else:
             self._send(404, b'{"error":"not_found"}')
 

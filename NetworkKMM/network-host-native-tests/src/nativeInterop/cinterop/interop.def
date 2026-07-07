@@ -1,0 +1,2 @@
+package = com.tencent.qqlive.kmm.native.libcurl
+headers = curl_wrapper.h
