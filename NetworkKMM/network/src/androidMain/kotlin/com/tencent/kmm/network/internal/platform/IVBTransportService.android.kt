@@ -20,7 +20,6 @@ import com.tencent.kmm.network.export.VBTransportBaseRequest
 import com.tencent.kmm.network.export.VBTransportBaseResponse
 import com.tencent.kmm.network.export.VBTransportBytesRequest
 import com.tencent.kmm.network.export.VBTransportBytesResponse
-import com.tencent.kmm.network.export.VBTransportContentType
 import com.tencent.kmm.network.export.VBTransportGetRequest
 import com.tencent.kmm.network.export.VBTransportGetResponse
 import com.tencent.kmm.network.export.VBTransportPostRequest
@@ -255,6 +254,8 @@ object AndroidTransportImpl : IVBTransportService {
     }
 
     private fun HttpRequestBuilder.constructRequest(kmmRequest: VBTransportBaseRequest) {
+        val hasContentType = hasExplicitContentType(kmmRequest.header)
+
         // 设置 header
         kmmRequest.header
             .filter { (k, v) -> k.isNotEmpty() && v.isNotEmpty() }
@@ -265,14 +266,9 @@ object AndroidTransportImpl : IVBTransportService {
             setBody(it)
         }
 
-        val requestContentType = kmmRequest.header["Content-Type"]?.let { contentType ->
-            if (contentType.contains(VBTransportContentType.JSON.toString(), ignoreCase = true)) {
-                ContentType.Application.Json
-            } else {
-                ContentType.Application.OctetStream
-            }
-        } ?: ContentType.Application.OctetStream
-        contentType(requestContentType)
+        if (!hasContentType) {
+            contentType(ContentType.Application.OctetStream)
+        }
     }
 
     private fun logI(content: String, logTag: String = "") {
@@ -302,5 +298,10 @@ object AndroidTransportImpl : IVBTransportService {
         )
     }
 }
+
+internal fun hasExplicitContentType(headers: Map<String, String>): Boolean =
+    headers.any { (key, value) ->
+        key.equals("Content-Type", ignoreCase = true) && value.isNotBlank()
+    }
 
 actual fun getIVBTransportService(): IVBTransportService = AndroidTransportImpl
