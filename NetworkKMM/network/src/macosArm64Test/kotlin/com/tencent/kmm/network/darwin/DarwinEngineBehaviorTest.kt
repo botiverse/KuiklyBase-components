@@ -62,6 +62,18 @@ class DarwinEngineBehaviorTest {
     private fun get(url: String) = NetworkRequest(method = VBTransportMethod.GET, url = url)
 
     @Test
+    fun ciHarnessSuppliesTheServerUrl() {
+        // Guards against a vacuous green: on CI (GitHub sets CI=true) the
+        // base URL must have reached the test process, otherwise every other
+        // test here silently no-ops.
+        @OptIn(ExperimentalForeignApi::class)
+        val onCi = getenv("CI")?.toKString() == "true"
+        if (onCi) {
+            assertTrue(baseUrl != null, "DARWIN_TEST_BASE_URL must be set on CI")
+        }
+    }
+
+    @Test
     fun exactLengthBodyCompletesAndDeliversContent() = run { base ->
         val response = client.execute(get("$base/ok"))
         assertEquals(200, response.statusCode)
