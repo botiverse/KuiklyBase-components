@@ -8,15 +8,18 @@
   OHOS build/trust-store facts: CC-Cata
 - Origin: #Kuiklybase:160e7a07 — proxy/IPv6 cold-connection timeout ladders
   (Raft mobile P1; Quiver 03c175b5: 16s channel opens behind ClashMeta)
-- Related shipped work:
-  - **raft.9** (shipped 2026-07-08): connect decoupled to `min(3s, total)` on
-    Android/iOS Ktor; EOF-safe reads; classified failure reasons.
-  - **raft.10** (in flight, #32): Android engine → Ktor-OkHttp with
-    `fastFallback = true` (= Option A, implemented).
-  - **raft.11** (Cata): OHOS `CURLOPT_CONNECTTIMEOUT_MS` + explicit
-    `CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS`; CURLINFO segment timings are already
-    collected in the wrapper (ElapseStats → `elapseStatis`) and only need
-    Kotlin-side logging.
+- Related shipped work (all landed 2026-07-08):
+  - **raft.9**: connect decoupled to `min(3s, total)` on Android/iOS Ktor;
+    EOF-safe reads; classified failure reasons.
+  - **raft.12** (published; consumed by mobile PR #348 on the 1.1.0 line):
+    Android engine → Ktor-OkHttp with `fastFallback = true` (= Option A, #32)
+    + OHOS `CURLOPT_CONNECTTIMEOUT_MS` and explicit
+    `CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS` with slow-transfer phase logging
+    (#33, CURLINFO timings were already collected in the wrapper).
+    Version-number note: raft.10 was never published standalone, and the
+    raft.11 coordinates are poisoned (a failed publish left partial
+    alpha.16-built artifacts; GitHub Packages versions are immutable) —
+    consume raft.12, never raft.11.
 
 ## Problem
 
@@ -44,7 +47,7 @@ what would that actually cost?
 
 ## Options
 
-### A. Ktor engine swap: Android → OkHttp (`fastFallback = true`) — APPROVED, IN FLIGHT (#32)
+### A. Ktor engine swap: Android → OkHttp (`fastFallback = true`) — SHIPPED (raft.12, mobile #348)
 
 OkHttp 5.x implements RFC 8305 racing natively (`fastFallback`): v6 gets a
 ~250ms head start, then v4 joins in parallel; first connected route wins.
@@ -55,12 +58,17 @@ OkHttp 5.x implements RFC 8305 racing natively (`fastFallback`): v6 gets a
   Ktor API surface unchanged, raft.9 `HttpTimeout` wiring applies as-is.
 - Solves: Android racing (the current P1 platform). Does NOT touch OHOS/iOS.
 - Cost actually paid during implementation (new data): **the KBA toolchain's
-  Kotlin version is a hard dependency ceiling.** Every OkHttp 5.x stable ships
-  Kotlin 2.2 metadata; the KBA 2.0.21-ohos-aligned toolchain reads ≤2.1, so
-  the pin is `5.0.0-alpha.16` (newest Kotlin 2.1 build) until the toolchain
-  moves. This ceiling applies to ANY JVM dependency this repo adds — it is a
+  Kotlin version is a hard dependency ceiling — twice over.** (1) Every
+  OkHttp 5.x stable ships Kotlin 2.2 metadata; the KBA 2.0.21-ohos-aligned
+  compiler reads ≤2.1. (2) Even a Kotlin-2.1 build (alpha.16) fails: its
+  kotlin-stdlib 2.1.21 wins Gradle version resolution project-wide and ICEs
+  the commonMain metadata compilation. The final pin is `5.0.0-alpha.14`
+  (built with Kotlin 1.9.23, stays below the project stdlib; plain JVM
+  artifact, so no okhttp-android/androidx.startup edge) until the toolchain
+  moves. This ceiling applies to ANY JVM dependency this repo adds — a
   recurring line item for options A and B, and one libcurl (C) does not have
-  on the native side.
+  on the native side. The PR test lane now compiles common metadata so this
+  class of failure gates at PR time.
 - Remaining risks: behavioral deltas HttpURLConnection→OkHttp (redirects,
   connection pooling, proxy selector nuances) — regression pass on
   auth/upload/proxy scenarios rides the mobile bump (#563).
@@ -217,11 +225,11 @@ JVM-side JNI shim minimal.
 
 ## Where this lands (analysis conclusion, decision = artin)
 
-- **Now**: A is shipping (raft.10) on top of raft.9's floor; OHOS gets curl
-  HE + connect cap in raft.11. After that wave, every end has Happy Eyeballs
-  or a 3s connect cap, and the P1 symptom should be gone. QA acceptance:
-  proxy+IPv6 ladder collapses to sub-second (Android) / ≤3s (OHOS until HE
-  verified).
+- **Now**: A + the OHOS curl HE/connect cap shipped together in raft.12 and
+  are consumed by mobile (PR #348, 1.1.0 line). Every end now has Happy
+  Eyeballs or a 3s connect cap. QA acceptance: proxy+IPv6 ladder collapses
+  to sub-second (Android) / ≤3s (OHOS until HE verified by the raft.12
+  phase-log data).
 - **C as target state**: the architecture value is real but its gate is
   C-1 (Android TLS bridge = new security responsibility) and C-2 (proxy
   parity). Recommended trigger conditions to reopen C for execution:
@@ -232,11 +240,13 @@ JVM-side JNI shim minimal.
 - **B stays excluded** unless QUIC becomes a goal AND C's curl-HTTP3 path is
   rejected.
 
-## Rollout state (A)
+## Rollout state (A) — complete
 
-1. raft.9 stopgap — **shipped** (2026-07-08).
-2. raft.10: OkHttp engine, default on, kill switch — **#32, CI running**.
-3. Mobile bump (#563, KMP-专家): one bump eats raft.9+raft.10; regression
-   auth/upload/proxy + Quiver latency histogram comparison via raft.9's
-   classified reasons + timing markers.
-4. raft.11 (Cata): OHOS connect cap + explicit HE + marker logging.
+1. raft.9 stopgap — shipped (2026-07-08).
+2. OkHttp engine (default on, kill switch
+   `VBTransportAndroidEngine.okHttpEnabled`) + OHOS connect cap/HE/phase
+   log — shipped as **raft.12** (raft.10 unpublished, raft.11 poisoned).
+3. Mobile bump — **merged** (PR #348, raft.8 → raft.12 + foreground
+   prewarm marker), on the 1.1.0 packaging line.
+4. Remaining: device measurement in the reproducing environment (ClashMeta
+   proxy + IPv6) — ladder gone = root fix confirmed.
