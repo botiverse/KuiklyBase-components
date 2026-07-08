@@ -136,6 +136,11 @@ android {
     defaultConfig {
         minSdk = 21
     }
+    testOptions {
+        // OkHttp's static init logs through android.util.Log; JVM unit tests
+        // get the unmocked stub ("not mocked" RuntimeException) without this.
+        unitTests.isReturnDefaultValues = true
+    }
 }
 
 // Stub secrets to let the project sync and build without the publication values set up
