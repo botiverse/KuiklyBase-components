@@ -1,5 +1,18 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.12 (clean republish of raft.11 content — CONSUME THIS, NOT raft.11)
+
+- **raft.11 coordinates are poisoned — do not consume.** Its first publish run
+  uploaded the Android/OHOS/iosX64 artifacts built with the okhttp
+  5.0.0-alpha.16 pin, then died on the commonMain metadata ICE (stdlib 2.1.21
+  leak), leaving no KMP root module. GitHub Packages versions are immutable
+  (retry = 409 Conflict), so the version number moves forward instead.
+- raft.12 = the raft.11 changelog content (OHOS connect budget + HE pin +
+  phase log) + the OkHttp pin corrected to **5.0.0-alpha.14** (built with
+  Kotlin 1.9.23, stays below the project stdlib; plain JVM artifact, so the
+  androidx.startup edge disappears) + the PR test lane now compiles common
+  metadata so this class of failure gates at PR time.
+
 ## 0.1.0-raft.11 (OHOS connect budget + Happy Eyeballs pin + slow-transfer phase log)
 
 - **OHOS connect budget**: the curl wrapper now sets
