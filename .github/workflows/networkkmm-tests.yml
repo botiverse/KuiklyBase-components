@@ -72,39 +72,6 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      # knoi 0.0.4 has no published macos variant; the lane builds knoi's
-      # macos klibs from this repo's source into mavenLocal (NetworkKMM's
-      # repositories already list mavenLocal first). Root-module + macos
-      # publications only — ohos/android artifacts are not built here.
-      - name: Prime knoi macos variants into mavenLocal
-        shell: bash
-        working-directory: knoi
-        run: |
-          # knoi signs publications unconditionally (sonatype flow); mavenLocal
-          # priming has no keys and needs none — disable Sign tasks wholesale.
-          cat > /tmp/no-signing.init.gradle <<'INIT'
-          allprojects {
-            tasks.withType(org.gradle.plugins.signing.Sign).configureEach { onlyIf { false } }
-            // knoi runtime pins knoi-annotation 0.0.1 from the catalog, which
-            // also has no macos variant — build against the in-repo project.
-            // Guarded: this init script also visits buildSrc, where the
-            // project path does not exist.
-            if (rootProject.findProject(':knoi-annotation') != null) {
-              configurations.all {
-                resolutionStrategy.dependencySubstitution {
-                  substitute(module('com.tencent.kuiklybase:knoi-annotation')).using(project(':knoi-annotation'))
-                }
-              }
-            }
-          }
-          INIT
-          ./gradlew -I /tmp/no-signing.init.gradle \
-            :knoi-annotation:publishKotlinMultiplatformPublicationToMavenLocal \
-            :knoi-annotation:publishMacosArm64PublicationToMavenLocal \
-            :knoi:publishKotlinMultiplatformPublicationToMavenLocal \
-            :knoi:publishMacosArm64PublicationToMavenLocal \
-            -PdarwinBehaviorTests --console=plain --no-daemon
-
       - name: Start local test server
         shell: bash
         run: |
