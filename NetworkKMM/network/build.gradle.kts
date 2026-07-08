@@ -38,12 +38,22 @@ kotlin {
     iosX64()
     iosArm64()
     iosSimulatorArm64()
+    // Darwin behavior-test lane (-PdarwinBehaviorTests): a macosArm64 target that
+    // runs the SAME iosMain transport (ktor Darwin/NSURLSession) natively on a
+    // macOS CI runner against a local server. iOS was the only platform whose
+    // engine semantics shipped untested (raft.9 lesson); this lane closes that.
+    // Conditional so publications and consumer dependency resolution are
+    // untouched for everyone else.
+    if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
+        macosArm64()
+    }
     cocoapods {
         name = "network"
         summary = "Some description for the Shared Module"
         homepage = "Link to the Shared Module homepage"
         version = "1.0"
         ios.deploymentTarget = "12.0"
+        osx.deploymentTarget = "11.0"
         podfile = project.file("../iosApp/Podfile")
         framework {
             baseName = "network"
@@ -125,6 +135,11 @@ kotlin {
             dependencies {
                 // 鸿蒙依赖
             }
+        }
+
+        if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
+            val iosMain = getByName("iosMain")
+            getByName("macosArm64Main").dependsOn(iosMain)
         }
 
     }

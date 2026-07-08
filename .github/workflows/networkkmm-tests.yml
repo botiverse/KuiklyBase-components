@@ -57,3 +57,42 @@ jobs:
         with:
           name: network-test-reports
           path: NetworkKMM/network/build/reports/tests/
+
+  darwin-behavior-tests:
+    name: Darwin engine behavior tests (macosArm64)
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Start local test server
+        shell: bash
+        run: |
+          python3 NetworkKMM/tests/wrapper/test_server.py 18923 &
+          echo $! > /tmp/test-server.pid
+          for _ in $(seq 1 50); do
+            curl -sf "http://127.0.0.1:18923/ok" >/dev/null 2>&1 && break
+            sleep 0.1
+          done
+          curl -sf "http://127.0.0.1:18923/ok" >/dev/null
+
+      # Runs the SAME iosMain transport (ktor Darwin/NSURLSession) natively —
+      # the engine-semantics lane iOS never had (raft.9 lesson). Bounded
+      # per-test timeouts turn engine hangs into red tests, not stuck CI.
+      - name: Run Darwin engine behavior tests
+        shell: bash
+        working-directory: NetworkKMM
+        env:
+          DARWIN_TEST_BASE_URL: http://127.0.0.1:18923
+        run: ./gradlew :network:macosArm64Test -PdarwinBehaviorTests --console=plain --no-daemon --stacktrace
+
+      - name: Stop test server
+        if: always()
+        shell: bash
+        run: kill "$(cat /tmp/test-server.pid)" 2>/dev/null || true
