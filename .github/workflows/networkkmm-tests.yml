@@ -52,8 +52,29 @@ jobs:
         working-directory: NetworkKMM
         run: ./gradlew :network:compileCommonMainKotlinMetadata --no-daemon --stacktrace
 
+      # Generating the ohosArm64 publication metadata runs the ohos cinterop,
+      # which needs the HarmonyOS SDK env (same derivation as the publish
+      # workflow; the container ships the SDK at the default path).
+      - name: Resolve HarmonyOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found at $ohos_sdk_home"; exit 1; }
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          deveco_sdk_home="${DEVECO_SDK_HOME:-$(cd "$ohos_sdk_home/../.." && pwd)}"
+          deveco_studio_home="${DEVECO_STUDIO_HOME:-$(cd "$deveco_sdk_home/.." && pwd)}"
+          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
+          echo "DEVECO_SDK_HOME=$deveco_sdk_home" >> "$GITHUB_ENV"
+          echo "DEVECO_STUDIO_HOME=$deveco_studio_home" >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/toolchains" >> "$GITHUB_PATH"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+
       # The ohos variant's PUBLISHED metadata must declare the KBA forks even
-      # though commonMain declares upstream (versionMapping fromResolutionResult
+      # though commonMain declares upstream (the per-publication versionMapping
       # mirrors the force()d graph). A consumer's ohos resolution would break
       # silently on bump if this regressed — assert it at PR time.
       - name: Verify published ohos variant declares the KBA forks
