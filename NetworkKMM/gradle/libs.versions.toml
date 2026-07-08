@@ -3,6 +3,12 @@ atomicfu = "0.23.2-KBA-001"
 kotlinx-coroutines-core = "1.8.0-KBA-002"
 ktor-client-core-version = "2.3.7"
 kotlin-stdlib-platform-ext = "0.1.0"
+# OkHttp 5.x is required for fastFallback (RFC 8305 Happy Eyeballs); the
+# ktor-client-okhttp 2.3.7 POM only pulls 4.12.0, so the version is forced here.
+# Pinned to alpha.16, the newest OkHttp built with Kotlin <= 2.1: this module
+# compiles with Kotlin 2.0.21-KBA-010, which cannot read the 2.2 metadata that
+# every 5.x stable (5.0.0+) ships. Revisit when the KBA toolchain moves to 2.2.
+okhttp = "5.0.0-alpha.16"
 
 [libraries]
 atomicfu = { module = "org.jetbrains.kotlinx:atomicfu", version.ref = "atomicfu" }
@@ -10,6 +16,8 @@ kotlin-stdlib-platform-ext = { module = "com.tencent.tmm:kotlin-stdlib-platform-
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinx-coroutines-core" }
 ktor-client-android = { module = "io.ktor:ktor-client-android", version.ref = "ktor-client-core-version" }
 ktor-client-darwin = { module = "io.ktor:ktor-client-darwin", version.ref = "ktor-client-core-version" }
+ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor-client-core-version" }
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
 ktor-ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor-client-core-version" }
 
 [plugins]

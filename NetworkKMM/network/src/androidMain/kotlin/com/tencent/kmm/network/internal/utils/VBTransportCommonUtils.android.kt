@@ -16,10 +16,13 @@
  */
 package com.tencent.kmm.network.internal.utils
 
+import com.tencent.kmm.network.export.VBTransportAndroidEngine
 import com.tencent.kmm.network.export.VBTransportBaseRequest
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.android.Android
+import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
+import okhttp3.OkHttpClient
 
 actual suspend fun readKnownSize(
     channel: ByteReadChannelWrapper,
@@ -45,11 +48,30 @@ actual fun ByteArray.mergeFromChunks(chunks: List<ByteArray>) {
 
 // One client per process: connection pooling, TLS session reuse, and no
 // per-request engine construction. Timeouts are applied per request through
-// the HttpTimeout plugin (see IVBTransportService triggerRequest).
+// the HttpTimeout plugin (see IVBTransportService triggerRequest); Ktor's
+// OkHttp engine honours them by deriving per-timeout clients via newBuilder(),
+// which preserves the fastFallback setting.
 private val sharedHttpClient: HttpClient by lazy {
-    HttpClient(Android) {
-        install(HttpTimeout)
-    }
+    buildTransportHttpClient(VBTransportAndroidEngine.okHttpEnabled)
 }
+
+internal fun buildTransportHttpClient(okHttpEnabled: Boolean): HttpClient =
+    if (okHttpEnabled) {
+        HttpClient(OkHttp) {
+            install(HttpTimeout)
+            engine {
+                config { applyTransportOkHttpDefaults() }
+            }
+        }
+    } else {
+        HttpClient(Android) {
+            install(HttpTimeout)
+        }
+    }
+
+// fastFallback = RFC 8305 Happy Eyeballs racing. Explicit rather than relying
+// on the OkHttp 5.x default, so the intent survives dependency bumps.
+internal fun OkHttpClient.Builder.applyTransportOkHttpDefaults(): OkHttpClient.Builder =
+    fastFallback(true)
 
 actual fun getHttpClient(kmmRequest: VBTransportBaseRequest): Any? = sharedHttpClient
