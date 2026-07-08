@@ -16,6 +16,7 @@ import com.tencent.tmm.kmmgradle.generator.MRGenerator
 import com.tencent.tmm.kmmgradle.generator.apple.action.CopyResourcesFromKLibsToExecutableAction
 import com.tencent.tmm.kmmgradle.generator.apple.action.PackResourcesToKLibAction
 import com.tencent.tmm.kmmgradle.generator.apple.task.CopyResourcesFromKLibsToDirTask
+import com.tencent.tmm.kmmgradle.generator.apple.task.CopyResourcesFromKLibsToFrameworkTask
 import com.tencent.tmm.kmmgradle.tasks.CopyFrameworkResourcesToAppEntryPointTask
 import com.tencent.tmm.kmmgradle.tasks.CopyFrameworkResourcesToAppTask
 import com.tencent.tmm.kmmgradle.tasks.MergeAppleResourcesTask
@@ -168,6 +169,25 @@ class AppleMRGenerator(
                 toDirTask.linkTask = linkTask
 
                 linkTask.finalizedBy(toDirTask)
+
+                // Copy the klib-packed resources (the MR `.bundle`) into the
+                // framework's own output directory. Without this the bundle only
+                // lives inside the klib and never reaches the framework, so
+                // neither `embedAndSignAppleFrameworkForXcode` (which embeds the
+                // framework's resources) nor `copyFrameworkResourcesToApp` (which
+                // copies `*.bundle` from `framework.outputFile`) have anything to
+                // deliver — leaving `MR.*` unresolvable at runtime on iOS.
+                val toFrameworkTaskName =
+                    CopyResourcesFromKLibsToFrameworkTask.TASK_NAME + "_" + linkTask.name
+
+                val toFrameworkTask = GradleUtils.addTaskCompact(
+                    project, project.tasks, toFrameworkTaskName,
+                    CopyResourcesFromKLibsToFrameworkTask::class.java
+                )
+
+                toFrameworkTask.linkTask = linkTask
+
+                linkTask.finalizedBy(toFrameworkTask)
 
                 if (framework.isStatic) {
                     val resourcesExtension: MultiplatformResourcesPluginExtension =
