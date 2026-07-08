@@ -36,4 +36,14 @@ java {
     targetCompatibility = JavaVersion.VERSION_17
 }
 
+// Pin the Kotlin bytecode target too. `java {}` only governs Java sources; without
+// this the Kotlin classes are emitted at the build JDK's version (classfile 66 /
+// Java 22 when built on JDK 22), which JDK <= 21 consumers (JBR21 Gradle daemons,
+// mobile CI lanes) cannot load — UnsupportedClassVersionError.
+kotlin {
+    compilerOptions {
+        jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    }
+}
+
 apply(from = file(rootProject.file("gradle/publishing.gradle")))
