@@ -134,7 +134,11 @@ kotlin {
 
         val ohosArm64Main by getting {
             dependencies {
-                // 鸿蒙依赖
+                // 鸿蒙依赖 — the KBA coroutines/atomicfu substitution happens at
+                // configuration level below, NOT here: a source-set strictly()
+                // stacks against commonMain's upstream constraint instead of
+                // replacing it, and Gradle cannot satisfy {strictly KBA} +
+                // upstream together (verified: cinteropInteropOhosArm64 fails).
             }
         }
 
@@ -143,6 +147,20 @@ kotlin {
             getByName("macosArm64Main").dependsOn(iosMain)
         }
 
+    }
+}
+
+// ohosArm64 must keep the KBA forks (upstream publishes no ohos klibs) while
+// commonMain declares upstream so iOS/Android/macOS klibs reference official
+// symbols only. force() replaces every other constraint on the module —
+// unlike strictly(), which coexists with and conflicts against them — and is
+// scoped to ohos configurations only, so the non-ohos graphs stay official.
+// The -KBA-* qualifier sorts BELOW the upstream release in Gradle version
+// ordering, which is why plain conflict resolution can never pick the fork.
+configurations.matching { it.name.startsWith("ohosArm64") }.configureEach {
+    resolutionStrategy {
+        force("org.jetbrains.kotlinx:kotlinx-coroutines-core:${libs.versions.kotlinx.coroutines.core.kba.get()}")
+        force("org.jetbrains.kotlinx:atomicfu:${libs.versions.atomicfu.kba.get()}")
     }
 }
 
@@ -282,6 +300,19 @@ publishing {
                 username = githubPackagesUsername.orEmpty()
                 password = githubPackagesToken.orEmpty()
             }
+        }
+    }
+
+    // The ohosArm64 variant must PUBLISH the KBA fork versions even though
+    // commonMain declares upstream (so the iOS/Android variants stay
+    // official). Plain fromResolutionResult() is a no-op for K/N variants —
+    // the default usage mapping never reaches the ohos klib graph (verified:
+    // module.json kept the upstream declarations) — so the mapping points
+    // explicitly at the configuration the force() actually rewrote. The PR
+    // CI generates this publication's metadata and asserts the KBA versions.
+    publications.withType<MavenPublication>().matching { it.name.equals("ohosArm64", ignoreCase = true) }.configureEach {
+        versionMapping {
+            allVariants { fromResolutionOf("ohosArm64CompileKlibraries") }
         }
     }
 
