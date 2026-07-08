@@ -459,6 +459,22 @@ object CurlRequestServiceHM : ICurlRequestService {
         return tmpHeaders
     }
 
+    // raft.9: CURLcode → coarse failure reason, same tag vocabulary as the
+    // ktor transports (TransportFailureClassifier). curl's own strerror text
+    // is kept after the tag.
+    private fun describeCurlFailure(code: Int, errorMsg: String): String {
+        val reason = when (code) {
+            28 -> "timeout"                                    // CURLE_OPERATION_TIMEDOUT
+            6, 8 -> "dns"                                      // CURLE_COULDNT_RESOLVE_HOST / WEIRD_SERVER_REPLY
+            35, 51, 53, 54, 58, 59, 60, 64, 66, 77, 80, 82, 83, 90, 91 -> "tls"
+            18, 55, 56 -> "connection_lost"                    // PARTIAL_FILE / SEND / RECV
+            7 -> "connect"                                     // CURLE_COULDNT_CONNECT
+            42 -> "cancelled"                                  // CURLE_ABORTED_BY_CALLBACK
+            else -> "engine"
+        }
+        return "[$reason] CURLcode:$code $errorMsg"
+    }
+
     private fun updateResponse(
         logTag: String,
         nativeResponse: CurlNativeResponse,
@@ -478,7 +494,15 @@ object CurlRequestServiceHM : ICurlRequestService {
             } else {
                 nativeResponse.code
             }
-        response.errorMessage = nativeResponse.errorMsg
+        // raft.9: failed transfers carry a classified reason tag, aligned with
+        // the Android/iOS transports' describeTransportFailure vocabulary, so
+        // the same failure reads the same on every platform.
+        response.errorMessage =
+            if (nativeResponse.code == 0) {
+                nativeResponse.errorMsg
+            } else {
+                describeCurlFailure(nativeResponse.code, nativeResponse.errorMsg)
+            }
         response.header = convertHeaderMap(nativeResponse.headers)
         // 处理重定向情况
         if (nativeResponse.redirectUrl.isNotEmpty()) {

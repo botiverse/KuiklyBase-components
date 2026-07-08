@@ -32,6 +32,7 @@ import com.tencent.kmm.network.export.VBTransportStringRequest
 import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.VBPBLog
 import com.tencent.kmm.network.internal.utils.ByteReadChannelWrapper
+import com.tencent.kmm.network.internal.utils.describeTransportFailure
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.buildResponseAndCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapBytesCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapGetCallback
@@ -100,9 +101,21 @@ class IOSTransportImpl : IVBTransportService {
                 }
 
                 val channel = response.bodyAsChannel()
-                val data = when (val contentLength = response.contentLength()) {
+                val contentLength = response.contentLength()
+                val data = when (contentLength) {
                     null -> readUnknownSize(ByteReadChannelWrapper(channel))  // 动态扩容方案
                     else -> readKnownSize(ByteReadChannelWrapper(channel), contentLength)  // 预分配方案
+                }
+                // raft.9: a delivered size differing from the header length is
+                // legal (see ByteReadChannelWrapper.readAvailable) but almost
+                // always the thing you need to know when a payload looks wrong.
+                if (contentLength != null && data.size.toLong() != contentLength) {
+                    VBPBLog.e(
+                        VBPBLog.HMTRANSPORTIMPL,
+                        "${request.logTag} response body length mismatch, id:${request.requestId}, " +
+                            "content-length:$contentLength, read:${data.size}, " +
+                            "encoding:${response.headers["Content-Encoding"] ?: "-"}"
+                    )
                 }
 
                 buildResponseAndCallback(
@@ -250,10 +263,13 @@ class IOSTransportImpl : IVBTransportService {
                     throw throwable
                 }
                 taskMap.remove(kmmRequest.requestId)
+                // raft.9: classified failure reason, same shape as callbackFailure.
+                val describedFailure = describeTransportFailure(throwable)
+                VBPBLog.e(TAG, "${kmmRequest.logTag} stream request failed, id:${kmmRequest.requestId}, error:$describedFailure")
                 onComplete(
                     VBTransportResponse().apply {
                         this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
-                        this.errorMessage = throwable.message?.takeIf { it.isNotBlank() } ?: throwable.toString()
+                        this.errorMessage = describedFailure
                         this.data = null
                         this.request = kmmRequest
                     }
@@ -295,8 +311,10 @@ class IOSTransportImpl : IVBTransportService {
         throwable: Throwable,
         kmmCallback: (response: VBTransportBaseResponse) -> Unit
     ) {
-        val errorMessage = throwable.message?.takeIf { it.isNotBlank() } ?: throwable.toString()
-        VBPBLog.i(TAG, "${request.logTag} request failed, id:${request.requestId}, error:${errorMessage}")
+        // raft.9: classify the failure so callers see WHY ([timeout]/[dns]/
+        // [tls]/[connection_lost]/…) instead of a bare engine message.
+        val errorMessage = describeTransportFailure(throwable)
+        VBPBLog.e(TAG, "${request.logTag} request failed, id:${request.requestId}, error:${errorMessage}")
         buildResponseAndCallback(
             taskMap,
             VBTransportResultCode.CODE_NETWORK_ERROR,

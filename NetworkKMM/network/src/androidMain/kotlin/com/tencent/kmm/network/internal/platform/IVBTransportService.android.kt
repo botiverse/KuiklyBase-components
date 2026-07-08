@@ -32,6 +32,7 @@ import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.VBPBLog
 import com.tencent.kmm.network.internal.utils.ByteReadChannelWrapper
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.buildResponseAndCallback
+import com.tencent.kmm.network.internal.utils.describeTransportFailure
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapBytesCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapGetCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapPostCallback
@@ -101,6 +102,17 @@ object AndroidTransportImpl : IVBTransportService {
                 } else {
                     // 预分配方案
                     readKnownSize(ByteReadChannelWrapper(channel), contentLength)
+                }
+                // raft.9: a delivered size differing from the header length is
+                // legal (see ByteReadChannelWrapper.readAvailable) but almost
+                // always the thing you need to know when a payload looks wrong.
+                if (contentLength != null && data.size.toLong() != contentLength) {
+                    logE(
+                        "response body length mismatch, id:${request.requestId}, " +
+                            "content-length:$contentLength, read:${data.size}, " +
+                            "encoding:${response.headers["Content-Encoding"] ?: "-"}",
+                        request.logTag
+                    )
                 }
 
                 buildResponseAndCallback(
@@ -240,10 +252,13 @@ object AndroidTransportImpl : IVBTransportService {
                     throw throwable
                 }
                 taskMap.remove(kmmRequest.requestId)
+                // raft.9: classified failure reason, same shape as callbackFailure.
+                val describedFailure = describeTransportFailure(throwable)
+                logE("stream request failed, id:${kmmRequest.requestId}, error:$describedFailure", kmmRequest.logTag)
                 onComplete(
                     VBTransportResponse().apply {
                         this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
-                        this.errorMessage = throwable.message?.takeIf { it.isNotBlank() } ?: throwable.toString()
+                        this.errorMessage = describedFailure
                         this.data = null
                         this.request = kmmRequest
                     }
@@ -275,6 +290,10 @@ object AndroidTransportImpl : IVBTransportService {
         VBPBLog.i(VBPBLog.HMTRANSPORTIMPL, "$logTag $content")
     }
 
+    private fun logE(content: String, logTag: String = "") {
+        VBPBLog.e(VBPBLog.HMTRANSPORTIMPL, "$logTag $content")
+    }
+
     override fun cancel(requestId: Int) {
         logI("requestID -> $requestId task cancel by user")
         taskMap[requestId]?.cancel()
@@ -285,8 +304,10 @@ object AndroidTransportImpl : IVBTransportService {
         throwable: Throwable,
         kmmCallback: (response: VBTransportBaseResponse) -> Unit
     ) {
-        val errorMessage = throwable.message?.takeIf { it.isNotBlank() } ?: throwable.toString()
-        logI("request failed, id:${request.requestId}, error:${errorMessage}", request.logTag)
+        // raft.9: classify the failure so callers see WHY ([timeout]/[dns]/
+        // [tls]/[connection_lost]/…) instead of a bare engine message.
+        val errorMessage = describeTransportFailure(throwable)
+        logE("request failed, id:${request.requestId}, error:${errorMessage}", request.logTag)
         buildResponseAndCallback(
             taskMap,
             VBTransportResultCode.CODE_NETWORK_ERROR,
