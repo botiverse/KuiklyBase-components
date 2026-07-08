@@ -135,7 +135,18 @@ kotlin {
 
         val ohosArm64Main by getting {
             dependencies {
-                // 鸿蒙依赖
+                // ohosArm64 is the ONE target that must use the KBA forks
+                // (upstream publishes no ohos klibs). strictly() beats
+                // Gradle's default "highest version wins" — the fork's
+                // -KBA-* qualifier sorts LOWER than the upstream release,
+                // so a plain declaration would resolve upstream and fail.
+                // Versions live in libs.versions.toml (*-kba entries).
+                implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core") {
+                    version { strictly(libs.versions.kotlinx.coroutines.core.kba.get()) }
+                }
+                implementation("org.jetbrains.kotlinx:atomicfu") {
+                    version { strictly(libs.versions.atomicfu.kba.get()) }
+                }
             }
         }
 
