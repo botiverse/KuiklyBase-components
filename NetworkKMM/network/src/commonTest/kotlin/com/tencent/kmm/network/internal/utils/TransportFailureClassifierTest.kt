@@ -44,3 +44,22 @@ class TransportFailureClassifierTest {
         assertTrue("something exotic happened" in described)
     }
 }
+
+class TransportTimeoutsTest {
+    @Test
+    fun connectBudgetIsCappedAtThreeSeconds() {
+        kotlin.test.assertEquals(3_000L, transportConnectTimeoutMillis(30_000L))
+    }
+
+    @Test
+    fun connectBudgetNeverExceedsTheRequestTotalTimeout() {
+        kotlin.test.assertEquals(1_500L, transportConnectTimeoutMillis(1_500L))
+    }
+
+    @Test
+    fun nonPositiveTotalTimeoutFallsBackToTheDefaultConnectBudget() {
+        // totalTimeout <= 0 means "no explicit timeout" upstream; the connect
+        // budget still applies so a dead address family cannot hang forever.
+        kotlin.test.assertEquals(3_000L, transportConnectTimeoutMillis(0L))
+    }
+}

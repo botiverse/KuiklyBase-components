@@ -33,6 +33,7 @@ import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.VBPBLog
 import com.tencent.kmm.network.internal.utils.ByteReadChannelWrapper
 import com.tencent.kmm.network.internal.utils.describeTransportFailure
+import com.tencent.kmm.network.internal.utils.transportConnectTimeoutMillis
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.buildResponseAndCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapBytesCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapGetCallback
@@ -84,7 +85,10 @@ class IOSTransportImpl : IVBTransportService {
                     if (request.totalTimeout > 0) {
                         timeout {
                             requestTimeoutMillis = request.totalTimeout
-                            connectTimeoutMillis = request.totalTimeout
+                            // raft.9: connect gets its own short budget so a dead
+                            // address family can't eat the whole request timeout
+                            // (see TransportTimeouts.kt for the 3s rationale).
+                            connectTimeoutMillis = transportConnectTimeoutMillis(request.totalTimeout)
                             socketTimeoutMillis = request.totalTimeout
                         }
                     }
@@ -217,7 +221,10 @@ class IOSTransportImpl : IVBTransportService {
                     if (kmmRequest.totalTimeout > 0) {
                         timeout {
                             requestTimeoutMillis = kmmRequest.totalTimeout
-                            connectTimeoutMillis = kmmRequest.totalTimeout
+                            // raft.9: connect gets its own short budget so a dead
+                            // address family can't eat the whole request timeout
+                            // (see TransportTimeouts.kt for the 3s rationale).
+                            connectTimeoutMillis = transportConnectTimeoutMillis(kmmRequest.totalTimeout)
                             socketTimeoutMillis = kmmRequest.totalTimeout
                         }
                     }
