@@ -13,12 +13,6 @@ kotlin {
     iosX64()
     iosArm64()
     iosSimulatorArm64()
-    // NetworkKMM Darwin behavior-test lane (-PdarwinBehaviorTests): macos
-    // variant so the lane's macosArm64 consumer can resolve knoi from
-    // mavenLocal. Conditional so normal (linux-hosted) publishes are unchanged.
-    if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
-        macosArm64()
-    }
 
     // Android平台
     androidTarget {
@@ -33,21 +27,16 @@ kotlin {
         publishLibraryVariantsGroupedByFlavor = true
         publishLibraryVariants("release", "debug")
     }
-    // The Darwin behavior-test lane primes mavenLocal on a macOS runner with
-    // no OHOS SDK — the ohos cinterop cannot configure there, and the lane's
-    // consumer only needs the macos variant. Normal builds are unchanged.
-    if (!providers.gradleProperty("darwinBehaviorTests").isPresent) {
-        ohosArm64 {
-            val main by compilations.getting
-            val interop by main.cinterops.creating {
-                includeDirs("$projectDir/src/nativeInterop/cinterop/cpp/include")
-            }
-            compilations.forEach {
-                it.compilerOptions.options.optIn.addAll(
-                    "kotlinx.cinterop.ExperimentalForeignApi",
-                    "kotlin.experimental.ExperimentalNativeApi",
-                )
-            }
+    ohosArm64 {
+        val main by compilations.getting
+        val interop by main.cinterops.creating {
+            includeDirs("$projectDir/src/nativeInterop/cinterop/cpp/include")
+        }
+        compilations.forEach {
+            it.compilerOptions.options.optIn.addAll(
+                "kotlinx.cinterop.ExperimentalForeignApi",
+                "kotlin.experimental.ExperimentalNativeApi",
+            )
         }
     }
 
@@ -60,10 +49,8 @@ kotlin {
 //                api(project(":knoi-annotation"))
             }
         }
-        if (!providers.gradleProperty("darwinBehaviorTests").isPresent) {
-            val ohosArm64Main by getting {
-                dependencies {
-                }
+        val ohosArm64Main by getting {
+            dependencies {
             }
         }
         val commonTest by getting {
