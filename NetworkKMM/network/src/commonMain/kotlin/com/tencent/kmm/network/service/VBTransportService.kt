@@ -222,7 +222,7 @@ object VBTransportService {
             VBPBLog.i(
                 VBPBLog.TASK_MANAGER, "${request.logTag} execute() coroutine " +
                     "totalTimeout: ${timeout}, requestId: $requestId")
-            if (timeout <= 0) return@launch
+            if (timeout <= 0) return@transportLaunch
             delay(timeout)
             taskManager.getTask(requestId)?.let { task ->
                 if (task.getState() != VBTransportState.Done) {
