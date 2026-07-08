@@ -34,6 +34,7 @@ import com.tencent.kmm.network.export.VBTransportStringCompletionHandler
 import com.tencent.kmm.network.export.VBTransportStringRequest
 import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.VBPBLog
+import com.tencent.kmm.network.internal.transportLaunch
 import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
 import com.tencent.kmm.network.internal.VBTransportManager
 import com.tencent.kmm.network.internal.VBTransportState
@@ -44,7 +45,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.launch
 
 object VBTransportService {
 
@@ -68,7 +68,7 @@ object VBTransportService {
         handler: VBTransportBytesCompletionHandler?,
     ) {
         request.requestId = VBPBRequestIdGenerator.getRequestId()
-        networkScope.launch(track = true) {
+        networkScope.transportLaunch {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendBytesRequest(request) { response ->
@@ -94,7 +94,7 @@ object VBTransportService {
         handler: VBTransportStringCompletionHandler?,
     ) {
         request.requestId = VBPBRequestIdGenerator.getRequestId()
-        networkScope.launch(track = true) {
+        networkScope.transportLaunch {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendStringRequest(request) { response ->
@@ -119,7 +119,7 @@ object VBTransportService {
         handler: VBTransportPostHandler?
     ) {
         request.requestId = VBPBRequestIdGenerator.getRequestId()
-        networkScope.launch(track = true) {
+        networkScope.transportLaunch {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendPostRequest(request) { response ->
@@ -144,7 +144,7 @@ object VBTransportService {
         handler: VBTransportGetHandler?
     ) {
         request.requestId = VBPBRequestIdGenerator.getRequestId()
-        networkScope.launch(track = true) {
+        networkScope.transportLaunch {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendGetRequest(request) { response ->
@@ -169,7 +169,7 @@ object VBTransportService {
         handler: VBTransportHandler?
     ) {
         request.requestId = VBPBRequestIdGenerator.getRequestId()
-        networkScope.launch(track = true) {
+        networkScope.transportLaunch {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendRequest(request) { response ->
@@ -200,7 +200,7 @@ object VBTransportService {
         handler: VBTransportHandler?
     ) {
         request.requestId = VBPBRequestIdGenerator.getRequestId()
-        networkScope.launch(track = true) {
+        networkScope.transportLaunch {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.streamRequest(request, onResponseStart, onChunk) { response ->
@@ -218,7 +218,7 @@ object VBTransportService {
         request: VBTransportBaseRequest,
         handlerBlock: () -> Unit
     ) {
-        networkScope.launch(track = true) {
+        networkScope.transportLaunch {
             VBPBLog.i(
                 VBPBLog.TASK_MANAGER, "${request.logTag} execute() coroutine " +
                     "totalTimeout: ${timeout}, requestId: $requestId")

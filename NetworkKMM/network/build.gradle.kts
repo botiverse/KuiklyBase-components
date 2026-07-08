@@ -306,6 +306,15 @@ publishing {
 
     // Configure all publications
     publications.withType<MavenPublication> {
+        // The published dependency declarations must mirror the RESOLVED
+        // graph per variant, not the raw declarations: commonMain declares
+        // upstream coroutines/atomicfu, but the ohosArm64 variant's graph is
+        // force()d to the KBA forks — without this, the ohos variant's
+        // .module/POM would still declare upstream (which has no ohos klibs)
+        // and every consumer's ohos resolution would break on bump.
+        versionMapping {
+            allVariants { fromResolutionResult() }
+        }
         // Stub javadoc.jar artifact
 //        artifact(javadocJar.get())
 
