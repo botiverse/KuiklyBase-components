@@ -79,7 +79,14 @@ jobs:
         shell: bash
         working-directory: knoi
         run: |
-          ./gradlew \
+          # knoi signs publications unconditionally (sonatype flow); mavenLocal
+          # priming has no keys and needs none — disable Sign tasks wholesale.
+          cat > /tmp/no-signing.init.gradle <<'INIT'
+          allprojects {
+            tasks.withType(org.gradle.plugins.signing.Sign).configureEach { onlyIf { false } }
+          }
+          INIT
+          ./gradlew -I /tmp/no-signing.init.gradle \
             :knoi-annotation:publishKotlinMultiplatformPublicationToMavenLocal \
             :knoi-annotation:publishMacosArm64PublicationToMavenLocal \
             :knoi:publishKotlinMultiplatformPublicationToMavenLocal \
