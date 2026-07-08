@@ -53,7 +53,9 @@ kotlin {
         homepage = "Link to the Shared Module homepage"
         version = "1.0"
         ios.deploymentTarget = "12.0"
-        osx.deploymentTarget = "11.0"
+        if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
+            osx.deploymentTarget = "11.0"
+        }
         podfile = project.file("../iosApp/Podfile")
         framework {
             baseName = "network"

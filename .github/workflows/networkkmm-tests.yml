@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "NetworkKMM/**"
+      - "knoi/**"
       - ".github/workflows/networkkmm-tests.yml"
   workflow_dispatch:
 
