@@ -76,6 +76,7 @@ object AndroidTransportImpl : IVBTransportService {
         val job = scope.launch {
             try {
                 val client = getHttpClient(request) as HttpClient
+                val startMark = kotlin.time.TimeSource.Monotonic.markNow()
                 val response = client.request(request.url) {
                     method = HttpMethod(request.method.name)
                     if (request.totalTimeout > 0) {
@@ -90,6 +91,15 @@ object AndroidTransportImpl : IVBTransportService {
                     }
                     constructRequest(request)
                 }
+
+                // raft.13 chain bracket 2/3: headers arrived — everything before
+                // this line is connect/TLS/TTFB, everything after is body read.
+                logI(
+                    "response received, id:${request.requestId}, status:${response.status.value}, " +
+                        "contentLength:${response.contentLength() ?: -1}, " +
+                        "elapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
+                    request.logTag
+                )
 
                 var errMsg = ""
                 var errorCode = 0
@@ -119,6 +129,14 @@ object AndroidTransportImpl : IVBTransportService {
                     )
                 }
 
+                // raft.13 chain bracket 3/3: body fully read — a hang between
+                // bracket 2 and here is a body-read stall, not a network wait.
+                logI(
+                    "body read, id:${request.requestId}, bytes:${data.size}, " +
+                        "totalElapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
+                    request.logTag
+                )
+
                 buildResponseAndCallback(
                     taskMap,
                     errorCode,
@@ -144,7 +162,7 @@ object AndroidTransportImpl : IVBTransportService {
         kmmBytesResponseCallback: (response: VBTransportBytesResponse) -> Unit
     ) {
         logI("send bytes request, id:${kmmBytesRequest.requestId}, url:${kmmBytesRequest.url}, " +
-                "header:${kmmBytesRequest.header}", kmmBytesRequest.logTag)
+                "headerKeys:${kmmBytesRequest.header.keys}", kmmBytesRequest.logTag)
         triggerRequest(kmmBytesRequest, wrapBytesCallback(kmmBytesResponseCallback))
     }
 
@@ -153,7 +171,7 @@ object AndroidTransportImpl : IVBTransportService {
         kmmStringResponseCallback: (response: VBTransportStringResponse) -> Unit
     ) {
         logI("send string request, id:${kmmStringRequest.requestId}, url:${kmmStringRequest.url}, " +
-                "header:${kmmStringRequest.header}", kmmStringRequest.logTag)
+                "headerKeys:${kmmStringRequest.header.keys}", kmmStringRequest.logTag)
         triggerRequest(kmmStringRequest, wrapStringCallback(kmmStringResponseCallback))
     }
 
@@ -162,7 +180,7 @@ object AndroidTransportImpl : IVBTransportService {
         kmmPostResponseCallback: (response: VBTransportPostResponse) -> Unit
     ) {
         logI("send post request, id:${kmmPostRequest.requestId}, url:${kmmPostRequest.url}, " +
-                "header:${kmmPostRequest.header}", kmmPostRequest.logTag)
+                "headerKeys:${kmmPostRequest.header.keys}", kmmPostRequest.logTag)
 
         if (!kmmPostRequest.isDataInitialize()) {
             callbackFailure(
@@ -181,7 +199,7 @@ object AndroidTransportImpl : IVBTransportService {
         kmmGetResponseCallback: (response: VBTransportGetResponse) -> Unit
     ) {
         logI("send get request, id:${kmmGetRequest.requestId}, url:${kmmGetRequest.url}, " +
-                "header:${kmmGetRequest.header}", kmmGetRequest.logTag)
+                "headerKeys:${kmmGetRequest.header.keys}", kmmGetRequest.logTag)
         triggerRequest(kmmGetRequest, wrapGetCallback(kmmGetResponseCallback))
     }
 
@@ -190,7 +208,7 @@ object AndroidTransportImpl : IVBTransportService {
         kmmResponseCallback: (response: VBTransportResponse) -> Unit
     ) {
         logI("send ${kmmRequest.method} request, id:${kmmRequest.requestId}, url:${kmmRequest.url}, " +
-                "header:${kmmRequest.header}", kmmRequest.logTag)
+                "headerKeys:${kmmRequest.header.keys}", kmmRequest.logTag)
         triggerRequest(kmmRequest, wrapRequestCallback(kmmResponseCallback))
     }
 
@@ -207,6 +225,7 @@ object AndroidTransportImpl : IVBTransportService {
         val job = scope.launch {
             try {
                 val client = getHttpClient(kmmRequest) as HttpClient
+                val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
                 val response = client.request(kmmRequest.url) {
                     method = HttpMethod(kmmRequest.method.name)
                     if (kmmRequest.totalTimeout > 0) {
@@ -229,19 +248,33 @@ object AndroidTransportImpl : IVBTransportService {
                     errMsg = response.status.description
                 }
 
+                // raft.13 stream bracket: headers arrived.
+                logI(
+                    "stream response received, id:${kmmRequest.requestId}, status:${response.status.value}, " +
+                        "contentLength:${response.contentLength() ?: -1}, elapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}",
+                    kmmRequest.logTag
+                )
                 val responseHeaders = response.headers.entries().associate { it.key to it.value }
                 onResponseStart(errorCode, responseHeaders)
 
                 val channel = response.bodyAsChannel()
+                var streamedBytes = 0L
                 while (!channel.isClosedForRead) {
                     val packet = channel.readRemaining(STREAM_CHUNK_BYTES)
                     while (!packet.isEmpty) {
                         val bytes = packet.readBytes()
                         if (bytes.isNotEmpty()) {
+                            streamedBytes += bytes.size
                             onChunk(bytes)
                         }
                     }
                 }
+                // raft.13 stream bracket: body fully streamed.
+                logI(
+                    "stream complete, id:${kmmRequest.requestId}, bytes:$streamedBytes, " +
+                        "totalElapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}",
+                    kmmRequest.logTag
+                )
 
                 taskMap.remove(kmmRequest.requestId)
                 onComplete(
