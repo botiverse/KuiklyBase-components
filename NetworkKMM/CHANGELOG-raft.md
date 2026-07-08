@@ -1,5 +1,25 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased (Android engine: OkHttp + fastFallback)
+
+- **Android transport engine switched from Ktor `Android` (HttpURLConnection)
+  to Ktor `OkHttp` with `fastFallback = true`** (RFC 8305 Happy Eyeballs):
+  IPv6/IPv4 connect attempts race in parallel (~250ms stagger) instead of a
+  black-holed family serially exhausting the connect budget. This is the root
+  fix behind raft.9's 3s connect stopgap — on dual-stack networks with one
+  broken family, cold connections now settle in the sub-second range instead
+  of paying the 3s fail-fast step. OkHttp is forced to 5.4.0 (fastFallback
+  API exists since 5.0; the ktor-client-okhttp 2.3.7 POM only pulls 4.12.0).
+- **Kill switch**: `VBTransportAndroidEngine.okHttpEnabled = false` (before the
+  first request, e.g. app startup) falls back to the legacy HttpURLConnection
+  engine. Default is OkHttp. Ktor API surface and the raft.9 per-request
+  timeout wiring (`HttpTimeout` plugin) are unchanged and apply to both
+  engines.
+- Behavioural deltas to regression-test on the consumer side: redirects,
+  connection pooling, system-proxy handling (OkHttp reads
+  `java.net.ProxySelector` like HttpURLConnection, but PAC/edge cases differ),
+  auth and multipart upload paths. iOS/OHOS transports are untouched.
+
 ## 0.1.0-raft.9 (EOF-safe body reads, classified failure reasons, connect-timeout decoupling)
 
 - **Connect timeout decoupled from the request total timeout (Android + iOS ktor

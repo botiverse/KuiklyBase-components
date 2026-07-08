@@ -81,7 +81,12 @@ kotlin {
         val androidMain by getting {
             dependencies {
                 implementation(libs.ktor.ktor.client.core)
-                // Android 平台的 Ktor 引擎
+                // OkHttp 引擎（默认）：fastFallback 提供 RFC 8305 Happy Eyeballs
+                // 并行竞速，坏地址族不再串行吃掉整个连接预算。
+                implementation(libs.ktor.client.okhttp)
+                // 强制 OkHttp 5.x：fastFallback API 自 5.0 起才存在。
+                implementation(libs.okhttp)
+                // 旧 HttpURLConnection 引擎保留作运行时回退开关。
                 implementation(libs.ktor.client.android)
             }
         }
