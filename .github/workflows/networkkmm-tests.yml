@@ -42,6 +42,15 @@ jobs:
         working-directory: NetworkKMM
         run: ./gradlew :network:testDebugUnitTest --no-daemon --stacktrace
 
+      # The raft.11 publish failure (stdlib version leak ICE) only surfaced in
+      # the publish job's metadata compilation — the android-only task graph
+      # above never runs it. Compile common metadata here so dependency
+      # resolution problems fail the PR, not the release.
+      - name: Compile commonMain metadata
+        shell: bash
+        working-directory: NetworkKMM
+        run: ./gradlew :network:compileCommonMainKotlinMetadata --no-daemon --stacktrace
+
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4
