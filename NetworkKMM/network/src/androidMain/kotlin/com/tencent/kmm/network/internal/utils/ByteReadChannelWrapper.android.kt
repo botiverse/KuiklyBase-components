@@ -72,6 +72,10 @@ actual class ByteReadChannelWrapper(private val byteReadChannel: Any) {
             if (reachedEof) {
                 head.copyOf(readTotal)
             } else {
+                // readBytes loops readRemaining(limit) until the channel is
+                // exhausted — the 8KB argument is a per-chunk cap, NOT a total
+                // cap. Draining here must always reach EOF; capping it would
+                // silently truncate over-delivered (decompressed) bodies.
                 val tail = readBytes(READ_TO_EOF_CHUNK_BYTES)
                 if (tail.isEmpty()) head else head + tail
             }
