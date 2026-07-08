@@ -1,5 +1,23 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.11 (OHOS connect budget + Happy Eyeballs pin + slow-transfer phase log)
+
+- **OHOS connect budget**: the curl wrapper now sets
+  `CURLOPT_CONNECTTIMEOUT_MS = 3000` (aligned with the ktor transports' raft.9
+  connect cap; libcurl's default connect timeout is 300s) and pins
+  `CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS = 200` explicitly instead of trusting the
+  libcurl default. Ships the rebuilt `.so` (networkkmm-ohos-native run
+  28931135301, committed as fd91f7b).
+- **Slow-transfer phase log (OHOS)**: failed or ≥3s transfers log a one-line
+  curl phase breakdown (`transport_timing … dnsMs/connectMs/tlsMs/ttfbMs/
+  redirectMs/totalMs`) from the ElapseStats the wrapper already collects —
+  "connect slow vs transfer slow" becomes one log line. No API change; the
+  timings were already exposed via `NetworkResponse.timing`.
+- Note: **0.1.0-raft.10 was never published** — its content (Android engine
+  switched to Ktor-OkHttp with `fastFallback = true`, kill switch
+  `VBTransportAndroidEngine.okHttpEnabled`) ships for the first time in this
+  release. See the raft.10 changelog entry below for details.
+
 ## 0.1.0-raft.10 (Android engine: OkHttp + fastFallback)
 
 - **Android transport engine switched from Ktor `Android` (HttpURLConnection)
