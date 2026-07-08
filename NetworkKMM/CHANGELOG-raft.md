@@ -8,8 +8,10 @@
   black-holed family serially exhausting the connect budget. This is the root
   fix behind raft.9's 3s connect stopgap — on dual-stack networks with one
   broken family, cold connections now settle in the sub-second range instead
-  of paying the 3s fail-fast step. OkHttp is forced to 5.4.0 (fastFallback
-  API exists since 5.0; the ktor-client-okhttp 2.3.7 POM only pulls 4.12.0).
+  of paying the 3s fail-fast step. OkHttp is forced to 5.0.0-alpha.16
+  (fastFallback exists since 5.0.0-alpha.4; the ktor-client-okhttp 2.3.7 POM
+  only pulls 4.12.0, and every 5.x stable ships Kotlin 2.2 metadata that the
+  KBA 2.0.21 toolchain cannot read — alpha.16 is the newest Kotlin-2.1 build).
 - **Kill switch**: `VBTransportAndroidEngine.okHttpEnabled = false` (before the
   first request, e.g. app startup) falls back to the legacy HttpURLConnection
   engine. Default is OkHttp. Ktor API surface and the raft.9 per-request
