@@ -86,9 +86,13 @@ jobs:
             tasks.withType(org.gradle.plugins.signing.Sign).configureEach { onlyIf { false } }
             // knoi runtime pins knoi-annotation 0.0.1 from the catalog, which
             // also has no macos variant — build against the in-repo project.
-            configurations.all {
-              resolutionStrategy.dependencySubstitution {
-                substitute(module('com.tencent.kuiklybase:knoi-annotation')).using(project(':knoi-annotation'))
+            // Guarded: this init script also visits buildSrc, where the
+            // project path does not exist.
+            if (rootProject.findProject(':knoi-annotation') != null) {
+              configurations.all {
+                resolutionStrategy.dependencySubstitution {
+                  substitute(module('com.tencent.kuiklybase:knoi-annotation')).using(project(':knoi-annotation'))
+                }
               }
             }
           }
