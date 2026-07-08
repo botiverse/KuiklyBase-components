@@ -71,6 +71,21 @@ jobs:
           distribution: temurin
           java-version: "17"
 
+      # knoi 0.0.4 has no published macos variant; the lane builds knoi's
+      # macos klibs from this repo's source into mavenLocal (NetworkKMM's
+      # repositories already list mavenLocal first). Root-module + macos
+      # publications only — ohos/android artifacts are not built here.
+      - name: Prime knoi macos variants into mavenLocal
+        shell: bash
+        working-directory: knoi
+        run: |
+          ./gradlew \
+            :knoi-annotation:publishKotlinMultiplatformPublicationToMavenLocal \
+            :knoi-annotation:publishMacosArm64PublicationToMavenLocal \
+            :knoi:publishKotlinMultiplatformPublicationToMavenLocal \
+            :knoi:publishMacosArm64PublicationToMavenLocal \
+            -PdarwinBehaviorTests --console=plain --no-daemon
+
       - name: Start local test server
         shell: bash
         run: |

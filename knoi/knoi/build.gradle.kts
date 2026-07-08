@@ -13,6 +13,12 @@ kotlin {
     iosX64()
     iosArm64()
     iosSimulatorArm64()
+    // NetworkKMM Darwin behavior-test lane (-PdarwinBehaviorTests): macos
+    // variant so the lane's macosArm64 consumer can resolve knoi from
+    // mavenLocal. Conditional so normal (linux-hosted) publishes are unchanged.
+    if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
+        macosArm64()
+    }
 
     // Android平台
     androidTarget {
