@@ -10,7 +10,6 @@ plugins {
     kotlin("multiplatform")
     id("org.jetbrains.kotlin.native.cocoapods")
     id("com.android.library")
-    id("com.tencent.kuiklybase.knoi.plugin")
     `maven-publish`
     signing
 }
