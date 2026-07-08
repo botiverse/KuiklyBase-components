@@ -304,17 +304,21 @@ publishing {
         }
     }
 
+    // The ohosArm64 variant must PUBLISH the KBA fork versions even though
+    // commonMain declares upstream (so the iOS/Android variants stay
+    // official). Plain fromResolutionResult() is a no-op for K/N variants —
+    // the default usage mapping never reaches the ohos klib graph (verified:
+    // module.json kept the upstream declarations) — so the mapping points
+    // explicitly at the configuration the force() actually rewrote. The PR
+    // CI generates this publication's metadata and asserts the KBA versions.
+    publications.withType<MavenPublication>().matching { it.name.equals("ohosArm64", ignoreCase = true) }.configureEach {
+        versionMapping {
+            allVariants { fromResolutionOf("ohosArm64CompileKlibraries") }
+        }
+    }
+
     // Configure all publications
     publications.withType<MavenPublication> {
-        // The published dependency declarations must mirror the RESOLVED
-        // graph per variant, not the raw declarations: commonMain declares
-        // upstream coroutines/atomicfu, but the ohosArm64 variant's graph is
-        // force()d to the KBA forks — without this, the ohos variant's
-        // .module/POM would still declare upstream (which has no ohos klibs)
-        // and every consumer's ohos resolution would break on bump.
-        versionMapping {
-            allVariants { fromResolutionResult() }
-        }
         // Stub javadoc.jar artifact
 //        artifact(javadocJar.get())
 
