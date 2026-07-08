@@ -254,3 +254,71 @@ JVM-side JNI shim minimal.
    prewarm marker), on the 1.1.0 packaging line.
 4. Remaining: device measurement in the reproducing environment (ClashMeta
    proxy + IPv6) — ladder gone = root fix confirmed.
+
+---
+
+# Appendices — thread Q&A distilled (2026-07-08, artin's questions)
+
+## Appendix A: TLS backend for C — BoringSSL vs OpenSSL
+
+Same lineage (BoringSSL = Google's post-Heartbleed 2014 fork), different
+governance. What matters for us:
+
+| | OpenSSL | BoringSSL |
+| --- | --- | --- |
+| Releases | Versioned + LTS, formal CVE process, ABI-stable within 3.x | **No releases, no API/ABI promise** — consumers (Chrome/Android/gRPC) vendor a snapshot and track master |
+| Surface | Full-featured (provider architecture, FIPS provider) | Legacy trimmed (no engines/old protocols) — smaller attack surface and binary |
+| Ecosystem | The well-trodden curl pairing; docs everywhere | Hardened by Chrome-scale fuzzing; curl support is "works, with sharp edges"; required if HTTP/3 goes via quiche |
+
+**Recommendation: OpenSSL.** It is what the OHOS lane already cross-compiles,
+version-pinnable CVE handling suits a small team, and the only BoringSSL
+draws (size, quiche/QUIC alignment) don't outweigh the track-master
+maintenance tax. Revisit only if C reopens *because of* QUIC. (Note: the
+excluded option B — Cronet — is where BoringSSL would have entered.)
+
+## Appendix B: can the C wrapper be handed to all three ends directly?
+
+The C++ core (curl_wrapper.cpp + libcurl + OpenSSL) is 100% shareable; the
+question is the **binding layer into Kotlin**, which differs per platform:
+
+| End | Binding | Status |
+| --- | --- | --- |
+| OHOS | Kotlin/Native cinterop | **Live today** |
+| iOS | Kotlin/Native cinterop — same mechanism, same headers | **Near-reuse**: apple cross-compile lane + TLS/proxy bridges (Appendix C); whether to migrate at all is Appendix C's call |
+| Android | **No cinterop exists on JVM/ART** | Hand-written JNI binding (incl. callback thread/memory marshalling — entirely different from K/N function pointers) + a custom Ktor engine, *then* the C-1 trust bridge and C-2 proxy/PAC bridge on top |
+
+Minor shared item: the wrapper's log layer is currently pinned to OHOS hilog
+and needs a per-platform abstraction (android log / os_log) — half-day scale.
+
+So "one C wrapper for three ends" is true at the source level; the cost lives
+almost entirely in Android's binding + behavior bridges, which is exactly why
+C-5 names Android as option C's main engineering line.
+
+## Appendix C: iOS — keep Darwin or migrate? (cost sheet)
+
+**Keeping Darwin costs ≈ 0** and is the recommendation. NSURLSession natively
+provides Happy Eyeballs, HTTP/3 (iOS 15+), the system trust chain
+(keychain/enterprise/user certs, ATS), system proxy/PAC/VPN integration, and
+power-aware scheduling — and iOS never exhibited the P1 symptom.
+
+**Migration cost estimate (if C reopens and insists on iOS):**
+
+1. curl+OpenSSL apple cross-compile lane (device + simulator, macOS runner):
+   ~2–3 person-days
+2. cinterop wiring + promoting CurlRequestService from ohosArm64Main to an
+   apple/ohos shared source set: ~2–3 person-days
+3. **TLS trust bridge (the critical item)**: iOS has **no public API to
+   enumerate system root certificates** — a baked CA path (OHOS-style) is
+   impossible. The correct shape is a verify callback delegating to
+   `SecTrustEvaluateWithError` (which also honours user-installed certs):
+   ~2–3 person-days **+ security review**
+4. Proxy bridge: `CFNetworkCopyProxiesForURL` (includes PAC evaluation) →
+   `CURLOPT_PROXY`: ~1–2 person-days
+5. Recurring tax: every curl/OpenSSL CVE changes from a version-line edit to
+   an iOS static-library rebuild as well
+
+Total ≈ two weeks of one-time work + security review, and the purchase is
+**only** three-end marker unification — while HE/H3 are native there already
+(migrating would actually regress HTTP/3 → HTTP/2). The cheap substitute:
+align iOS diagnostics to the `elapseStatis` contract via
+NSURLSessionTaskMetrics (~1–2 days) and get ~90% of the marker value.
