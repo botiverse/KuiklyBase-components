@@ -80,6 +80,9 @@ import kotlin.reflect.KFunction1
 
 private const val TAG = "CurlRequestServiceHM"
 
+// raft.11: transfers slower than this log their curl phase breakdown.
+private const val SLOW_TRANSFER_LOG_THRESHOLD_MS = 3_000.0
+
 var curlLogNative: IVBPBLog? = null
 private const val CURL_LOG_LEVEL_DEBUG = 0
 private const val CURL_LOG_LEVEL_INFO = 1
@@ -511,6 +514,20 @@ object CurlRequestServiceHM : ICurlRequestService {
         }
 
         response.elapseStatis = nativeResponse.elapse
+        // raft.11: phase breakdown for failed or slow transfers, so "connect
+        // slow vs transfer slow" is one log line instead of a manual ledger of
+        // repeated requests (the transport P1 was located exactly that way).
+        // curl collects these timings on every transfer; only anomalies log.
+        val elapse = nativeResponse.elapse
+        if (nativeResponse.code != 0 || elapse.totalTimeMs >= SLOW_TRANSFER_LOG_THRESHOLD_MS) {
+            logE(
+                "[$logTag] transport_timing id:${request.requestId} code:${nativeResponse.code} " +
+                    "http:${nativeResponse.httpCode} totalMs:${elapse.totalTimeMs.toLong()} " +
+                    "dnsMs:${elapse.nameLookupTimeMs.toLong()} connectMs:${elapse.connectTimeMs.toLong()} " +
+                    "tlsMs:${elapse.sslCostTimeMs.toLong()} ttfbMs:${elapse.startTransferTimeMs.toLong()} " +
+                    "redirectMs:${elapse.redirectTime.toLong()}"
+            )
+        }
         when (response) {
             is VBTransportPostResponse -> {
                 response.data = data
@@ -574,6 +591,10 @@ object CurlRequestServiceHM : ICurlRequestService {
 
     private fun logI(content: String) {
         VBPBLog.i(VBPBLog.HMCURLIMPL, content)
+    }
+
+    private fun logE(content: String) {
+        VBPBLog.e(VBPBLog.HMCURLIMPL, content)
     }
 
     private fun CurlResponse.toCurlNativeResponse(): CurlNativeResponse {

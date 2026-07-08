@@ -320,6 +320,12 @@ class CurlClient {
         if (timeout > 0) {
             curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout);
         }
+        // raft.11: connect gets its own short budget (aligned with the ktor
+        // transports' 3s cap) so a black-holed address family fails fast
+        // instead of inheriting the whole-request timeout, and Happy Eyeballs
+        // racing is pinned explicitly instead of trusting the libcurl default.
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+        curl_easy_setopt(curl_, CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200L);
         // Pool connections/DNS/TLS sessions across per-request easy handles.
         CURLSH *share = GetCurlShare();
         if (share != nullptr) {
