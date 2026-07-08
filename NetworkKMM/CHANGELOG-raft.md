@@ -1,5 +1,26 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.9 (EOF-safe body reads + classified transport failure reasons)
+
+- **EOF-safe body reads (Android + iOS ktor transports)**: `ByteReadChannelWrapper.readAvailable`
+  treated ktor's `-1` EOF return as progress, so any response whose delivered
+  byte count differed from `Content-Length` (early close, or a transparently
+  decompressed body whose header still carried the compressed length) spun in
+  the read loop until the request timeout and surfaced as an opaque transport
+  error ("HTTP 0") — the root cause behind avatar image downloads all failing
+  (botiverse/mobile#440). `Content-Length` is now a hint: short delivery
+  returns the bytes that arrived, over-delivery drains to EOF instead of
+  truncating, and a mismatch is logged at error level with declared/actual
+  sizes and `Content-Encoding`. OHOS is unaffected (native curl write-callback
+  assembly; short bodies already surface as `CURLE_PARTIAL_FILE`).
+- **Classified failure reasons (all transports)**: failed transfers now carry a
+  reason tag in `errorMessage` — `[timeout]` / `[dns]` / `[tls]` /
+  `[connection_lost]` / `[connect]` / `[cancelled]` / `[engine]` — via a common
+  exception classifier on Android/iOS and a CURLcode map on OHOS sharing the
+  same vocabulary. No API change; the tag flows through the existing
+  `errorMessage` field so callers' logs become diagnosable without new wiring.
+- OHOS native `.so` is unchanged from raft.7 (Kotlin-side changes only).
+
 ## 0.1.0-raft.8 (Android multipart Content-Type fix)
 
 - **Android multipart uploads**: the ktor Android transport overrode the request
