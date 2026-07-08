@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "NetworkKMM/**"
+      - "knoi/**"
       - ".github/workflows/networkkmm-tests.yml"
   workflow_dispatch:
 
@@ -57,3 +58,75 @@ jobs:
         with:
           name: network-test-reports
           path: NetworkKMM/network/build/reports/tests/
+
+  darwin-behavior-tests:
+    name: Darwin engine behavior tests (macosArm64)
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # knoi 0.0.4 has no published macos variant; the lane builds knoi's
+      # macos klibs from this repo's source into mavenLocal (NetworkKMM's
+      # repositories already list mavenLocal first). Root-module + macos
+      # publications only — ohos/android artifacts are not built here.
+      - name: Prime knoi macos variants into mavenLocal
+        shell: bash
+        working-directory: knoi
+        run: |
+          # knoi signs publications unconditionally (sonatype flow); mavenLocal
+          # priming has no keys and needs none — disable Sign tasks wholesale.
+          cat > /tmp/no-signing.init.gradle <<'INIT'
+          allprojects {
+            tasks.withType(org.gradle.plugins.signing.Sign).configureEach { onlyIf { false } }
+            // knoi runtime pins knoi-annotation 0.0.1 from the catalog, which
+            // also has no macos variant — build against the in-repo project.
+            // Guarded: this init script also visits buildSrc, where the
+            // project path does not exist.
+            if (rootProject.findProject(':knoi-annotation') != null) {
+              configurations.all {
+                resolutionStrategy.dependencySubstitution {
+                  substitute(module('com.tencent.kuiklybase:knoi-annotation')).using(project(':knoi-annotation'))
+                }
+              }
+            }
+          }
+          INIT
+          ./gradlew -I /tmp/no-signing.init.gradle \
+            :knoi-annotation:publishKotlinMultiplatformPublicationToMavenLocal \
+            :knoi-annotation:publishMacosArm64PublicationToMavenLocal \
+            :knoi:publishKotlinMultiplatformPublicationToMavenLocal \
+            :knoi:publishMacosArm64PublicationToMavenLocal \
+            -PdarwinBehaviorTests --console=plain --no-daemon
+
+      - name: Start local test server
+        shell: bash
+        run: |
+          python3 NetworkKMM/tests/wrapper/test_server.py 18923 &
+          echo $! > /tmp/test-server.pid
+          for _ in $(seq 1 50); do
+            curl -sf "http://127.0.0.1:18923/ok" >/dev/null 2>&1 && break
+            sleep 0.1
+          done
+          curl -sf "http://127.0.0.1:18923/ok" >/dev/null
+
+      # Runs the SAME iosMain transport (ktor Darwin/NSURLSession) natively —
+      # the engine-semantics lane iOS never had (raft.9 lesson). Bounded
+      # per-test timeouts turn engine hangs into red tests, not stuck CI.
+      - name: Run Darwin engine behavior tests
+        shell: bash
+        working-directory: NetworkKMM
+        env:
+          DARWIN_TEST_BASE_URL: http://127.0.0.1:18923
+        run: ./gradlew :network:macosArm64Test -PdarwinBehaviorTests --console=plain --no-daemon --stacktrace
+
+      - name: Stop test server
+        if: always()
+        shell: bash
+        run: kill "$(cat /tmp/test-server.pid)" 2>/dev/null || true
