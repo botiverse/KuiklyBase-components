@@ -1,6 +1,6 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased (Android engine: OkHttp + fastFallback)
+## 0.1.0-raft.10 (Android engine: OkHttp + fastFallback)
 
 - **Android transport engine switched from Ktor `Android` (HttpURLConnection)
   to Ktor `OkHttp` with `fastFallback = true`** (RFC 8305 Happy Eyeballs):
