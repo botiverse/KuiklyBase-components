@@ -204,8 +204,12 @@ NSURLSessionTaskMetrics, which maps 1:1 to the CURLINFO segments). But the
    pin-set, or code-level)? Determines C-1 bridge scope. → mobile side (HanXin)
 2. User-CA behavior baseline on all three current stacks (MITM debug cert
    accepted or not?) → QA matrix, doubles as A regression
-3. Is curl's native HE effective in our OHOS DNS path? → answered by Cata's
-   raft.11 markers + explicit `HAPPY_EYEBALLS_TIMEOUT_MS`
+3. Is curl's native HE effective in our OHOS DNS path? → **partially
+   answered**: the explicit `HAPPY_EYEBALLS_TIMEOUT_MS=200` pin + phase
+   markers shipped in raft.12 and the marker passthrough is device-verified;
+   what remains is observing the connectMs distribution in a real
+   dual-stack broken-family scenario (expect ~250ms-scale racing, not a 3s
+   connect-cap ceiling) — folded into the QA proxy matrix (C-2/#2)
 4. Android APK delta measured (not estimated) from a spike build → C spike,
    only if C proceeds past gate review
 
