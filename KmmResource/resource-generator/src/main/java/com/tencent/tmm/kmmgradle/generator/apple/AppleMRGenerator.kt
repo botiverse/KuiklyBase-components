@@ -17,6 +17,7 @@ import com.tencent.tmm.kmmgradle.generator.apple.action.CopyResourcesFromKLibsTo
 import com.tencent.tmm.kmmgradle.generator.apple.action.PackResourcesToKLibAction
 import com.tencent.tmm.kmmgradle.generator.apple.task.CopyResourcesFromKLibsToDirTask
 import com.tencent.tmm.kmmgradle.generator.apple.task.CopyResourcesFromKLibsToFrameworkTask
+import com.tencent.tmm.kmmgradle.generator.apple.task.PackModuleResourcesToFrameworkTask
 import com.tencent.tmm.kmmgradle.tasks.CopyFrameworkResourcesToAppEntryPointTask
 import com.tencent.tmm.kmmgradle.tasks.CopyFrameworkResourcesToAppTask
 import com.tencent.tmm.kmmgradle.tasks.MergeAppleResourcesTask
@@ -188,6 +189,30 @@ class AppleMRGenerator(
                 toFrameworkTask.linkTask = linkTask
 
                 linkTask.finalizedBy(toFrameworkTask)
+
+                // The klib-based paths above do not deliver THIS module's own MR
+                // resources under recent KGP: `KotlinNativeCompile` does not run
+                // ordinary `doLast` actions (so `PackResourcesToKLibAction` never
+                // packs the module's klib), and the module's own compile output is
+                // an unpacked klib directory that the `.klib`-extension filter in
+                // the copy tasks skips. Write the owning module's MR bundle
+                // straight into the framework from its generated resources.
+                val packModuleTaskName =
+                    PackModuleResourcesToFrameworkTask.TASK_NAME + "_" + linkTask.name
+
+                val packModuleTask = GradleUtils.addTaskCompact(
+                    project, project.tasks, packModuleTaskName,
+                    PackModuleResourcesToFrameworkTask::class.java
+                )
+
+                packModuleTask.linkTask = linkTask
+                packModuleTask.resourcesGenerationDir = resourcesGenerationDir
+                packModuleTask.assetsDirectory = File(assetsGenerationDir.parentFile, "res")
+                packModuleTask.bundleName = bundleIdentifierProvider
+                packModuleTask.bundleIdentifier = bundleIdentifierProvider
+                packModuleTask.baseLocalizationRegion = baseLocalizationRegion
+
+                linkTask.finalizedBy(packModuleTask)
 
                 if (framework.isStatic) {
                     val resourcesExtension: MultiplatformResourcesPluginExtension =
