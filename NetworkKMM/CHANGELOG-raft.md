@@ -1,5 +1,31 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.13 (iOS coroutines linkage fix, full chain logging, knoi removal)
+
+- **iOS/Android klibs reference official kotlinx.coroutines/atomicfu again**
+  (#42): the transport source used the KBA fork's `launch(track = true)`
+  overload in common code, baking KBA-only symbols into every platform's
+  klib — on iOS, where consumers link upstream coroutines, each request died
+  at the call site with `IrLinkageError` (the "stuck at Signing in..." P1;
+  broken since the dual-toolchain split, surfaced by the first real iOS
+  login attempt). Fixed three layers down: an expect/actual `transportLaunch`
+  seam (ohos actual keeps `track = true`, everything else pure upstream),
+  ohos-scoped `force()` to the KBA versions (the only line with an ohos
+  klib), and per-publication `versionMapping(fromResolutionOf(
+  "ohosArm64CompileKlibraries"))` so the published ohos variant honestly
+  declares KBA while ios/android declare upstream. PR CI now asserts the
+  ohos metadata on every change.
+- **Full request-chain log brackets (Android + iOS ktor, execute + stream)**
+  (#41): send → response-received (status/contentLength/elapsedMs) → body
+  read/stream complete (bytes/totalElapsedMs). With raft.9's classified
+  failure reasons, every request names the layer it died in. Send logs now
+  print header KEYS only — the old full-header logging would have leaked
+  Authorization values the moment hosts wire the info logger.
+- **knoi plugin removed from :network** (#40): vestigial template carry-over
+  (zero knoi references in any source set); drops the per-target KSP no-op
+  tasks and the Darwin lane's dependency workarounds.
+- OHOS native `.so` unchanged from raft.11/12 line (Kotlin-side changes only).
+
 ## 0.1.0-raft.12 (clean republish of raft.11 content — CONSUME THIS, NOT raft.11)
 
 - **raft.11 coordinates are poisoned — do not consume.** Its first publish run
