@@ -93,18 +93,25 @@ void CancelAfterCallbackException(CallbackContext *context) {
     }
 }
 
-void CancelIfSignalled(CallbackContext *context) {
+bool CancelIfSignalled(CallbackContext *context) {
     const jboolean cancelled = context->env->CallBooleanMethod(context->callback, context->is_cancelled);
     if (context->env->ExceptionCheck()) {
         context->env->ExceptionClear();
         Cancel(context->client);
-    } else if (cancelled == JNI_TRUE) {
-        Cancel(context->client);
+        return true;
     }
+    if (cancelled == JNI_TRUE) {
+        Cancel(context->client);
+        return true;
+    }
+    return false;
 }
 
 void OnResponseStart(void *callback_ref, long http_code, const char *headers, int header_length) {
     auto *context = static_cast<CallbackContext *>(callback_ref);
+    if (CancelIfSignalled(context)) {
+        return;
+    }
     std::string header_text = headers == nullptr || header_length <= 0
         ? std::string()
         : std::string(headers, static_cast<size_t>(header_length));
@@ -122,6 +129,9 @@ void OnResponseStart(void *callback_ref, long http_code, const char *headers, in
 
 void OnChunk(void *callback_ref, const char *data, int length) {
     auto *context = static_cast<CallbackContext *>(callback_ref);
+    if (CancelIfSignalled(context)) {
+        return;
+    }
     jbyteArray chunk = NewByteArray(context->env, data, length);
     context->env->CallVoidMethod(context->callback, context->on_chunk, chunk);
     if (chunk != nullptr) {
