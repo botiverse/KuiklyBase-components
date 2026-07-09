@@ -1,6 +1,6 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased (dual build trees — kuikly convention, task #18)
+## 0.1.0-raft.14 / 0.1.0-raft.14-ohos (dual build trees — kuikly convention, task #18)
 
 - **The repo now has two build trees** (like kuikly-open): the normal tree
   (`settings.gradle.kts`, upstream Kotlin 2.1.21, android + ios targets,
