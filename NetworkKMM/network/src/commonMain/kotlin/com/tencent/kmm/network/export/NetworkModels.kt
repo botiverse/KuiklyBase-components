@@ -477,3 +477,84 @@ private fun encodeUrlComponent(value: String): String {
     }
     return builder.toString()
 }
+
+/**
+ * issue #8 slice 2: a Multipart body containing at least one Stream/FileRef
+ * part streams out as a composite — framing bytes from
+ * [NetworkMultipartFraming] (identical to the buffered builder's wire format)
+ * interleaved with part bodies pulled chunk-by-chunk. Small scalar parts
+ * (Bytes/Text/Json/Form) are encoded up front; only Stream/FileRef parts are
+ * pulled lazily. Returns null when no part streams — all-scalar multiparts
+ * keep the battle-tested buffered path (raft.8 multer compatibility).
+ *
+ * The composite's contentLength is exact when every streaming part declares
+ * one (true Content-Length upload); any unknown part length makes the whole
+ * body chunked.
+ */
+internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): NetworkByteStream? {
+    val hasStreamingPart = parts.any { it.body is NetworkBody.Stream || it.body is NetworkBody.FileRef }
+    if (!hasStreamingPart) return null
+
+    class PartPlan(
+        val prologue: ByteArray,
+        val scalarBytes: ByteArray?,
+        val streamBody: NetworkBody?,
+        val bodyLength: Long?
+    )
+
+    val plans = parts.map { part ->
+        val prologue = NetworkMultipartFraming.partPrologue(
+            boundary = boundary,
+            name = part.name,
+            fileName = part.fileName,
+            contentType = part.body.contentType,
+            headers = part.headers
+        )
+        when (val body = part.body) {
+            is NetworkBody.Stream ->
+                PartPlan(prologue, null, body, body.stream.contentLength)
+            is NetworkBody.FileRef ->
+                PartPlan(prologue, null, body, body.contentLength)
+            else -> {
+                val bytes = body.toBytes(null)
+                bytes.error?.let { throw IllegalStateException(it.message ?: "multipart part failed to encode") }
+                PartPlan(prologue, bytes.bytes ?: ByteArray(0), null, (bytes.bytes ?: ByteArray(0)).size.toLong())
+            }
+        }
+    }
+    val epilogue = NetworkMultipartFraming.partEpilogue()
+    val terminator = NetworkMultipartFraming.terminator(boundary)
+    val totalLength: Long? =
+        if (plans.all { it.bodyLength != null }) {
+            plans.sumOf { it.prologue.size.toLong() + it.bodyLength!! + epilogue.size } + terminator.size
+        } else {
+            null
+        }
+
+    return NetworkByteStream.fromChunks(
+        contentLength = totalLength,
+        cancelBlock = { parts.forEach { it.body.cancel() } }
+    ) { sink ->
+        plans.forEach { plan ->
+            sink.write(plan.prologue)
+            when (val body = plan.streamBody) {
+                is NetworkBody.Stream -> body.stream.readChunks(sink)
+                is NetworkBody.FileRef -> {
+                    val stream = body.openStream()
+                    if (stream != null) {
+                        stream.readChunks(sink)
+                    } else {
+                        val bytes = body.readAll()
+                            ?: throw IllegalStateException(
+                                "FileRef part requires a readAllBlock or openStreamBlock on this engine."
+                            )
+                        sink.write(bytes)
+                    }
+                }
+                else -> plan.scalarBytes?.let { if (it.isNotEmpty()) sink.write(it) }
+            }
+            sink.write(epilogue)
+        }
+        sink.write(terminator)
+    }
+}
