@@ -84,6 +84,9 @@ typedef struct {
 } CurlResponse;
 
 // Curl 响应回调
+// 所有权契约（对所有 *Callback / CurlUploadSource 一致）：结构体由调用方分配、
+// 调用方释放，wrapper 只在请求期间借用——传栈上/自管内存都合法。wrapper
+// 绝不 delete/free 它们（历史上 StartRequest 曾接管并 delete，栈上回调会炸）。
 typedef struct {
     void *callbackRef;
     void (*callback)(void *callbackRef, CurlResponse *response);
