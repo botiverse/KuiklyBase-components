@@ -1,6 +1,12 @@
 # NetworkKMM Raft fork changelog
 
-## 0.1.0-raft.15 / 0.1.0-raft.15-ohos (streaming upload end-to-end + Kotlin 2.1.21 revert)
+## 0.1.0-raft.16 / 0.1.0-raft.16-ohos (streaming upload end-to-end)
+
+> Version-trap note: the raft.15 coordinate was published the morning of
+> 2026-07-09 (the Kotlin 2.1.21 revert, consumed by mobile #422) — BEFORE
+> the streaming slices merged. GitHub Packages versions are immutable and
+> the publish skip-probe green-skips existing versions, so raft.15 does NOT
+> contain issue #8. raft.16 is the first coordinate that ships it.
 
 ### Streaming upload (issue #8, all three slices)
 
@@ -26,7 +32,10 @@
   truncated body; `Expect: 100-continue` is disabled on OHOS for parity with
   the ktor/OkHttp transports.
 
-### Toolchain (normal tree back to Kotlin 2.1.21 — consumer klib ABI)
+## 0.1.0-raft.15 / 0.1.0-raft.15-ohos (normal tree back to Kotlin 2.1.21 — consumer klib ABI)
+
+> Published 2026-07-09 morning, before the streaming slices merged — see the
+> raft.16 note above. Contains ONLY the toolchain revert below.
 
 - **raft.14's iOS klibs are unusable by mobile — do not consume raft.14 on
   iOS.** The normal tree's Kotlin 2.2.21 produced klibs with ABI 2.2.0, and
