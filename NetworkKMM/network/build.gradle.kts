@@ -16,6 +16,8 @@ plugins {
 
 @OptIn(org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi::class)
 kotlin {
+    val iosCurlSpikeEnabled = providers.gradleProperty("iosCurlSpike").isPresent
+
     // 使用默认层级结构模板
     KotlinHierarchyTemplate.default
 
@@ -35,7 +37,15 @@ kotlin {
     // iOS平台
     iosX64()
     iosArm64()
-    iosSimulatorArm64()
+    iosSimulatorArm64 {
+        if (iosCurlSpikeEnabled) {
+            val main by compilations.getting
+            main.cinterops.create("iosCurlSpike") {
+                definitionFile.set(project.file("src/iosCurlSpikeMain/c_interop/ios_curl_spike.def"))
+                includeDirs("${project.rootDir}/ohosApp/pbcurlwrapper/src/main/cpp/wrapper/include")
+            }
+        }
+    }
     // Darwin behavior-test lane (-PdarwinBehaviorTests): a macosArm64 target that
     // runs the SAME iosMain transport (ktor Darwin/NSURLSession) natively on a
     // macOS CI runner against a local server. iOS was the only platform whose
@@ -98,6 +108,9 @@ kotlin {
         val iosX64Main by getting
         val iosArm64Main by getting
         val iosSimulatorArm64Main by getting
+        if (iosCurlSpikeEnabled) {
+            iosSimulatorArm64Main.kotlin.srcDir("src/iosCurlSpikeMain/kotlin")
+        }
         val iosMain by creating {
             dependsOn(commonMain)
             iosX64Main.dependsOn(this)

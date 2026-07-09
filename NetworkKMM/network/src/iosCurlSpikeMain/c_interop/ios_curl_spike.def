@@ -1,0 +1,2 @@
+headers = curl_wrapper.h
+package = com.tencent.kmm.network.curl.spike.native
