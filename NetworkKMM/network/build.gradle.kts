@@ -148,6 +148,7 @@ android {
     compileSdk = 36
     defaultConfig {
         minSdk = 21
+        consumerProguardFiles("consumer-rules.pro")
     }
     testOptions {
         // OkHttp's static init logs through android.util.Log; JVM unit tests

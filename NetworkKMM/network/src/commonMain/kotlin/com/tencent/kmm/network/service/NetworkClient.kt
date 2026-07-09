@@ -430,7 +430,7 @@ object VBTransportNetworkEngine : NetworkEngine {
         // on platforms whose transport supports it; everything else (and every
         // body on non-streaming platforms) keeps the buffered path below.
         if (capabilities.requestBodyStreaming) {
-            uploadStreamSourceOrNull(request)?.let { source ->
+            networkUploadStreamSourceOrNull(request)?.let { source ->
                 return executeStreaming(request, call, source)
             }
         }
@@ -509,35 +509,10 @@ object VBTransportNetworkEngine : NetworkEngine {
         }
     }
 
-    private class UploadStreamSource(
-        val stream: NetworkByteStream,
-        val contentType: String?,
-        val contentLength: Long?
-    )
-
-    private suspend fun uploadStreamSourceOrNull(request: NetworkRequest): UploadStreamSource? =
-        when (val body = request.body) {
-            is NetworkBody.Stream ->
-                UploadStreamSource(body.stream, body.contentType, body.contentLength)
-            is NetworkBody.FileRef ->
-                body.openStream()?.let { stream ->
-                    UploadStreamSource(stream, body.contentType, stream.contentLength ?: body.contentLength)
-                }
-            // issue #8 slice 2: multiparts stream when they carry at least one
-            // Stream/FileRef part; all-scalar multiparts keep the buffered
-            // path (identical wire bytes either way — NetworkMultipartFraming
-            // is the single framing source).
-            is NetworkBody.Multipart ->
-                body.streamingUploadStreamOrNull()?.let { stream ->
-                    UploadStreamSource(stream, body.contentType, stream.contentLength)
-                }
-            else -> null
-        }
-
     private suspend fun executeStreaming(
         request: NetworkRequest,
         call: NetworkCall,
-        source: UploadStreamSource
+        source: NetworkUploadStreamSource
     ): NetworkResponse {
         val uploadProgress = request.progress.uploadProgress
         return suspendCancellableCoroutine { continuation ->
@@ -579,6 +554,29 @@ object VBTransportNetworkEngine : NetworkEngine {
         }
     }
 }
+
+internal class NetworkUploadStreamSource(
+    val stream: NetworkByteStream,
+    val contentType: String?,
+    val contentLength: Long?
+)
+
+internal suspend fun networkUploadStreamSourceOrNull(request: NetworkRequest): NetworkUploadStreamSource? =
+    when (val body = request.body) {
+        is NetworkBody.Stream ->
+            NetworkUploadStreamSource(body.stream, body.contentType, body.contentLength)
+        is NetworkBody.FileRef ->
+            body.openStream()?.let { stream ->
+                NetworkUploadStreamSource(stream, body.contentType, stream.contentLength ?: body.contentLength)
+            }
+        // issue #8 slice 2: multiparts stream when they carry at least one
+        // Stream/FileRef part; all-scalar multiparts keep the buffered path.
+        is NetworkBody.Multipart ->
+            body.streamingUploadStreamOrNull()?.let { stream ->
+                NetworkUploadStreamSource(stream, body.contentType, stream.contentLength)
+            }
+        else -> null
+    }
 
 private class RealNetworkInterceptorChain(
     private val interceptors: List<NetworkInterceptor>,
@@ -693,6 +691,7 @@ internal fun classifyNetworkErrorKind(
         errorCode == VBTransportResultCode.CODE_FORCE_TIMEOUT -> NetworkErrorKind.TIMEOUT
         statusCode == 401 || statusCode == 403 -> NetworkErrorKind.AUTH
         statusCode != null -> NetworkErrorKind.HTTP_STATUS
+        "cancelled" in normalizedMessage || "canceled" in normalizedMessage -> NetworkErrorKind.CANCELLED
         "timeout" in normalizedMessage || "timed out" in normalizedMessage -> NetworkErrorKind.TIMEOUT
         "dns" in normalizedMessage ||
             "resolve" in normalizedMessage ||

@@ -60,3 +60,31 @@ internal object CurlResponseCodec {
         )
     }
 }
+
+internal fun parseCurlHeaders(headerText: String): Map<String, List<String>> {
+    return headerText.lines()
+        .filter { it.isNotBlank() && !it.startsWith("HTTP/") }
+        .mapNotNull { line ->
+            val colonIndex = line.indexOf(':')
+            if (colonIndex < 0) {
+                null
+            } else {
+                line.substring(0, colonIndex).trim() to line.substring(colonIndex + 1).trim()
+            }
+        }
+        .groupBy({ it.first }, { it.second })
+}
+
+/** Stable failure tags shared by every curl-backed platform engine. */
+internal fun describeCurlFailure(code: Int, errorMessage: String): String {
+    val reason = when (code) {
+        28 -> "timeout"
+        6, 8 -> "dns"
+        35, 51, 53, 54, 58, 59, 60, 64, 66, 77, 80, 82, 83, 90, 91 -> "tls"
+        18, 55, 56 -> "connection_lost"
+        7 -> "connect"
+        42 -> "cancelled"
+        else -> "engine"
+    }
+    return "[$reason] CURLcode:$code $errorMessage"
+}
