@@ -453,6 +453,14 @@ HTTPS 200 ×2 with connection reuse):
       hint, synchronises no other data); fixes the pre-existing plain-`bool`
       cross-thread race on both Android JNI cancel and the OHOS
       `CurlRequestServiceHM.cancel` path (#24 native core).
+- [ ] **Cancel-before-native-registration closed**: each end carries a
+      per-request cancellation signal and re-checks it *immediately after the
+      native handle is published*, so a cancel arriving before the handle is
+      registered in the lookup map is not lost (no leaking native tombstone
+      set). Same register-vs-lookup window on Android JNI (#22) and iOS cinterop
+      (#23); **orthogonal** to `cancel_flag_` (that guards the perform-thread
+      read vs cancel-thread write *during* transfer, this guards the pre-publish
+      window).
 
 **Cross-cutting (any one end proves the capability, then generalise):**
 - [ ] QUIC/HTTP/3: one backend, an H3 request completes; H3→H2 fallback works.
