@@ -28,8 +28,8 @@ permissions:
   packages: write
 
 jobs:
-  publish-android-ohos:
-    name: Publish Android, OHOS, runtime, and plugin
+  publish-ohos-tree:
+    name: Publish OHOS tree (-ohos version: ohosArm64 + root + runtime + plugin)
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
@@ -37,9 +37,13 @@ jobs:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
       NETWORK_REQUIRE_TASKS: "true"
+      # OHOS tree (task #18 dual-tree): publishes the -ohos version, including
+      # its OWN root kotlinMultiplatform module (variants: ohosArm64), plus
+      # the ohos-runtime modules. Selected via NETWORK_SETTINGS_FILE.
+      NETWORK_SETTINGS_FILE: settings.ohos.gradle.kts
       NETWORK_PUBLISH_TASKS: >-
-        :network:publishAndroidPublicationToGithubPackagesRepository
         :network:publishOhosArm64PublicationToGithubPackagesRepository
+        :network:publishKotlinMultiplatformPublicationToGithubPackagesRepository
         :network-ohos-runtime:publishAllPublicationsToGithubPackagesRepository
         :network-ohos-runtime-gradle-plugin:publishAllPublicationsToGithubPackagesRepository
     steps:
@@ -248,10 +252,67 @@ jobs:
           cd NetworkKMM
           ./scripts/publish-github-packages.sh
 
+  # Normal tree: Android artifact at the base version (no suffix).
+  publish-android:
+    name: Publish Android (normal tree)
+    runs-on: ubuntu-latest
+    env:
+      ANDROID_HOME: /tmp/android-sdk
+      ANDROID_SDK_ROOT: /tmp/android-sdk
+      NETWORK_REQUIRE_TASKS: "true"
+      NETWORK_PUBLISH_TASKS: >-
+        :network:publishAndroidPublicationToGithubPackagesRepository
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/android-commandline-tools.zip
+          unzip -q /tmp/android-commandline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Resolve publish inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${INPUT_VERSION:-}" ]]; then
+            echo "MAVEN_VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
+          fi
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+
+      - name: Publish NetworkKMM Android publication
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd NetworkKMM
+          ./scripts/publish-github-packages.sh
+
   publish-kmp-metadata:
-    name: Publish KMP metadata
+    name: Publish KMP metadata (normal tree root: android + ios)
     needs:
-      - publish-android-ohos
+      - publish-android
       - publish-ios
     runs-on: macos-latest
     env:

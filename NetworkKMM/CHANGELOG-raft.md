@@ -1,5 +1,33 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased (dual build trees — kuikly convention, task #18)
+
+- **The repo now has two build trees** (like kuikly-open): the normal tree
+  (`settings.gradle.kts`, upstream Kotlin 2.1.21, android + ios targets,
+  official dependencies) and the OHOS tree (`-c settings.ohos.gradle.kts`,
+  KBA 2.0.21 toolchain, ohosArm64 + the ohos-runtime/sample/host-native-test
+  modules, KBA coroutines/atomicfu declared directly).
+- **Same coordinates, two versions**: the normal tree publishes
+  `com.tencent.kuiklybase:network:<v>` (root module variants: android + ios),
+  the OHOS tree publishes `<v>-ohos` with its own root module (variants:
+  ohosArm64). Consumers select the tree by version, exactly how mobile
+  already consumes kuikly-open (`…-2.1.21` vs `…-2.0.21-ohos`). Consumer
+  change: mobile's `build.ohos.gradle.kts` switches its network and
+  ohos-runtime-plugin coordinates to the `-ohos` suffix; the normal tree
+  needs no change.
+- **The #42 force()/versionMapping machinery is gone**: each tree declares
+  its own dependencies plainly, so published metadata is honest by
+  construction. The transportLaunch expect/actual seam stays (the ohos
+  actual keeps the fork's `track = true` and only compiles in the OHOS tree).
+- **OkHttp unpinned to stable 5.4.0**: the alpha.14 ceiling existed only
+  because the single tree compiled everything with the KBA 2.0.21 toolchain;
+  the normal tree's Kotlin 2.1.21 reads OkHttp's Kotlin 2.2 metadata fine.
+- CI: the PR lane gains an `ohos-tree` job (KBA compile + publication
+  metadata assertions: `-ohos` suffix + KBA dependency declarations); the
+  publish workflow splits into normal-tree jobs (android, ios, root
+  metadata) and an OHOS-tree job (ohosArm64 + its root + runtime modules).
+
+
 ## 0.1.0-raft.13 (iOS coroutines linkage fix, full chain logging, knoi removal)
 
 - **iOS/Android klibs reference official kotlinx.coroutines/atomicfu again**

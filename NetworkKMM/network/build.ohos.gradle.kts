@@ -6,87 +6,49 @@ import org.gradle.plugins.signing.SigningExtension
 import org.jetbrains.kotlin.gradle.plugin.KotlinHierarchyTemplate
 import java.util.*
 
+// OHOS build tree for :network (task #18 dual-tree split). Compiled with the
+// KBA Kotlin toolchain; declares the KBA coroutines/atomicfu forks DIRECTLY —
+// no force()/versionMapping machinery, published metadata is honest because
+// the declarations are. Publishes com.tencent.kuiklybase:network at
+// `${mavenVersion}-ohos` with its own root kotlinMultiplatform module whose
+// only native variant is ohosArm64.
 plugins {
     kotlin("multiplatform")
-    id("org.jetbrains.kotlin.native.cocoapods")
-    id("com.android.library")
     `maven-publish`
     signing
 }
 
 @OptIn(org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi::class)
 kotlin {
-    // 使用默认层级结构模板
     KotlinHierarchyTemplate.default
 
-    // Android平台
-    androidTarget {
-        compilations.all {
-            kotlinOptions {
-                jvmTarget = "1.8"
-            }
+    ohosArm64 {
+
+        val main by compilations.getting
+
+        val interop by main.cinterops.creating {
+            includeDirs("${project.rootDir}/ohosApp/pbcurlwrapper/src/main/cpp/wrapper/include")
         }
 
-        // 添加以下配置，将Android平台打包到组件产物中
-        publishAllLibraryVariants()
-        publishLibraryVariantsGroupedByFlavor = true
-        publishLibraryVariants("release", "debug")
-    }
-
-    // iOS平台
-    iosX64()
-    iosArm64()
-    iosSimulatorArm64()
-    // Darwin behavior-test lane (-PdarwinBehaviorTests): a macosArm64 target that
-    // runs the SAME iosMain transport (ktor Darwin/NSURLSession) natively on a
-    // macOS CI runner against a local server. iOS was the only platform whose
-    // engine semantics shipped untested (raft.9 lesson); this lane closes that.
-    // Conditional so publications and consumer dependency resolution are
-    // untouched for everyone else.
-    if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
-        macosArm64()
-    }
-    cocoapods {
-        name = "network"
-        summary = "Some description for the Shared Module"
-        homepage = "Link to the Shared Module homepage"
-        version = "1.0"
-        ios.deploymentTarget = "12.0"
-        if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
-            osx.deploymentTarget = "11.0"
+        compilations.forEach {
+            it.compilerOptions.options.optIn.addAll(
+                "kotlinx.cinterop.ExperimentalForeignApi",
+                "kotlin.experimental.ExperimentalNativeApi",
+            )
         }
-        podfile = project.file("../iosApp/Podfile")
-        framework {
-            baseName = "network"
-            // 如果依赖的 pod 组件是静态库，那么建议打开下面注释
-            // 同时需要去除 iosApp 中对应脚本：iosApp Target -> Build Phases -> Run Script
-//            isStatic = true
+        binaries.all {
+            freeCompilerArgs += "-Xadd-light-debug=enable"
+            freeCompilerArgs += "-Xbinary=sourceInfoType=libbacktrace"
         }
     }
-
-    // ohosArm64 lives in the OHOS build tree only (build.ohos.gradle.kts,
-    // selected via -c settings.ohos.gradle.kts) — task #18 dual-tree split.
 
     sourceSets {
-        val androidMain by getting {
-            dependencies {
-                implementation(libs.ktor.ktor.client.core)
-                // OkHttp 引擎（默认）：fastFallback 提供 RFC 8305 Happy Eyeballs
-                // 并行竞速，坏地址族不再串行吃掉整个连接预算。
-                implementation(libs.ktor.client.okhttp)
-                // 强制 OkHttp 5.x：fastFallback API 自 5.0 起才存在。
-                implementation(libs.okhttp)
-                // 旧 HttpURLConnection 引擎保留作运行时回退开关。
-                implementation(libs.ktor.client.android)
-            }
-        }
-
         val commonMain by getting {
             dependencies {
-                // 协程
-                implementation(libs.kotlinx.coroutines.core)
-                // 原子操作
-                implementation(libs.atomicfu)
+                // KBA forks, declared plainly: this tree's graph and its
+                // published metadata are the same statement.
+                implementation(libs.kotlinx.coroutines.core.kba)
+                implementation(libs.atomicfu.kba)
             }
         }
 
@@ -96,42 +58,11 @@ kotlin {
             }
         }
 
-        val iosX64Main by getting
-        val iosArm64Main by getting
-        val iosSimulatorArm64Main by getting
-        val iosMain by creating {
-            dependsOn(commonMain)
-            iosX64Main.dependsOn(this)
-            iosArm64Main.dependsOn(this)
-            iosSimulatorArm64Main.dependsOn(this)
+        val ohosArm64Main by getting {
             dependencies {
-                implementation(libs.ktor.ktor.client.core)
-                // iOS 平台的 Ktor 引擎
-                implementation(libs.ktor.client.darwin)
+                // 鸿蒙依赖
             }
         }
-
-
-        if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
-            val iosMain = getByName("iosMain")
-            getByName("macosArm64Main").dependsOn(iosMain)
-        }
-
-    }
-}
-
-android {
-    namespace = "com.tencent.tmm.networkkmm"
-    // 34: okhttp-android (raft.10) pulls androidx.startup:1.2.0, which
-    // requires consumers to compile against API 34+.
-    compileSdk = 34
-    defaultConfig {
-        minSdk = 21
-    }
-    testOptions {
-        // OkHttp's static init logs through android.util.Log; JVM unit tests
-        // get the unmocked stub ("not mocked" RuntimeException) without this.
-        unitTests.isReturnDefaultValues = true
     }
 }
 
@@ -195,7 +126,8 @@ if (publishFile.exists()) {
 }
 
 val publishGroupID = getRequiredPublishProperty("gruopID", "MAVEN_GROUP_ID")
-val publishVersion = getRequiredPublishProperty("mavenVersion", "MAVEN_VERSION")
+// OHOS tree: same coordinates, `-ohos` version suffix (kuikly convention).
+val publishVersion = getRequiredPublishProperty("mavenVersion", "MAVEN_VERSION") + "-ohos"
 val publishArtifactID = getRequiredPublishProperty("artifactID", "MAVEN_ARTIFACT_ID")
 val githubRepositoryEnv = System.getenv("GITHUB_REPOSITORY")
 val githubPackagesOwner = (

@@ -14,16 +14,12 @@ kotlinx-coroutines-core-kba = "1.8.0-KBA-002"
 ktor-client-core-version = "2.3.7"
 kotlin-stdlib-platform-ext = "0.1.0"
 # OkHttp 5.x is required for fastFallback (RFC 8305 Happy Eyeballs); the
-# ktor-client-okhttp 2.3.7 POM only pulls 4.12.0, so the version is forced here.
-# Pinned to alpha.14 to fit the KBA 2.0.21 toolchain, twice over:
-# - every 5.x stable ships Kotlin 2.2 metadata (compiler reads <= 2.1);
-# - alpha.16 pulls kotlin-stdlib 2.1.21, which then WINS version resolution
-#   over the project stdlib and reaches the commonMain metadata compilation,
-#   where the 2.0.21 metadata compiler ICEs (raft.11 publish failure).
-# alpha.14 is built with Kotlin 1.9.23 (loses resolution to the project
-# stdlib) and is a plain JVM jar (no okhttp-android -> no androidx.startup).
-# fastFallback exists since alpha.4. Revisit when KBA moves to Kotlin 2.2.
-okhttp = "5.0.0-alpha.14"
+# ktor-client-okhttp 2.3.7 POM only pulls 4.12.0, so the version is forced
+# here. Stable release: the normal build tree compiles with upstream Kotlin
+# 2.1.21, which reads OkHttp 5.x's Kotlin 2.2 metadata fine — the alpha.14
+# pin existed only for the old single-tree KBA 2.0.21 toolchain (task #18
+# dual-tree split removed that ceiling; the OHOS tree never sees OkHttp).
+okhttp = "5.4.0"
 
 [libraries]
 atomicfu = { module = "org.jetbrains.kotlinx:atomicfu", version.ref = "atomicfu" }

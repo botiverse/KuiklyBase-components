@@ -23,11 +23,21 @@ dependencyResolutionManagement {
     }
 }
 
+// OHOS build tree (kuikly dual-tree convention, task #18): compiled with the
+// KBA Kotlin toolchain and the KBA coroutines/atomicfu forks, publishing the
+// SAME coordinates as the normal tree under the `-ohos` version suffix with
+// its own root kotlinMultiplatform module (variants: ohosArm64). Consumers'
+// ohos build selects this tree by version, exactly like kuikly-open
+// (2.21.0-2.1.21 vs 2.21.0-2.0.21-ohos).
 rootProject.name = "NetworkKMM"
-// Normal (non-OHOS) build tree: upstream Kotlin toolchain, android + ios
-// targets, official dependencies. The OHOS modules live in the parallel tree
-// selected with `-c settings.ohos.gradle.kts` (kuikly dual-tree convention,
-// task #18). Modules present in both trees pick their build file per tree
-// via buildFileName.
-include(":androidApp")
+
+val ohosBuildFileName = "build.ohos.gradle.kts"
+rootProject.buildFileName = ohosBuildFileName
+
 include(":network")
+project(":network").buildFileName = ohosBuildFileName
+
+include(":network-host-native-tests")
+include(":network-sample")
+include(":network-ohos-runtime")
+include(":network-ohos-runtime-gradle-plugin")

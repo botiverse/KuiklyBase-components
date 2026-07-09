@@ -52,43 +52,6 @@ jobs:
         working-directory: NetworkKMM
         run: ./gradlew :network:compileCommonMainKotlinMetadata --no-daemon --stacktrace
 
-      # Generating the ohosArm64 publication metadata runs the ohos cinterop,
-      # which needs the HarmonyOS SDK env (same derivation as the publish
-      # workflow; the container ships the SDK at the default path).
-      - name: Resolve HarmonyOS SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
-          test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found at $ohos_sdk_home"; exit 1; }
-          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
-          deveco_sdk_home="${DEVECO_SDK_HOME:-$(cd "$ohos_sdk_home/../.." && pwd)}"
-          deveco_studio_home="${DEVECO_STUDIO_HOME:-$(cd "$deveco_sdk_home/.." && pwd)}"
-          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
-          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
-          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
-          echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
-          echo "DEVECO_SDK_HOME=$deveco_sdk_home" >> "$GITHUB_ENV"
-          echo "DEVECO_STUDIO_HOME=$deveco_studio_home" >> "$GITHUB_ENV"
-          echo "$ohos_sdk_home/toolchains" >> "$GITHUB_PATH"
-          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
-
-      # The ohos variant's PUBLISHED metadata must declare the KBA forks even
-      # though commonMain declares upstream (the per-publication versionMapping
-      # mirrors the force()d graph). A consumer's ohos resolution would break
-      # silently on bump if this regressed — assert it at PR time.
-      - name: Verify published ohos variant declares the KBA forks
-        shell: bash
-        working-directory: NetworkKMM
-        run: |
-          ./gradlew :network:generateMetadataFileForOhosArm64Publication --no-daemon --console=plain
-          MODULE_JSON=$(find network/build/publications -ipath "*ohosarm64*" -name "module.json" | head -1)
-          test -n "$MODULE_JSON" || { echo "ohosArm64 module.json not generated"; exit 1; }
-          grep -A5 '"module": "kotlinx-coroutines-core"' "$MODULE_JSON" | grep -q "KBA" || {
-            echo "ohos variant does not declare the KBA coroutines fork:"; grep -A5 'kotlinx-coroutines-core' "$MODULE_JSON" | head -20; exit 1; }
-          grep -A5 '"module": "atomicfu"' "$MODULE_JSON" | grep -q "KBA" || {
-            echo "ohos variant does not declare the KBA atomicfu fork:"; grep -A5 '"module": "atomicfu"' "$MODULE_JSON" | head -20; exit 1; }
-
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -134,3 +97,49 @@ jobs:
         if: always()
         shell: bash
         run: kill "$(cat /tmp/test-server.pid)" 2>/dev/null || true
+
+  ohos-tree:
+    name: OHOS tree compile & publication metadata (:network)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve HarmonyOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found at $ohos_sdk_home"; exit 1; }
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          deveco_sdk_home="${DEVECO_SDK_HOME:-$(cd "$ohos_sdk_home/../.." && pwd)}"
+          deveco_studio_home="${DEVECO_STUDIO_HOME:-$(cd "$deveco_sdk_home/.." && pwd)}"
+          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
+          echo "DEVECO_SDK_HOME=$deveco_sdk_home" >> "$GITHUB_ENV"
+          echo "DEVECO_STUDIO_HOME=$deveco_studio_home" >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/toolchains" >> "$GITHUB_PATH"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+
+      # The OHOS tree (settings.ohos.gradle.kts) compiles with the KBA
+      # toolchain and declares the KBA forks directly. Assert both halves of
+      # the dual-tree contract on its publication metadata: the version
+      # carries the -ohos suffix and the dependencies are the KBA forks.
+      - name: Compile OHOS tree and verify publication metadata
+        shell: bash
+        working-directory: NetworkKMM
+        run: |
+          ./gradlew -c settings.ohos.gradle.kts :network:compileKotlinOhosArm64 --no-daemon --console=plain --stacktrace
+          ./gradlew -c settings.ohos.gradle.kts :network:generateMetadataFileForOhosArm64Publication --no-daemon --console=plain
+          MODULE_JSON=$(find network/build/publications -ipath "*ohosarm64*" -name "module.json" | head -1)
+          test -n "$MODULE_JSON" || { echo "ohosArm64 module.json not generated"; exit 1; }
+          grep -q '"version": "[^"]*-ohos"' "$MODULE_JSON" || {
+            echo "ohos tree publication version does not carry the -ohos suffix:"; grep '"version"' "$MODULE_JSON" | head -3; exit 1; }
+          grep -A5 '"module": "kotlinx-coroutines-core"' "$MODULE_JSON" | grep -q "KBA" || {
+            echo "ohos variant does not declare the KBA coroutines fork:"; grep -A5 'kotlinx-coroutines-core' "$MODULE_JSON" | head -20; exit 1; }
+          grep -A5 '"module": "atomicfu"' "$MODULE_JSON" | grep -q "KBA" || {
+            echo "ohos variant does not declare the KBA atomicfu fork:"; grep -A5 '"module": "atomicfu"' "$MODULE_JSON" | head -20; exit 1; }
