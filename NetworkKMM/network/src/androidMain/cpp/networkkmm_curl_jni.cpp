@@ -93,6 +93,16 @@ void CancelAfterCallbackException(CallbackContext *context) {
     }
 }
 
+void CancelIfSignalled(CallbackContext *context) {
+    const jboolean cancelled = context->env->CallBooleanMethod(context->callback, context->is_cancelled);
+    if (context->env->ExceptionCheck()) {
+        context->env->ExceptionClear();
+        Cancel(context->client);
+    } else if (cancelled == JNI_TRUE) {
+        Cancel(context->client);
+    }
+}
+
 void OnResponseStart(void *callback_ref, long http_code, const char *headers, int header_length) {
     auto *context = static_cast<CallbackContext *>(callback_ref);
     std::string header_text = headers == nullptr || header_length <= 0
@@ -107,6 +117,7 @@ void OnResponseStart(void *callback_ref, long http_code, const char *headers, in
     );
     context->env->DeleteLocalRef(java_headers);
     CancelAfterCallbackException(context);
+    CancelIfSignalled(context);
 }
 
 void OnChunk(void *callback_ref, const char *data, int length) {
@@ -117,6 +128,7 @@ void OnChunk(void *callback_ref, const char *data, int length) {
         context->env->DeleteLocalRef(chunk);
     }
     CancelAfterCallbackException(context);
+    CancelIfSignalled(context);
 }
 
 int ReadUploadChunk(void *read_ref, char *buffer, int max_length) {
@@ -299,13 +311,7 @@ void NativePerform(
         std::lock_guard<std::mutex> lock(g_clients_mutex);
         g_clients[request_id] = client;
     }
-    const jboolean cancelled = env->CallBooleanMethod(callback, context.is_cancelled);
-    if (env->ExceptionCheck()) {
-        env->ExceptionClear();
-        Cancel(client);
-    } else if (cancelled == JNI_TRUE) {
-        Cancel(client);
-    }
+    CancelIfSignalled(&context);
 
     if (mode == kModeStreamDownload) {
         CurlStreamCallback stream_callback{};

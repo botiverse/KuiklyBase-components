@@ -260,6 +260,26 @@ class AndroidCurlNetworkEngineTest {
         assertFalse(resolvedKtor.diagnostics.capabilities.responseBodyStreaming)
     }
 
+    @Test
+    fun jniCallbackLatchesUserFailureAndSignalsNativeCancellation() {
+        val signal = AndroidCurlCancellationSignal()
+        val callback = AndroidCurlJniCallback(
+            onResponseStartBlock = null,
+            onChunkBlock = { error("consumer rejected chunk") },
+            uploadSource = null,
+            cancellationSignal = signal,
+            onCompleteBlock = {}
+        )
+
+        callback.onChunk("chunk".encodeToByteArray())
+
+        assertTrue(callback.isCancelled())
+        assertEquals(
+            "Android curl callback failed: consumer rejected chunk",
+            callback.failureMessage()
+        )
+    }
+
     private open class FakeBridge(
         override val isAvailable: Boolean = true
     ) : AndroidCurlNativeBridge {

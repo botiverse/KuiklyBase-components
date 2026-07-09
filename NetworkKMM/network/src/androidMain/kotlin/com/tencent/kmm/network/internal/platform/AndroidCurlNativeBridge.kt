@@ -23,6 +23,7 @@ import com.tencent.kmm.network.export.VBTransportElapseStatistics
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.jvm.JvmName
 
 internal class AndroidCurlCancellationSignal {
@@ -144,6 +145,9 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
         }.getOrElse { throwable ->
             return@withContext unavailableResponse(throwable.message ?: "Android curl JNI failed")
         }
+        callback.failureMessage()?.let { message ->
+            return@withContext unavailableResponse(message)
+        }
         response ?: unavailableResponse("Android curl JNI returned without a completion callback")
     }
 
@@ -176,23 +180,39 @@ internal class AndroidCurlJniCallback(
     private val cancellationSignal: AndroidCurlCancellationSignal,
     private val onCompleteBlock: (CurlNativeResponse) -> Unit
 ) {
+    private val callbackFailure = AtomicReference<Throwable?>(null)
+
     @JvmName("onResponseStart")
     fun onResponseStart(httpCode: Long, headers: String) {
         runCatching { onResponseStartBlock?.invoke(httpCode, headers) }
+            .onFailure(::recordFailure)
     }
 
     @JvmName("onChunk")
     fun onChunk(chunk: ByteArray) {
         runCatching { onChunkBlock?.invoke(chunk) }
+            .onFailure(::recordFailure)
     }
 
     @JvmName("readUploadChunk")
     fun readUploadChunk(maxLength: Int): ByteArray? {
-        return runCatching { uploadSource?.read(maxLength) }.getOrNull()
+        return runCatching { uploadSource?.read(maxLength) }
+            .onFailure(::recordFailure)
+            .getOrNull()
     }
 
     @JvmName("isCancelled")
     fun isCancelled(): Boolean = cancellationSignal.isCancelled()
+
+    fun failureMessage(): String? = callbackFailure.get()?.let { failure ->
+        "Android curl callback failed: ${failure.message ?: failure::class.simpleName.orEmpty()}"
+    }
+
+    private fun recordFailure(throwable: Throwable) {
+        if (callbackFailure.compareAndSet(null, throwable)) {
+            cancellationSignal.cancel()
+        }
+    }
 
     @Suppress("LongParameterList")
     @JvmName("onComplete")
