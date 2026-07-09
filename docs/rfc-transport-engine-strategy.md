@@ -539,7 +539,10 @@ of a chat thread.
   entry sets `CURLOPT_UPLOAD`, which would mutate wire semantics for non-POST
   verbs (`GET` becomes `PUT`; `HEAD` conflicts with an upload). All CURL ends
   (#22 Android, #23 iOS, OHOS) **reject streaming `GET`/`HEAD` with a classified
-  engine error** rather than silently changing or dropping the body;
+  transport error** rather than silently changing or dropping the body
+  (Android #22 returns `NetworkErrorKind.UNKNOWN` with an explicit method
+  message; OHOS uses the `describeTransportFailure` vocabulary — there is no
+  public `ENGINE` error kind);
   `POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS` streaming stays supported. This is a
   conscious **upward** convergence, not an alignment-down: it supersedes OHOS's
   prior "buffered fallback", which is in fact a *silent body drop* —
