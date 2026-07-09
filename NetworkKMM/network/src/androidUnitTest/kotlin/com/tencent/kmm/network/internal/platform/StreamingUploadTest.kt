@@ -1,6 +1,8 @@
 package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.export.NetworkBody
+import com.tencent.kmm.network.export.NetworkMultipartPart
+import com.tencent.kmm.network.export.VBTransportMultipartBodyBuilder
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkRequest
@@ -221,5 +223,179 @@ class StreamingUploadTest {
             response.errorMessage.contains("source stream broke mid-write"),
             "classified error must carry the cause: ${response.errorMessage}"
         )
+    }
+
+    // ---- issue #8 slice 2: multipart streaming ----
+
+    private fun expectedMultipartBytes(boundary: String, fileBytes: ByteArray): ByteArray =
+        VBTransportMultipartBodyBuilder(boundary)
+            .addFormField("purpose", "slice2")
+            .addFile(
+                name = "file",
+                fileName = "payload.bin",
+                bytes = fileBytes,
+                contentType = "application/octet-stream"
+            )
+            .build()
+            .data
+
+    private fun multipartWithStreamingFile(
+        boundary: String,
+        fileBytes: ByteArray,
+        declaredLength: Long?
+    ): NetworkBody.Multipart =
+        NetworkBody.Multipart(
+            boundary = boundary,
+            parts = listOf(
+                NetworkMultipartPart(name = "purpose", body = NetworkBody.Text("slice2", contentType = "text/plain; charset=utf-8")),
+                NetworkMultipartPart(
+                    name = "file",
+                    fileName = "payload.bin",
+                    body = NetworkBody.Stream(
+                        stream = NetworkByteStream.fromChunks(contentLength = declaredLength) { sink ->
+                            fileBytes.toList().chunked(3072).forEach { chunk ->
+                                sink.write(chunk.toByteArray())
+                            }
+                        },
+                        contentType = "application/octet-stream"
+                    )
+                )
+            )
+        )
+
+    @Test
+    fun streamedMultipartWithKnownLengthsMatchesBufferedBuilderBytesExactly() = runBlocking {
+        // The strongest slice-2 contract: a server cannot tell a streamed
+        // multipart from the legacy buffered one — wire bytes are identical.
+        val boundary = "slice2-boundary-A"
+        val fileBytes = ByteArray(40_000) { (it % 251).toByte() }
+        // Text part uses the builder's addFormField (no explicit content type)
+        // in the reference; align both sides on the same part shapes instead:
+        val expected = run {
+            val builder = VBTransportMultipartBodyBuilder(boundary)
+            builder.addPart(name = "purpose", bytes = "slice2".encodeToByteArray(), contentType = "text/plain; charset=utf-8")
+            builder.addPart(name = "file", bytes = fileBytes, fileName = "payload.bin", contentType = "application/octet-stream")
+            builder.build().data
+        }
+        val client = NetworkClient(NetworkClientConfig(defaultPolicy = NetworkRequestPolicy(timeoutMillis = 10_000)))
+        val response = client.execute(
+            NetworkRequest(
+                method = VBTransportMethod.POST,
+                url = "http://127.0.0.1:$port/upload",
+                body = multipartWithStreamingFile(boundary, fileBytes, declaredLength = fileBytes.size.toLong())
+            )
+        )
+        assertEquals(200, response.statusCode)
+        assertTrue(
+            receivedHeaders.lineSequence().any { it.equals("Content-Length: ${expected.size}", ignoreCase = true) },
+            "all-known-length multipart must send exact Content-Length:\n$receivedHeaders"
+        )
+        assertContentEquals(expected, receivedBody)
+    }
+
+    @Test
+    fun streamedMultipartWithUnknownPartLengthGoesChunkedWithIdenticalBytes() = runBlocking {
+        val boundary = "slice2-boundary-B"
+        val fileBytes = ByteArray(25_000) { ((it * 7) % 251).toByte() }
+        val expected = run {
+            val builder = VBTransportMultipartBodyBuilder(boundary)
+            builder.addPart(name = "purpose", bytes = "slice2".encodeToByteArray(), contentType = "text/plain; charset=utf-8")
+            builder.addPart(name = "file", bytes = fileBytes, fileName = "payload.bin", contentType = "application/octet-stream")
+            builder.build().data
+        }
+        val client = NetworkClient(NetworkClientConfig(defaultPolicy = NetworkRequestPolicy(timeoutMillis = 10_000)))
+        val response = client.execute(
+            NetworkRequest(
+                method = VBTransportMethod.POST,
+                url = "http://127.0.0.1:$port/upload",
+                body = multipartWithStreamingFile(boundary, fileBytes, declaredLength = null)
+            )
+        )
+        assertEquals(200, response.statusCode)
+        assertTrue(
+            receivedHeaders.lineSequence().any {
+                it.replace(" ", "").equals("Transfer-Encoding:chunked", ignoreCase = true)
+            },
+            "unknown part length must go out chunked:\n$receivedHeaders"
+        )
+        assertContentEquals(expected, receivedBody)
+    }
+
+    @Test
+    fun multipartScalarPartEncodeFailureFallsBackToClassifiedError() = runBlocking {
+        // CC-希乐's #53 finding: a scalar part that fails to encode must not
+        // throw out of the streaming plan builder — the body falls back to the
+        // buffered path, whose toBytes error becomes a classified
+        // NetworkResponse.error exactly like a streamless multipart's would.
+        val client = NetworkClient(NetworkClientConfig(defaultPolicy = NetworkRequestPolicy(timeoutMillis = 10_000)))
+        val response = client.execute(
+            NetworkRequest(
+                method = VBTransportMethod.POST,
+                url = "http://127.0.0.1:$port/upload",
+                body = NetworkBody.Multipart(
+                    boundary = "slice2-boundary-D",
+                    parts = listOf(
+                        NetworkMultipartPart(
+                            name = "file",
+                            fileName = "payload.bin",
+                            body = NetworkBody.Stream(
+                                stream = NetworkByteStream.fromChunks(contentLength = 3L) { sink ->
+                                    sink.write(byteArrayOf(1, 2, 3))
+                                },
+                                contentType = "application/octet-stream"
+                            )
+                        ),
+                        // The one scalar body that can fail to encode: a nested
+                        // multipart holding a FileRef with neither readAllBlock
+                        // nor openStreamBlock.
+                        NetworkMultipartPart(
+                            name = "meta",
+                            body = NetworkBody.Multipart(
+                                boundary = "slice2-inner",
+                                parts = listOf(
+                                    NetworkMultipartPart(name = "broken", body = NetworkBody.FileRef(path = "/nowhere.bin"))
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        assertEquals(null, response.statusCode)
+        val error = response.error
+        assertTrue(error != null, "encode failure must surface as a classified error, not a throw")
+        assertTrue(
+            error.message.orEmpty().contains("readAllBlock or openStreamBlock"),
+            "classified error must carry the encode-failure cause: $error"
+        )
+    }
+
+    @Test
+    fun allScalarMultipartKeepsBufferedPathBytes() = runBlocking {
+        // No streaming part -> legacy buffered path; bytes stay the
+        // raft.8-validated builder output.
+        val boundary = "slice2-boundary-C"
+        val expected = run {
+            val builder = VBTransportMultipartBodyBuilder(boundary)
+            builder.addPart(name = "alpha", bytes = "one".encodeToByteArray(), contentType = "text/plain; charset=utf-8")
+            builder.addPart(name = "beta", bytes = "two".encodeToByteArray(), contentType = "text/plain; charset=utf-8")
+            builder.build().data
+        }
+        val client = NetworkClient(NetworkClientConfig(defaultPolicy = NetworkRequestPolicy(timeoutMillis = 10_000)))
+        val response = client.execute(
+            NetworkRequest(
+                method = VBTransportMethod.POST,
+                url = "http://127.0.0.1:$port/upload",
+                body = NetworkBody.Multipart(
+                    boundary = boundary,
+                    parts = listOf(
+                        NetworkMultipartPart(name = "alpha", body = NetworkBody.Text("one", contentType = "text/plain; charset=utf-8")),
+                        NetworkMultipartPart(name = "beta", body = NetworkBody.Text("two", contentType = "text/plain; charset=utf-8"))
+                    )
+                )
+            )
+        )
+        assertEquals(200, response.statusCode)
+        assertContentEquals(expected, receivedBody)
     }
 }

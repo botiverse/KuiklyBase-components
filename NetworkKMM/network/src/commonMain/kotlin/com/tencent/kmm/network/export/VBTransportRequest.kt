@@ -71,35 +71,22 @@ class VBTransportMultipartBodyBuilder(
         contentType: String? = null,
         headers: Map<String, String> = emptyMap()
     ): VBTransportMultipartBodyBuilder {
-        appendString("--$boundary\r\n")
-        val disposition = buildString {
-            append("Content-Disposition: form-data; name=\"")
-            append(sanitizeHeaderValue(name))
-            append("\"")
-            fileName?.let {
-                append("; filename=\"")
-                append(sanitizeHeaderValue(it))
-                append("\"")
-            }
-        }
-        appendString("$disposition\r\n")
-        val partHeaders = headers.toMutableMap()
-        contentType?.let {
-            if (!partHeaders.keys.any { key -> key.equals("Content-Type", ignoreCase = true) }) {
-                partHeaders["Content-Type"] = it
-            }
-        }
-        partHeaders.forEach { (headerName, headerValue) ->
-            appendString("${sanitizeHeaderName(headerName)}: ${sanitizeHeaderValue(headerValue)}\r\n")
-        }
-        appendString("\r\n")
+        chunks.add(
+            NetworkMultipartFraming.partPrologue(
+                boundary = boundary,
+                name = name,
+                fileName = fileName,
+                contentType = contentType,
+                headers = headers
+            )
+        )
         chunks.add(bytes)
-        appendString("\r\n")
+        chunks.add(NetworkMultipartFraming.partEpilogue())
         return this
     }
 
     fun build(): VBTransportMultipartBody {
-        val body = mergeChunks(chunks + "--$boundary--\r\n".encodeToByteArray())
+        val body = mergeChunks(chunks + NetworkMultipartFraming.terminator(boundary))
         return VBTransportMultipartBody(
             boundary = boundary,
             contentType = "multipart/form-data; boundary=$boundary",
@@ -111,15 +98,6 @@ class VBTransportMultipartBodyBuilder(
         chunks.add(value.encodeToByteArray())
     }
 
-    private fun sanitizeHeaderValue(value: String): String =
-        value.replace("\"", "%22")
-            .replace("\r", "")
-            .replace("\n", "")
-
-    private fun sanitizeHeaderName(value: String): String =
-        value.replace(":", "")
-            .replace("\r", "")
-            .replace("\n", "")
 
     private fun mergeChunks(chunks: List<ByteArray>): ByteArray {
         var totalSize = 0
@@ -194,4 +172,58 @@ class VBTransportRequest : VBTransportBaseRequest() {
 fun VBTransportRequest.setMultipartBody(body: VBTransportMultipartBody) {
     header["Content-Type"] = body.contentType
     data = body.data
+}
+
+/**
+ * issue #8 slice 2: ONE source of truth for the multipart wire format, shared
+ * by the buffered [VBTransportMultipartBodyBuilder] and the streaming
+ * multipart writer — the bytes on the wire are identical whichever path a
+ * request takes, so servers cannot tell the difference.
+ */
+internal object NetworkMultipartFraming {
+
+    fun partPrologue(
+        boundary: String,
+        name: String,
+        fileName: String?,
+        contentType: String?,
+        headers: Map<String, String>
+    ): ByteArray {
+        val out = StringBuilder()
+        out.append("--").append(boundary).append("\r\n")
+        out.append("Content-Disposition: form-data; name=\"")
+        out.append(sanitizeHeaderValue(name)).append("\"")
+        fileName?.let {
+            out.append("; filename=\"").append(sanitizeHeaderValue(it)).append("\"")
+        }
+        out.append("\r\n")
+        val partHeaders = headers.toMutableMap()
+        contentType?.let {
+            if (!partHeaders.keys.any { key -> key.equals("Content-Type", ignoreCase = true) }) {
+                partHeaders["Content-Type"] = it
+            }
+        }
+        partHeaders.forEach { (headerName, headerValue) ->
+            out.append(sanitizeHeaderName(headerName))
+                .append(": ")
+                .append(sanitizeHeaderValue(headerValue))
+                .append("\r\n")
+        }
+        out.append("\r\n")
+        return out.toString().encodeToByteArray()
+    }
+
+    fun partEpilogue(): ByteArray = "\r\n".encodeToByteArray()
+
+    fun terminator(boundary: String): ByteArray = "--$boundary--\r\n".encodeToByteArray()
+
+    private fun sanitizeHeaderValue(value: String): String =
+        value.replace("\"", "%22")
+            .replace("\r", "")
+            .replace("\n", "")
+
+    private fun sanitizeHeaderName(value: String): String =
+        value.replace(":", "")
+            .replace("\r", "")
+            .replace("\n", "")
 }

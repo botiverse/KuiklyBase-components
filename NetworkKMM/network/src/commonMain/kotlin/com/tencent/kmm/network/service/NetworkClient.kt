@@ -17,6 +17,7 @@
 package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.export.NetworkBody
+import com.tencent.kmm.network.export.streamingUploadStreamOrNull
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkDispatcher
@@ -459,6 +460,14 @@ object VBTransportNetworkEngine : NetworkEngine {
             is NetworkBody.FileRef ->
                 body.openStream()?.let { stream ->
                     UploadStreamSource(stream, body.contentType, stream.contentLength ?: body.contentLength)
+                }
+            // issue #8 slice 2: multiparts stream when they carry at least one
+            // Stream/FileRef part; all-scalar multiparts keep the buffered
+            // path (identical wire bytes either way — NetworkMultipartFraming
+            // is the single framing source).
+            is NetworkBody.Multipart ->
+                body.streamingUploadStreamOrNull()?.let { stream ->
+                    UploadStreamSource(stream, body.contentType, stream.contentLength)
                 }
             else -> null
         }

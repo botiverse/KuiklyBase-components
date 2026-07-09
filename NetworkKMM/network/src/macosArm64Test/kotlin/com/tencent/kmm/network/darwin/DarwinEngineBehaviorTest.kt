@@ -145,6 +145,50 @@ class DarwinEngineBehaviorTest {
     }
 
     @Test
+    fun streamedMultipartUploadDeliversFullBodyThroughTheRealEngine() = run { base ->
+        // issue #8 slice 2 on the real NSURLSession engine: a multipart with a
+        // streaming file part must arrive complete (server echoes byte count).
+        val boundary = "darwin-slice2"
+        val fileBytes = ByteArray(30_000) { (it % 251).toByte() }
+        val expectedLength = com.tencent.kmm.network.export.VBTransportMultipartBodyBuilder(boundary)
+            .addPart(name = "purpose", bytes = "slice2".encodeToByteArray(), contentType = "text/plain; charset=utf-8")
+            .addPart(name = "file", bytes = fileBytes, fileName = "payload.bin", contentType = "application/octet-stream")
+            .build().data.size
+        val response = client.execute(
+            NetworkRequest(
+                method = VBTransportMethod.POST,
+                url = "$base/echo",
+                body = com.tencent.kmm.network.export.NetworkBody.Multipart(
+                    boundary = boundary,
+                    parts = listOf(
+                        com.tencent.kmm.network.export.NetworkMultipartPart(
+                            name = "purpose",
+                            body = NetworkBody.Text("slice2", contentType = "text/plain; charset=utf-8")
+                        ),
+                        com.tencent.kmm.network.export.NetworkMultipartPart(
+                            name = "file",
+                            fileName = "payload.bin",
+                            body = NetworkBody.Stream(
+                                stream = com.tencent.kmm.network.export.NetworkByteStream.fromChunks(
+                                    contentLength = fileBytes.size.toLong()
+                                ) { sink ->
+                                    fileBytes.toList().chunked(4096).forEach { sink.write(it.toByteArray()) }
+                                },
+                                contentType = "application/octet-stream"
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        assertEquals(200, response.statusCode)
+        assertTrue(
+            response.body.text().orEmpty().contains("\"echoLen\":$expectedLength"),
+            "server must receive the full multipart body: ${response.body.text()}"
+        )
+    }
+
+    @Test
     fun serverErrorBodyIsReadableAndCompletes() = run { base ->
         val response = client.execute(get("$base/boom500"))
         assertEquals(500, response.statusCode)
