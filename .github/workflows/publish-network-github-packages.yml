@@ -119,6 +119,9 @@ jobs:
             echo "NETWORK_PUBLISH_TASKS=$REQUESTED_TASKS" >> "$GITHUB_ENV"
           fi
 
+      # The OHOS tree publishes the -ohos suffixed version — check THAT, not the
+      # base version, or a partial retry after the normal-tree publish would
+      # silently skip the OHOS artifacts (Codex review caveat on #46).
       - name: Check existing NetworkKMM version
         shell: bash
         env:
@@ -132,8 +135,8 @@ jobs:
           metadata_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network/maven-metadata.xml"
           metadata_file="$(mktemp)"
           if curl -fsSL -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$metadata_url" -o "$metadata_file" \
-            && grep -F "<version>$MAVEN_VERSION</version>" "$metadata_file" >/dev/null; then
-            echo "NetworkKMM version $MAVEN_VERSION already exists; skipping publish."
+            && grep -F "<version>$MAVEN_VERSION-ohos</version>" "$metadata_file" >/dev/null; then
+            echo "NetworkKMM version $MAVEN_VERSION-ohos already exists; skipping publish."
             echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
           fi
 
