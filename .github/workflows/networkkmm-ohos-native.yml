@@ -73,7 +73,10 @@ jobs:
         shell: bash
         run: |
           cd NetworkKMM
-          ./gradlew :network-host-native-tests:linuxX64Test --console=plain --no-daemon
+          # network-host-native-tests lives in the OHOS build tree
+          # (settings.ohos.gradle.kts) since the task #18 dual-tree split —
+          # the wrapper is OHOS-domain code.
+          ./gradlew -c settings.ohos.gradle.kts :network-host-native-tests:linuxX64Test --console=plain --no-daemon
 
   build-native:
     name: Cross-compile OHOS native (OpenSSL + curl + wrapper)
