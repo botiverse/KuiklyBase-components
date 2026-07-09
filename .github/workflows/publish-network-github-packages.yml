@@ -29,7 +29,7 @@ permissions:
 
 jobs:
   publish-ohos-tree:
-    name: Publish OHOS tree (-ohos version: ohosArm64 + root + runtime + plugin)
+    name: "Publish OHOS tree (ohosArm64 + root + runtime + plugin, -ohos version)"
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
@@ -310,7 +310,7 @@ jobs:
           ./scripts/publish-github-packages.sh
 
   publish-kmp-metadata:
-    name: Publish KMP metadata (normal tree root: android + ios)
+    name: "Publish KMP metadata (normal tree root, android + ios)"
     needs:
       - publish-android
       - publish-ios
