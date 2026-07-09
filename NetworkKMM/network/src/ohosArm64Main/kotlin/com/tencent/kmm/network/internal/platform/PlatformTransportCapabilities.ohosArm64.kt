@@ -16,6 +16,7 @@
  */
 package com.tencent.kmm.network.internal.platform
 
-// OHOS keeps the buffered fallback until the curl READFUNCTION slice
-// (issue #8 slice 3) lands with its .so rebuild.
-internal actual val platformRequestBodyStreaming: Boolean = false
+// issue #8 slice 3: the curl wrapper pulls request bodies through
+// CURLOPT_READFUNCTION (StartUploadRequest, .so rebuilt in this branch), so
+// OHOS streams Stream/FileRef/multipart-composite bodies like the ktor ends.
+internal actual val platformRequestBodyStreaming: Boolean = true

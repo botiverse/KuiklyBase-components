@@ -18,6 +18,7 @@
 #include "curl_wrapper.h"
 #include <algorithm>
 #include <cctype>
+#include <climits>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -212,6 +213,47 @@ class CurlClient {
         }
     }
 
+    // issue #8 slice 3: pull-based upload body. libcurl asks for up to
+    // size*nitems bytes on the perform thread; the source copies what it has
+    // ready (blocking until data is available is fine here). 0 = EOF,
+    // negative from the source = abort (CURL_READFUNC_ABORT).
+    static size_t UploadReadCallback(char *buffer, size_t size, size_t nitems, void *userp) {
+        CurlClient *client = static_cast<CurlClient *>(userp);
+        if (client == nullptr || client->upload_source_ == nullptr
+            || client->upload_source_->readChunk == nullptr) {
+            logE(gDefaultTag, "UploadReadCallback, client/source is nullptr!!!");
+            return CURL_READFUNC_ABORT;
+        }
+        if (client->cancel_flag_) {
+            logI(client->log_tag_, "UploadReadCallback cancel by user.");
+            return CURL_READFUNC_ABORT;
+        }
+        size_t maxLen = size * nitems;
+        if (maxLen == 0) {
+            return 0;
+        }
+        // readChunk's contract is int-sized; curl's per-call buffer is far
+        // below INT_MAX, this cap is only defensive.
+        int capped = maxLen > static_cast<size_t>(INT_MAX) ? INT_MAX : static_cast<int>(maxLen);
+        int n = client->upload_source_->readChunk(client->upload_source_->readRef, buffer, capped);
+        if (n < 0) {
+            logE(client->log_tag_, "UploadReadCallback source aborted, ret:" + std::to_string(n));
+            return CURL_READFUNC_ABORT;
+        }
+        return static_cast<size_t>(n);
+    }
+
+    // The upload source is a one-shot stream: a rewind request (redirect
+    // re-POST, auth retry) must fail honestly (curl surfaces
+    // CURLE_SEND_FAIL_REWIND) instead of silently resending a truncated body.
+    static int UploadSeekCallback(void *userp, curl_off_t offset, int origin) {
+        CurlClient *client = static_cast<CurlClient *>(userp);
+        if (client != nullptr) {
+            logE(client->log_tag_, "UploadSeekCallback: non-seekable upload source, rewind refused.");
+        }
+        return CURL_SEEKFUNC_FAIL;
+    }
+
     static int ProgressCallback(void *clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal,
                                 curl_off_t ulnow) {
         CurlClient *client = static_cast<CurlClient *>(clientp);
@@ -394,6 +436,75 @@ class CurlClient {
         // Content-Encoding (zlib/brotli/zstd), so content_data_ is already the
         // decompressed payload — no manual gzip pass.
         CURLcode res = curl_easy_perform(curl_);
+        FinishBufferedRequest(res, callback);
+    }
+
+    // issue #8 slice 3: streaming upload. The request body is pulled from the
+    // source chunk-by-chunk through UploadReadCallback (never buffered whole);
+    // the response is buffered and delivered exactly like StartRequest.
+    void StartUploadRequest(CurlRequest request, CurlUploadSource *source, CurlCallback *callback) {
+        upload_source_ = source;
+        std::string method;
+        if (!ConfigureRequest(request, method)) {
+            return;
+        }
+
+        // Pull-based body plumbing. ConfigureRequest skipped the POSTFIELDS
+        // branch (upload requests carry no postBody), so the read callback is
+        // the only body source.
+        curl_easy_setopt(curl_, CURLOPT_READFUNCTION, UploadReadCallback);
+        curl_easy_setopt(curl_, CURLOPT_READDATA, this);
+        curl_easy_setopt(curl_, CURLOPT_SEEKFUNCTION, UploadSeekCallback);
+        curl_easy_setopt(curl_, CURLOPT_SEEKDATA, this);
+
+        int64_t total = source != nullptr ? source->totalLength : -1;
+        if (method == "POST") {
+            // CURLOPT_POST is already set; a known size goes out as a real
+            // Content-Length via POSTFIELDSIZE_LARGE.
+            if (total >= 0) {
+                curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE_LARGE, static_cast<curl_off_t>(total));
+            }
+        } else {
+            // PUT and custom methods use the upload channel; CUSTOMREQUEST
+            // (set by ConfigureRequest for non-POST/GET/HEAD) still pins the
+            // verb on the wire.
+            curl_easy_setopt(curl_, CURLOPT_UPLOAD, 1L);
+            if (total >= 0) {
+                curl_easy_setopt(curl_, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(total));
+            }
+        }
+        // Unknown length must be announced as chunked by the caller side of
+        // libcurl (it does not add the header on its own for HTTP/1.1).
+        // Also disable Expect: 100-continue — the ktor/OkHttp transports never
+        // send it, and it costs a round-trip (or a 1s stall) on servers that
+        // ignore it; OHOS should not behave differently from the other ends.
+        {
+            struct curl_slist *updated = nullptr;
+            if (total < 0) {
+                updated = curl_slist_append(header_list_, "Transfer-Encoding: chunked");
+                if (updated != nullptr) {
+                    header_list_ = updated;
+                }
+            }
+            updated = curl_slist_append(header_list_, "Expect:");
+            if (updated != nullptr) {
+                header_list_ = updated;
+            }
+            curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, header_list_);
+        }
+        logI(log_tag_, "streaming upload, method:" + method + ", totalLength:" + std::to_string(total)
+            + (total < 0 ? " (unknown -> chunked)" : ""));
+
+        // Buffered response, same as StartRequest.
+        curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, DataWriteCallback);
+        curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &content_data_);
+        CURLcode res = curl_easy_perform(curl_);
+        FinishBufferedRequest(res, callback);
+    }
+
+    // Shared post-perform tail of StartRequest/StartUploadRequest: build the
+    // buffered CurlResponse and invoke the callback exactly once.
+    void FinishBufferedRequest(CURLcode res, CurlCallback *callback) {
         int errorCode = res;
 
         char *ip = nullptr;
@@ -566,6 +677,8 @@ class CurlClient {
     std::string accept_encoding_;
     // fork #8 streaming: set for the lifetime of a StartStreamRequest call.
     CurlStreamCallback *stream_callback_ = nullptr;
+    // issue #8 slice 3: set for the lifetime of a StartUploadRequest call.
+    CurlUploadSource *upload_source_ = nullptr;
     bool stream_started_ = false;
     // Streaming forces Accept-Encoding: identity so Content-Length matches the
     // bytes delivered to onChunk (determinate progress, no transparent decode).
@@ -586,6 +699,14 @@ void StartStreamRequest(CurClientHandle handle, CurlRequest request, CurlStreamC
         return;
     }
     reinterpret_cast<CurlClient *>(handle)->StartStreamRequest(request, callback);
+}
+
+void StartUploadRequest(CurClientHandle handle, CurlRequest request, CurlUploadSource *source, CurlCallback *callback) {
+    if (handle == nullptr) {
+        logE(gDefaultTag, "client is nullptr!!!");
+        return;
+    }
+    reinterpret_cast<CurlClient *>(handle)->StartUploadRequest(request, source, callback);
 }
 
 CurClientHandle CreateCurlClient(const char *logTag) {

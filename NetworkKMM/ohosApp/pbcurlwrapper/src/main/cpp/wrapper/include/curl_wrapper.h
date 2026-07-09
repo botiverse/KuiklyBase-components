@@ -99,6 +99,19 @@ typedef struct {
     void (*onComplete)(void *callbackRef, CurlResponse *response);
 } CurlStreamCallback;
 
+// 流式上传拉取回调 (issue #8 slice 3): 把最多 maxLen 字节拷入 buffer 并返回
+// 实际字节数; 0 = EOF (body 结束), 负数 = 中止传输。在 curl perform 线程上
+// 同步调用, 可以阻塞等待数据。
+typedef int (*curlReadChunk)(void *readRef, char *buffer, int maxLen);
+
+// 流式上传请求体来源 (issue #8 slice 3)。totalLength >= 0 时发送真实
+// Content-Length; -1 = 长度未知, 走 Transfer-Encoding: chunked。
+typedef struct {
+    void *readRef;
+    curlReadChunk readChunk;
+    int64_t totalLength;  // -1 = unknown
+} CurlUploadSource;
+
 // CurClient 对象指针
 typedef void* CurClientHandle;
 
@@ -116,6 +129,13 @@ void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *cal
 
 // Curl 流式发送请求 (fork #8): 响应体逐块通过 callback->onChunk 交付, 不缓冲整包。
 void StartStreamRequest(CurClientHandle handle, CurlRequest request, CurlStreamCallback *callback);
+
+// Curl 流式上传请求 (issue #8 slice 3): 请求体从 source->readChunk 逐块拉取,
+// 不整包进内存 (request 的 postBody/postBodyLen 被忽略); 响应仍整包缓冲后经
+// callback 交付, 与 StartRequest 一致。source 为非可寻址流: 需要重发 body 的
+// 场景 (重定向 re-POST / 认证重试) 会以 CURLE_SEND_FAIL_REWIND 失败而不是
+// 静默发送残缺 body。
+void StartUploadRequest(CurClientHandle handle, CurlRequest request, CurlUploadSource *source, CurlCallback *callback);
 
 #ifdef __cplusplus
 }
