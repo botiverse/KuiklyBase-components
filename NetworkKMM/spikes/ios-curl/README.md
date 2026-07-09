@@ -19,7 +19,7 @@ Run from `NetworkKMM` on an Apple Silicon Mac with a booted iOS Simulator:
 The expected success marker is:
 
 ```text
-SLOCK_IOS_CURL_SPIKE completed passed=true
+SLOCK_IOS_CURL_SPIKE completed passed=true reused=true
 ```
 
 The Kotlin/Native binding probe is opt-in so normal publications and source

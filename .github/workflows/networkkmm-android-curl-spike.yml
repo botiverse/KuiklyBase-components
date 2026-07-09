@@ -1,0 +1,70 @@
+name: NetworkKMM Android curl spike
+
+on:
+  pull_request:
+    paths:
+      - "NetworkKMM/scripts/build-android-curl-spike.sh"
+      - "NetworkKMM/spikes/android-curl/**"
+      - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - "NetworkKMM/settings.gradle.kts"
+      - ".github/workflows/networkkmm-android-curl-spike.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-emulator-curl-spike:
+    name: Android Emulator curl/OpenSSL runtime
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo chmod 666 /dev/kvm
+
+      - name: Install Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "ndk;28.0.13004108"
+
+      - name: Build and run curl/OpenSSL spike
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          profile: pixel_6
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: |
+            set -euo pipefail
+            cd NetworkKMM
+            mkdir -p build/android-curl-spike
+            ANDROID_ABI=x86_64 ./scripts/build-android-curl-spike.sh --run 2>&1 | tee build/android-curl-spike/ci-output.log
+            grep -q "SLOCK_ANDROID_CURL_SPIKE completed passed=true reused=true" build/android-curl-spike/android-curl-spike.log
+
+      - name: Upload spike APK, library, and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: networkkmm-android-curl-spike
+          if-no-files-found: warn
+          path: |
+            NetworkKMM/spikes/android-curl/build/outputs/apk/debug/android-curl-spike-debug.apk
+            NetworkKMM/build/android-curl-spike/jniLibs/x86_64/libnetworkkmmcurlspike.so
+            NetworkKMM/build/android-curl-spike/android-curl-spike.log
+            NetworkKMM/build/android-curl-spike/ci-output.log

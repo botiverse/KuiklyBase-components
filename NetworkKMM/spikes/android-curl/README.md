@@ -5,8 +5,8 @@ Ktor OkHttp transport.
 
 The harness cross-compiles OpenSSL 3.5.4 and curl 8.16.0 with Android NDK 28,
 links the existing `pbcurlwrapper` into a JNI shared library, packages a
-minimal arm64-v8a APK, and performs two real HTTPS requests. Mozilla roots are
-bundled as the initial self-managed trust store.
+minimal arm64-v8a or x86_64 APK, and performs two real HTTPS requests. Mozilla
+roots are bundled as the initial self-managed trust store.
 
 Run from `NetworkKMM` with an arm64 Android device or emulator connected:
 
@@ -17,8 +17,18 @@ Run from `NetworkKMM` with an arm64 Android device or emulator connected:
 The expected marker is:
 
 ```text
-SLOCK_ANDROID_CURL_SPIKE completed passed=true
+SLOCK_ANDROID_CURL_SPIKE completed passed=true reused=true
 ```
+
+The `NetworkKMM Android curl spike` GitHub Actions workflow runs the same
+harness on an x86_64 Android Emulator for hardware-accelerated Linux CI:
+
+```bash
+ANDROID_ABI=x86_64 ./scripts/build-android-curl-spike.sh --run
+```
+
+The default remains arm64-v8a so the local 16 KB-page packaging check is not
+weakened by the CI architecture choice.
 
 ## Measured result
 

@@ -71,14 +71,16 @@ Java_com_tencent_networkkmm_curlspike_MainActivity_runProbe(
     ProbeResult first = RunSingleProbe(ca_path);
     ProbeResult second = RunSingleProbe(ca_path);
     env->ReleaseStringUTFChars(caInfoPath, ca_path);
+    bool reused_connection = second.connect_ms == 0 && second.tls_ms == 0;
 
     char output[512];
     std::snprintf(
         output,
         sizeof(output),
-        "completed passed=%s first={curl=%d http=%ld bytes=%d connectMs=%.3f tlsMs=%.3f totalMs=%.3f} "
+        "completed passed=%s reused=%s first={curl=%d http=%ld bytes=%d connectMs=%.3f tlsMs=%.3f totalMs=%.3f} "
         "second={curl=%d http=%ld bytes=%d connectMs=%.3f tlsMs=%.3f totalMs=%.3f}",
-        first.passed && second.passed ? "true" : "false",
+        first.passed && second.passed && reused_connection ? "true" : "false",
+        reused_connection ? "true" : "false",
         first.curl_code,
         first.http_code,
         first.bytes,

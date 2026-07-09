@@ -24,6 +24,8 @@ int SpikeLog(int level, const char *tag, const char *content) {
 
 struct ProbeResult {
     bool passed = false;
+    double connectMs = 0;
+    double tlsMs = 0;
 };
 
 void ProbeCallback(void *callbackRef, CurlResponse *response) {
@@ -45,6 +47,8 @@ void ProbeCallback(void *callbackRef, CurlResponse *response) {
         error
     );
     result->passed = response->code == 0 && response->httpCode == 200 && response->dataLen > 0;
+    result->connectMs = response->elapse.connectTimeMs;
+    result->tlsMs = response->elapse.sslCostTimeMs;
 }
 
 void RunProbe() {
@@ -66,6 +70,7 @@ void RunProbe() {
         request.timeout = 10'000;
 
         bool passed = true;
+        bool reusedConnection = false;
         for (int attempt = 1; attempt <= 2; ++attempt) {
             ProbeResult result;
             CurlCallback callback{};
@@ -77,6 +82,9 @@ void RunProbe() {
             StartRequest(client, request, &callback);
             DeleteCurlClient(client);
             passed = passed && result.passed;
+            if (attempt == 2) {
+                reusedConnection = result.connectMs == 0 && result.tlsMs == 0;
+            }
             std::fprintf(
                 stderr,
                 "SLOCK_IOS_CURL_SPIKE attempt=%d passed=%s\n",
@@ -85,7 +93,13 @@ void RunProbe() {
             );
         }
 
-        std::fprintf(stderr, "SLOCK_IOS_CURL_SPIKE completed passed=%s\n", passed ? "true" : "false");
+        passed = passed && reusedConnection;
+        std::fprintf(
+            stderr,
+            "SLOCK_IOS_CURL_SPIKE completed passed=%s reused=%s\n",
+            passed ? "true" : "false",
+            reusedConnection ? "true" : "false"
+        );
         std::fflush(stderr);
         std::exit(passed ? 0 : 3);
     }
