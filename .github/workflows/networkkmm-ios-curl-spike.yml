@@ -1,0 +1,94 @@
+name: NetworkKMM iOS curl spike
+
+on:
+  pull_request:
+    paths:
+      - "NetworkKMM/scripts/build-ios-curl-spike.sh"
+      - "NetworkKMM/spikes/ios-curl/**"
+      - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - "NetworkKMM/network/src/iosCurlSpikeMain/**"
+      - "NetworkKMM/network/build.gradle.kts"
+      - ".github/workflows/networkkmm-ios-curl-spike.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ios-simulator-curl-spike:
+    name: iOS Simulator curl/OpenSSL runtime
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Select simulator architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          host_arch="$(uname -m)"
+          case "$host_arch" in
+            arm64)
+              kotlin_task=compileKotlinIosSimulatorArm64
+              ;;
+            x86_64)
+              kotlin_task=compileKotlinIosX64
+              ;;
+            *)
+              echo "Unsupported macOS runner architecture: $host_arch" >&2
+              exit 2
+              ;;
+          esac
+          echo "IOS_SIMULATOR_ARCH=$host_arch" >> "$GITHUB_ENV"
+          echo "IOS_CURL_SPIKE_KOTLIN_TASK=$kotlin_task" >> "$GITHUB_ENV"
+
+      - name: Boot an available iPhone simulator
+        shell: bash
+        run: |
+          set -euo pipefail
+          device_id="$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for runtime, devices in data["devices"].items():
+              if "iOS" not in runtime:
+                  continue
+              for device in devices:
+                  if device.get("isAvailable") and device["name"].startswith("iPhone"):
+                      print(device["udid"])
+                      raise SystemExit(0)
+          raise SystemExit("No available iPhone simulator")
+          ')"
+          echo "IOS_SIMULATOR_UDID=$device_id" >> "$GITHUB_ENV"
+          xcrun simctl boot "$device_id" 2>/dev/null || true
+          xcrun simctl bootstatus "$device_id" -b
+
+      - name: Build and run curl/OpenSSL spike
+        shell: bash
+        working-directory: NetworkKMM
+        run: |
+          set -euo pipefail
+          mkdir -p build/ios-curl-spike
+          ./scripts/build-ios-curl-spike.sh --run 2>&1 | tee build/ios-curl-spike/ios-curl-spike.log
+          grep -q "SLOCK_IOS_CURL_SPIKE completed passed=true reused=true" build/ios-curl-spike/ios-curl-spike.log
+
+      - name: Compile Kotlin/Native cinterop probe
+        shell: bash
+        working-directory: NetworkKMM
+        run: ./gradlew ":network:${IOS_CURL_SPIKE_KOTLIN_TASK}" -PiosCurlSpike --console=plain --no-daemon --stacktrace
+
+      - name: Upload spike app and log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: networkkmm-ios-curl-spike
+          if-no-files-found: warn
+          path: |
+            NetworkKMM/build/ios-curl-spike/NetworkKMMCurlSpike.app
+            NetworkKMM/build/ios-curl-spike/ios-curl-spike.log

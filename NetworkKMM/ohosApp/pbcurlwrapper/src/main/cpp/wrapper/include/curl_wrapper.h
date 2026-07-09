@@ -127,6 +127,10 @@ void DeleteCurlClient(CurClientHandle handle);
 // 取消 CurClient 请求
 void Cancel(CurClientHandle handle);
 
+// Override the CA bundle for this client. The path is copied. Passing nullptr
+// restores libcurl's compiled default trust path.
+void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath);
+
 // Curl 发送请求
 void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback);
 

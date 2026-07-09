@@ -384,6 +384,9 @@ class CurlClient {
         // system certificates, so no CA file needs to be bundled or set here.
         curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 1L);
         curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 2L);
+        if (!ca_info_path_.empty()) {
+            curl_easy_setopt(curl_, CURLOPT_CAINFO, ca_info_path_.c_str());
+        }
         // 使用curl的内部重定向逻辑
         curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);
 
@@ -674,6 +677,10 @@ class CurlClient {
     // and an indeterminate value aborts the request (CURLE_ABORTED_BY_CALLBACK).
     bool cancel_flag_ = false;
 
+    void SetCaInfo(const char *caInfoPath) {
+        ca_info_path_ = caInfoPath == nullptr ? "" : caInfoPath;
+    }
+
  private:
     std::string log_tag_;
     CURL *curl_;
@@ -686,6 +693,7 @@ class CurlClient {
     // Caller-pinned Accept-Encoding (from the request header); empty = advertise
     // all codecs libcurl supports and let it decode transparently.
     std::string accept_encoding_;
+    std::string ca_info_path_;
     // fork #8 streaming: set for the lifetime of a StartStreamRequest call.
     CurlStreamCallback *stream_callback_ = nullptr;
     // issue #8 slice 3: set for the lifetime of a StartUploadRequest call.
@@ -743,4 +751,11 @@ void Cancel(CurClientHandle handle) {
     logI(gDefaultTag, "cancel request");
     CurlClient *curl = reinterpret_cast<CurlClient *>(handle);
     curl->cancel_flag_ = 1;
+}
+
+void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath) {
+    if (handle == nullptr) {
+        return;
+    }
+    reinterpret_cast<CurlClient *>(handle)->SetCaInfo(caInfoPath);
 }
