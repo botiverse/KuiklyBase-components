@@ -511,9 +511,10 @@ This is the raft.12 `okHttpEnabled` kill-switch pattern, generalised.
 
 ### Engine-level invariants (binding for #22/#23/#24)
 
-Two invariants surfaced during the #63 selector review and #22/#24 kickoff. They
-are recorded here as the **single canonical source** so per-end acceptance can
-point at the RFC instead of a chat thread.
+The following invariants and cross-end behaviour baselines surfaced during the
+#63 selector review and the #22/#24 kickoff. They are recorded here as the
+**single canonical source** so per-end acceptance can point at the RFC instead
+of a chat thread.
 
 - **Capabilities are owned by the selected delegate engine, not platform-level.**
   Once a second engine registers, a capability query (streaming upload, HTTP/3,
@@ -533,6 +534,26 @@ point at the RFC instead of a chat thread.
   set, and timing markers internally consistent across its own retries — a
   request never straddles two engines. (Impl: `RoutingNetworkEngine.resolve`,
   landed in #63.)
+- **Degenerate request-method contract is fail-explicit on every CURL end.** A
+  streaming body on `GET`/`HEAD` is a caller error: the shared wrapper's upload
+  entry sets `CURLOPT_UPLOAD`, which would mutate wire semantics for non-POST
+  verbs (`GET` becomes `PUT`; `HEAD` conflicts with an upload). All CURL ends
+  (#22 Android, #23 iOS, OHOS) **reject streaming `GET`/`HEAD` with a classified
+  engine error** rather than silently changing or dropping the body;
+  `POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS` streaming stays supported. This is a
+  conscious **upward** convergence, not an alignment-down: it supersedes OHOS's
+  prior "buffered fallback", which is in fact a *silent body drop* —
+  `HmTransportImpl.requestUploadStream` buffers, but `CurlClient::ConfigureRequest`
+  then skips the body for `GET`/`HEAD` (the `method != "GET" && method != "HEAD"`
+  guard), so the request goes out with the body discarded. Fail-explicit removes
+  that existing silent drop, so the "align to the OHOS baseline" rule (the CURL
+  branch mirrors OHOS's shipped behaviour) does **not** apply here — the baseline
+  itself is corrected upward. OHOS converges in #24 (batched with the
+  `cancel_flag_` atomic and the same `.so`/publish cadence), emitting a
+  `describeTransportFailure`-classified error with a method-semantics note.
+  Verified 2026-07-09: **zero** streaming-body consumers on mobile `main`
+  (`NetworkBody.Stream`/`FileRef`/`uploadStream` unused; attachments still ride
+  the existing multipart path), so the OHOS flip carries no regression risk.
 
 ### Phased program (tasks #21–#25, 2026-07-09)
 
