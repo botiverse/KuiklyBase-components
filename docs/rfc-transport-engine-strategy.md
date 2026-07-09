@@ -462,16 +462,22 @@ This is the raft.12 `okHttpEnabled` kill-switch pattern, generalised.
 
 ### Selector contract (design input to task #21; impl = Codex-KMP-Developer)
 
-- **Typed, not stringly**: a `NetworkEngine` sum type — `NetworkEngine.Ktor`
-  (current: Android OkHttp / iOS Darwin / OHOS libcurl-buffered) and
-  `NetworkEngine.Curl` (unified libcurl transport). External/remote config maps
-  the raw `"ktor" | "curl"` **at the boundary only**; the raw string never sinks
-  into the transport/business layer.
-- **Default = current engine** on every platform. `Curl` is opt-in.
+- **Typed, not stringly**: a `NetworkTransportEngine` sum type —
+  `NetworkTransportEngine.KTOR` (current: Android OkHttp / iOS Darwin / OHOS
+  libcurl-buffered) and `NetworkTransportEngine.CURL` (unified libcurl
+  transport). (Named `NetworkTransportEngine`, not `NetworkEngine`, to avoid
+  colliding with the existing executable `NetworkEngine` interface — impl
+  decision, Codex, 2026-07-09.) External/remote config maps the raw
+  `"ktor" | "curl"` **at the boundary only**; the raw string never sinks into
+  the transport/business layer.
+- **Default = current engine** on every platform. `CURL` is opt-in. Platform
+  defaults: Android/iOS = `KTOR`, OHOS = `CURL`; Android/iOS `CURL` resolves
+  *unavailable* until tasks #22/#23 land the production transport (fail-closed
+  to the default — Phase 1 behaviour).
 - **Per-platform gate**: the selection is resolvable per platform (an
   Android-only `curl` rollout must not force iOS). OHOS's existing curl path is
-  the `Curl` branch there — zero change, and it doubles as the **behaviour
-  baseline** the Android/iOS `Curl` paths align to (classified errors, timing
+  the `CURL` branch there — zero change, and it doubles as the **behaviour
+  baseline** the Android/iOS `CURL` paths align to (classified errors, timing
   markers, connection reuse — already shipped and device-verified on OHOS since
   issue #8). Android/iOS do **not** re-invent "how curl should behave".
 - **Remote-configurable + instant rollback**: driven by a remote flag so a bad
@@ -480,14 +486,14 @@ This is the raft.12 `okHttpEnabled` kill-switch pattern, generalised.
 - **Wire point**: the selection routes at the existing engine-selection seam —
   `VBTransportNetworkEngine.execute` / the `SlockHttpExecutor` boundary — the
   same layer where issue #8's `capabilities.requestBodyStreaming` gating lives.
-  The `Curl` branch reuses issue #8's `executeStreaming` / upload-pull machinery
+  The `CURL` branch reuses issue #8's `executeStreaming` / upload-pull machinery
   where applicable; adding an engine dimension is additive to that seam, not a
   rewrite.
 
 ### Phased program (tasks #21–#25, 2026-07-09)
 
 - **Phase 1 — #21 (Codex)**: the typed selector + capability routing +
-  per-platform gray/rollback seam (this contract). Nothing behind `Curl` on
+  per-platform gray/rollback seam (this contract). Nothing behind `CURL` on
   Android/iOS yet; the seam + default-Ktor + OHOS-Curl wired and green.
 - **Phase 2 — #22 (Codex, Android) / #23 (Codex, iOS)**: production transport
   behind `engine=curl` — request/stream/upload/cancel via JNI (Android) and
@@ -500,7 +506,7 @@ This is the raft.12 `okHttpEnabled` kill-switch pattern, generalised.
 
 ### Acceptance
 
-Each `Curl`-branch end is accepted against the **D-5 rubric** (transport /
+Each `CURL`-branch end is accepted against the **D-5 rubric** (transport /
 bundled-OpenSSL trust + self-signed accept-reject / system proxy), on the real
 runtime CI lanes (Android emulator + iOS simulator, both asserting connection
 reuse). The selector's own acceptance: default stays byte-for-byte on the
