@@ -195,4 +195,31 @@ class StreamingUploadTest {
         chunks.forEach { it.copyInto(expected, off); off += it.size }
         assertContentEquals(expected, captured)
     }
+
+    @Test
+    fun interfaceDefaultReportsWriteBodyFailureInsteadOfHanging() = runBlocking {
+        // CC-希乐's #48 finding: a throwing writeBody must reach the callback
+        // as a classified error — never a swallowed exception + eternal hang
+        // (uploadStream schedules no force-timeout by design).
+        val service = object : IVBTransportService {
+            override fun sendBytesRequest(kmmBytesRequest: com.tencent.kmm.network.export.VBTransportBytesRequest, kmmBytesResponseCallback: (com.tencent.kmm.network.export.VBTransportBytesResponse) -> Unit) = error("unused")
+            override fun sendStringRequest(kmmStringRequest: com.tencent.kmm.network.export.VBTransportStringRequest, kmmStringResponseCallback: (com.tencent.kmm.network.export.VBTransportStringResponse) -> Unit) = error("unused")
+            override fun post(kmmPostRequest: com.tencent.kmm.network.export.VBTransportPostRequest, kmmPostResponseCallback: (com.tencent.kmm.network.export.VBTransportPostResponse) -> Unit) = error("unused")
+            override fun get(kmmGetRequest: com.tencent.kmm.network.export.VBTransportGetRequest, kmmGetResponseCallback: (com.tencent.kmm.network.export.VBTransportGetResponse) -> Unit) = error("unused")
+            override fun request(kmmRequest: VBTransportRequest, kmmResponseCallback: (VBTransportResponse) -> Unit) = error("must not reach request() on writeBody failure")
+            override fun cancel(requestId: Int) = Unit
+        }
+        val done = kotlinx.coroutines.CompletableDeferred<VBTransportResponse>()
+        service.requestUploadStream(
+            kmmRequest = VBTransportRequest(),
+            contentLength = null,
+            writeBody = { _: NetworkByteStreamSink -> throw IllegalStateException("source stream broke mid-write") }
+        ) { done.complete(it) }
+        val response = done.await()
+        assertEquals(com.tencent.kmm.network.export.VBTransportResultCode.CODE_NETWORK_ERROR, response.errorCode)
+        assertTrue(
+            response.errorMessage.contains("source stream broke mid-write"),
+            "classified error must carry the cause: ${response.errorMessage}"
+        )
+    }
 }

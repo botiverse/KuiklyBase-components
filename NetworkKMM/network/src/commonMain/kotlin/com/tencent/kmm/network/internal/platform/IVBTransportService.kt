@@ -114,20 +114,37 @@ interface IVBTransportService {
         kmmResponseCallback: (response: VBTransportResponse) -> Unit
     ) {
         uploadStreamFallbackScope.launch {
-            val chunks = mutableListOf<ByteArray>()
-            var total = 0
-            writeBody(object : NetworkByteStreamSink {
-                override suspend fun write(bytes: ByteArray) {
-                    if (bytes.isEmpty()) return
-                    chunks.add(bytes.copyOf())
-                    total += bytes.size
+            // A writeBody failure must reach the callback: this scope's
+            // SupervisorJob would otherwise swallow it, and uploadStream
+            // deliberately schedules no force-timeout — the caller would
+            // hang forever (CC-希乐's #48 review finding).
+            val buffered = runCatching {
+                val chunks = mutableListOf<ByteArray>()
+                var total = 0
+                writeBody(object : NetworkByteStreamSink {
+                    override suspend fun write(bytes: ByteArray) {
+                        if (bytes.isEmpty()) return
+                        chunks.add(bytes.copyOf())
+                        total += bytes.size
+                    }
+                })
+                val merged = ByteArray(total)
+                var offset = 0
+                chunks.forEach { chunk ->
+                    chunk.copyInto(merged, destinationOffset = offset)
+                    offset += chunk.size
                 }
-            })
-            val buffered = ByteArray(total)
-            var offset = 0
-            chunks.forEach { chunk ->
-                chunk.copyInto(buffered, destinationOffset = offset)
-                offset += chunk.size
+                merged
+            }.getOrElse { failure ->
+                kmmResponseCallback(
+                    VBTransportResponse().apply {
+                        this.request = kmmRequest
+                        this.errorCode = com.tencent.kmm.network.export.VBTransportResultCode.CODE_NETWORK_ERROR
+                        this.errorMessage =
+                            com.tencent.kmm.network.internal.utils.describeTransportFailure(failure)
+                    }
+                )
+                return@launch
             }
             kmmRequest.data = buffered
             request(kmmRequest, kmmResponseCallback)
