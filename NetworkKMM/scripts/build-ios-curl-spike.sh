@@ -13,9 +13,10 @@ BUILD_ROOT="${IOS_CURL_SPIKE_BUILD_ROOT:-${NETWORK_ROOT}/build/ios-curl-spike}"
 DOWNLOADS_DIR="${BUILD_ROOT}/downloads"
 OPENSSL_SOURCE="${BUILD_ROOT}/openssl-${OPENSSL_VERSION}"
 OPENSSL_PREFIX="${BUILD_ROOT}/openssl-out"
-OPENSSL_STAMP="${OPENSSL_PREFIX}/.ios-deployment-target"
+OPENSSL_STAMP="${OPENSSL_PREFIX}/.ios-build-config"
 CURL_SOURCE="${BUILD_ROOT}/curl-${CURL_VERSION}"
 CURL_BUILD="${BUILD_ROOT}/curl-build"
+CURL_STAMP="${CURL_BUILD}/.ios-build-config"
 WRAPPER_BUILD="${BUILD_ROOT}/wrapper-build"
 APP_DIR="${BUILD_ROOT}/NetworkKMMCurlSpike.app"
 APP_EXECUTABLE="${APP_DIR}/NetworkKMMCurlSpike"
@@ -27,7 +28,12 @@ if [[ "${1:-}" == "--run" ]]; then
 fi
 
 SDK="iphonesimulator"
-ARCH="arm64"
+ARCH="${IOS_SIMULATOR_ARCH:-$(uname -m)}"
+if [[ "$ARCH" != "arm64" && "$ARCH" != "x86_64" ]]; then
+  echo "Unsupported iOS Simulator architecture: $ARCH" >&2
+  exit 2
+fi
+BUILD_CONFIG="${ARCH}:${IOS_DEPLOYMENT_TARGET}"
 SDK_PATH="$(xcrun --sdk "$SDK" --show-sdk-path)"
 
 mkdir -p "$DOWNLOADS_DIR" "$WRAPPER_BUILD" "$APP_DIR"
@@ -39,17 +45,17 @@ fetch() {
   fi
 }
 
-echo "==> Building OpenSSL ${OPENSSL_VERSION} for arm64 iOS Simulator"
+echo "==> Building OpenSSL ${OPENSSL_VERSION} for ${ARCH} iOS Simulator"
 fetch \
   "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/openssl-${OPENSSL_VERSION}.tar.gz"
-if [[ ! -f "${OPENSSL_PREFIX}/lib/libssl.a" || ! -f "${OPENSSL_PREFIX}/lib/libcrypto.a" || ! -f "$OPENSSL_STAMP" || "$(cat "$OPENSSL_STAMP" 2>/dev/null)" != "$IOS_DEPLOYMENT_TARGET" ]]; then
+if [[ ! -f "${OPENSSL_PREFIX}/lib/libssl.a" || ! -f "${OPENSSL_PREFIX}/lib/libcrypto.a" || ! -f "$OPENSSL_STAMP" || "$(cat "$OPENSSL_STAMP" 2>/dev/null)" != "$BUILD_CONFIG" ]]; then
   rm -rf "$OPENSSL_SOURCE" "$OPENSSL_PREFIX"
   tar -xf "${DOWNLOADS_DIR}/openssl-${OPENSSL_VERSION}.tar.gz" -C "$BUILD_ROOT"
   (
     cd "$OPENSSL_SOURCE"
-    CFLAGS="-mios-simulator-version-min=${IOS_DEPLOYMENT_TARGET}" \
-    LDFLAGS="-mios-simulator-version-min=${IOS_DEPLOYMENT_TARGET}" \
+    CFLAGS="-arch ${ARCH} -mios-simulator-version-min=${IOS_DEPLOYMENT_TARGET}" \
+    LDFLAGS="-arch ${ARCH} -mios-simulator-version-min=${IOS_DEPLOYMENT_TARGET}" \
       ./Configure iossimulator-xcrun \
       no-shared no-tests no-apps no-docs \
       --prefix="$OPENSSL_PREFIX" \
@@ -57,14 +63,14 @@ if [[ ! -f "${OPENSSL_PREFIX}/lib/libssl.a" || ! -f "${OPENSSL_PREFIX}/lib/libcr
     make -j"$(sysctl -n hw.ncpu)" build_libs
     make install_dev
   )
-  printf '%s' "$IOS_DEPLOYMENT_TARGET" > "$OPENSSL_STAMP"
+  printf '%s' "$BUILD_CONFIG" > "$OPENSSL_STAMP"
 fi
 
 echo "==> Building curl ${CURL_VERSION} with OpenSSL"
 fetch \
   "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/curl-${CURL_VERSION}.tar.gz"
-if [[ ! -f "${CURL_BUILD}/lib/libcurl.a" ]]; then
+if [[ ! -f "${CURL_BUILD}/lib/libcurl.a" || ! -f "$CURL_STAMP" || "$(cat "$CURL_STAMP" 2>/dev/null)" != "$BUILD_CONFIG" ]]; then
   rm -rf "$CURL_SOURCE" "$CURL_BUILD"
   tar -xf "${DOWNLOADS_DIR}/curl-${CURL_VERSION}.tar.gz" -C "$BUILD_ROOT"
   cmake -S "$CURL_SOURCE" -B "$CURL_BUILD" \
@@ -96,6 +102,7 @@ if [[ ! -f "${CURL_BUILD}/lib/libcurl.a" ]]; then
     -DCURL_DISABLE_LDAPS=ON \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON
   cmake --build "$CURL_BUILD" -j"$(sysctl -n hw.ncpu)"
+  printf '%s' "$BUILD_CONFIG" > "$CURL_STAMP"
 fi
 
 echo "==> Compiling pbcurlwrapper for iOS Simulator"

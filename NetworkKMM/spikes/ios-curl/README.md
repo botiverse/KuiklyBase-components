@@ -5,10 +5,10 @@ the production iOS engine away from Ktor Darwin/NSURLSession and it is not a
 production transport implementation.
 
 The harness cross-compiles OpenSSL, curl, and the existing `pbcurlwrapper`
-sources for arm64 iOS Simulator, bundles Mozilla CA roots for the spike, then
-installs a minimal app that performs a real HTTPS GET through `StartRequest`.
-The harness performs the request twice to exercise connection sharing across
-two separately created wrapper clients.
+sources for an arm64 or x86_64 iOS Simulator, bundles Mozilla CA roots for the
+spike, then installs a minimal app that performs a real HTTPS GET through
+`StartRequest`. The harness performs the request twice to exercise connection
+sharing across two separately created wrapper clients.
 
 Run from `NetworkKMM` on an Apple Silicon Mac with a booted iOS Simulator:
 
@@ -32,6 +32,12 @@ sets remain unchanged:
 The same compile without `-PiosCurlSpike` validates that the default Darwin
 configuration is unaffected.
 
+The `NetworkKMM iOS curl spike` GitHub Actions workflow boots an available
+iPhone Simulator on `macos-14`, selects the simulator architecture from the
+runner, runs the native harness, requires the success marker, and compiles the
+matching opt-in Kotlin/Native target. `IOS_SIMULATOR_ARCH=arm64|x86_64` can be
+used to select an architecture explicitly when reproducing that lane locally.
+
 ## Measured result
 
 Environment: Apple Silicon Mac, Xcode 26.1, arm64 iPhone Simulator, iOS 12.0
@@ -42,7 +48,7 @@ deployment target, OpenSSL 3.5.4, curl 8.16.0.
 - `libcrypto.a`: 8.6 MB.
 - `libssl.a`: 1.9 MB.
 - `libcurl.a`: 1.2 MB.
-- `libpbcurlwrapper.a`: 200 KB.
+- `libpbcurlwrapper.a`: 188 KB.
 - Dead-stripped simulator executable: 6.5 MB.
 - First HTTPS request: HTTP 200, 559 bytes, about 503 ms total in the recorded
   run (about 399 ms TLS).

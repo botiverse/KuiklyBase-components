@@ -35,7 +35,15 @@ kotlin {
     }
 
     // iOS平台
-    iosX64()
+    iosX64 {
+        if (iosCurlSpikeEnabled) {
+            val main by compilations.getting
+            main.cinterops.create("iosCurlSpike") {
+                definitionFile.set(project.file("src/iosCurlSpikeMain/c_interop/ios_curl_spike.def"))
+                includeDirs("${project.rootDir}/ohosApp/pbcurlwrapper/src/main/cpp/wrapper/include")
+            }
+        }
+    }
     iosArm64()
     iosSimulatorArm64 {
         if (iosCurlSpikeEnabled) {
@@ -109,6 +117,7 @@ kotlin {
         val iosArm64Main by getting
         val iosSimulatorArm64Main by getting
         if (iosCurlSpikeEnabled) {
+            iosX64Main.kotlin.srcDir("src/iosCurlSpikeMain/kotlin")
             iosSimulatorArm64Main.kotlin.srcDir("src/iosCurlSpikeMain/kotlin")
         }
         val iosMain by creating {
