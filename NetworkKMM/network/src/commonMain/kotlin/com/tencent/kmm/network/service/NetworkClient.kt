@@ -18,6 +18,7 @@ package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkByteStream
+import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkDispatcher
 import com.tencent.kmm.network.export.NetworkError
 import com.tencent.kmm.network.export.NetworkErrorKind
@@ -388,7 +389,9 @@ class NetworkClient(
 
 object VBTransportNetworkEngine : NetworkEngine {
     override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(
-        requestBodyStreaming = false,
+        // issue #8 slice 1: true on the ktor platforms (WriteChannelContent);
+        // OHOS stays false until the curl READFUNCTION slice lands.
+        requestBodyStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming,
         responseBodyStreaming = false,
         multipartStreaming = false,
         uploadProgress = true,
@@ -396,6 +399,14 @@ object VBTransportNetworkEngine : NetworkEngine {
     )
 
     override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+        // issue #8 slice 1: Stream/FileRef bodies go out as a true byte stream
+        // on platforms whose transport supports it; everything else (and every
+        // body on non-streaming platforms) keeps the buffered path below.
+        if (capabilities.requestBodyStreaming) {
+            uploadStreamSourceOrNull(request)?.let { source ->
+                return executeStreaming(request, call, source)
+            }
+        }
         val bodyBytes = request.body.toBytes(request.progress.uploadProgress)
         bodyBytes.error?.let {
             return NetworkResponse(
@@ -430,6 +441,68 @@ object VBTransportNetworkEngine : NetworkEngine {
                 VBTransportService.cancel(vbRequest.requestId)
             }
             continuation.invokeOnCancellation {
+                VBTransportService.cancel(vbRequest.requestId)
+            }
+        }
+    }
+
+    private class UploadStreamSource(
+        val stream: NetworkByteStream,
+        val contentType: String?,
+        val contentLength: Long?
+    )
+
+    private suspend fun uploadStreamSourceOrNull(request: NetworkRequest): UploadStreamSource? =
+        when (val body = request.body) {
+            is NetworkBody.Stream ->
+                UploadStreamSource(body.stream, body.contentType, body.contentLength)
+            is NetworkBody.FileRef ->
+                body.openStream()?.let { stream ->
+                    UploadStreamSource(stream, body.contentType, stream.contentLength ?: body.contentLength)
+                }
+            else -> null
+        }
+
+    private suspend fun executeStreaming(
+        request: NetworkRequest,
+        call: NetworkCall,
+        source: UploadStreamSource
+    ): NetworkResponse {
+        val uploadProgress = request.progress.uploadProgress
+        return suspendCancellableCoroutine { continuation ->
+            val vbRequest = VBTransportRequest().apply {
+                method = request.method
+                url = request.resolvedUrl()
+                header.putAll(request.headers)
+                source.contentType?.let {
+                    if (!header.keys.any { key -> key.equals("Content-Type", ignoreCase = true) }) {
+                        header["Content-Type"] = it
+                    }
+                }
+                totalTimeout = request.policy.timeoutMillis
+            }
+            val writeBody: suspend (NetworkByteStreamSink) -> Unit = { sink ->
+                var sent = 0L
+                source.stream.readChunks(object : NetworkByteStreamSink {
+                    override suspend fun write(bytes: ByteArray) {
+                        if (bytes.isEmpty()) return
+                        sink.write(bytes)
+                        sent += bytes.size
+                        uploadProgress?.invoke(NetworkTransferProgress(sent, source.contentLength))
+                    }
+                })
+            }
+            VBTransportService.uploadStream(vbRequest, source.contentLength, writeBody) { response ->
+                if (continuation.isActive) {
+                    continuation.resume(response.toNetworkResponse(request))
+                }
+            }
+            call.addCancelHandler {
+                source.stream.cancel()
+                VBTransportService.cancel(vbRequest.requestId)
+            }
+            continuation.invokeOnCancellation {
+                source.stream.cancel()
                 VBTransportService.cancel(vbRequest.requestId)
             }
         }

@@ -49,6 +49,10 @@ import io.ktor.client.request.header
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsChannel
+import io.ktor.http.content.OutgoingContent
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.writeFully
+import com.tencent.kmm.network.export.NetworkByteStreamSink
 import io.ktor.http.ContentType
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
@@ -71,7 +75,8 @@ private const val STREAM_CHUNK_BYTES = 16L * 1024L
 object AndroidTransportImpl : IVBTransportService {
     private fun triggerRequest(
         request: VBTransportBaseRequest,
-        kmmCallback: (response: VBTransportBaseResponse) -> Unit
+        kmmCallback: (response: VBTransportBaseResponse) -> Unit,
+        uploadBody: StreamingUploadBody? = null
     ) {
         val job = scope.launch {
             try {
@@ -90,6 +95,11 @@ object AndroidTransportImpl : IVBTransportService {
                         }
                     }
                     constructRequest(request)
+                    // issue #8: streaming upload — the body is written to the
+                    // engine channel as it is produced, never buffered whole.
+                    if (uploadBody != null) {
+                        setBody(uploadBody.toOutgoingContent())
+                    }
                 }
 
                 // raft.13 chain bracket 2/3: headers arrived — everything before
@@ -326,6 +336,26 @@ object AndroidTransportImpl : IVBTransportService {
         }
     }
 
+    // issue #8: true streaming upload via ktor WriteChannelContent — the
+    // interface's buffered default is bypassed on Android.
+    override fun requestUploadStream(
+        kmmRequest: VBTransportRequest,
+        contentLength: Long?,
+        writeBody: suspend (NetworkByteStreamSink) -> Unit,
+        kmmResponseCallback: (response: VBTransportResponse) -> Unit
+    ) {
+        logI(
+            "send upload-stream request, id:${kmmRequest.requestId}, url:${kmmRequest.url}, " +
+                "contentLength:${contentLength ?: -1}, headerKeys:${kmmRequest.header.keys}",
+            kmmRequest.logTag
+        )
+        triggerRequest(
+            kmmRequest,
+            wrapRequestCallback(kmmResponseCallback),
+            uploadBody = StreamingUploadBody(contentLength, writeBody)
+        )
+    }
+
     private fun logI(content: String, logTag: String = "") {
         VBPBLog.i(VBPBLog.HMTRANSPORTIMPL, "$logTag $content")
     }
@@ -366,3 +396,25 @@ internal fun hasExplicitContentType(headers: Map<String, String>): Boolean =
     }
 
 actual fun getIVBTransportService(): IVBTransportService = AndroidTransportImpl
+
+
+// issue #8: adapter from the transport's push-sink contract to ktor's
+// streaming request body. contentLength known -> real Content-Length header;
+// null -> chunked transfer encoding (ktor decides from contentLength).
+internal class StreamingUploadBody(
+    private val length: Long?,
+    private val writeBody: suspend (NetworkByteStreamSink) -> Unit
+) {
+    fun toOutgoingContent(): OutgoingContent = object : OutgoingContent.WriteChannelContent() {
+        override val contentLength: Long? = length
+        override suspend fun writeTo(channel: ByteWriteChannel) {
+            writeBody(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) {
+                    if (bytes.isEmpty()) return
+                    channel.writeFully(bytes, 0, bytes.size)
+                }
+            })
+            channel.flush()
+        }
+    }
+}
