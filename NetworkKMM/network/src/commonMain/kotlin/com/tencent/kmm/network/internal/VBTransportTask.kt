@@ -258,6 +258,28 @@ class VBTransportTask(
         }
     }
 
+    // issue #8: streaming upload — body pushed by [writeBody] into the
+    // transport sink; buffering (or true streaming) is the transport's choice.
+    fun uploadStreamRequest(
+        request: VBTransportRequest,
+        contentLength: Long?,
+        writeBody: suspend (com.tencent.kmm.network.export.NetworkByteStreamSink) -> Unit,
+        handler: VBTransportHandler?
+    ) {
+        if (isCanceledOrRemoved()) {
+            val response = VBTransportResponse()
+            response.errorCode = VBTransportResultCode.CODE_CANCELED
+            response.errorMessage = "Request has been canceled"
+            logI("uploadStreamRequest() task is canceled before")
+            handler?.invoke(response)
+            return
+        }
+        state = VBTransportState.Running
+        getIVBTransportService().requestUploadStream(request, contentLength, writeBody) { response ->
+            handleResponse(request, response, wrapResponse(handler))
+        }
+    }
+
     fun getState(): VBTransportState = this.state
 
     fun setState(state: VBTransportState) {

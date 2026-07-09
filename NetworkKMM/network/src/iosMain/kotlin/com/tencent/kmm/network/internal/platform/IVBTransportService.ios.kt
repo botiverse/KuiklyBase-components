@@ -50,6 +50,10 @@ import io.ktor.client.request.header
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsChannel
+import io.ktor.http.content.OutgoingContent
+import io.ktor.utils.io.ByteWriteChannel
+import io.ktor.utils.io.writeFully
+import com.tencent.kmm.network.export.NetworkByteStreamSink
 import io.ktor.http.ContentType
 import io.ktor.http.HttpMethod
 import io.ktor.http.HttpStatusCode
@@ -75,7 +79,8 @@ private const val STREAM_CHUNK_BYTES = 16L * 1024L
 class IOSTransportImpl : IVBTransportService {
     private fun startRequest(
         request: VBTransportBaseRequest,
-        kmmCallback: (response: VBTransportBaseResponse) -> Unit
+        kmmCallback: (response: VBTransportBaseResponse) -> Unit,
+        uploadBody: IosStreamingUploadBody? = null
     ) {
         val job = scope.launch {
             try {
@@ -94,6 +99,11 @@ class IOSTransportImpl : IVBTransportService {
                         }
                     }
                     constructRequest(request)
+                    // issue #8: streaming upload — body written to the engine
+                    // channel as produced, never buffered whole.
+                    if (uploadBody != null) {
+                        setBody(uploadBody.toOutgoingContent())
+                    }
                 }
 
                 // raft.13 chain bracket 2/3: headers arrived — everything before
@@ -342,6 +352,26 @@ class IOSTransportImpl : IVBTransportService {
         contentType(requestContentType)
     }
 
+    // issue #8: true streaming upload via ktor WriteChannelContent — the
+    // interface's buffered default is bypassed on iOS (and the Darwin lane).
+    override fun requestUploadStream(
+        kmmRequest: VBTransportRequest,
+        contentLength: Long?,
+        writeBody: suspend (NetworkByteStreamSink) -> Unit,
+        kmmResponseCallback: (response: VBTransportResponse) -> Unit
+    ) {
+        VBPBLog.i(
+            VBPBLog.HMTRANSPORTIMPL,
+            "${kmmRequest.logTag} send upload-stream request, id:${kmmRequest.requestId}, " +
+                "url:${kmmRequest.url}, contentLength:${contentLength ?: -1}, headerKeys:${kmmRequest.header.keys}"
+        )
+        startRequest(
+            kmmRequest,
+            wrapRequestCallback(kmmResponseCallback),
+            uploadBody = IosStreamingUploadBody(contentLength, writeBody)
+        )
+    }
+
     override fun cancel(requestId: Int) {
         VBPBLog.i(TAG, "requestID -> $requestId task cancel by user")
         taskMap[requestId]?.cancel()
@@ -369,3 +399,24 @@ class IOSTransportImpl : IVBTransportService {
 }
 
 actual fun getIVBTransportService(): IVBTransportService = iOSTransportImpl
+
+
+// issue #8: adapter from the transport's push-sink contract to ktor's
+// streaming request body (see the Android twin for semantics).
+internal class IosStreamingUploadBody(
+    private val length: Long?,
+    private val writeBody: suspend (NetworkByteStreamSink) -> Unit
+) {
+    fun toOutgoingContent(): OutgoingContent = object : OutgoingContent.WriteChannelContent() {
+        override val contentLength: Long? = length
+        override suspend fun writeTo(channel: ByteWriteChannel) {
+            writeBody(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) {
+                    if (bytes.isEmpty()) return
+                    channel.writeFully(bytes, 0, bytes.size)
+                }
+            })
+            channel.flush()
+        }
+    }
+}

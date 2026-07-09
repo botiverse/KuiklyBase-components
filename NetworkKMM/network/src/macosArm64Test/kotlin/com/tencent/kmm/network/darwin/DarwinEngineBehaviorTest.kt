@@ -119,6 +119,32 @@ class DarwinEngineBehaviorTest {
     }
 
     @Test
+    fun streamedUploadArrivesCompleteThroughTheDarwinEngine() = run { base ->
+        // issue #8 slice 1: the request body is produced chunk-by-chunk through
+        // the streaming path (never buffered whole); the server's echoLen
+        // proves every byte arrived through the real NSURLSession engine.
+        val chunks = (0 until 6).map { i -> ByteArray(2048) { j -> ((i * 17 + j) % 251).toByte() } }
+        val total = chunks.sumOf { it.size }.toLong()
+        val response = client.execute(
+            NetworkRequest(
+                method = VBTransportMethod.POST,
+                url = "$base/echo",
+                body = com.tencent.kmm.network.export.NetworkBody.Stream(
+                    stream = com.tencent.kmm.network.export.NetworkByteStream.fromChunks(contentLength = total) { sink ->
+                        chunks.forEach { sink.write(it) }
+                    },
+                    contentType = "application/octet-stream"
+                )
+            )
+        )
+        assertEquals(200, response.statusCode)
+        assertTrue(
+            response.body.text().orEmpty().contains("\"echoLen\":$total"),
+            "server must have received all $total streamed bytes: ${response.body.text()}"
+        )
+    }
+
+    @Test
     fun serverErrorBodyIsReadableAndCompletes() = run { base ->
         val response = client.execute(get("$base/boom500"))
         assertEquals(500, response.statusCode)

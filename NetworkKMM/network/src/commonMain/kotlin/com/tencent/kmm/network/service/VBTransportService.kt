@@ -189,6 +189,28 @@ object VBTransportService {
         }
     }
 
+    // issue #8: streaming upload. The body is pushed by [writeBody]; like
+    // streamRequest, no force-timeout task is scheduled — a large upload is
+    // expected to outlive totalTimeout.
+    fun uploadStream(
+        request: VBTransportRequest,
+        contentLength: Long?,
+        writeBody: suspend (com.tencent.kmm.network.export.NetworkByteStreamSink) -> Unit,
+        handler: VBTransportHandler?
+    ) {
+        request.requestId = VBPBRequestIdGenerator.getRequestId()
+        networkScope.transportLaunch {
+            val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
+            taskManager.onTaskBegin(task)
+            task.uploadStreamRequest(request, contentLength, writeBody) { response ->
+                if (task.getState() != VBTransportState.Done) {
+                    task.setState(VBTransportState.Done)
+                    handler?.let { it(response) }
+                }
+            }
+        }
+    }
+
     // fork #8: streaming download. Chunks are delivered via [onChunk] as they
     // arrive; [handler] receives the body-less completion. No force-timeout
     // task is scheduled — a long stream is expected to outlive totalTimeout,

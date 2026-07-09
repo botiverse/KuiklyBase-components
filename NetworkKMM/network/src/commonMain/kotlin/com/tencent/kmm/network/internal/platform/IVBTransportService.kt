@@ -22,6 +22,8 @@ import com.tencent.kmm.network.export.VBTransportGetRequest
 import com.tencent.kmm.network.export.VBTransportGetResponse
 import com.tencent.kmm.network.export.VBTransportPostRequest
 import com.tencent.kmm.network.export.VBTransportPostResponse
+import com.tencent.kmm.network.export.NetworkByteStreamSink
+import kotlinx.coroutines.launch
 import com.tencent.kmm.network.export.VBTransportRequest
 import com.tencent.kmm.network.export.VBTransportResponse
 import com.tencent.kmm.network.export.VBTransportStringRequest
@@ -97,11 +99,54 @@ interface IVBTransportService {
     }
 
     /**
+     * 流式上传 (issue #8): 请求体由 [writeBody] 向 sink 逐块推送, 而不是预先
+     * 缓冲成 ByteArray。[contentLength] 已知时按真实 Content-Length 发送,
+     * null 时按 chunked 传输。
+     *
+     * 默认实现回退到全量缓冲: 先把 [writeBody] 推的所有块收进内存, 再走
+     * [request]——语义正确但不省内存 (与 requestStream 下载侧的默认回退对称)。
+     * ktor 平台 (Android/iOS) 覆写此方法用 WriteChannelContent 真流式发送。
+     */
+    fun requestUploadStream(
+        kmmRequest: VBTransportRequest,
+        contentLength: Long?,
+        writeBody: suspend (NetworkByteStreamSink) -> Unit,
+        kmmResponseCallback: (response: VBTransportResponse) -> Unit
+    ) {
+        uploadStreamFallbackScope.launch {
+            val chunks = mutableListOf<ByteArray>()
+            var total = 0
+            writeBody(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) {
+                    if (bytes.isEmpty()) return
+                    chunks.add(bytes.copyOf())
+                    total += bytes.size
+                }
+            })
+            val buffered = ByteArray(total)
+            var offset = 0
+            chunks.forEach { chunk ->
+                chunk.copyInto(buffered, destinationOffset = offset)
+                offset += chunk.size
+            }
+            kmmRequest.data = buffered
+            request(kmmRequest, kmmResponseCallback)
+        }
+    }
+
+    /**
      * 取消网络请求
      */
     fun cancel(requestId: Int)
 
 }
+
+// requestUploadStream 缓冲回退需要一个执行 suspend writeBody 的作用域;
+// SupervisorJob 隔离单请求失败 (与 VBTransportService.networkScope 同理)。
+private val uploadStreamFallbackScope =
+    kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default
+    )
 
 // 需要各平台实现获取传输能力的实力
 expect fun getIVBTransportService(): IVBTransportService
