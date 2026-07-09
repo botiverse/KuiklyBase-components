@@ -108,9 +108,9 @@ val body = NetworkBody.FileRef(
 )
 ```
 
-Because `VBTransportService` currently accepts buffered request/response bodies, the built-in engine
-materializes `Stream` and `FileRef` as a compatibility fallback. Future engines can implement true
-large-file streaming without changing call sites that already use these body types.
+The built-in transports now stream `Stream`, `FileRef`, and multipart bodies that contain streaming
+parts on Android, iOS, and OHOS. A custom engine can keep the default buffered fallback until it
+implements the corresponding capability, without changing request call sites.
 
 ## Check engine capabilities
 
@@ -118,14 +118,51 @@ Each engine declares what it can do through `NetworkEngine.capabilities`:
 
 | Capability | `VBTransportNetworkEngine` |
 | --- | --- |
-| Request body streaming | `false` |
-| Response body streaming | `false` |
-| Multipart streaming | `false` |
+| Request body streaming | `true` |
+| Response body streaming | `true` |
+| Multipart streaming | `true` |
 | Upload progress callback | `true` |
 | Download progress callback | `true` |
 
 Use this when an app needs to decide whether a large upload can be sent as a true stream or must use the
 buffered fallback.
+
+## Select the transport engine with gray rollout and rollback
+
+`NetworkClient` routes through a typed `NetworkTransportEngine` selector. Map a remote raw value once
+at the app/config boundary; do not pass `"ktor"` or `"curl"` through business request code:
+
+```kotlin
+val client = NetworkClient(
+    NetworkClientConfig(
+        engineSelector = { request ->
+            val rollout = currentNetworkRollout(request.metadata["accountId"])
+            NetworkEngineSelection.fromExternalConfig(
+                engine = rollout.engine, // "ktor" or "curl", parsed here only
+                curlEnabled = rollout.curlEnabledOnThisPlatform,
+                forcePlatformDefault = rollout.rollback
+            )
+        },
+        engineDiagnostics = object : NetworkEngineDiagnosticsListener {
+            override fun onEngineCompleted(diagnostics: NetworkEngineExecutionDiagnostics) {
+                recordNetworkEngine(
+                    selected = diagnostics.selection.selectedEngine,
+                    reason = diagnostics.selection.reason,
+                    timing = diagnostics.timing
+                )
+            }
+        }
+    )
+)
+```
+
+The selector runs for each new `NetworkCall`, so a remote `rollback` change takes effect on the next
+call without rebuilding the client. The decision is latched for that call: auth/policy retries never
+switch engines midway. Resolution always fails closed to the platform's current default: Ktor on
+Android/iOS and curl on OHOS. In Phase 1, requesting curl on Android/iOS reports `UNAVAILABLE` and uses
+Ktor until the production JNI/cinterop engines are registered.
+`NetworkEngineSelectionDiagnostics.capabilities` always describes the engine that was actually
+selected, not the requested engine.
 
 ## Handle stable error kinds
 
