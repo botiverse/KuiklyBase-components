@@ -75,14 +75,18 @@ deployment target, OpenSSL 3.5.4, curl 8.16.0.
 
 ## Production boundary
 
-The bundled `cacert.pem` proves that curl/OpenSSL can run, but it does not
-preserve Darwin's SecTrust semantics, enterprise or user-installed roots, ATS,
+The bundled `cacert.pem` proves that curl/OpenSSL can run. If the product
+chooses an application-owned trust store (including private/self-signed
+roots), SecTrust parity is no longer a migration requirement, but CA updates,
+revocation policy, pinning, and incident response become application-owned.
+The bundle still does not inherit enterprise or user-installed roots, ATS,
 system proxy/PAC discovery, credential challenges, VPN integration, or
 NSURLSession's platform behavior. The spike also does not wire
 `CurlRequestServiceIOS` into production, package device/x64 slices as an
 XCFramework, validate background transfers, or establish HTTP/2/HTTP/3 parity.
 
 The practical conclusion is that native build and cinterop are low-to-moderate
-engineering work. Trust and proxy parity are the expensive product risks. Keep
-Ktor Darwin/NSURLSession as the default unless transport unification becomes a
-product goal that justifies those semantics and maintenance costs.
+engineering work. With a self-managed trust policy accepted, proxy integration
+and the full request/stream/upload service are the remaining migration work.
+Ktor Darwin/NSURLSession remains the default until that production path exists
+behind a rollback switch.
