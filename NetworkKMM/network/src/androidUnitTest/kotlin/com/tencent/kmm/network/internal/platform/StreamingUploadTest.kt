@@ -322,6 +322,55 @@ class StreamingUploadTest {
     }
 
     @Test
+    fun multipartScalarPartEncodeFailureFallsBackToClassifiedError() = runBlocking {
+        // CC-希乐's #53 finding: a scalar part that fails to encode must not
+        // throw out of the streaming plan builder — the body falls back to the
+        // buffered path, whose toBytes error becomes a classified
+        // NetworkResponse.error exactly like a streamless multipart's would.
+        val client = NetworkClient(NetworkClientConfig(defaultPolicy = NetworkRequestPolicy(timeoutMillis = 10_000)))
+        val response = client.execute(
+            NetworkRequest(
+                method = VBTransportMethod.POST,
+                url = "http://127.0.0.1:$port/upload",
+                body = NetworkBody.Multipart(
+                    boundary = "slice2-boundary-D",
+                    parts = listOf(
+                        NetworkMultipartPart(
+                            name = "file",
+                            fileName = "payload.bin",
+                            body = NetworkBody.Stream(
+                                stream = NetworkByteStream.fromChunks(contentLength = 3L) { sink ->
+                                    sink.write(byteArrayOf(1, 2, 3))
+                                },
+                                contentType = "application/octet-stream"
+                            )
+                        ),
+                        // The one scalar body that can fail to encode: a nested
+                        // multipart holding a FileRef with neither readAllBlock
+                        // nor openStreamBlock.
+                        NetworkMultipartPart(
+                            name = "meta",
+                            body = NetworkBody.Multipart(
+                                boundary = "slice2-inner",
+                                parts = listOf(
+                                    NetworkMultipartPart(name = "broken", body = NetworkBody.FileRef(path = "/nowhere.bin"))
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        assertEquals(null, response.statusCode)
+        val error = response.error
+        assertTrue(error != null, "encode failure must surface as a classified error, not a throw")
+        assertTrue(
+            error.message.orEmpty().contains("readAllBlock or openStreamBlock"),
+            "classified error must carry the encode-failure cause: $error"
+        )
+    }
+
+    @Test
     fun allScalarMultipartKeepsBufferedPathBytes() = runBlocking {
         // No streaming part -> legacy buffered path; bytes stay the
         // raft.8-validated builder output.

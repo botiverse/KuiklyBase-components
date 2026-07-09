@@ -517,7 +517,11 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                 PartPlan(prologue, null, body, body.contentLength)
             else -> {
                 val bytes = body.toBytes(null)
-                bytes.error?.let { throw IllegalStateException(it.message ?: "multipart part failed to encode") }
+                // A scalar part that fails to encode must not invent a second
+                // error contract on the streaming path: fall back to the
+                // buffered path, whose toBytes error handling classifies the
+                // failure into a NetworkResponse.error like every other body.
+                if (bytes.error != null) return null
                 PartPlan(prologue, bytes.bytes ?: ByteArray(0), null, (bytes.bytes ?: ByteArray(0)).size.toLong())
             }
         }
