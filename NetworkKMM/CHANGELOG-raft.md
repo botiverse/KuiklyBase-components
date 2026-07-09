@@ -1,5 +1,21 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.15 / 0.1.0-raft.15-ohos (normal tree back to Kotlin 2.1.21 — consumer klib ABI)
+
+- **raft.14's iOS klibs are unusable by mobile — do not consume raft.14 on
+  iOS.** The normal tree's Kotlin 2.2.21 produced klibs with ABI 2.2.0, and
+  Kotlin/Native klib ABI is strictly forward-only: mobile's Kotlin 2.1.21
+  iOS compiler rejects them (caught by consumer verification on mobile PR
+  #422; Android and the -ohos line were unaffected). The producer toolchain
+  must not exceed the consumer's Kotlin — the jar-metadata N+1 rule does NOT
+  apply to K/N klibs.
+- Normal tree back to Kotlin **2.1.21**, OkHttp back to **5.0.0-alpha.14**
+  (5.x stable forces stdlib 2.2.21 which breaks the 2.1.21 metadata
+  transform). fastFallback unaffected. Both move to stable/2.2.x together
+  with mobile's own Kotlin bump — recorded in the task #18 trigger list.
+- Dual-tree structure, publish lanes, and skip probes unchanged from raft.14.
+
+
 ## 0.1.0-raft.14 / 0.1.0-raft.14-ohos (dual build trees — kuikly convention, task #18)
 
 - **The repo now has two build trees** (like kuikly-open): the normal tree

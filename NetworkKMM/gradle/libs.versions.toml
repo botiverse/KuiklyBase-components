@@ -15,11 +15,12 @@ ktor-client-core-version = "2.3.7"
 kotlin-stdlib-platform-ext = "0.1.0"
 # OkHttp 5.x is required for fastFallback (RFC 8305 Happy Eyeballs); the
 # ktor-client-okhttp 2.3.7 POM only pulls 4.12.0, so the version is forced
-# here. Stable release: the normal build tree compiles with upstream Kotlin
-# 2.1.21, which reads OkHttp 5.x's Kotlin 2.2 metadata fine — the alpha.14
-# pin existed only for the old single-tree KBA 2.0.21 toolchain (task #18
-# dual-tree split removed that ceiling; the OHOS tree never sees OkHttp).
-okhttp = "5.4.0"
+# here. Still alpha.14 (Kotlin 1.9.23 build): 5.x stable pulls stdlib 2.2.21,
+# which forces the normal tree onto Kotlin 2.2.21 — and K/N klib ABI is
+# strictly forward-only, so mobile's Kotlin 2.1.21 iOS compiler cannot
+# consume 2.2.x klibs (raft.14 lesson). fastFallback works since alpha.4.
+# Move to stable together with mobile's Kotlin 2.2.x bump (task #18 triggers).
+okhttp = "5.0.0-alpha.14"
 
 [libraries]
 atomicfu = { module = "org.jetbrains.kotlinx:atomicfu", version.ref = "atomicfu" }
