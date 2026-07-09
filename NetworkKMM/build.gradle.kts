@@ -1,15 +1,18 @@
 plugins {
     // trick: for the same plugin versions in all sub-modules
-    // Normal (non-OHOS) tree: upstream Kotlin 2.2.21 — matches the stdlib
-    // OkHttp 5.x stable pulls (2.2.21), so the commonMain metadata transform
-    // never sees a stdlib klib newer than the compiler (the raft.11 lesson,
-    // which reproduced on 2.1.21 + stdlib 2.2.21). Consumers on Kotlin 2.1.x
-    // read 2.2 metadata fine (N+1 rule). The OHOS tree
-    // (build.ohos.gradle.kts, selected via -c settings.ohos.gradle.kts) keeps
-    // the KBA toolchain; ksp/knoi are OHOS-tree concerns and live there.
+    // Normal (non-OHOS) tree: upstream Kotlin 2.1.21 — matched to the
+    // CONSUMER's Kotlin/Native, not to any dependency: K/N klib ABI is
+    // strictly forward-only (a 2.1.21 consumer cannot read 2.2.x klibs —
+    // raft.14 lesson, caught by Codex on mobile PR #422), so the producer
+    // toolchain may not exceed mobile's Kotlin until mobile itself bumps.
+    // This is also why OkHttp stays on alpha.14 (5.x stable pulls stdlib
+    // 2.2.21 which breaks the 2.1.21 metadata transform). Both move together
+    // when mobile reaches Kotlin 2.2.x — see task #18 trigger list. The OHOS
+    // tree (build.ohos.gradle.kts, -c settings.ohos.gradle.kts) keeps the KBA
+    // toolchain; ksp/knoi are OHOS-tree concerns and live there.
     id("com.android.application").version("8.13.2").apply(false)
     id("com.android.library").version("8.13.2").apply(false)
-    kotlin("multiplatform").version("2.2.21").apply(false)
+    kotlin("multiplatform").version("2.1.21").apply(false)
 }
 
 allprojects {
