@@ -1,6 +1,32 @@
 # NetworkKMM Raft fork changelog
 
-## 0.1.0-raft.15 / 0.1.0-raft.15-ohos (normal tree back to Kotlin 2.1.21 — consumer klib ABI)
+## 0.1.0-raft.15 / 0.1.0-raft.15-ohos (streaming upload end-to-end + Kotlin 2.1.21 revert)
+
+### Streaming upload (issue #8, all three slices)
+
+- **Request bodies stream on every platform — no full buffering.**
+  Stream/FileRef bodies go out as a true byte stream: known length → real
+  Content-Length, unknown → chunked, per-chunk progress preserved.
+  - Slice 1 (#48): Android/iOS via ktor `WriteChannelContent`; buffered
+    interface fallback keeps a classified-error contract (a failing
+    writeBody reaches the callback, never a silent hang).
+  - Slice 2 (#53): multiparts containing streaming parts go out as a
+    composite stream. `NetworkMultipartFraming` is the single wire-format
+    source — streamed and buffered multiparts are byte-identical (pinned by
+    test), so servers cannot tell the difference. All-scalar multiparts keep
+    the raft.8-validated buffered path.
+  - Slice 3 (#54): OHOS true streaming via curl `CURLOPT_READFUNCTION`
+    (`CurlUploadSource`/`StartUploadRequest` in the rebuilt wrapper .so) with
+    a push→pull bridge on a dedicated writer pool.
+    `platformRequestBodyStreaming = true` on ohosArm64.
+- `NetworkEngineCapabilities.requestBodyStreaming` now reports truthfully on
+  android/ios/ohos. Semantics shared by all ends: the upload source is
+  one-shot — a redirect re-POST/auth retry fails honestly
+  (`CURLE_SEND_FAIL_REWIND` on OHOS) instead of silently resending a
+  truncated body; `Expect: 100-continue` is disabled on OHOS for parity with
+  the ktor/OkHttp transports.
+
+### Toolchain (normal tree back to Kotlin 2.1.21 — consumer klib ABI)
 
 - **raft.14's iOS klibs are unusable by mobile — do not consume raft.14 on
   iOS.** The normal tree's Kotlin 2.2.21 produced klibs with ABI 2.2.0, and
