@@ -1,9 +1,14 @@
 # RFC: NetworkKMM Transport Engine Strategy
 
-- Status: **Analysis** — artin's direction (2026-07-08): deep-cost C (libcurl
-  unification) as the candidate target state; A (OkHttp) approved and being
-  implemented as the Android root fix (#32); no engine migration decision is
-  being taken in this phase beyond A.
+- Status: **Analysis → C worth-scheduling (spike-gated)** — artin's direction
+  (2026-07-08): deep-cost C (libcurl unification) as the candidate target state;
+  A (OkHttp) approved and shipped as the Android root fix (#32/raft.12).
+  **Updated 2026-07-09 (Appendix D)**: artin accepts bundled OpenSSL + wants
+  self-signed certs, which removes C's biggest cost driver (the system-trust
+  bridge) and makes *true three-end* unification feasible. C is upgraded from
+  `analyzed-not-scheduled` to `worth scheduling, spike-gated`; the go/no-go is
+  the per-end feasibility spike in Appendix D-5 (Codex-KMP-Developer). Android
+  POC already runs (HTTPS 200 + reuse on 16 KB-page emulator).
 - Author: CC-希乐 (KuiklyBase side); mobile-consumption inputs: HanXin;
   OHOS build/trust-store facts: CC-Cata
 - Origin: #Kuiklybase:160e7a07 — proxy/IPv6 cold-connection timeout ladders
@@ -322,3 +327,111 @@ Total ≈ two weeks of one-time work + security review, and the purchase is
 (migrating would actually regress HTTP/3 → HTTP/2). The cheap substitute:
 align iOS diagnostics to the `elapseStatis` contract via
 NSURLSessionTaskMetrics (~1–2 days) and get ~90% of the marker value.
+
+## Appendix D: bundled-OpenSSL unified route + three-end spike rubric (artin's 2026-07-09 direction)
+
+After issue #8 landed three-end streaming upload on the *existing* engines
+(Android Ktor-OkHttp, iOS Ktor-Darwin, OHOS libcurl), artin re-opened C with a
+key constraint change that **removes the option's biggest cost driver**:
+
+> "自带 OpenSSL 没问题 … 甚至以后我们还要自签证书" — bundling OpenSSL is
+> acceptable, and self-managed / self-signed certificates are a *wanted* future
+> capability.
+
+### D-1. The pivot: bundle OpenSSL + own trust store — the SecTrust/system-trust bridge evaporates
+
+The whole "hard part" of C in this RFC (C-1 Android system-trust bridge;
+Appendix C step 3 iOS `SecTrustEvaluateWithError` bridge + security review) was
+about **following the platform trust store**. If instead we **bundle OpenSSL and
+own the CA/trust store**, that bridge is not built at all:
+
+- iOS: no `SecTrust` verify-callback, no "enumerate system roots" problem — ship
+  a curated CA bundle (Mozilla set) + our own roots. Appendix C's critical
+  step 3 drops from the estimate.
+- Android: no user-CA / `networkSecurityConfig` reconciliation — our bundle is
+  the trust store. (Trade-off honestly stated in D-3.)
+- OHOS: already OpenSSL + baked CA path — status quo.
+
+Owning the trust store is not a workaround here; it is **the enabling
+mechanism for the self-signed-cert requirement** artin named. What was the
+option's largest tax becomes a requested feature.
+
+### D-2. Why unify (the payoff per-engine stacks cannot give uniformly)
+
+"一端搞事，三端收益" is literally true for the capabilities artin listed —
+these live in the transport core and are impossible to deliver *uniformly*
+across three heterogeneous engines:
+
+- **QUIC / HTTP/3**: one backend choice (ngtcp2 + nghttp3, or quiche); Alt-Svc,
+  0-RTT, and H3→H2 fallback in one core. (Note: on iOS this *replaces* the
+  native NSURLSession H3 we would otherwise keep — a wash, not a regression, if
+  the curl H3 backend is enabled.)
+- **HttpDNS**: `CURLOPT_RESOLVE` / a resolver hook feeds our own host→IP
+  scheduling (cache, degrade, IPv4/v6 racing) while curl still does SNI, Host,
+  and cert verification against the original hostname. Uniform DNS-pollution
+  bypass across three ends — unreachable with per-engine stacks today.
+- **Self-managed CA / self-signed** (D-1): our trust store, our rules.
+- **Unified connect/TTFB/TLS/QUIC markers, retry policy, connection pool, and
+  Happy Eyeballs** — built once, benefiting all three ends.
+
+### D-3. Costs to own (not blockers — accepted line items)
+
+1. **Binary size**: static libcurl + OpenSSL ≈ Codex's unoptimised Android
+   measurement **7.5 MB / ABI** (single-ABI `.so`; +7.6 MB min APK). Optimisable
+   (feature-strip curl protocols, LTO, single ABI where possible), but non-zero.
+2. **CA-bundle refresh becomes ours**: no automatic OS CA updates — we ship and
+   rotate the bundle. This is inherent to bundling and *required* for the
+   self-signed goal.
+3. **Proxy / PAC**: libcurl reads neither platform proxy nor PAC (C-2). At
+   minimum wire system direct/manual proxy per end; PAC needs a platform
+   evaluator (e.g. `CFNetworkCopyProxiesForURL` on iOS) feeding `CURLOPT_PROXY`.
+4. **CVE tax**: OpenSSL/curl CVEs become a static-lib rebuild across ends, not a
+   version-line edit.
+5. **H3 build**: ngtcp2/quiche cross-compile per end (Apple + Android + OHOS).
+
+### D-4. Revised verdict
+
+With bundled OpenSSL accepted, C's blocking cost (the trust bridge) is gone and
+**true three-end unification (iOS on curl too) is feasible**, not the "honest
+2-end" of C-6. The remaining work is a bounded engineering matrix, not an
+open-ended trust-store research problem. **C is upgraded from
+`analyzed-not-scheduled` → `worth scheduling, spike-gated`**; the go/no-go is
+the per-end feasibility spike below (Codex-KMP-Developer). Estimate to gray
+release, two ends in parallel: ~4–6 weeks (Codex, 2026-07-09) — a scheduled
+migration, not a same-day engine switch.
+
+### D-5. Per-end feasibility spike acceptance rubric
+
+The spike answers "三端都能接入吗" with reproducible PASS gates per end. A gate
+is PASS only with concrete evidence (server-side receipt / logcat/HiLog / packet
+or curl-verbose trace), not "it compiled".
+
+**Android** (Codex POC already: NDK `.so` + JNI + APK on 16 KB-page emulator,
+HTTPS 200 ×2 with connection reuse):
+- [ ] Full JNI transport (GET/POST/stream, headers, timeouts, cancel) behind the
+      existing `SlockHttpExecutor` seam.
+- [ ] Bundled-OpenSSL trust store: normal HTTPS PASS; **self-signed cert in our
+      bundle accepted**; expired / not-in-bundle rejected.
+- [ ] System proxy (direct + manual) wired via `CURLOPT_PROXY`.
+
+**iOS** (Codex: curl/OpenSSL/cinterop/HTTPS already compiles + runs):
+- [ ] **Bundled OpenSSL + own trust store** (NOT `SecTrust` — per D-1): normal
+      HTTPS PASS against our CA bundle.
+- [ ] Expired / self-signed-not-in-our-CA **rejected**; self-signed-in-our-CA
+      **accepted** (proves the self-signed capability).
+- [ ] System proxy at least direct/manual; document whether PAC is resolved via
+      `CFNetworkCopyProxiesForURL` before feeding curl (or deferred).
+
+**OHOS** (status-quo baseline — already libcurl + OpenSSL):
+- [ ] No regression: issue #8 streaming upload + normal requests stay green on
+      the unified core; confirms the shared core did not break the working end.
+
+**Cross-cutting (any one end proves the capability, then generalise):**
+- [ ] QUIC/HTTP/3: one backend, an H3 request completes; H3→H2 fallback works.
+- [ ] HttpDNS: a resolver hook overrides host→IP while SNI/Host/cert verify still
+      target the original hostname (server sees correct SNI, cert validates).
+- [ ] Unified markers: connect/TTFB/TLS(/QUIC) timings emitted through the
+      `elapseStatis` contract, identical shape across ends.
+
+If a gate fails, record the *specific* failure point (not "hard") for artin's
+go/no-go — per Codex's commitment.
