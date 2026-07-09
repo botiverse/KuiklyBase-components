@@ -132,11 +132,12 @@ jobs:
           if [[ -z "${MAVEN_VERSION:-}" ]]; then
             exit 0
           fi
-          metadata_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network/maven-metadata.xml"
-          metadata_file="$(mktemp)"
-          if curl -fsSL -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$metadata_url" -o "$metadata_file" \
-            && grep -F "<version>$MAVEN_VERSION-ohos</version>" "$metadata_file" >/dev/null; then
-            echo "NetworkKMM version $MAVEN_VERSION-ohos already exists; skipping publish."
+          # Probe an artifact THIS job publishes (HEAD): the root module's
+          # maven-metadata.xml listing lags/misses versions on GitHub Packages
+          # and produced 409 retries (raft.14 lesson).
+          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-ohosarm64/$MAVEN_VERSION-ohos/network-ohosarm64-$MAVEN_VERSION-ohos.klib"
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
+            echo "NetworkKMM version $MAVEN_VERSION-ohos (ohosarm64 klib) already exists; skipping publish."
             echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
           fi
 
@@ -229,11 +230,12 @@ jobs:
           if [[ -z "${MAVEN_VERSION:-}" ]]; then
             exit 0
           fi
-          metadata_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network/maven-metadata.xml"
-          metadata_file="$(mktemp)"
-          if curl -fsSL -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$metadata_url" -o "$metadata_file" \
-            && grep -F "<version>$MAVEN_VERSION</version>" "$metadata_file" >/dev/null; then
-            echo "NetworkKMM version $MAVEN_VERSION already exists; skipping publish."
+          # Probe an artifact THIS job publishes (HEAD): the root module's
+          # maven-metadata.xml listing lags/misses versions on GitHub Packages
+          # and produced 409 retries (raft.14 lesson).
+          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-iosarm64/$MAVEN_VERSION/network-iosarm64-$MAVEN_VERSION.klib"
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
+            echo "NetworkKMM version $MAVEN_VERSION (iosarm64 klib) already exists; skipping publish."
             echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
           fi
 
@@ -302,7 +304,24 @@ jobs:
         env:
           INPUT_VERSION: ${{ inputs.version }}
 
+      - name: Check existing NetworkKMM version
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            exit 0
+          fi
+          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-android/$MAVEN_VERSION/network-android-$MAVEN_VERSION.aar"
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
+            echo "NetworkKMM version $MAVEN_VERSION (android aar) already exists; skipping publish."
+            echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+          fi
+
       - name: Publish NetworkKMM Android publication
+        if: env.NETWORK_SKIP_PUBLISH != 'true'
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
@@ -384,11 +403,12 @@ jobs:
           if [[ -z "${MAVEN_VERSION:-}" ]]; then
             exit 0
           fi
-          metadata_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network/maven-metadata.xml"
-          metadata_file="$(mktemp)"
-          if curl -fsSL -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$metadata_url" -o "$metadata_file" \
-            && grep -F "<version>$MAVEN_VERSION</version>" "$metadata_file" >/dev/null; then
-            echo "NetworkKMM version $MAVEN_VERSION already exists; skipping publish."
+          # Probe an artifact THIS job publishes (HEAD): the root module's
+          # maven-metadata.xml listing lags/misses versions on GitHub Packages
+          # and produced 409 retries (raft.14 lesson).
+          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network/$MAVEN_VERSION/network-$MAVEN_VERSION.module"
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
+            echo "NetworkKMM version $MAVEN_VERSION (root module) already exists; skipping publish."
             echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
           fi
 
