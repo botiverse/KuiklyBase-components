@@ -21,10 +21,9 @@ kotlin {
 
     // Android平台
     androidTarget {
-        compilations.all {
-            kotlinOptions {
-                jvmTarget = "1.8"
-            }
+        // Kotlin 2.2 removed the deprecated kotlinOptions DSL.
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
         }
 
         // 添加以下配置，将Android平台打包到组件产物中
