@@ -129,7 +129,13 @@ jobs:
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Plain dispatches carry no version input — default to the repo's
+          # own mavenVersion so the probe always runs (empty MAVEN_VERSION
+          # skipped the probe entirely and every retry 409'd).
           if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            MAVEN_VERSION="$(grep '^mavenVersion=' NetworkKMM/gradle.properties | cut -d= -f2)"
+          fi
+          if [[ -z "$MAVEN_VERSION" ]]; then
             exit 0
           fi
           # Probe an artifact THIS job publishes (HEAD): the root module's
@@ -227,7 +233,13 @@ jobs:
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Plain dispatches carry no version input — default to the repo's
+          # own mavenVersion so the probe always runs (empty MAVEN_VERSION
+          # skipped the probe entirely and every retry 409'd).
           if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            MAVEN_VERSION="$(grep '^mavenVersion=' NetworkKMM/gradle.properties | cut -d= -f2)"
+          fi
+          if [[ -z "$MAVEN_VERSION" ]]; then
             exit 0
           fi
           # Probe an artifact THIS job publishes (HEAD): the root module's
@@ -311,7 +323,13 @@ jobs:
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Plain dispatches carry no version input — default to the repo's
+          # own mavenVersion so the probe always runs (empty MAVEN_VERSION
+          # skipped the probe entirely and every retry 409'd).
           if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            MAVEN_VERSION="$(grep '^mavenVersion=' NetworkKMM/gradle.properties | cut -d= -f2)"
+          fi
+          if [[ -z "$MAVEN_VERSION" ]]; then
             exit 0
           fi
           probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-android/$MAVEN_VERSION/network-android-$MAVEN_VERSION.aar"
@@ -400,7 +418,13 @@ jobs:
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          # Plain dispatches carry no version input — default to the repo's
+          # own mavenVersion so the probe always runs (empty MAVEN_VERSION
+          # skipped the probe entirely and every retry 409'd).
           if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            MAVEN_VERSION="$(grep '^mavenVersion=' NetworkKMM/gradle.properties | cut -d= -f2)"
+          fi
+          if [[ -z "$MAVEN_VERSION" ]]; then
             exit 0
           fi
           # Probe an artifact THIS job publishes (HEAD): the root module's
