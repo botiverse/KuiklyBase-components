@@ -21,11 +21,14 @@ import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
+import com.tencent.kmm.network.export.NetworkError
+import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.VBTransportAndroidCurl
+import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
 import com.tencent.kmm.network.service.NetworkCall
@@ -134,6 +137,9 @@ internal class AndroidCurlNetworkEngine(
         call: NetworkCall,
         source: NetworkUploadStreamSource
     ): NetworkResponse = coroutineScope {
+        if (request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) {
+            return@coroutineScope unsupportedStreamingMethodResponse(request)
+        }
         val requestId = VBPBRequestIdGenerator.getRequestId()
         val pullBridge = AndroidCurlUploadPullBridge()
         val nativeRequest = request.toNativeRequest(
@@ -212,6 +218,18 @@ internal class AndroidCurlNetworkEngine(
             code = 42,
             errorMsg = "cancelled before Android curl native start"
         ).toNetworkResponse(request)
+
+    private fun unsupportedStreamingMethodResponse(request: NetworkRequest): NetworkResponse =
+        NetworkResponse(
+            request = request,
+            statusCode = null,
+            headers = emptyMap(),
+            body = NetworkResponseBody(),
+            error = NetworkError(
+                kind = NetworkErrorKind.UNKNOWN,
+                message = "Android curl does not stream request bodies for ${request.method}."
+            )
+        )
 }
 
 internal class AndroidCurlUploadPullBridge {

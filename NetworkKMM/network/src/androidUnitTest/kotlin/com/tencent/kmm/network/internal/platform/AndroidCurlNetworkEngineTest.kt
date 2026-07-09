@@ -194,6 +194,24 @@ class AndroidCurlNetworkEngineTest {
     }
 
     @Test
+    fun streamingGetFailsInsteadOfChangingTheWireMethod() = runBlocking {
+        val bridge = FakeBridge()
+        val request = NetworkRequest(
+            method = VBTransportMethod.GET,
+            url = "https://example.test/upload",
+            body = NetworkBody.Stream(
+                NetworkByteStream.fromChunks { sink -> sink.write("body".encodeToByteArray()) }
+            )
+        )
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals(NetworkErrorKind.UNKNOWN, response.error?.kind)
+        assertEquals("Android curl does not stream request bodies for GET.", response.error?.message)
+        assertNull(bridge.lastRequest)
+    }
+
+    @Test
     fun cancellingCallCancelsNativeRequestAndMapsTerminalResponse() = runBlocking {
         val bridge = BlockingBridge()
         val request = NetworkRequest(url = "https://example.test/slow")
