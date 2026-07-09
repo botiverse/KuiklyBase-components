@@ -373,6 +373,23 @@ across three heterogeneous engines:
 - **Self-managed CA / self-signed** (D-1): our trust store, our rules.
 - **Unified connect/TTFB/TLS/QUIC markers, retry policy, connection pool, and
   Happy Eyeballs** — built once, benefiting all three ends.
+- **Hands (crash/telemetry) reporting traffic collected onto the same
+  transport** — the "one place, three-end benefit" extends past the app to our
+  own SDK. CC-Cata's 2026-07-09 source read of `oranix-io/quiver` clients/:
+  the three Hands SDKs are today native-per-platform (Android Kotlin+OkHttp,
+  iOS ObjC+NSURLSession, OHOS ArkTS+platform http). Sequencing:
+  - **Android — do now, independent of C**: `HandsClient` already takes an
+    injectable `OkHttpClient` ("Designed to be replaceable"); only
+    `HandsCrash.install()` doesn't surface it. A small quiver PR exposing an
+    optional `httpClient` lets the app inject the *same* NetworkKMM Android
+    OkHttpClient → Hands reporting reuses the app's already-warm connection
+    pool + fastFallback/HE + our timing/classification logs. ~½ day SDK + one
+    line app.
+  - **iOS / OHOS — ride C**: iOS Hands already shares the system NSURLSession
+    stack (≈zero gain to bridge now); OHOS Hands is ArkTS (a per-reporting NAPI
+    bridge isn't worth it). Once C lands, Hands-iOS consumes the XCFramework
+    transport and Hands-OHOS goes through the unified transport's NAPI face —
+    the correct point to extend three-end unification to reporting.
 
 ### D-3. Costs to own (not blockers — accepted line items)
 
