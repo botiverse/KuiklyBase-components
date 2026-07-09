@@ -452,3 +452,57 @@ HTTPS 200 ×2 with connection reuse):
 
 If a gate fails, record the *specific* failure point (not "hard") for artin's
 go/no-go — per Codex's commitment.
+
+## Appendix D-6: migration plan — reversible dual-engine via a typed selector (artin's 2026-07-09 go)
+
+Once the D-5 feasibility spike proves three-end curl (Android/iOS in CI, OHOS
+already live), artin greenlit the **full migration**, gated on a **typed engine
+selector** so it is a reversible, gradual rollout — not a same-day engine swap.
+This is the raft.12 `okHttpEnabled` kill-switch pattern, generalised.
+
+### Selector contract (design input to task #21; impl = Codex-KMP-Developer)
+
+- **Typed, not stringly**: a `NetworkEngine` sum type — `NetworkEngine.Ktor`
+  (current: Android OkHttp / iOS Darwin / OHOS libcurl-buffered) and
+  `NetworkEngine.Curl` (unified libcurl transport). External/remote config maps
+  the raw `"ktor" | "curl"` **at the boundary only**; the raw string never sinks
+  into the transport/business layer.
+- **Default = current engine** on every platform. `Curl` is opt-in.
+- **Per-platform gate**: the selection is resolvable per platform (an
+  Android-only `curl` rollout must not force iOS). OHOS's existing curl path is
+  the `Curl` branch there — zero change, and it doubles as the **behaviour
+  baseline** the Android/iOS `Curl` paths align to (classified errors, timing
+  markers, connection reuse — already shipped and device-verified on OHOS since
+  issue #8). Android/iOS do **not** re-invent "how curl should behave".
+- **Remote-configurable + instant rollback**: driven by a remote flag so a bad
+  `curl` rollout flips back to `ktor` without a release; supports A/B (same
+  environment, curl vs ktor, compared on the connect/TTFB/reuse markers).
+- **Wire point**: the selection routes at the existing engine-selection seam —
+  `VBTransportNetworkEngine.execute` / the `SlockHttpExecutor` boundary — the
+  same layer where issue #8's `capabilities.requestBodyStreaming` gating lives.
+  The `Curl` branch reuses issue #8's `executeStreaming` / upload-pull machinery
+  where applicable; adding an engine dimension is additive to that seam, not a
+  rewrite.
+
+### Phased program (tasks #21–#25, 2026-07-09)
+
+- **Phase 1 — #21 (Codex)**: the typed selector + capability routing +
+  per-platform gray/rollback seam (this contract). Nothing behind `Curl` on
+  Android/iOS yet; the seam + default-Ktor + OHOS-Curl wired and green.
+- **Phase 2 — #22 (Codex, Android) / #23 (Codex, iOS)**: production transport
+  behind `engine=curl` — request/stream/upload/cancel via JNI (Android) and
+  cinterop (iOS). **#24 (Cata, native core)**: generalise `pbcurlwrapper` into
+  the shared three-end C core (on #60's ownership/header cleanup) + the
+  per-platform `.so`/XCFramework artifacts and publish pipeline.
+- **Phase 3 — #25**: app-owned CA/cert matrix (bundled OpenSSL + self-signed
+  per D-1) + system proxy + A/B gray rollout, then the HttpDNS / HTTP-3 gates
+  (D-2 capability payoff) on the unified core.
+
+### Acceptance
+
+Each `Curl`-branch end is accepted against the **D-5 rubric** (transport /
+bundled-OpenSSL trust + self-signed accept-reject / system proxy), on the real
+runtime CI lanes (Android emulator + iOS simulator, both asserting connection
+reuse). The selector's own acceptance: default stays byte-for-byte on the
+current engine (no regression when `curl` is off), and per-platform + remote
+flip both take effect without a release.
