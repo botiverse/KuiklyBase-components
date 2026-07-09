@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "NetworkKMM/scripts/build-android-curl-spike.sh"
+      - "NetworkKMM/scripts/run-android-curl-spike-ci.sh"
       - "NetworkKMM/spikes/android-curl/**"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
       - "NetworkKMM/settings.gradle.kts"
@@ -50,14 +51,7 @@ jobs:
           profile: pixel_6
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: |
-            bash <<'BASH'
-            set -euo pipefail
-            cd NetworkKMM
-            mkdir -p build/android-curl-spike
-            ANDROID_ABI=x86_64 ./scripts/build-android-curl-spike.sh --run 2>&1 | tee build/android-curl-spike/ci-output.log
-            grep -q "SLOCK_ANDROID_CURL_SPIKE completed passed=true reused=true" build/android-curl-spike/android-curl-spike.log
-            BASH
+          script: bash NetworkKMM/scripts/run-android-curl-spike-ci.sh
 
       - name: Upload spike APK, library, and logs
         if: always()
