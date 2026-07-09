@@ -443,6 +443,17 @@ HTTPS 200 ×2 with connection reuse):
 - [ ] No regression: issue #8 streaming upload + normal requests stay green on
       the unified core; confirms the shared core did not break the working end.
 
+**Engine-level (binding once the CURL delegate is production — see D-6
+"Engine-level invariants"):**
+- [ ] Capability queries answered by the **selected delegate**, not a
+      platform-default constant (#22/#23 runtime acceptance).
+- [ ] Engine decision **latched per `NetworkCall`**; a retry never straddles two
+      engines; a remote flip lands on the next call.
+- [ ] **`cancel_flag_` is `std::atomic<bool>`** (relaxed load/store — pure cancel
+      hint, synchronises no other data); fixes the pre-existing plain-`bool`
+      cross-thread race on both Android JNI cancel and the OHOS
+      `CurlRequestServiceHM.cancel` path (#24 native core).
+
 **Cross-cutting (any one end proves the capability, then generalise):**
 - [ ] QUIC/HTTP/3: one backend, an H3 request completes; H3→H2 fallback works.
 - [ ] HttpDNS: a resolver hook overrides host→IP while SNI/Host/cert verify still
@@ -489,6 +500,31 @@ This is the raft.12 `okHttpEnabled` kill-switch pattern, generalised.
   The `CURL` branch reuses issue #8's `executeStreaming` / upload-pull machinery
   where applicable; adding an engine dimension is additive to that seam, not a
   rewrite.
+
+### Engine-level invariants (binding for #22/#23/#24)
+
+Two invariants surfaced during the #63 selector review and #22/#24 kickoff. They
+are recorded here as the **single canonical source** so per-end acceptance can
+point at the RFC instead of a chat thread.
+
+- **Capabilities are owned by the selected delegate engine, not platform-level.**
+  Once a second engine registers, a capability query (streaming upload, HTTP/3,
+  HttpDNS, self-signed trust store, …) must be answered by the *same* delegate
+  that `resolveNetworkEngine` selected — `capabilities()` routes through the
+  chosen `KTOR`/`CURL` delegate, each declaring what it actually supports. The
+  selector routes; it must not assume capabilities. The Phase-1 platform-default
+  constant (e.g. issue #8's `capabilities.requestBodyStreaming`) is correct only
+  while one engine exists per platform — the moment a second engine is reachable
+  it will report the wrong engine's capability. #22/#23 must move capability
+  ownership onto the selected delegate before their production runtime is
+  accepted.
+- **The engine decision is latched per `NetworkCall`, not re-resolved mid-call.**
+  `resolveNetworkEngine` runs once per call via the call's `getOrResolveEngine {}`
+  latch; a remote flip (curl→ktor) takes effect on the *next* call, never on a
+  retry of an in-flight one. This keeps a single call's transport, capability
+  set, and timing markers internally consistent across its own retries — a
+  request never straddles two engines. (Impl: `RoutingNetworkEngine.resolve`,
+  landed in #63.)
 
 ### Phased program (tasks #21–#25, 2026-07-09)
 
