@@ -14,17 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.tencent.kmm.network.internal.platform
+package com.tencent.kmm.network.export
 
-import com.tencent.kmm.network.service.NetworkEngine
-import com.tencent.kmm.network.service.NetworkTransportEngine
-import com.tencent.kmm.network.service.VBTransportNetworkEngine
+import com.tencent.kmm.network.internal.platform.AndroidCurlEngineProvider
 
-internal actual val platformDefaultNetworkTransportEngine: NetworkTransportEngine =
-    NetworkTransportEngine.KTOR
+/** Android curl runtime inputs supplied by the host application. */
+object VBTransportAndroidCurl {
+    /** Absolute path to the app-owned CA bundle. Null uses curl's compiled default. */
+    @Volatile
+    var caInfoPath: String? = null
 
-internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine): NetworkEngine? =
-    when (engine) {
-        NetworkTransportEngine.KTOR -> VBTransportNetworkEngine
-        NetworkTransportEngine.CURL -> AndroidCurlEngineProvider.resolve()
-    }
+    val nativeAvailable: Boolean
+        get() = AndroidCurlEngineProvider.nativeAvailable
+}

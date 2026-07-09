@@ -429,7 +429,7 @@ object CurlRequestServiceHM : ICurlRequestService {
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
             val handler = object : IStreamHandler {
                 override fun onResponseStart(httpCode: Long, headers: String) {
-                    onResponseStart(httpCode.toInt(), convertHeaderMap(headers))
+                    onResponseStart(httpCode.toInt(), parseCurlHeaders(headers))
                 }
 
                 override fun onChunk(chunk: ByteArray) {
@@ -556,22 +556,6 @@ object CurlRequestServiceHM : ICurlRequestService {
         return tmpHeaders
     }
 
-    // raft.9: CURLcode → coarse failure reason, same tag vocabulary as the
-    // ktor transports (TransportFailureClassifier). curl's own strerror text
-    // is kept after the tag.
-    private fun describeCurlFailure(code: Int, errorMsg: String): String {
-        val reason = when (code) {
-            28 -> "timeout"                                    // CURLE_OPERATION_TIMEDOUT
-            6, 8 -> "dns"                                      // CURLE_COULDNT_RESOLVE_HOST / WEIRD_SERVER_REPLY
-            35, 51, 53, 54, 58, 59, 60, 64, 66, 77, 80, 82, 83, 90, 91 -> "tls"
-            18, 55, 56 -> "connection_lost"                    // PARTIAL_FILE / SEND / RECV
-            7 -> "connect"                                     // CURLE_COULDNT_CONNECT
-            42 -> "cancelled"                                  // CURLE_ABORTED_BY_CALLBACK
-            else -> "engine"
-        }
-        return "[$reason] CURLcode:$code $errorMsg"
-    }
-
     private fun updateResponse(
         logTag: String,
         nativeResponse: CurlNativeResponse,
@@ -600,7 +584,7 @@ object CurlRequestServiceHM : ICurlRequestService {
             } else {
                 describeCurlFailure(nativeResponse.code, nativeResponse.errorMsg)
             }
-        response.header = convertHeaderMap(nativeResponse.headers)
+        response.header = parseCurlHeaders(nativeResponse.headers)
         // 处理重定向情况
         if (nativeResponse.redirectUrl.isNotEmpty()) {
             logI("[$logTag] curl redirect url, old: ${request.url}, new: ${nativeResponse.redirectUrl}")
@@ -648,25 +632,6 @@ object CurlRequestServiceHM : ICurlRequestService {
                 response.request = request as VBTransportRequest
             }
         }
-    }
-
-    private fun convertHeaderMap(headerStr: String): Map<String, List<String>> {
-        return headerStr.lines()
-            // 过滤空行和 HTTP 状态行（如 "HTTP/1.1 200 OK"）
-            .filter { it.isNotBlank() && !it.startsWith("HTTP/") }
-            // 处理每一行，分割键值对
-            .mapNotNull { line ->
-                val colonIndex = line.indexOf(':')
-                if (colonIndex == -1) {
-                    null
-                } else {
-                    val key = line.substring(0, colonIndex).trim()
-                    val value = line.substring(colonIndex + 1).trim()
-                    key to value
-                }
-            }
-            // 合并相同键的值到列表（兼容多值头字段）
-            .groupBy({ it.first }, { it.second })
     }
 
     private fun convertDataWithContentType(

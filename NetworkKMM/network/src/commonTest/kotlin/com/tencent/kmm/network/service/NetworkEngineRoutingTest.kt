@@ -187,6 +187,13 @@ class NetworkEngineRoutingTest {
         assertContentEquals("curl".encodeToByteArray(), chunks.single())
         assertEquals(listOf("curl-stream"), curl.executed)
         assertTrue(requireNotNull(diagnostic).capabilities.responseBodyStreaming)
+
+        val defaultCapabilities = resolveNetworkEngine(
+            selection = NetworkEngineSelection(forcePlatformDefault = true),
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { engine -> if (engine == NetworkTransportEngine.KTOR) ktor else curl }
+        ).diagnostics.capabilities
+        assertFalse(defaultCapabilities.responseBodyStreaming)
     }
 
     @Test

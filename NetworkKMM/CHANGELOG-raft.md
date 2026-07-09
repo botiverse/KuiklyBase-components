@@ -1,6 +1,6 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased (typed transport selector and rollback seam)
+## Unreleased (typed selector and Android curl transport)
 
 - Added `NetworkTransportEngine.KTOR/CURL` and a typed per-request selector at
   the `NetworkEngine` routing boundary. External `"ktor" | "curl"` values map
@@ -18,6 +18,16 @@
 - `NetworkClient.downloadStream` now routes through `NetworkEngine`, so future
   Android/iOS curl transports cannot be selected for buffered/upload requests
   while silently bypassed by streaming downloads.
+- Android now has an injectable curl `NetworkEngine` plus a production JNI
+  bridge for buffered requests, streaming downloads, streaming uploads, and
+  cross-thread cancellation. The delegate is registered only when
+  `libnetworkkmmcurl.so` loads successfully, so rollout still fails closed to
+  Ktor when the standard AAR does not contain the native artifact.
+- Android curl owns its streaming/progress capabilities, maps curl/HTTP errors
+  and timing through the shared response contract, supports an app-provided CA
+  bundle path, and preserves cancellation arriving both before native handle
+  publication and while a transfer is running. JNI callback names are retained
+  through consumer ProGuard rules.
 
 ## 0.1.0-raft.16 / 0.1.0-raft.16-ohos (streaming upload end-to-end)
 
