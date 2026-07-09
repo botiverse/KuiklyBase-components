@@ -42,6 +42,12 @@ gradle_args=(
   "-PgithubPackagesToken=$GITHUB_PACKAGES_TOKEN"
 )
 
+# Dual-tree support (task #18): NETWORK_SETTINGS_FILE selects the build tree
+# (e.g. settings.ohos.gradle.kts for the OHOS/KBA tree). Default = normal tree.
+if [[ -n "${NETWORK_SETTINGS_FILE:-}" ]]; then
+  gradle_args+=("-c" "$NETWORK_SETTINGS_FILE")
+fi
+
 if [[ -n "${MAVEN_VERSION:-}" ]]; then
   gradle_args+=("-PmavenVersion=$MAVEN_VERSION")
 fi
@@ -65,7 +71,11 @@ task_exists() {
   local task_file="$task_cache_dir/${cache_name:-root}.tasks"
 
   if [[ ! -f "$task_file" ]]; then
-    if ! ./gradlew --no-daemon --console=plain "$project_path:tasks" --all > "$task_file" 2>&1; then
+    local discover_args=(--no-daemon --console=plain)
+    if [[ -n "${NETWORK_SETTINGS_FILE:-}" ]]; then
+      discover_args+=("-c" "$NETWORK_SETTINGS_FILE")
+    fi
+    if ! ./gradlew "${discover_args[@]}" "$project_path:tasks" --all > "$task_file" 2>&1; then
       cat "$task_file" >&2
       return 2
     fi
