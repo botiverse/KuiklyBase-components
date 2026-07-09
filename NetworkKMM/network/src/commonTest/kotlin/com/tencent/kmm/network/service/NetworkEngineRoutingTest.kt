@@ -1,0 +1,247 @@
+/*
+ * Tencent is pleased to support the open source community by making KuiklyBase available.
+ * Copyright (C) 2025 Tencent. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.tencent.kmm.network.service
+
+import com.tencent.kmm.network.export.NetworkEngineCapabilities
+import com.tencent.kmm.network.export.NetworkRequest
+import com.tencent.kmm.network.export.NetworkResponse
+import com.tencent.kmm.network.export.NetworkResponseBody
+import com.tencent.kmm.network.export.VBTransportElapseStatistics
+import kotlinx.coroutines.runBlocking
+import kotlin.test.Test
+import kotlin.test.assertContentEquals
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+class NetworkEngineRoutingTest {
+    @Test
+    fun externalConfigMapsOnceAndFailsClosed() {
+        val curl = NetworkEngineSelection.fromExternalConfig(
+            engine = " CURL ",
+            curlEnabled = true
+        )
+        assertEquals(NetworkTransportEngine.CURL, curl.requestedEngine)
+        assertTrue(NetworkTransportEngine.CURL in curl.allowedEngines)
+
+        val disabled = NetworkEngineSelection.fromExternalConfig(
+            engine = "curl",
+            curlEnabled = false
+        )
+        assertEquals(NetworkTransportEngine.CURL, disabled.requestedEngine)
+        assertFalse(NetworkTransportEngine.CURL in disabled.allowedEngines)
+
+        val invalid = NetworkEngineSelection.fromExternalConfig(
+            engine = "cronet",
+            curlEnabled = true
+        )
+        assertNull(invalid.requestedEngine)
+        assertFalse(invalid.externalValueValid)
+    }
+
+    @Test
+    fun selectionUsesRequestedEngineAndFallsBackSafely() {
+        val ktor = FakeEngine("ktor")
+        val curl = FakeEngine("curl")
+        val resolver: (NetworkTransportEngine) -> NetworkEngine? = {
+            when (it) {
+                NetworkTransportEngine.KTOR -> ktor
+                NetworkTransportEngine.CURL -> curl
+            }
+        }
+
+        val requested = resolveNetworkEngine(
+            selection = NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL),
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = resolver
+        )
+        assertEquals(NetworkTransportEngine.CURL, requested.diagnostics.selectedEngine)
+        assertEquals(NetworkEngineSelectionReason.REQUESTED, requested.diagnostics.reason)
+
+        val disallowed = resolveNetworkEngine(
+            selection = NetworkEngineSelection(
+                requestedEngine = NetworkTransportEngine.CURL,
+                allowedEngines = setOf(NetworkTransportEngine.KTOR)
+            ),
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = resolver
+        )
+        assertEquals(NetworkTransportEngine.KTOR, disallowed.diagnostics.selectedEngine)
+        assertEquals(NetworkEngineSelectionReason.DISALLOWED, disallowed.diagnostics.reason)
+
+        val unavailable = resolveNetworkEngine(
+            selection = NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL),
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { engine -> if (engine == NetworkTransportEngine.KTOR) ktor else null }
+        )
+        assertEquals(NetworkTransportEngine.KTOR, unavailable.diagnostics.selectedEngine)
+        assertEquals(NetworkEngineSelectionReason.UNAVAILABLE, unavailable.diagnostics.reason)
+
+        val invalid = resolveNetworkEngine(
+            selection = NetworkEngineSelection.fromExternalConfig(
+                engine = "unknown",
+                curlEnabled = true
+            ),
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = resolver
+        )
+        assertEquals(NetworkTransportEngine.KTOR, invalid.diagnostics.selectedEngine)
+        assertEquals(NetworkEngineSelectionReason.INVALID_EXTERNAL_VALUE, invalid.diagnostics.reason)
+    }
+
+    @Test
+    fun selectorCanGrayThenRollbackWithoutRebuildingClient() = runBlocking {
+        val ktor = FakeEngine("ktor")
+        val curl = FakeEngine("curl", totalTimeMs = 42.0)
+        val selected = mutableListOf<NetworkEngineSelectionDiagnostics>()
+        val completed = mutableListOf<NetworkEngineExecutionDiagnostics>()
+        var rollback = false
+        val router = RoutingNetworkEngine(
+            selector = {
+                NetworkEngineSelection(
+                    requestedEngine = NetworkTransportEngine.CURL,
+                    forcePlatformDefault = rollback
+                )
+            },
+            diagnosticsListener = object : NetworkEngineDiagnosticsListener {
+                override fun onEngineSelected(diagnostics: NetworkEngineSelectionDiagnostics) {
+                    selected += diagnostics
+                }
+
+                override fun onEngineCompleted(diagnostics: NetworkEngineExecutionDiagnostics) {
+                    completed += diagnostics
+                }
+            },
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { engine -> if (engine == NetworkTransportEngine.KTOR) ktor else curl }
+        )
+        val request = NetworkRequest().apply { url = "https://example.test" }
+        val firstCall = NetworkCall(request)
+
+        router.execute(request, firstCall)
+        rollback = true
+        // A retry/second attempt on the same call must not switch engines.
+        router.execute(request, firstCall)
+        router.execute(request, NetworkCall(request))
+
+        assertEquals(listOf("curl", "curl"), curl.executed)
+        assertEquals(listOf("ktor"), ktor.executed)
+        assertEquals(
+            listOf(NetworkTransportEngine.CURL, NetworkTransportEngine.KTOR),
+            selected.map { it.selectedEngine }
+        )
+        assertEquals(NetworkEngineSelectionReason.REMOTE_ROLLBACK, selected.last().reason)
+        assertEquals(42.0, completed.first().timing.totalTimeMs)
+        assertEquals(3, completed.size)
+    }
+
+    @Test
+    fun streamingUsesSelectedEngineAndReportsActualCapabilities() = runBlocking {
+        val ktor = FakeEngine("ktor")
+        val curl = FakeEngine(
+            name = "curl",
+            capabilities = NetworkEngineCapabilities(
+                requestBodyStreaming = true,
+                responseBodyStreaming = true,
+                multipartStreaming = true
+            )
+        )
+        var diagnostic: NetworkEngineSelectionDiagnostics? = null
+        val router = RoutingNetworkEngine(
+            selector = { NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL) },
+            diagnosticsListener = object : NetworkEngineDiagnosticsListener {
+                override fun onEngineSelected(diagnostics: NetworkEngineSelectionDiagnostics) {
+                    diagnostic = diagnostics
+                }
+            },
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { engine -> if (engine == NetworkTransportEngine.KTOR) ktor else curl }
+        )
+        val request = NetworkRequest().apply { url = "https://example.test/stream" }
+        var startStatus = 0
+        val chunks = mutableListOf<ByteArray>()
+
+        router.downloadStream(
+            request = request,
+            call = NetworkCall(request),
+            onResponseStart = { status, _, _ -> startStatus = status },
+            onChunk = { chunks += it }
+        )
+
+        assertEquals(200, startStatus)
+        assertContentEquals("curl".encodeToByteArray(), chunks.single())
+        assertEquals(listOf("curl-stream"), curl.executed)
+        assertTrue(requireNotNull(diagnostic).capabilities.responseBodyStreaming)
+    }
+
+    @Test
+    fun selectorFailureFallsBackToPlatformDefault() = runBlocking {
+        val ktor = FakeEngine("ktor")
+        var diagnostic: NetworkEngineSelectionDiagnostics? = null
+        val router = RoutingNetworkEngine(
+            selector = { error("remote config unavailable") },
+            diagnosticsListener = object : NetworkEngineDiagnosticsListener {
+                override fun onEngineSelected(diagnostics: NetworkEngineSelectionDiagnostics) {
+                    diagnostic = diagnostics
+                }
+            },
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { ktor }
+        )
+        val request = NetworkRequest().apply { url = "https://example.test" }
+
+        router.execute(request, NetworkCall(request))
+
+        assertEquals(NetworkEngineSelectionReason.SELECTOR_ERROR, diagnostic?.reason)
+        assertEquals(listOf("ktor"), ktor.executed)
+    }
+
+    private class FakeEngine(
+        private val name: String,
+        override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(),
+        private val totalTimeMs: Double = 0.0
+    ) : NetworkEngine {
+        val executed = mutableListOf<String>()
+
+        override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+            executed += name
+            return response(request)
+        }
+
+        override suspend fun downloadStream(
+            request: NetworkRequest,
+            call: NetworkCall,
+            onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
+            onChunk: (ByteArray) -> Unit
+        ): NetworkResponse {
+            executed += "$name-stream"
+            val bytes = name.encodeToByteArray()
+            onResponseStart(200, bytes.size.toLong(), mapOf("Content-Length" to listOf(bytes.size.toString())))
+            onChunk(bytes)
+            return response(request)
+        }
+
+        private fun response(request: NetworkRequest): NetworkResponse = NetworkResponse(
+            request = request,
+            statusCode = 200,
+            headers = emptyMap(),
+            body = NetworkResponseBody(),
+            timing = VBTransportElapseStatistics(totalTimeMs = totalTimeMs)
+        )
+    }
+}

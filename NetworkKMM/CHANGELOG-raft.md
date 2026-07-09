@@ -1,5 +1,24 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased (typed transport selector and rollback seam)
+
+- Added `NetworkTransportEngine.KTOR/CURL` and a typed per-request selector at
+  the `NetworkEngine` routing boundary. External `"ktor" | "curl"` values map
+  once through `NetworkEngineSelection.fromExternalConfig`; business and
+  transport code do not perform raw string checks.
+- Current platform engines remain the default: Android/iOS use Ktor and OHOS
+  uses curl. Unsupported or disallowed requests fail closed to that platform
+  default. A dynamic `forcePlatformDefault` flag provides remote rollback
+  without rebuilding the `NetworkClient`. Selection is latched per
+  `NetworkCall`, so retries never switch engines mid-call; rollback applies to
+  the next call.
+- Selection and completion diagnostics expose requested/selected/default
+  engine, fallback reason, actual engine capabilities, status/error, and a
+  copy of `VBTransportElapseStatistics`.
+- `NetworkClient.downloadStream` now routes through `NetworkEngine`, so future
+  Android/iOS curl transports cannot be selected for buffered/upload requests
+  while silently bypassed by streaming downloads.
+
 ## 0.1.0-raft.16 / 0.1.0-raft.16-ohos (streaming upload end-to-end)
 
 > Version-trap note: the raft.15 coordinate was published the morning of

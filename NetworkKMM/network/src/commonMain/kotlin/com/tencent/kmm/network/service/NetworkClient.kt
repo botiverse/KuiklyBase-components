@@ -103,7 +103,14 @@ class NetworkClientConfig(
     val requestMiddlewares: List<NetworkRequestMiddleware> = emptyList(),
     val responseMiddlewares: List<NetworkResponseMiddleware> = emptyList(),
     val interceptors: List<NetworkInterceptor> = emptyList(),
-    val auth: NetworkAuthConfig? = null
+    val auth: NetworkAuthConfig? = null,
+    /**
+     * Returns a typed transport selection for each request. Hosts can read
+     * remote config or apply stable gray-routing here; raw `ktor|curl` values
+     * should be mapped once with [NetworkEngineSelection.fromExternalConfig].
+     */
+    val engineSelector: ((NetworkRequest) -> NetworkEngineSelection)? = null,
+    val engineDiagnostics: NetworkEngineDiagnosticsListener? = null
 )
 
 interface NetworkEngine {
@@ -111,6 +118,26 @@ interface NetworkEngine {
         get() = NetworkEngineCapabilities()
 
     suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse
+
+    /**
+     * Streams a response when supported, otherwise falls back to one buffered
+     * chunk. Engines with native streaming should override this method.
+     */
+    suspend fun downloadStream(
+        request: NetworkRequest,
+        call: NetworkCall,
+        onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
+        onChunk: (ByteArray) -> Unit
+    ): NetworkResponse {
+        val response = execute(request, call)
+        onResponseStart(
+            response.statusCode ?: 0,
+            contentLengthFromHeaders(response.headers) ?: response.body.bytes?.size?.toLong(),
+            response.headers
+        )
+        response.body.bytes?.takeIf { it.isNotEmpty() }?.let(onChunk)
+        return response.withoutBody()
+    }
 }
 
 class NetworkCall internal constructor(
@@ -120,6 +147,8 @@ class NetworkCall internal constructor(
     private val cancelHandlers = mutableListOf<() -> Unit>()
     private var job: Job? = null
     private var cancelled = false
+    private var resolvedEngine: ResolvedNetworkEngine? = null
+    private var engineSelectionReported = false
 
     val isCancelled: Boolean
         get() = cancelled
@@ -143,6 +172,18 @@ class NetworkCall internal constructor(
         if (!completion.isCompleted) {
             completion.complete(response)
         }
+    }
+
+    internal fun getOrResolveEngine(resolve: () -> ResolvedNetworkEngine): ResolvedNetworkEngine {
+        return resolvedEngine ?: resolve().also { resolvedEngine = it }
+    }
+
+    internal fun markEngineSelectionReported(): Boolean {
+        if (engineSelectionReported) {
+            return false
+        }
+        engineSelectionReported = true
+        return true
     }
 
     suspend fun await(): NetworkResponse = completion.await()
@@ -172,7 +213,10 @@ class NetworkCall internal constructor(
 
 class NetworkClient(
     private val config: NetworkClientConfig = NetworkClientConfig(),
-    private val engine: NetworkEngine = VBTransportNetworkEngine,
+    private val engine: NetworkEngine = RoutingNetworkEngine(
+        selector = config.engineSelector,
+        diagnosticsListener = config.engineDiagnostics
+    ),
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 ) {
     private val refreshMutex = Mutex()
@@ -233,27 +277,9 @@ class NetworkClient(
                 onComplete(cancelled)
                 return@launch
             }
-            val vbRequest = VBTransportRequest().apply {
-                method = prepared.method
-                url = prepared.resolvedUrl()
-                header.putAll(prepared.headers)
-                totalTimeout = prepared.policy.timeoutMillis
-            }
-            call.addCancelHandler { VBTransportService.cancel(vbRequest.requestId) }
-            VBTransportService.streamRequest(
-                vbRequest,
-                onResponseStart = { rawStatus, headers ->
-                    // rawStatus follows the transport's errorCode convention
-                    // (0 == OK); expose the real HTTP status to callers.
-                    val httpStatus = statusCodeFromErrorCode(rawStatus) ?: rawStatus
-                    onResponseStart(httpStatus, contentLengthFromHeaders(headers), headers)
-                },
-                onChunk = onChunk
-            ) { response ->
-                val networkResponse = response.toNetworkResponse(prepared)
-                call.complete(networkResponse)
-                onComplete(networkResponse)
-            }
+            val response = engine.downloadStream(prepared, call, onResponseStart, onChunk)
+            call.complete(response)
+            onComplete(response)
         }
         call.attachJob(job)
         return call
@@ -390,11 +416,11 @@ class NetworkClient(
 
 object VBTransportNetworkEngine : NetworkEngine {
     override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(
-        // issue #8 slice 1: true on the ktor platforms (WriteChannelContent);
-        // OHOS stays false until the curl READFUNCTION slice lands.
+        // issue #8: every current platform has true request streaming
+        // (ktor WriteChannelContent or curl READFUNCTION).
         requestBodyStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming,
-        responseBodyStreaming = false,
-        multipartStreaming = false,
+        responseBodyStreaming = true,
+        multipartStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming,
         uploadProgress = true,
         downloadProgress = true
     )
@@ -444,6 +470,42 @@ object VBTransportNetworkEngine : NetworkEngine {
             continuation.invokeOnCancellation {
                 VBTransportService.cancel(vbRequest.requestId)
             }
+        }
+    }
+
+    override suspend fun downloadStream(
+        request: NetworkRequest,
+        call: NetworkCall,
+        onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
+        onChunk: (ByteArray) -> Unit
+    ): NetworkResponse = suspendCancellableCoroutine { continuation ->
+        val vbRequest = VBTransportRequest().apply {
+            method = request.method
+            url = request.resolvedUrl()
+            header.putAll(request.headers)
+            totalTimeout = request.policy.timeoutMillis
+        }
+        VBTransportService.streamRequest(
+            vbRequest,
+            onResponseStart = { rawStatus, headers ->
+                // rawStatus follows the transport errorCode convention
+                // (0 == OK); callers receive the real HTTP status.
+                val httpStatus = statusCodeFromErrorCode(rawStatus) ?: rawStatus
+                onResponseStart(httpStatus, contentLengthFromHeaders(headers), headers)
+            },
+            onChunk = onChunk
+        ) { response ->
+            if (continuation.isActive) {
+                // Preserve the existing VBTransport streaming completion
+                // response exactly; callers already treat it as body-less.
+                continuation.resume(response.toNetworkResponse(request))
+            }
+        }
+        call.addCancelHandler {
+            VBTransportService.cancel(vbRequest.requestId)
+        }
+        continuation.invokeOnCancellation {
+            VBTransportService.cancel(vbRequest.requestId)
         }
     }
 
@@ -569,6 +631,16 @@ private fun VBTransportBaseResponse.toNetworkResponse(request: NetworkRequest): 
         timing = elapseStatis
     )
 }
+
+private fun NetworkResponse.withoutBody(): NetworkResponse = NetworkResponse(
+    request = request,
+    statusCode = statusCode,
+    headers = headers,
+    body = NetworkResponseBody(),
+    error = error,
+    rawResponse = rawResponse,
+    timing = timing
+)
 
 private fun Any?.toResponseBytes(): ByteArray? {
     return when (this) {

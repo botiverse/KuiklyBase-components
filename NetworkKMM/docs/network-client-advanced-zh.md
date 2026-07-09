@@ -104,9 +104,9 @@ val body = NetworkBody.FileRef(
 )
 ```
 
-由于当前 `VBTransportService` 接收的是 buffered request/response body，内置 engine 会把 `Stream`
-和 `FileRef` materialize 成 bytes 作为兼容 fallback。后续 engine 可以实现真正的大文件 streaming，
-已经使用这些 body 类型的调用方不需要改 API。
+当前 Android、iOS、OHOS 的内置 transport 都会真实流式发送 `Stream`、`FileRef`，以及包含流式
+part 的 multipart。自定义 engine 在实现对应 capability 之前仍可使用默认 buffered fallback，
+请求调用方不需要修改 API。
 
 ## 检查 engine capability
 
@@ -114,13 +114,49 @@ val body = NetworkBody.FileRef(
 
 | Capability | `VBTransportNetworkEngine` |
 | --- | --- |
-| Request body streaming | `false` |
-| Response body streaming | `false` |
-| Multipart streaming | `false` |
+| Request body streaming | `true` |
+| Response body streaming | `true` |
+| Multipart streaming | `true` |
 | Upload progress callback | `true` |
 | Download progress callback | `true` |
 
 App 需要判断大文件上传是否可以真 streaming、还是必须走 buffered fallback 时，读取这个 capability。
+
+## 使用可灰度、可回滚的 transport engine selector
+
+`NetworkClient` 在 `NetworkEngine` 边界使用 typed `NetworkTransportEngine` selector。远端配置里的
+原始字符串只在 App/config 边界映射一次，不要让 `"ktor"` / `"curl"` 判断进入业务请求代码：
+
+```kotlin
+val client = NetworkClient(
+    NetworkClientConfig(
+        engineSelector = { request ->
+            val rollout = currentNetworkRollout(request.metadata["accountId"])
+            NetworkEngineSelection.fromExternalConfig(
+                engine = rollout.engine, // 只在这里解析 "ktor" / "curl"
+                curlEnabled = rollout.curlEnabledOnThisPlatform,
+                forcePlatformDefault = rollout.rollback
+            )
+        },
+        engineDiagnostics = object : NetworkEngineDiagnosticsListener {
+            override fun onEngineCompleted(diagnostics: NetworkEngineExecutionDiagnostics) {
+                recordNetworkEngine(
+                    selected = diagnostics.selection.selectedEngine,
+                    reason = diagnostics.selection.reason,
+                    timing = diagnostics.timing
+                )
+            }
+        }
+    )
+)
+```
+
+selector 会在每个新 `NetworkCall` 执行，因此远端把 `rollback` 翻开后无需重建 client，下一次
+call 就会回退。选择结果会在当前 call 内锁定，auth/policy retry 不会中途切换 engine。解析失败、
+平台禁用或实现尚未注册时，一律回退到当前平台默认：Android/iOS 为 Ktor，OHOS 为 curl。
+Phase 1 阶段在 Android/iOS 请求 curl 会记录 `UNAVAILABLE` 并继续走 Ktor，直到 production
+JNI/cinterop engine 在后续阶段注册。`NetworkEngineSelectionDiagnostics.capabilities` 描述的是
+**实际选中的 engine**，不是请求但未命中的 engine。
 
 ## 处理稳定错误分类
 
