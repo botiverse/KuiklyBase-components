@@ -5,7 +5,7 @@ plugins {
 
 android {
     namespace = "com.tencent.kmm.component.template.android"
-    compileSdk = 33
+    compileSdk = 36
     defaultConfig {
         applicationId = "com.tencent.kmm.component.template.android"
         minSdk = 24

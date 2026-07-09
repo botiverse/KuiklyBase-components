@@ -121,9 +121,9 @@ kotlin {
 
 android {
     namespace = "com.tencent.tmm.networkkmm"
-    // 34: okhttp-android (raft.10) pulls androidx.startup:1.2.0, which
-    // requires consumers to compile against API 34+.
-    compileSdk = 34
+    // 36: okhttp-android 5.4.0 (stable, task #18 unpin) requires consumers
+    // to compile against API 36+ (its androidx.startup pull required 34+).
+    compileSdk = 36
     defaultConfig {
         minSdk = 21
     }
