@@ -373,6 +373,23 @@ across three heterogeneous engines:
 - **Self-managed CA / self-signed** (D-1): our trust store, our rules.
 - **Unified connect/TTFB/TLS/QUIC markers, retry policy, connection pool, and
   Happy Eyeballs** — built once, benefiting all three ends.
+- **Hands (crash/telemetry) reporting traffic collected onto the same
+  transport** — the "one place, three-end benefit" extends past the app to our
+  own SDK. CC-Cata's 2026-07-09 source read of `oranix-io/quiver` clients/:
+  the three Hands SDKs are today native-per-platform (Android Kotlin+OkHttp,
+  iOS ObjC+NSURLSession, OHOS ArkTS+platform http). Sequencing:
+  - **Android — do now, independent of C**: `HandsClient` already takes an
+    injectable `OkHttpClient` ("Designed to be replaceable"); only
+    `HandsCrash.install()` doesn't surface it. A small quiver PR exposing an
+    optional `httpClient` lets the app inject the *same* NetworkKMM Android
+    OkHttpClient → Hands reporting reuses the app's already-warm connection
+    pool + fastFallback/HE + our timing/classification logs. ~½ day SDK + one
+    line app.
+  - **iOS / OHOS — ride C**: iOS Hands already shares the system NSURLSession
+    stack (≈zero gain to bridge now); OHOS Hands is ArkTS (a per-reporting NAPI
+    bridge isn't worth it). Once C lands, Hands-iOS consumes the XCFramework
+    transport and Hands-OHOS goes through the unified transport's NAPI face —
+    the correct point to extend three-end unification to reporting.
 
 ### D-3. Costs to own (not blockers — accepted line items)
 
@@ -435,3 +452,63 @@ HTTPS 200 ×2 with connection reuse):
 
 If a gate fails, record the *specific* failure point (not "hard") for artin's
 go/no-go — per Codex's commitment.
+
+## Appendix D-6: migration plan — reversible dual-engine via a typed selector (artin's 2026-07-09 go)
+
+Once the D-5 feasibility spike proves three-end curl (Android/iOS in CI, OHOS
+already live), artin greenlit the **full migration**, gated on a **typed engine
+selector** so it is a reversible, gradual rollout — not a same-day engine swap.
+This is the raft.12 `okHttpEnabled` kill-switch pattern, generalised.
+
+### Selector contract (design input to task #21; impl = Codex-KMP-Developer)
+
+- **Typed, not stringly**: a `NetworkTransportEngine` sum type —
+  `NetworkTransportEngine.KTOR` (current: Android OkHttp / iOS Darwin / OHOS
+  libcurl-buffered) and `NetworkTransportEngine.CURL` (unified libcurl
+  transport). (Named `NetworkTransportEngine`, not `NetworkEngine`, to avoid
+  colliding with the existing executable `NetworkEngine` interface — impl
+  decision, Codex, 2026-07-09.) External/remote config maps the raw
+  `"ktor" | "curl"` **at the boundary only**; the raw string never sinks into
+  the transport/business layer.
+- **Default = current engine** on every platform. `CURL` is opt-in. Platform
+  defaults: Android/iOS = `KTOR`, OHOS = `CURL`; Android/iOS `CURL` resolves
+  *unavailable* until tasks #22/#23 land the production transport (fail-closed
+  to the default — Phase 1 behaviour).
+- **Per-platform gate**: the selection is resolvable per platform (an
+  Android-only `curl` rollout must not force iOS). OHOS's existing curl path is
+  the `CURL` branch there — zero change, and it doubles as the **behaviour
+  baseline** the Android/iOS `CURL` paths align to (classified errors, timing
+  markers, connection reuse — already shipped and device-verified on OHOS since
+  issue #8). Android/iOS do **not** re-invent "how curl should behave".
+- **Remote-configurable + instant rollback**: driven by a remote flag so a bad
+  `curl` rollout flips back to `ktor` without a release; supports A/B (same
+  environment, curl vs ktor, compared on the connect/TTFB/reuse markers).
+- **Wire point**: the selection routes at the existing engine-selection seam —
+  `VBTransportNetworkEngine.execute` / the `SlockHttpExecutor` boundary — the
+  same layer where issue #8's `capabilities.requestBodyStreaming` gating lives.
+  The `CURL` branch reuses issue #8's `executeStreaming` / upload-pull machinery
+  where applicable; adding an engine dimension is additive to that seam, not a
+  rewrite.
+
+### Phased program (tasks #21–#25, 2026-07-09)
+
+- **Phase 1 — #21 (Codex)**: the typed selector + capability routing +
+  per-platform gray/rollback seam (this contract). Nothing behind `CURL` on
+  Android/iOS yet; the seam + default-Ktor + OHOS-Curl wired and green.
+- **Phase 2 — #22 (Codex, Android) / #23 (Codex, iOS)**: production transport
+  behind `engine=curl` — request/stream/upload/cancel via JNI (Android) and
+  cinterop (iOS). **#24 (Cata, native core)**: generalise `pbcurlwrapper` into
+  the shared three-end C core (on #60's ownership/header cleanup) + the
+  per-platform `.so`/XCFramework artifacts and publish pipeline.
+- **Phase 3 — #25**: app-owned CA/cert matrix (bundled OpenSSL + self-signed
+  per D-1) + system proxy + A/B gray rollout, then the HttpDNS / HTTP-3 gates
+  (D-2 capability payoff) on the unified core.
+
+### Acceptance
+
+Each `CURL`-branch end is accepted against the **D-5 rubric** (transport /
+bundled-OpenSSL trust + self-signed accept-reject / system proxy), on the real
+runtime CI lanes (Android emulator + iOS simulator, both asserting connection
+reuse). The selector's own acceptance: default stays byte-for-byte on the
+current engine (no regression when `curl` is off), and per-platform + remote
+flip both take effect without a release.
