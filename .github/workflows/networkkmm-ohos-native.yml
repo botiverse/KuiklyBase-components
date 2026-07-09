@@ -85,7 +85,7 @@ jobs:
     permissions:
       contents: write
     container:
-      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:latest
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

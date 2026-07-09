@@ -36,8 +36,7 @@ jobs:
     outputs:
       skipped: ${{ steps.check_version.outputs.skipped }}
     env:
-      ANDROID_HOME: /tmp/android-sdk
-      ANDROID_SDK_ROOT: /tmp/android-sdk
+      # Android SDK comes baked in the image (/opt/android-sdk, task #240).
       NETWORK_REQUIRE_TASKS: "true"
       # OHOS tree (task #18 dual-tree): publishes the -ohos version, including
       # its OWN root kotlinMultiplatform module (variants: ohosArm64), plus
@@ -51,26 +50,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Install Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y --no-install-recommends curl unzip
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/android-commandline-tools.zip
-          unzip -q /tmp/android-commandline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
-          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
       - name: Resolve HarmonyOS SDK
         shell: bash
@@ -285,40 +264,19 @@ jobs:
   publish-android:
     name: Publish Android (normal tree)
     runs-on: ubuntu-latest
+    # The image bakes the Android SDK + JDK 17 (task #240) — this job needed
+    # nothing OHOS-specific, but the per-run SDK download is gone.
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     outputs:
       skipped: ${{ steps.check_version.outputs.skipped }}
     env:
-      ANDROID_HOME: /tmp/android-sdk
-      ANDROID_SDK_ROOT: /tmp/android-sdk
       NETWORK_REQUIRE_TASKS: "true"
       NETWORK_PUBLISH_TASKS: >-
         :network:publishAndroidPublicationToGithubPackagesRepository
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Set up JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: "17"
-
-      - name: Install Android SDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          curl -fsSL https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -o /tmp/android-commandline-tools.zip
-          unzip -q /tmp/android-commandline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
-          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
-          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
       - name: Resolve publish inputs
         shell: bash
