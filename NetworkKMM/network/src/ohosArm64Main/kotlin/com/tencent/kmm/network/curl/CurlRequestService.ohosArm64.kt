@@ -530,7 +530,14 @@ object CurlRequestServiceHM : ICurlRequestService {
                     bridgeRef.dispose()
                     callbackWrapper.release()
                 }
-                buildResponseAndCallback(request, nativeResponse, responseCallback)
+                // Built inline (like streamRequest's onComplete): responseCallback
+                // is typed (VBTransportResponse) -> Unit, narrower than
+                // buildResponseAndCallback's (VBTransportBaseResponse) -> Unit.
+                responseCallback(
+                    VBTransportResponse().apply {
+                        updateResponse(request.logTag, nativeResponse, request, this)
+                    }
+                )
             }
         } finally {
             // perform is over — a writer still blocked in send() (abort paths)
@@ -854,10 +861,21 @@ internal fun uploadReadChunk(readRef: COpaquePointer?, buffer: CPointer<ByteVar>
     }
 }
 
-// Producer side of the upload bridge. IO keeps the writers off the pool that
-// runs the blocking curl performs; SupervisorJob isolates per-request failures.
+// Producer side of the upload bridge. INVARIANT (the no-deadlock premise):
+// writers must never share a bounded pool with the blocking curl performs —
+// each perform parks a worker in fill()'s runBlocking until its writer runs,
+// so co-pooling them deadlocks once concurrent uploads reach the pool size.
+// KBA-native coroutines has no Dispatchers.IO; a small dedicated pool keeps
+// the invariant by construction. Writers only suspend (channel.send), so two
+// threads are headroom, not a ceiling. SupervisorJob isolates per-request
+// failures.
+@OptIn(
+    kotlinx.coroutines.ObsoleteCoroutinesApi::class,
+    kotlinx.coroutines.ExperimentalCoroutinesApi::class
+)
 private val uploadWriterScope = kotlinx.coroutines.CoroutineScope(
-    kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+    kotlinx.coroutines.SupervisorJob() +
+        kotlinx.coroutines.newFixedThreadPoolContext(2, "NetworkKmmUploadWriter")
 )
 
 actual fun getCurlRequestService(): ICurlRequestService = CurlRequestServiceHM
