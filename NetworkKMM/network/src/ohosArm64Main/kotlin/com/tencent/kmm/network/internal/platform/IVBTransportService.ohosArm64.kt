@@ -81,6 +81,24 @@ object HmTransportImpl : IVBTransportService {
         CurlRequestService.sendRequest(kmmRequest, kmmResponseCallback, logTag)
     }
 
+    // issue #8 slice 3: OHOS 原生流式上传 — 请求体经 libcurl READFUNCTION 逐块
+    // 拉取, 不整包进内存; 响应仍整包缓冲。GET/HEAD 带流式体没有 curl 上传语义
+    // (CURLOPT_UPLOAD 会改写动词), 走接口的缓冲默认实现。
+    override fun requestUploadStream(
+        kmmRequest: VBTransportRequest,
+        contentLength: Long?,
+        writeBody: suspend (com.tencent.kmm.network.export.NetworkByteStreamSink) -> Unit,
+        kmmResponseCallback: (response: VBTransportResponse) -> Unit
+    ) {
+        val method = kmmRequest.method.name.uppercase()
+        if (method == "GET" || method == "HEAD") {
+            super.requestUploadStream(kmmRequest, contentLength, writeBody, kmmResponseCallback)
+            return
+        }
+        val logTag = kmmRequest.logTag + "_" + kmmRequest.requestId
+        CurlRequestServiceHM.uploadStreamRequest(kmmRequest, contentLength, writeBody, kmmResponseCallback, logTag)
+    }
+
     // fork #8: OHOS 原生流式下载 — libcurl 的 write 回调逐块回传, 不缓冲整包。
     override fun requestStream(
         kmmRequest: VBTransportRequest,

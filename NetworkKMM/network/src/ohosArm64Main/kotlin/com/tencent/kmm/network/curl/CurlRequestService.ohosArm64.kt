@@ -18,6 +18,7 @@ package com.tencent.kmm.network.curl
 
 import com.tencent.kmm.network.export.IVBPBLog
 import com.tencent.kmm.network.internal.VBPBLog
+import com.tencent.kmm.network.internal.transportLaunch
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapBytesCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapGetCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapPostCallback
@@ -30,11 +31,14 @@ import com.tencent.qqlive.kmm.native.libcurl.CurlRequest
 import com.tencent.qqlive.kmm.native.libcurl.CurlResponse
 import com.tencent.qqlive.kmm.native.libcurl.DeleteCurlClient
 import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
+import com.tencent.qqlive.kmm.native.libcurl.CurlUploadSource
 import com.tencent.qqlive.kmm.native.libcurl.StartRequest
 import com.tencent.qqlive.kmm.native.libcurl.StartStreamRequest
+import com.tencent.qqlive.kmm.native.libcurl.StartUploadRequest
 import com.tencent.qqlive.kmm.native.libcurl.StringDic
 import com.tencent.qqlive.kmm.native.libcurl.StringPair
 import com.tencent.qqlive.kmm.native.libcurl.setCurlLogImpl
+import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.VBTransportBaseRequest
 import com.tencent.kmm.network.export.VBTransportBaseResponse
 import com.tencent.kmm.network.export.VBTransportBytesRequest
@@ -452,6 +456,89 @@ object CurlRequestServiceHM : ICurlRequestService {
         }
     }
 
+    // issue #8 slice 3: 流式上传 — 请求体经 [writeBody] 推入桥, curl perform 线程
+    // 通过 READFUNCTION 逐块拉取, 不整包进内存; 响应仍整包缓冲 (与 request 一致)。
+    // 异常不外逸 (upstream #31: 恰好一次回调)。
+    fun uploadStreamRequest(
+        request: VBTransportRequest,
+        contentLength: Long?,
+        writeBody: suspend (NetworkByteStreamSink) -> Unit,
+        responseCallback: (response: VBTransportResponse) -> Unit,
+        logTag: String
+    ) {
+        try {
+            uploadStreamRequestUnsafe(request, contentLength, writeBody, responseCallback, logTag)
+        } catch (throwable: Throwable) {
+            logI("[$logTag] uploadStreamRequest failed: ${throwable.message ?: throwable::class.simpleName}")
+            responseCallback(
+                VBTransportResponse().apply {
+                    this.request = request
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = throwable.message ?: "native upload stream request failed"
+                }
+            )
+        }
+    }
+
+    private fun uploadStreamRequestUnsafe(
+        request: VBTransportRequest,
+        contentLength: Long?,
+        writeBody: suspend (NetworkByteStreamSink) -> Unit,
+        responseCallback: (response: VBTransportResponse) -> Unit,
+        logTag: String
+    ) {
+        val bridge = UploadPullBridge()
+        // The writer pushes writeBody's chunks into the bridge from its own
+        // worker; the curl perform thread blocks in the READFUNCTION pulling
+        // them out. Dispatchers.IO keeps the (blocking) producer off the
+        // Default pool the perform coroutine already occupies.
+        val writerJob = uploadWriterScope.transportLaunch {
+            try {
+                writeBody(bridge.sink)
+                bridge.closeSuccess()
+            } catch (throwable: Throwable) {
+                logI("[$logTag] upload writeBody failed: ${throwable.message ?: throwable::class.simpleName}")
+                bridge.closeFailure(throwable)
+            }
+        }
+        try {
+            memScoped {
+                val headers = toStringDic(buildRequestHeader(request), memScope)
+                val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
+                var nativeResponse = CurlNativeResponse()
+                val callback = object : ICurlCallback {
+                    override fun onResponse(result: CurlResponse) {
+                        nativeResponse = handleCurlNativeResponse(result, logTag)
+                    }
+                }
+                val callbackWrapper = CurlCallbackWrapper(callback)
+                val bridgeRef = StableRef.create(bridge)
+                try {
+                    val source = memScope.alloc<CurlUploadSource> {
+                        this.readRef = bridgeRef.asCPointer()
+                        this.readChunk = staticCFunction(::uploadReadChunk)
+                        this.totalLength = contentLength ?: -1L
+                    }
+                    val handle = CreateCurlClient(logTag)
+                    taskMap[request.requestId] = handle
+                    logI("[$logTag] upload-stream transport task add, id:${request.requestId}, " +
+                            "handle:${handle}, contentLength:${contentLength ?: -1}")
+                    StartUploadRequest(handle, curlRequest, source.ptr, callbackWrapper.getCallbackNativePtr())
+                    DeleteCurlClient(handle)
+                    taskMap.remove(request.requestId)
+                } finally {
+                    bridgeRef.dispose()
+                    callbackWrapper.release()
+                }
+                buildResponseAndCallback(request, nativeResponse, responseCallback)
+            }
+        } finally {
+            // perform is over — a writer still blocked in send() (abort paths)
+            // must not leak.
+            writerJob.cancel()
+        }
+    }
+
     // Like buildRequestHeader but never defaults Accept-Encoding: gzip — streaming
     // does not incrementally decompress, so the download must be identity.
     private fun buildStreamRequestHeader(request: VBTransportBaseRequest): Map<String, String> {
@@ -708,5 +795,69 @@ internal fun streamOnComplete(callbackRef: COpaquePointer?, result: CPointer<Cur
     val res = result ?: return
     callbackRef?.asStableRef<IStreamHandler>()?.get()?.onComplete(res.pointed)
 }
+
+// issue #8 slice 3: push→pull adapter between the transport's writeBody sink
+// (producer coroutine) and curl's READFUNCTION (consumer on the perform
+// thread). A bounded channel provides the backpressure: the producer suspends
+// when the consumer falls behind, so no more than a few chunks are in flight.
+internal class UploadPullBridge {
+    private val channel = kotlinx.coroutines.channels.Channel<ByteArray>(capacity = 4)
+    private var leftover: ByteArray = ByteArray(0)
+    private var leftoverOffset = 0
+
+    val sink: NetworkByteStreamSink = object : NetworkByteStreamSink {
+        override suspend fun write(bytes: ByteArray) {
+            if (bytes.isEmpty()) return
+            channel.send(bytes.copyOf())
+        }
+    }
+
+    fun closeSuccess() = channel.close()
+
+    fun closeFailure(cause: Throwable) {
+        channel.close(cause)
+    }
+
+    // Runs on the curl perform thread (blocking there is the contract).
+    // Returns bytes copied into [buffer]; 0 = EOF; negative = abort.
+    fun fill(buffer: CPointer<ByteVar>, maxLen: Int): Int {
+        if (leftoverOffset >= leftover.size) {
+            val next = kotlinx.coroutines.runBlocking { channel.receiveCatching() }
+            val chunk = next.getOrNull()
+            if (chunk == null) {
+                // closed: cleanly (EOF) or with the writer's failure (abort).
+                return if (next.exceptionOrNull() != null) -1 else 0
+            }
+            leftover = chunk
+            leftoverOffset = 0
+        }
+        val count = minOf(maxLen, leftover.size - leftoverOffset)
+        leftover.usePinned { pinned ->
+            memcpy(buffer, pinned.addressOf(leftoverOffset), count.convert())
+        }
+        leftoverOffset += count
+        return count
+    }
+}
+
+// C-side curlReadChunk trampoline: readRef is a StableRef<UploadPullBridge>.
+// Never throw across the C boundary — any failure becomes an abort (-1).
+internal fun uploadReadChunk(readRef: COpaquePointer?, buffer: CPointer<ByteVar>?, maxLen: Int): Int {
+    val bridge = readRef?.asStableRef<UploadPullBridge>()?.get() ?: return -1
+    val target = buffer ?: return -1
+    if (maxLen <= 0) return 0
+    return try {
+        bridge.fill(target, maxLen)
+    } catch (throwable: Throwable) {
+        VBPBLog.e(VBPBLog.HMCURLIMPL, "uploadReadChunk failed: ${throwable.message ?: throwable::class.simpleName}")
+        -1
+    }
+}
+
+// Producer side of the upload bridge. IO keeps the writers off the pool that
+// runs the blocking curl performs; SupervisorJob isolates per-request failures.
+private val uploadWriterScope = kotlinx.coroutines.CoroutineScope(
+    kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+)
 
 actual fun getCurlRequestService(): ICurlRequestService = CurlRequestServiceHM
