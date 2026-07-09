@@ -4,7 +4,11 @@ project(CurlDemo)
 
 set(NATIVERENDER_ROOT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
 
+# include/ holds the REAL libcurl headers (copied from the cross-compiled
+# curl by build-ohos-native.sh, currently 8.16) — they must match the linked
+# libcurl.a. The stale vendored 7.64 copy under wrapper/src/curl is gone.
 include_directories(${NATIVERENDER_ROOT_PATH}
+                    ${NATIVERENDER_ROOT_PATH}/include
                     ${NATIVERENDER_ROOT_PATH}/wrapper/include)
 
 # 添加 -fPIC 编译选项

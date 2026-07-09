@@ -60,11 +60,12 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     request.postBodyLen = body ? static_cast<int>(std::strlen(body)) : 0;
     request.postBody = body;
 
-    // StartRequest takes ownership of the callback and frees it after the
-    // response is delivered — it must be heap-allocated.
-    auto *callback = new CurlCallback{&captured, OnResponse};
+    // Caller owns the callback (wrapper only borrows it) — a stack struct is
+    // legal and pins the contract; the old take-ownership-and-delete
+    // semantics crashed exactly this pattern.
+    CurlCallback callback{&captured, OnResponse};
     CurClientHandle handle = CreateCurlClient("wrapper-test");
-    StartRequest(handle, request, callback);
+    StartRequest(handle, request, &callback);
     DeleteCurlClient(handle);
     return captured;
 }
@@ -161,9 +162,9 @@ int main(int argc, char **argv) {
         request.headers = &headers;
         request.timeout = 5000;
 
-        auto *callback = new CurlCallback{&echo, OnResponse};
+        CurlCallback callback{&echo, OnResponse};
         CurClientHandle handle = CreateCurlClient("wrapper-test");
-        StartRequest(handle, request, callback);
+        StartRequest(handle, request, &callback);
         DeleteCurlClient(handle);
 
         size_t count = 0, pos = 0;

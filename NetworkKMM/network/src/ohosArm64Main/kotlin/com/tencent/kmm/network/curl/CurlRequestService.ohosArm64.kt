@@ -751,6 +751,11 @@ class CurlCallbackWrapper(private val curlCallback: ICurlCallback) {
 
     fun release() {
         callbackStableRef.dispose()
+        // Caller owns the native struct (wrapper hygiene fix): the C side no
+        // longer deletes it — free here, symmetric with
+        // CurlStreamCallbackWrapper. MUST pair with the .so built from the
+        // same commit (the old .so still deletes → double free).
+        nativeHeap.free(callBlackNative.rawPtr)
     }
 }
 

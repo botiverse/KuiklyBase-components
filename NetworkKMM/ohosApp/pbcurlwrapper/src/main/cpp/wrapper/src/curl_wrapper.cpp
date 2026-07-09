@@ -23,7 +23,11 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include "curl/curl.h"
+// Angle-bracket include so the REAL libcurl headers (cpp/include, 8.16 — the
+// version actually linked) win. The quoted form used to resolve to a stale
+// vendored 7.64.0-DEV copy next to the sources (Codex-KMP-Developer's find:
+// it only worked because CURLOPT enums are append-only).
+#include <curl/curl.h>
 #include "log/curl_log.h"
 #include "utils/curl_utils.h"
 #include "zlib.h"
@@ -31,7 +35,6 @@
 using namespace std;
 
 bool curlGlobalInited = false;
-bool curlGlobalCleanuped = false;
 
 // Connection pooling across the per-request easy handles: a process-wide
 // share handle pools connections, DNS entries, and TLS sessions, so a fresh
@@ -539,8 +542,14 @@ class CurlClient {
         HandleElapseStatisticsInfo(curl_response_);
 
         logI(log_tag_, "libcurl callback.");
-        shared_ptr<CurlCallback> fetchCallbackBlockPtr(callback);
-        fetchCallbackBlockPtr->callback(fetchCallbackBlockPtr->callbackRef, curl_response_);
+        // Ownership: the callback struct is BORROWED — the caller allocates
+        // and frees it (same contract as StartStreamRequest). The old
+        // shared_ptr here took ownership and deleted it, which exploded on
+        // stack/self-managed callbacks (iOS curl spike) and was UB for
+        // malloc-family allocations (Kotlin nativeHeap).
+        if (callback != nullptr && callback->callback != nullptr) {
+            callback->callback(callback->callbackRef, curl_response_);
+        }
     }
 
     // fork #8: streaming download. The body is streamed to Kotlin chunk-by-chunk
@@ -607,10 +616,12 @@ class CurlClient {
             header_list_ = nullptr;
         }
 
-        if (!curlGlobalCleanuped) {
-            curlGlobalCleanuped = true;
-            curl_global_cleanup();
-        }
+        // No curl_global_cleanup() here: it used to fire on the FIRST client
+        // destruction while the process-wide gCurlShare (pooled TLS/DNS
+        // sessions) and possibly in-flight clients were still alive — global
+        // teardown mid-lifetime is undefined behavior territory. An app
+        // process never needs to clean up libcurl globals; the OS reclaims
+        // everything at exit (sanctioned by the libcurl docs).
     }
 
 
