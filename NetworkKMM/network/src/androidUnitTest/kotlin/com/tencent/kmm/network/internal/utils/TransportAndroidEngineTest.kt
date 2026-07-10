@@ -23,6 +23,18 @@ class TransportAndroidEngineTest {
     }
 
     @Test
+    fun transportDefaultsRaisePerHostConcurrencyWithoutTouchingGlobalCap() {
+        // task #587: OkHttp's default maxRequestsPerHost=5 throttled the ~10-wide
+        // foreground Thread h2 burst (task #586 tracing measured 212–752ms of
+        // Dispatcher permit wait on the 6th–10th calls). Lift the per-host cap to
+        // 16 while leaving the global maxRequests at OkHttp's default 64, so h1
+        // degradation / multi-host traffic cannot expand total concurrency.
+        val client = OkHttpClient.Builder().applyTransportOkHttpDefaults().build()
+        assertEquals(16, client.dispatcher.maxRequestsPerHost)
+        assertEquals(64, client.dispatcher.maxRequests)
+    }
+
+    @Test
     fun transportTracerSeparatesCoroutineAndDispatcherQueueTime() {
         var now = 1_000_000L
         AndroidTransportPhaseTracer.nanoTime = { now }
