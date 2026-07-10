@@ -172,6 +172,71 @@ int main(int argc, char **argv) {
         CHECK(cancelled.data.empty(), "pre-start cancel delivers no body");
     }
 
+    // 8c. Stream variant of the pre-start cancel: the contract still requires
+    //     start-before-complete, so the wrapper emits ONE response-start with
+    //     a sane empty state (httpCode 0, no headers) — never a misleading
+    //     200 — followed by exactly one aborted completion and zero chunks.
+    {
+        struct StreamCaptured {
+            bool started = false;
+            long startHttpCode = -1;
+            int startHeaderLen = -1;
+            int chunks = 0;
+            bool completed = false;
+            int code = -1;
+            long httpCode = -1;
+        } stream;
+
+        struct Hooks {
+            static void OnStart(void *ref, long httpCode, const char *, int headerLen) {
+                auto *out = static_cast<StreamCaptured *>(ref);
+                out->started = true;
+                out->startHttpCode = httpCode;
+                out->startHeaderLen = headerLen;
+            }
+            static void OnChunk(void *ref, const char *, int) {
+                static_cast<StreamCaptured *>(ref)->chunks++;
+            }
+            static void OnComplete(void *ref, CurlResponse *response) {
+                auto *out = static_cast<StreamCaptured *>(ref);
+                out->completed = true;
+                out->code = response->code;
+                out->httpCode = response->httpCode;
+            }
+        };
+
+        StringDic headers{};
+        headers.size = 0;
+        headers.stringPairs = nullptr;
+
+        CurlRequest request{};
+        std::string url = base + "/ok";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        CurlStreamCallback callback{};
+        callback.callbackRef = &stream;
+        callback.onResponseStart = Hooks::OnStart;
+        callback.onChunk = Hooks::OnChunk;
+        callback.onComplete = Hooks::OnComplete;
+
+        CurClientHandle handle = CreateCurlClient("wrapper-test");
+        Cancel(handle);
+        StartStreamRequest(handle, request, &callback);
+        DeleteCurlClient(handle);
+
+        CHECK(stream.started, "stream pre-start cancel still emits response-start");
+        CHECK(stream.startHttpCode == 0,
+              "stream pre-start cancel reports httpCode 0, not a fake status");
+        CHECK(stream.startHeaderLen == 0, "stream pre-start cancel has no headers");
+        CHECK(stream.chunks == 0, "stream pre-start cancel delivers no chunks");
+        CHECK(stream.completed, "stream pre-start cancel completes exactly once");
+        CHECK(stream.code == 42,
+              "stream pre-start cancel completion is CURLE_ABORTED_BY_CALLBACK");
+    }
+
     // 8. Upstream issue #28: request headers must not be duplicated on the
     //    wire. Send one custom header and count its occurrences in the echo.
     {
