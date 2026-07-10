@@ -198,9 +198,14 @@ android {
         // the networkkmm-android-native workflow (same committed-binary
         // pattern as the OHOS .so line). The Android CURL delegate stays
         // fail-closed when the directory is absent.
-        getByName("main") {
-            jniLibs.srcDir("libs/android")
-        }
+        // Android production runs OkHttp (artin decision A, 2026-07-10):
+        // the curl .so stays committed + CI-gated under libs/android but is
+        // NOT packaged into the default Android AAR. The CURL delegate
+        // fail-closes to Ktor when absent; a dedicated opt-in coordinate is
+        // a future decision.
+        // getByName("main") {
+        //     jniLibs.srcDir("libs/android")
+        // }
     }
     testOptions {
         // OkHttp's static init logs through android.util.Log; JVM unit tests
