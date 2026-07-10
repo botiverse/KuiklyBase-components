@@ -220,10 +220,14 @@ echo "==> Verify exported wrapper surface"
 for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
            "$XCFRAMEWORK"/ios-arm64_x86_64-simulator/libNetworkKMMCurl.a; do
   test -f "$lib"
+  # --defined-only + -j: one defined symbol name per line, external only.
+  syms="$(xcrun nm -g --defined-only -j -arch arm64 "$lib" 2>/dev/null || true)"
   for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo \
              _StartRequest _StartStreamRequest _StartUploadRequest; do
-    xcrun nm -arch arm64 "$lib" 2>/dev/null | grep -q "T ${sym}\$" || {
+    printf '%s\n' "$syms" | grep -qx "$sym" || {
       echo "Missing exported symbol ${sym} in ${lib}" >&2
+      echo "-- nearby defined globals in the wrapper member:" >&2
+      xcrun nm -g --defined-only -arch arm64 "$lib" 2>/dev/null | grep -i "curl" | head -40 >&2 || true
       exit 2
     }
   done
