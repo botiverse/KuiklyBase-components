@@ -25,6 +25,27 @@
   Completion diagnostics expose negotiated protocol as `UNKNOWN` until native
   protocol extraction is implemented.
 
+## 0.1.0-raft.21 / 0.1.0-raft.21-ohos (HTTP/2 for all curl engines)
+
+- All three curl engines negotiate HTTP/2 (#83, task #30): nghttp2 1.64.0
+  (SHA-256 pinned) statically linked into the Android per-ABI `.so`, the
+  iOS XCFramework slices and the OHOS wrapper — curl's default
+  HTTP/2-over-TLS ALPN activates with no API change; h1.1-only servers
+  keep working. The OHOS production engine gains connection multiplexing;
+  Android/iOS curl opt-ins reach parity with their platform defaults.
+- Guard rails from the review cycle: per-line archive symbol gates
+  (pin-exact `nghttp2_session_client_new3`; Mach-O end-anchored) plus the
+  iOS config-layer `USE_NGHTTP2` primary gate; iOS device-slice feature
+  detection fixed via compile-only try_compile (device SDK cannot link
+  test executables — the silent h1-only fallback this would have caused
+  is exactly what the gates now catch).
+- Wrapper logs the negotiated protocol at completion
+  (`transport_protocol http_version=h2/...`) — structured
+  `VBTransportElapseStatistics.protocol` wiring for the curl ends rides
+  the HTTP/3 line (task #31).
+- Artifacts are combined-source builds also carrying the #81 rollout
+  proxy/CA seams (verified per-end by symbol audit).
+
 ## 0.1.0-raft.20 / 0.1.0-raft.20-ohos (curl rollout gates + Android connection limits)
 
 - curl production rollout gates (#81, task #25): app-owned CA bundle
