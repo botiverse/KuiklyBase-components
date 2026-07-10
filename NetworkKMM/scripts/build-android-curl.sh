@@ -112,7 +112,7 @@ if [[ ! -f "${OPENSSL_PREFIX}/lib/libssl.a" || "$(cat "$OPENSSL_STAMP" 2>/dev/nu
     PATH="${TOOLCHAIN_ROOT}/bin:${PATH}" \
       ./Configure "$OPENSSL_TARGET" \
       -D__ANDROID_API__="$ANDROID_API" \
-      no-shared no-tests no-apps no-docs no-legacy no-engine no-comp \
+      no-shared no-tests no-apps no-docs no-legacy \
       --prefix="$OPENSSL_PREFIX" \
       --openssldir="$OPENSSL_PREFIX/ssl"
     PATH="${TOOLCHAIN_ROOT}/bin:${PATH}" make -j"$JOBS" build_libs

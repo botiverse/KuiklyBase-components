@@ -106,7 +106,7 @@ build_slice_arch() {
       CFLAGS="-arch ${arch} $(min_flag "$sdk")" \
       LDFLAGS="-arch ${arch} $(min_flag "$sdk")" \
         ./Configure "$openssl_target" \
-        no-shared no-tests no-apps no-docs no-legacy no-engine no-comp \
+        no-shared no-tests no-apps no-docs no-legacy \
         --prefix="$openssl_prefix" \
         --openssldir="$openssl_prefix/ssl"
       make -j"$JOBS" build_libs
