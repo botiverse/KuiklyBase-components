@@ -226,10 +226,12 @@ for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
   syms="$(xcrun nm -g --defined-only -arch arm64 "$lib" 2>/dev/null || true)"
   for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo \
              _StartRequest _StartStreamRequest _StartUploadRequest; do
-    printf '%s\n' "$syms" | grep -q " T ${sym}\$" || {
+    # herestring, not a pipe: grep -q exits on first match and pipefail
+    # would turn printf's SIGPIPE into a pipeline failure.
+    grep -q " T ${sym}\$" <<<"$syms" || {
       echo "Missing exported symbol ${sym} in ${lib}" >&2
       echo "-- exported entry-point-family globals:" >&2
-      printf '%s\n' "$syms" | grep -E "Start|Cancel|CurlClient|SetCurl" | head -30 >&2 || true
+      grep -E "Start|Cancel|CurlClient|SetCurl" <<<"$syms" | head -30 >&2 || true
       exit 2
     }
   done
