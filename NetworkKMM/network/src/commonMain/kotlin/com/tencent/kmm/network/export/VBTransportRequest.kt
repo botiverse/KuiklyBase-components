@@ -125,6 +125,7 @@ open class VBTransportBaseRequest {
     var totalTimeout: Long = 0L
     // 底层是否使用 libcurl 进行请求
     var useCurl: Boolean = true
+    internal var transportElapseStatistics: VBTransportElapseStatistics = VBTransportElapseStatistics()
 
     /** Internal curl inputs prepared and latched by the selected engine. */
     internal var curlCaInfoPath: String? = null
