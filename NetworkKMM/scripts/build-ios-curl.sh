@@ -19,6 +19,8 @@ CURL_VERSION="${CURL_VERSION:-8.16.0}"
 # platforms. No unchecked build-time downloads in the production line.
 OPENSSL_SHA256="${OPENSSL_SHA256:-967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99}"
 CURL_SHA256="${CURL_SHA256:-a21e20476e39eca5a4fc5cfb00acf84bbc1f5d8443ec3853ad14c26b3c85b970}"
+NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
+NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
 IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-12.0}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -59,6 +61,8 @@ fetch "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VE
   "${DOWNLOADS_DIR}/openssl-${OPENSSL_VERSION}.tar.gz" "$OPENSSL_SHA256"
 fetch "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/curl-${CURL_VERSION}.tar.gz" "$CURL_SHA256"
+fetch "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.gz" \
+  "${DOWNLOADS_DIR}/nghttp2-${NGHTTP2_VERSION}.tar.gz" "$NGHTTP2_SHA256"
 
 # min-version flag differs between device and simulator compilations.
 min_flag() {
@@ -82,9 +86,12 @@ build_slice_arch() {
   local curl_source="${slice_root}/curl-${CURL_VERSION}"
   local curl_build="${slice_root}/curl-build"
   local curl_stamp="${curl_build}/.build-config"
+  local nghttp2_source="${slice_root}/nghttp2-${NGHTTP2_VERSION}"
+  local nghttp2_build="${slice_root}/nghttp2-build"
+  local nghttp2_stamp="${nghttp2_build}/.build-config"
   local wrapper_build="${slice_root}/wrapper-build"
   local merged="${slice_root}/libNetworkKMMCurl.a"
-  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}"
+  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}"
   local sdk_path
   sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
 
@@ -113,6 +120,25 @@ build_slice_arch() {
       make install_dev
     ) >/dev/null
     printf '%s' "$build_config" > "$openssl_stamp"
+  fi
+
+  echo "==> [${sdk}/${arch}] nghttp2 ${NGHTTP2_VERSION}"
+  if [[ ! -f "${nghttp2_build}/lib/libnghttp2.a" || "$(cat "$nghttp2_stamp" 2>/dev/null)" != "$build_config" ]]; then
+    rm -rf "$nghttp2_source" "$nghttp2_build"
+    tar -xzf "${DOWNLOADS_DIR}/nghttp2-${NGHTTP2_VERSION}.tar.gz" -C "$slice_root"
+    cmake -S "$nghttp2_source" -B "$nghttp2_build" \
+      -DCMAKE_SYSTEM_NAME=iOS \
+      -DCMAKE_OSX_SYSROOT="$sdk" \
+      -DCMAKE_OSX_ARCHITECTURES="$arch" \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DENABLE_LIB_ONLY=ON \
+      -DBUILD_SHARED_LIBS=OFF \
+      -DBUILD_STATIC_LIBS=ON \
+      -DENABLE_DOC=OFF \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
+    cmake --build "$nghttp2_build" -j"$JOBS" >/dev/null
+    printf '%s' "$build_config" > "$nghttp2_stamp"
   fi
 
   echo "==> [${sdk}/${arch}] curl ${CURL_VERSION}"
@@ -145,7 +171,9 @@ build_slice_arch() {
       -DCURL_ZLIB=OFF \
       -DCURL_BROTLI=OFF \
       -DCURL_ZSTD=OFF \
-      -DUSE_NGHTTP2=OFF \
+      -DUSE_NGHTTP2=ON \
+      -DNGHTTP2_INCLUDE_DIR="${nghttp2_source}/lib/includes" \
+      -DNGHTTP2_LIBRARY="${nghttp2_build}/lib/libnghttp2.a" \
       -DUSE_LIBIDN2=OFF \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
     cmake --build "$curl_build" -j"$JOBS" >/dev/null
@@ -180,6 +208,7 @@ build_slice_arch() {
     "$wrapper_build/curl_log.o" \
     "$wrapper_build/curl_utils.o" \
     "$curl_build/lib/libcurl.a" \
+    "$nghttp2_build/lib/libnghttp2.a" \
     "$openssl_prefix/lib/libssl.a" \
     "$openssl_prefix/lib/libcrypto.a"
   echo "    $(du -h "$merged" | cut -f1)  $merged"

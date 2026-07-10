@@ -25,6 +25,10 @@ CURL_VERSION="${CURL_VERSION:-8.16.0}"
 ZLIB_VERSION="${ZLIB_VERSION:-1.3.1}"
 BROTLI_VERSION="${BROTLI_VERSION:-1.1.0}"
 ZSTD_VERSION="${ZSTD_VERSION:-1.5.6}"
+NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
+# nghttp2 publishes no sibling .sha256 — hard-pinned (verified against the
+# real release download; same discipline as the android/ios lines).
+NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
 OHOS_ARCH="arm64-v8a"
 OHOS_TRIPLE="aarch64-linux-ohos"
 
@@ -193,6 +197,21 @@ else
   rm -f "$DEPS_PREFIX"/lib/libzstd.so*
 fi
 
+if [[ -f "$DEPS_PREFIX/lib/libnghttp2.a" ]]; then
+  echo "==> nghttp2 already built, reusing"
+else
+  echo "==> Fetching nghttp2 ${NGHTTP2_VERSION}"
+  fetch "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.gz" \
+    "nghttp2-${NGHTTP2_VERSION}.tar.gz"
+  echo "${NGHTTP2_SHA256}  nghttp2-${NGHTTP2_VERSION}.tar.gz" | sha256sum -c -
+  rm -rf "nghttp2-${NGHTTP2_VERSION}"
+  tar xf "nghttp2-${NGHTTP2_VERSION}.tar.gz"
+  echo "==> Building nghttp2 (static)"
+  cmake_cross "nghttp2-${NGHTTP2_VERSION}" nghttp2-build \
+    -DENABLE_LIB_ONLY=ON -DBUILD_STATIC_LIBS=ON -DENABLE_DOC=OFF
+  rm -f "$DEPS_PREFIX"/lib/libnghttp2.so*
+fi
+
 echo "==> Fetching curl ${CURL_VERSION}"
 fetch_and_verify \
   "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
@@ -230,7 +249,9 @@ cmake -S "curl-${CURL_VERSION}" -B curl-build \
   -DZLIB_INCLUDE_DIR="$DEPS_PREFIX/include" \
   -DCURL_BROTLI=ON \
   -DCURL_ZSTD=ON \
-  -DUSE_NGHTTP2=OFF \
+  -DUSE_NGHTTP2=ON \
+  -DNGHTTP2_INCLUDE_DIR="$DEPS_PREFIX/include" \
+  -DNGHTTP2_LIBRARY="$DEPS_PREFIX/lib/libnghttp2.a" \
   -DUSE_LIBIDN2=OFF \
   -DCURL_DISABLE_LDAP=ON \
   -DCURL_DISABLE_WEBSOCKETS=OFF \
@@ -271,6 +292,7 @@ check_codec() {
 check_codec "zlib (gzip/deflate)" "inflate"
 check_codec "brotli" "BrotliDecoderDecompressStream"
 check_codec "zstd" "ZSTD_decompressStream"
+check_codec "nghttp2 (HTTP/2)" "nghttp2_session_client_new"
 if [[ "$codec_missing" -ne 0 ]]; then
   echo "One or more content-encoding codecs are missing from libcurl.a" >&2
   exit 1
@@ -283,7 +305,7 @@ cp -f "$BUILD_ROOT/libopenssl.so" "$WRAPPER_LIBS_DIR/libopenssl.so"
 # libcurl.a is static, so the content-encoding codecs it references must be
 # provided at the final libpbcurlwrapper.so link. Stage their static archives
 # next to libcurl.a; the wrapper CMakeLists links them.
-for codec in libz.a libbrotlidec.a libbrotlicommon.a libzstd.a; do
+for codec in libz.a libbrotlidec.a libbrotlicommon.a libzstd.a libnghttp2.a; do
   if [[ ! -f "$DEPS_PREFIX/lib/$codec" ]]; then
     echo "missing codec archive: $DEPS_PREFIX/lib/$codec" >&2
     exit 1
