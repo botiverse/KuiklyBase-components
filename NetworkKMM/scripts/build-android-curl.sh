@@ -112,7 +112,7 @@ if [[ ! -f "${OPENSSL_PREFIX}/lib/libssl.a" || "$(cat "$OPENSSL_STAMP" 2>/dev/nu
     PATH="${TOOLCHAIN_ROOT}/bin:${PATH}" \
       ./Configure "$OPENSSL_TARGET" \
       -D__ANDROID_API__="$ANDROID_API" \
-      no-shared no-tests no-apps \
+      no-shared no-tests no-apps no-docs \
       --prefix="$OPENSSL_PREFIX" \
       --openssldir="$OPENSSL_PREFIX/ssl"
     PATH="${TOOLCHAIN_ROOT}/bin:${PATH}" make -j"$JOBS" build_libs
@@ -127,17 +127,28 @@ fetch "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
 if [[ ! -f "${CURL_BUILD}/lib/libcurl.a" || "$(cat "$CURL_STAMP" 2>/dev/null)" != "$BUILD_CONFIG" ]]; then
   rm -rf "$CURL_SOURCE" "$CURL_BUILD"
   tar -xzf "${DOWNLOADS_DIR}/curl-${CURL_VERSION}.tar.gz" -C "$BUILD_ROOT"
+  # Explicit OpenSSL paths: the NDK toolchain file re-roots find_library into
+  # the sysroot (CMAKE_FIND_ROOT_PATH_MODE=ONLY), so OPENSSL_ROOT_DIR alone is
+  # ignored — the spike learned this the hard way; keep its proven invocation.
   cmake -S "$CURL_SOURCE" -B "$CURL_BUILD" \
     -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake" \
     -DANDROID_ABI="$ANDROID_ABI" \
     -DANDROID_PLATFORM="android-${ANDROID_API}" \
+    -DANDROID_STL=c++_static \
+    -DCMAKE_BUILD_TYPE=Release \
     -DBUILD_SHARED_LIBS=OFF \
     -DBUILD_CURL_EXE=OFF \
     -DBUILD_LIBCURL_DOCS=OFF \
-    -DCURL_DISABLE_LDAP=ON \
+    -DBUILD_MISC_DOCS=OFF \
+    -DENABLE_CURL_MANUAL=OFF \
+    -DBUILD_TESTING=OFF \
+    -DHTTP_ONLY=ON \
     -DCURL_USE_OPENSSL=ON \
     -DOPENSSL_ROOT_DIR="$OPENSSL_PREFIX" \
     -DOPENSSL_USE_STATIC_LIBS=ON \
+    -DOPENSSL_INCLUDE_DIR="${OPENSSL_PREFIX}/include" \
+    -DOPENSSL_CRYPTO_LIBRARY="${OPENSSL_PREFIX}/lib/libcrypto.a" \
+    -DOPENSSL_SSL_LIBRARY="${OPENSSL_PREFIX}/lib/libssl.a" \
     -DCURL_USE_LIBPSL=OFF \
     -DCURL_USE_LIBSSH2=OFF \
     -DCURL_ZLIB=OFF \
