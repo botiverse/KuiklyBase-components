@@ -25,7 +25,17 @@
   Completion diagnostics expose negotiated protocol as `UNKNOWN` until native
   protocol extraction is implemented.
 
-## 0.1.0-raft.21 / 0.1.0-raft.21-ohos (HTTP/2 for all curl engines)
+## 0.1.0-raft.22 / 0.1.0-raft.22-ohos (HTTP/2 for all curl engines)
+
+> Version-trap note: **raft.21 is BURNED — never consume it.** Its publish
+> run failed midway (GitHub Packages 409 on a retried PUT for the
+> iosSimulatorArm64 klib after a partial server-side write), leaving that
+> module partial and the root KMP metadata unpublished. Registry versions
+> are immutable, so the coordinate cannot be repaired (same failure mode
+> and remedy as raft.11 → raft.12). raft.22 is the identical content,
+> republished cleanly.
+
+## 0.1.0-raft.21 / 0.1.0-raft.21-ohos (HTTP/2 for all curl engines) — BURNED, see above
 
 - All three curl engines negotiate HTTP/2 (#83, task #30): nghttp2 1.64.0
   (SHA-256 pinned) statically linked into the Android per-ABI `.so`, the
