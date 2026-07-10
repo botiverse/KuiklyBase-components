@@ -1,5 +1,29 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.18 / 0.1.0-raft.18-ohos (production iOS curl transport)
+
+- iOS gains the production curl transport (task #23): `engine=curl` is an
+  explicit opt-in delegate behind the typed selector — buffered requests,
+  streaming downloads, streaming uploads with progress, cancellation (both
+  pre-start and cross-thread external), callback-failure latching, and
+  delegate-owned capabilities. The default iOS engine remains Ktor/Darwin;
+  the CURL delegate registers only when the native artifact loads AND an
+  app-owned CA path is set (`VBTransportIosCurl.caInfoPath`) — fail-closed
+  without one.
+- The AAR-style committed-binary line now covers iOS (task #24):
+  `network/libs/ios/NetworkKMMCurl.xcframework` — per-slice static library
+  (shared pbcurlwrapper + pinned OpenSSL 3.5.4/curl 8.16.0 merged), built and
+  symbol-verified by the `networkkmm-ios-native` macOS lane, consumed by the
+  KMP ios targets via cinterop. Phase 2's three-end native line is complete.
+- Blocking curl performs and upload producers run on dedicated isolated
+  thread pools (`NetworkKmmIosCurlPerform` ×4 / `NetworkKmmIosCurlUploadWriter`
+  ×2) — never the shared `Dispatchers.Default`; the concurrency runtime gate
+  pins more concurrent uploads than the perform pool width.
+- Repo hygiene: upstream sample/demo leftovers and an accidentally committed
+  coredump removed (task #26); the Android native CI lane runs in the
+  `kuikly-ci-images/android-ndk` container with SHA-256-pinned baked
+  toolchain + OpenSSL/curl sources (task #28).
+
 ## 0.1.0-raft.17 / 0.1.0-raft.17-ohos (typed selector and Android curl transport)
 
 - JNI shim: header-loop `JStringUtfChars` RAII wrappers now release their
