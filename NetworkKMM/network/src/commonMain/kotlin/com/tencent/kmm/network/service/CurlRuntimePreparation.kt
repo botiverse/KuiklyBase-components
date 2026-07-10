@@ -32,6 +32,36 @@ private const val CURL_RUNTIME_READY = "com.tencent.kmm.network.curl.runtime.rea
 private const val CURL_RUNTIME_CA_PATH = "com.tencent.kmm.network.curl.runtime.ca_path"
 private const val CURL_RUNTIME_PROXY_URL = "com.tencent.kmm.network.curl.runtime.proxy_url"
 
+internal data class CurlSystemProxySupport(
+    val available: Boolean,
+    val detail: String
+)
+
+internal data class CurlSystemProxyResolution(
+    val available: Boolean,
+    val proxyUrl: String? = null,
+    val reason: NetworkEngineUnavailableReason? = null,
+    val detail: String? = null
+) {
+    companion object {
+        fun resolved(proxyUrl: String): CurlSystemProxyResolution =
+            CurlSystemProxyResolution(available = true, proxyUrl = proxyUrl)
+
+        fun unavailable(
+            reason: NetworkEngineUnavailableReason,
+            detail: String
+        ): CurlSystemProxyResolution = CurlSystemProxyResolution(
+            available = false,
+            reason = reason,
+            detail = detail
+        )
+    }
+}
+
+internal expect val curlSystemProxySupport: CurlSystemProxySupport
+
+internal expect fun resolveCurlSystemProxy(url: String): CurlSystemProxyResolution
+
 internal fun prepareCurlRuntime(request: NetworkRequest): NetworkEngineAvailability {
     if (request.metadata[CURL_RUNTIME_READY] == "true") {
         return NetworkEngineAvailability.Available
@@ -73,6 +103,16 @@ internal fun prepareCurlRuntime(request: NetworkRequest): NetworkEngineAvailabil
     val proxyUrl = when (configuration.proxy.mode) {
         NetworkCurlProxyMode.DIRECT -> ""
         NetworkCurlProxyMode.MANUAL -> configuration.proxy.url.orEmpty()
+        NetworkCurlProxyMode.ANDROID_SYSTEM -> {
+            val resolution = resolveCurlSystemProxy(request.resolvedUrl())
+            if (!resolution.available) {
+                return NetworkEngineAvailability.unavailable(
+                    reason = resolution.reason ?: NetworkEngineUnavailableReason.PROXY_SYSTEM_UNAVAILABLE,
+                    detail = resolution.detail ?: "Android system proxy resolution is unavailable."
+                )
+            }
+            resolution.proxyUrl.orEmpty()
+        }
         NetworkCurlProxyMode.PAC_UNRESOLVED -> {
             return NetworkEngineAvailability.unavailable(
                 reason = NetworkEngineUnavailableReason.PROXY_PAC_UNSUPPORTED,
@@ -102,6 +142,8 @@ internal fun curlRuntimeFailureResponse(
         NetworkEngineUnavailableReason.TRUST_STORE_INVALID -> NetworkErrorKind.TLS
         NetworkEngineUnavailableReason.PROXY_RESOLUTION_REQUIRED,
         NetworkEngineUnavailableReason.PROXY_PAC_UNSUPPORTED,
+        NetworkEngineUnavailableReason.PROXY_SYSTEM_UNSUPPORTED,
+        NetworkEngineUnavailableReason.PROXY_SYSTEM_UNAVAILABLE,
         NetworkEngineUnavailableReason.PROXY_INVALID -> NetworkErrorKind.CONNECT
         NetworkEngineUnavailableReason.HTTPDNS_UNSUPPORTED -> NetworkErrorKind.DNS
         NetworkEngineUnavailableReason.HTTP3_UNSUPPORTED,
@@ -140,11 +182,15 @@ internal fun curlNetworkEngineCapabilities(): NetworkEngineCapabilities {
         manualProxy = NetworkEngineFeatureStatus.available(
             "Direct/manual proxy is passed explicitly through CURLOPT_PROXY."
         ),
-        pacProxy = NetworkEngineFeatureStatus.unavailable(
-            reason = NetworkEngineFeatureReason.PAC_UNSUPPORTED,
-            compiledIn = true,
-            detail = "The host must resolve PAC/system proxy rules to a fixed URL before curl rollout."
-        ),
+        pacProxy = if (curlSystemProxySupport.available) {
+            NetworkEngineFeatureStatus.available(curlSystemProxySupport.detail)
+        } else {
+            NetworkEngineFeatureStatus.unavailable(
+                reason = NetworkEngineFeatureReason.PAC_UNSUPPORTED,
+                compiledIn = true,
+                detail = curlSystemProxySupport.detail
+            )
+        },
         httpDns = NetworkEngineFeatureStatus.unavailable(
             reason = NetworkEngineFeatureReason.NOT_IMPLEMENTED,
             detail = "No custom resolver contract currently preserves original-host SNI and certificate verification."

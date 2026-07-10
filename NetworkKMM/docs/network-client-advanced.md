@@ -191,6 +191,11 @@ and PAC contract:
 - `direct()` sets an empty `CURLOPT_PROXY`, including disabling environment proxy inheritance.
 - `manual(url)` accepts a fixed `http(s)` or SOCKS URL already resolved by the host and passes it through
   `CURLOPT_PROXY`; environment `no_proxy` cannot override that host decision.
+- `androidSystem()` reads Android's current proxy decision for every request. Static proxy exclusions
+  are applied by the default `ProxySelector`. When PAC is active, Android exposes a localhost HTTP
+  forwarding proxy; curl connects to that local endpoint and Android keeps ownership of PAC download,
+  per-URL evaluation, ordered fallback, and proxy-change updates. If the local port is not ready or the
+  selector cannot produce one effective decision, curl is ineligible and Android falls back to Ktor.
 - `pacUnresolved()` makes curl ineligible. The selector falls back to Ktor on Android/iOS; an OHOS host
   must resolve PAC to a fixed URL before using its curl platform default.
 
@@ -218,10 +223,12 @@ Platform APIs can evaluate the effective proxy outside libcurl, but the result i
   requires newer releases for phone/tablet PAC evaluation; consumers compatible with API 12 cannot
   assume it exists.
 
-Full PAC parity therefore needs a per-request platform resolver and ordered retry state latched to one
-`NetworkCall`. It must also define whether a streaming upload can be replayed after a proxy connection
-failure. Passing only the first PAC result to `manual(url)` is not full PAC support and must not be
-reported through `NetworkEngineCapabilities.pacProxy`.
+Android `androidSystem()` avoids reimplementing these semantics by delegating the whole PAC decision to
+the OS localhost proxy. A host-side PAC evaluator on platforms without that forwarding proxy still needs
+a per-request resolver and ordered retry state latched to one `NetworkCall`; it must also define whether
+a streaming upload can be replayed after a proxy connection failure. Passing only the first PAC result
+to `manual(url)` is not full PAC support. `NetworkEngineCapabilities.pacProxy` is therefore available on
+Android and remains unavailable on Apple/OHOS curl delegates.
 
 Use `NetworkEngineRolloutConfig` for stable, reversible A/B cohorts instead of ad-hoc percentages:
 

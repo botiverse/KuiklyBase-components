@@ -164,8 +164,9 @@ check(status.configured) { status.detail ?: status.failureReason.name }
 ```
 
 使用 `scripts/prepare-app-owned-ca-bundle.sh` 生成仓库固定版本的 Mozilla CA 文件；runtime 会拒绝
-缺失或 SHA-256 不匹配的文件。Proxy 必须明确选择 `direct()`、`manual(fixedProxyUrl)` 或
-`pacUnresolved()`；PAC 未解析时 curl 会变为 ineligible，不会静默绕过系统代理。CA 轮换、稳定
+缺失或 SHA-256 不匹配的文件。Proxy 必须明确选择 `direct()`、`manual(fixedProxyUrl)`、Android 专用
+`androidSystem()` 或 `pacUnresolved()`。Android 系统 PAC 会走 OS 维护的本地转发代理；其他平台 PAC
+未解析时 curl 会变为 ineligible，不会静默绕过系统代理。CA 轮换、稳定
 A/B 灰度、立即回滚、diagnostics 和当前 HTTPDNS/HTTP3 gate 见
 [NetworkClient 进阶能力](./docs/network-client-advanced-zh.md)。
 

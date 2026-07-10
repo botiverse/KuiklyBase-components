@@ -81,12 +81,17 @@ OkHttp 5.x implements RFC 8305 racing natively (`fastFallback`): v6 gets a
 ### B. Cronet (Chromium network stack) — EXCLUDED for this problem class
 
 - Capability: native HE, QUIC/HTTP3, connection migration.
-- Exclusion rationale (HanXin, agreed): our bug lives in proxy environments,
-  and Cronet's system-proxy handling differs from OkHttp/HttpURLConnection —
-  fixing a proxy bug by introducing an engine whose proxy behavior needs
-  re-validation is risk in the wrong direction. Plus +2–5 MB per-ABI binary
-  cost, no official Ktor engine, Android-only. Re-enters only if QUIC/HTTP3
-  becomes a goal in its own right, and then competes with C's curl-HTTP3 path.
+- Proxy clarification (verified against Chromium main): Android Cronet does not
+  execute PAC JavaScript inside Cronet. It ignores the PAC URL and connects to
+  Android's localhost HTTP proxy, which owns PAC evaluation/fallback. This is
+  effective Android system-PAC support and lowers the semantic risk versus raw
+  libcurl. Newer Cronet `ProxyOptions` also supports app-supplied ordered proxy
+  fallback, but overrides system proxy configuration and is provider-version
+  dependent.
+- Exclusion rationale remains: +2–5 MB per-ABI binary cost, no official Ktor
+  engine, Android-only, and no reusable PAC solution for iOS/OHOS. Re-enters
+  only if QUIC/HTTP3 becomes a goal in its own right, and then competes with C's
+  curl-HTTP3 path.
 
 ### C. libcurl unification (all platforms on pbcurlwrapper) — the deep-cost analysis
 
@@ -164,8 +169,11 @@ Android to libcurl would *lose* user-CA trust the current stack has.
     [`ProxySelector.getDefault().select(uri)`](https://developer.android.com/reference/java/net/ProxySelector).
     The platform
     [PAC selector](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/master/core/java/android/net/PacProxySelector.java)
-    returns ordered direct, HTTP, and SOCKS entries; the caller must try the
-    next entry and notify `connectFailed` when appropriate.
+    returns ordered direct, HTTP, and SOCKS entries. Android also binds PAC to
+    a localhost HTTP forwarding proxy. The production bridge uses that local
+    endpoint per request, so Android retains PAC evaluation/fallback and curl
+    still receives one fixed `CURLOPT_PROXY` value. If that endpoint is not
+    ready, selection fails closed to Ktor.
   - iOS exposes `CFNetworkCopySystemProxySettings` and
     `CFNetworkCopyProxiesForURL`
     (<https://developer.apple.com/documentation/cfnetwork/cfnetworkcopyproxiesforurl(_:_:)>).
@@ -177,10 +185,11 @@ Android to libcurl would *lose* user-CA trust the current stack has.
     from API 20. Current NetworkKMM OHOS consumers declare compatibility with
     API 12, and the official PAC device matrix requires newer phone/tablet
     releases, so PAC resolution cannot be unconditional.
-- A complete bridge must latch the ordered proxy plan to one `NetworkCall`,
-  retry connection establishment in order, preserve a final `DIRECT` entry,
-  and define replay behavior for streaming request bodies. Mapping only the
-  first PAC entry to `CURLOPT_PROXY` is not PAC support.
+- Platforms without Android's localhost forwarder need a complete bridge that
+  latches the ordered proxy plan to one `NetworkCall`, retries connection
+  establishment in order, preserves a final `DIRECT` entry, and defines replay
+  behavior for streaming request bodies. Mapping only the first PAC entry to
+  `CURLOPT_PROXY` is not PAC support.
 - VPN-type proxies (ClashMeta in TUN mode) are transparent at socket level
   and unaffected; HTTP-proxy/PAC setups are the exposure.
 - Required validation: the proxy test matrix (WiFi proxy, PAC, VPN/TUN,
@@ -250,7 +259,7 @@ NSURLSessionTaskMetrics, which maps 1:1 to the CURLINFO segments). But the
 | APK/HAP size delta | ~hundreds of KB (okhttp+okio, mostly already present transitively → near-zero net) | **+2–5 MB** (cronet .so ×2 ABIs; largest cost item) | Android adds libcurl+TLS .so ~1–2 MB/ABI (OHOS sunk) |
 | Bump/publish complexity | Lowest: pure-Kotlin engine swap, existing raft.N line, no .so rebuild | Medium: Play-Services variant vs bundled .so ABI matrix | High: Android .so joins the native pipeline; every release ships native artifacts |
 | Three-end consistency | Android-only fix (iOS native HE, OHOS libcurl) — engines stay heterogeneous but every end has HE | Worst: Android-only, no OHOS/iOS benefit | Best available: Android+OHOS same stack, unified markers; iOS stays Darwin (see C-6) |
-| Migration risk surface | Low: Ktor API unchanged, one dependency, easy rollback (shipped with kill switch) | Medium-high: proxy behavior is a new variable exactly where our bug lives | High: TLS bridge (security review), proxy bridge, PAC unsupported, JNI + custom Ktor engine |
+| Migration risk surface | Low: Ktor API unchanged, one dependency, easy rollback (shipped with kill switch) | Medium: Android system PAC delegates to the OS, but provider versions/app-proxy override still need validation | High: app-owned TLS, Android proxy bridge, Apple/OHOS PAC gaps, JNI + custom Ktor engine |
 
 Plus the toolchain line item from A's implementation: **KBA Kotlin 2.0.21
 caps JVM dependency versions** (OkHttp had to be pinned to the last
@@ -342,8 +351,8 @@ power-aware scheduling — and iOS never exhibited the P1 symptom.
    impossible. The correct shape is a verify callback delegating to
    `SecTrustEvaluateWithError` (which also honours user-installed certs):
    ~2–3 person-days **+ security review**
-4. Proxy bridge: `CFNetworkCopyProxiesForURL` (includes PAC evaluation) →
-   `CURLOPT_PROXY`: ~1–2 person-days
+4. Proxy bridge: `CFNetworkCopyProxiesForURL`, asynchronous PAC URL execution,
+   and ordered retry around `CURLOPT_PROXY`: ~1–2 person-days
 5. Recurring tax: every curl/OpenSSL CVE changes from a version-line edit to
    an iOS static-library rebuild as well
 
@@ -424,9 +433,10 @@ across three heterogeneous engines:
 2. **CA-bundle refresh becomes ours**: no automatic OS CA updates — we ship and
    rotate the bundle. This is inherent to bundling and *required* for the
    self-signed goal.
-3. **Proxy / PAC**: libcurl reads neither platform proxy nor PAC (C-2). At
-   minimum wire system direct/manual proxy per end; PAC needs a platform
-   evaluator (e.g. `CFNetworkCopyProxiesForURL` on iOS) feeding `CURLOPT_PROXY`.
+3. **Proxy / PAC**: libcurl reads neither platform proxy nor PAC (C-2). Android
+   now feeds curl the OS localhost PAC forwarder per request. Apple/OHOS still
+   need platform evaluators and ordered retry rather than a first-result-only
+   `CURLOPT_PROXY` mapping.
 4. **CVE tax**: OpenSSL/curl CVEs become a static-lib rebuild across ends, not a
    version-line edit.
 5. **H3 build**: ngtcp2/quiche cross-compile per end (Apple + Android + OHOS).
@@ -601,13 +611,14 @@ of a chat thread.
 - **Phase 3 — #25 (implemented, pending merge)**: one app-owned CA contract on
   all curl ends, with a dated Mozilla snapshot and reviewed SHA-256 pin;
   runtime byte verification; valid/unknown/expired/hostname-mismatch/wrong-CA
-  runtime matrices on Android and iOS; explicit direct/manual/PAC-unresolved
-  proxy modes with observed CONNECT-proxy gates; stable basis-point cohorts
-  and immediate rollback; and fail-explicit HttpDNS/HTTP-3 capability gates.
-  PAC execution is intentionally not claimed: the host must resolve it to a
-  fixed proxy URL. HTTPDNS remains unavailable until a resolver preserves the
-  original host for SNI/certificate verification, and HTTP/3 remains
-  unavailable until the native artifacts compile and test a QUIC backend.
+  runtime matrices on Android and iOS; explicit direct/manual/Android-system/
+  PAC-unresolved proxy modes with observed CONNECT-proxy gates; stable
+  basis-point cohorts and immediate rollback; and fail-explicit HttpDNS/HTTP-3
+  capability gates. Android system PAC delegates to the OS localhost forwarding
+  proxy; Apple/OHOS PAC execution is intentionally not claimed. HTTPDNS remains
+  unavailable until a resolver preserves the original host for SNI/certificate
+  verification, and HTTP/3 remains unavailable until the native artifacts
+  compile and test a QUIC backend.
 
 ### Acceptance
 
@@ -615,8 +626,9 @@ Each `CURL`-branch end is accepted against the **D-5 rubric** (transport /
 bundled-OpenSSL trust + positive and negative certificate matrix / explicit
 proxy), on real runtime CI lanes (Android emulator + iOS simulator). “System
 proxy” in this phase means the app/platform bridge has resolved the effective
-decision and passes either direct or one fixed proxy URL; native PAC discovery
-is outside the accepted surface. The selector's own acceptance: default stays
-on the current engine when curl is off, a cohort decision is stable, remote
+decision and passes either direct or one fixed proxy URL. Android PAC is inside
+the accepted surface through the OS localhost forwarder; Apple/OHOS native PAC
+resolution remains outside it. The selector's own acceptance: default stays on
+the current engine when curl is off, a cohort decision is stable, remote
 rollback affects the next call without switching an in-flight retry, and every
 fallback reports a precise reason.

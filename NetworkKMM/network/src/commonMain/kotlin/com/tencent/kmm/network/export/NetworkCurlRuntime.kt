@@ -40,6 +40,12 @@ enum class NetworkCurlProxyMode {
     MANUAL,
 
     /**
+     * Use Android's current process proxy decision for every request. PAC is
+     * handled by Android's localhost forwarding proxy, not by libcurl.
+     */
+    ANDROID_SYSTEM,
+
+    /**
      * A PAC/system proxy exists but has not been resolved for this request.
      * PAC can return an ordered proxy chain, so taking only its first entry is
      * not equivalent to supporting the platform proxy contract.
@@ -58,6 +64,9 @@ data class NetworkCurlProxyConfiguration(
         fun manual(url: String): NetworkCurlProxyConfiguration =
             NetworkCurlProxyConfiguration(NetworkCurlProxyMode.MANUAL, url)
 
+        fun androidSystem(): NetworkCurlProxyConfiguration =
+            NetworkCurlProxyConfiguration(NetworkCurlProxyMode.ANDROID_SYSTEM)
+
         fun pacUnresolved(): NetworkCurlProxyConfiguration =
             NetworkCurlProxyConfiguration(NetworkCurlProxyMode.PAC_UNRESOLVED)
     }
@@ -68,8 +77,9 @@ data class NetworkCurlProxyConfiguration(
  *
  * The proxy choice is intentionally explicit. libcurl does not inherit the
  * Android/iOS/OHOS platform proxy/PAC contract, so a host must either declare
- * direct access, pass a fixed platform-resolved proxy URL, or mark PAC as
- * unresolved so routing can fail closed to the platform engine.
+ * direct access, use Android's current system proxy, pass a fixed
+ * platform-resolved proxy URL, or mark PAC as unresolved so routing can fail
+ * closed to the platform engine.
  */
 data class NetworkCurlRuntimeConfiguration(
     val trustStore: NetworkCurlTrustStore,

@@ -4,8 +4,9 @@
 
 - All curl delegates now consume one verified `VBTransportCurl` runtime
   configuration: app-owned CA path + expected SHA-256 and an explicit
-  direct/manual/PAC-unresolved proxy decision. Missing, modified, unreadable,
-  or mismatched bundles fail closed; failed reconfiguration clears stale state.
+  direct/manual/Android-system/PAC-unresolved proxy decision. Missing,
+  modified, unreadable, or mismatched bundles fail closed; failed
+  reconfiguration clears stale state.
 - The pinned CA staging helper uses the dated Mozilla `2026-05-14` snapshot and
   verifies SHA-256 before atomically publishing the file. Android emulator and
   iOS simulator runtime lanes cover valid, unknown, expired,
@@ -15,9 +16,11 @@
   salt, and immediate platform-default rollback. Selection diagnostics include
   the cohort bucket, requested/selected engines, and exact ineligibility reason.
 - Curl capabilities now report app-owned trust/manual proxy truth and keep PAC,
-  HTTPDNS, and HTTP/3 fail-explicit. PAC is per-URL and may return an ordered
-  proxy chain; libcurl evaluates neither the script nor multi-proxy failover,
-  so a first-result-only mapping is not reported as support. HTTPDNS has no
+  HTTPDNS, and HTTP/3 fail-explicit. Android `androidSystem()` now reads the
+  current process proxy per request and routes PAC through Android's localhost
+  forwarding proxy, preserving OS-owned script evaluation and fallback without
+  adding a PAC interpreter to libcurl. Apple/OHOS remain explicit-unavailable;
+  a first-result-only PAC mapping is not reported as support. HTTPDNS has no
   SNI-safe resolver contract yet; current native artifacts have no QUIC backend.
   Completion diagnostics expose negotiated protocol as `UNKNOWN` until native
   protocol extraction is implemented.

@@ -42,6 +42,8 @@ import com.tencent.kmm.network.service.NetworkEngineDiagnosticsListener
 import com.tencent.kmm.network.service.NetworkEngineSelection
 import com.tencent.kmm.network.service.NetworkEngineSelectionDiagnostics
 import com.tencent.kmm.network.service.NetworkTransportEngine
+import com.tencent.kmm.network.service.AndroidCurlSystemProxyResolver
+import com.tencent.kmm.network.service.CurlSystemProxyResolution
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayInputStream
@@ -97,6 +99,7 @@ class AndroidCurlRuntimeInstrumentedTest {
     @After
     fun tearDown() {
         server.close()
+        AndroidCurlSystemProxyResolver.testResolver = null
         VBTransportCurl.clear()
         trustStoreFile.delete()
     }
@@ -120,7 +123,8 @@ class AndroidCurlRuntimeInstrumentedTest {
             Log.i(
                 TAG,
                 "completed passed=true gates=buffered,download,upload,external-cancel," +
-                    "pre-start,cross-thread,callback-failure,concurrent-upload,cert-matrix,proxy"
+                    "pre-start,cross-thread,callback-failure,concurrent-upload,cert-matrix," +
+                    "manual-proxy,android-system-pac-proxy"
             )
         }
     }
@@ -350,6 +354,19 @@ class AndroidCurlRuntimeInstrumentedTest {
                 )
                 assertTrue(curlClient().execute(NetworkRequest(url = valid.url())).isSuccess)
                 assertTrue("manual proxy must observe CONNECT", proxy.awaitConnect())
+            }
+
+            RuntimeConnectProxy().use { proxy ->
+                AndroidCurlSystemProxyResolver.testResolver = {
+                    CurlSystemProxyResolution.resolved("http://127.0.0.1:${proxy.port}")
+                }
+                try {
+                    configureCurl(trustStoreFile, NetworkCurlProxyConfiguration.androidSystem())
+                    assertTrue(curlClient().execute(NetworkRequest(url = valid.url())).isSuccess)
+                    assertTrue("Android system PAC proxy must observe CONNECT", proxy.awaitConnect())
+                } finally {
+                    AndroidCurlSystemProxyResolver.testResolver = null
+                }
             }
         } finally {
             valid.close()

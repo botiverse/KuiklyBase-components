@@ -164,9 +164,10 @@ check(status.configured) { status.detail ?: status.failureReason.name }
 ```
 
 Use `scripts/prepare-app-owned-ca-bundle.sh` to stage the repository-pinned Mozilla snapshot. The
-runtime rejects missing or hash-mismatched files. Choose `direct()`, `manual(fixedProxyUrl)`, or
-`pacUnresolved()` explicitly; unresolved PAC makes curl ineligible rather than silently bypassing the
-platform proxy. See [Advanced NetworkClient features](./docs/network-client-advanced.md) for CA
+runtime rejects missing or hash-mismatched files. Choose `direct()`, `manual(fixedProxyUrl)`,
+Android-only `androidSystem()`, or `pacUnresolved()` explicitly. Android system PAC uses the local
+forwarding proxy maintained by the OS; unresolved PAC elsewhere makes curl ineligible rather than
+silently bypassing the platform proxy. See [Advanced NetworkClient features](./docs/network-client-advanced.md) for CA
 rotation, stable A/B rollout, rollback, diagnostics, and the current HTTPDNS/HTTP3 gates.
 
 ### Common Network Request Examples

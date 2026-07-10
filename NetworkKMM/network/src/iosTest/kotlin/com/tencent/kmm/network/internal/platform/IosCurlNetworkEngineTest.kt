@@ -157,6 +157,27 @@ class IosCurlNetworkEngineTest {
     }
 
     @Test
+    fun androidSystemProxyModeFailsClosedOnIos() = runBlocking {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    trustStorePath,
+                    networkCurlSha256Hex("unit-test-ca".encodeToByteArray())
+                ),
+                proxy = NetworkCurlProxyConfiguration.androidSystem()
+            )
+        )
+        val bridge = FakeBridge()
+        val request = NetworkRequest(url = "https://example.test")
+
+        val response = IosCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals(NetworkErrorKind.CONNECT, response.error?.kind)
+        assertNull(bridge.lastRequest)
+        assertFalse(IosCurlNetworkEngine(bridge).capabilities.pacProxy.rolloutEligible)
+    }
+
+    @Test
     fun responseTaxonomyPreservesHttpAndCurlFailures() = runBlocking {
         val bridge = FakeBridge()
         val engine = IosCurlNetworkEngine(bridge)

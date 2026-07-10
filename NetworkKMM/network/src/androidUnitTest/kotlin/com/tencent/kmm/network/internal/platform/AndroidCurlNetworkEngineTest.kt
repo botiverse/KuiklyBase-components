@@ -36,11 +36,21 @@ import com.tencent.kmm.network.export.networkCurlSha256Hex
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngineSelection
 import com.tencent.kmm.network.service.NetworkTransportEngine
+import com.tencent.kmm.network.service.AndroidCurlSystemProxyResolver
+import com.tencent.kmm.network.service.CurlSystemProxyResolution
+import com.tencent.kmm.network.service.NetworkEngineUnavailableReason
+import com.tencent.kmm.network.service.resolveAndroidCurlSystemProxy
 import com.tencent.kmm.network.service.resolveNetworkEngine
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import java.io.File
+import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.Proxy
+import java.net.ProxySelector
+import java.net.SocketAddress
+import java.net.URI
 import kotlin.test.AfterTest
 import kotlin.test.BeforeTest
 import kotlin.test.Test
@@ -75,6 +85,7 @@ class AndroidCurlNetworkEngineTest {
     @AfterTest
     fun resetBridge() {
         AndroidCurlEngineProvider.testBridge = null
+        AndroidCurlSystemProxyResolver.testResolver = null
         VBTransportCurl.clear()
         trustStoreFile.delete()
     }
@@ -138,6 +149,153 @@ class AndroidCurlNetworkEngineTest {
         AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
 
         assertEquals("http://127.0.0.1:8888", bridge.lastRequest?.proxyUrl)
+    }
+
+    @Test
+    fun androidSystemProxyIsResolvedPerRequestAndLatchedIntoNativeRequest() = runBlocking {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.androidSystem()
+            )
+        )
+        val resolvedUrls = mutableListOf<String>()
+        AndroidCurlSystemProxyResolver.testResolver = { url ->
+            resolvedUrls += url
+            CurlSystemProxyResolution.resolved("http://localhost:3128")
+        }
+        val bridge = FakeBridge()
+        val request = NetworkRequest(url = "https://example.test", path = "/through-pac")
+
+        AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals(listOf("https://example.test/through-pac"), resolvedUrls)
+        assertEquals("http://localhost:3128", bridge.lastRequest?.proxyUrl)
+        assertTrue(AndroidCurlNetworkEngine(bridge).capabilities.pacProxy.rolloutEligible)
+    }
+
+    @Test
+    fun androidPacProxyUsesSystemLocalForwarder() {
+        val resolution = resolveAndroidCurlSystemProxy(
+            url = "https://example.test/path",
+            proxySelector = null,
+            isPacSelector = true,
+            property = { key ->
+                mapOf(
+                    "https.proxyHost" to "localhost",
+                    "https.proxyPort" to "4321"
+                )[key]
+            }
+        )
+
+        assertTrue(resolution.available)
+        assertEquals("http://localhost:4321", resolution.proxyUrl)
+    }
+
+    @Test
+    fun androidPacProxyFailsClosedUntilLocalForwarderIsReady() {
+        val resolution = resolveAndroidCurlSystemProxy(
+            url = "https://example.test/path",
+            proxySelector = null,
+            isPacSelector = true,
+            property = { key ->
+                mapOf(
+                    "https.proxyHost" to "localhost",
+                    "https.proxyPort" to "-1"
+                )[key]
+            }
+        )
+
+        assertFalse(resolution.available)
+        assertEquals(NetworkEngineUnavailableReason.PROXY_SYSTEM_UNAVAILABLE, resolution.reason)
+    }
+
+    @Test
+    fun unavailableAndroidSystemProxyFallsBackToKtorDuringSelection() {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.androidSystem()
+            )
+        )
+        AndroidCurlSystemProxyResolver.testResolver = {
+            CurlSystemProxyResolution.unavailable(
+                NetworkEngineUnavailableReason.PROXY_SYSTEM_UNAVAILABLE,
+                "PAC localhost proxy is not ready"
+            )
+        }
+        val bridge = FakeBridge()
+        val curl = AndroidCurlNetworkEngine(bridge)
+        val ktor = object : com.tencent.kmm.network.service.NetworkEngine {
+            override suspend fun execute(request: NetworkRequest, call: NetworkCall) = error("unused")
+        }
+        val request = NetworkRequest(url = "https://example.test")
+
+        val resolved = resolveNetworkEngine(
+            selection = NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL),
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { engine -> if (engine == NetworkTransportEngine.KTOR) ktor else curl },
+            request = request
+        )
+
+        assertSame(ktor, resolved.engine)
+        assertEquals(NetworkEngineUnavailableReason.PROXY_SYSTEM_UNAVAILABLE, resolved.diagnostics.unavailableReason)
+        assertEquals("PAC localhost proxy is not ready", resolved.diagnostics.unavailableDetail)
+        assertNull(bridge.lastRequest)
+    }
+
+    @Test
+    fun androidStaticSystemProxyUsesSelectorPerRequest() {
+        val selector = object : ProxySelector() {
+            override fun select(uri: URI): List<Proxy> = if (uri.host == "intranet.test") {
+                listOf(Proxy.NO_PROXY)
+            } else {
+                listOf(Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved("proxy.test", 8080)))
+            }
+
+            override fun connectFailed(uri: URI, sa: SocketAddress, ioe: IOException) = Unit
+        }
+
+        val direct = resolveAndroidCurlSystemProxy(
+            url = "https://intranet.test",
+            proxySelector = selector,
+            isPacSelector = false
+        )
+        val proxied = resolveAndroidCurlSystemProxy(
+            url = "https://external.test",
+            proxySelector = selector,
+            isPacSelector = false
+        )
+
+        assertEquals("", direct.proxyUrl)
+        assertEquals("http://proxy.test:8080", proxied.proxyUrl)
+    }
+
+    @Test
+    fun androidSystemProxyDoesNotCollapseOrderedChoicesToFirstEntry() {
+        val selector = object : ProxySelector() {
+            override fun select(uri: URI): List<Proxy> = listOf(
+                Proxy(Proxy.Type.HTTP, InetSocketAddress.createUnresolved("primary.test", 8080)),
+                Proxy.NO_PROXY
+            )
+
+            override fun connectFailed(uri: URI, sa: SocketAddress, ioe: IOException) = Unit
+        }
+
+        val resolution = resolveAndroidCurlSystemProxy(
+            url = "https://external.test",
+            proxySelector = selector,
+            isPacSelector = false
+        )
+
+        assertFalse(resolution.available)
+        assertEquals(NetworkEngineUnavailableReason.PROXY_SYSTEM_UNAVAILABLE, resolution.reason)
     }
 
     @Test

@@ -183,6 +183,10 @@ libcurl 不会自动继承 Android/iOS/OHOS 完整的系统 proxy/PAC 合同，�
 
 - `direct()` 通过空 `CURLOPT_PROXY` 关闭代理，同时禁止继承环境代理。
 - `manual(url)` 接收 App/平台已经解析好的固定 `http(s)` 或 SOCKS URL；环境 `no_proxy` 不能覆盖该决策。
+- `androidSystem()` 会为每个请求读取 Android 当前代理决策。静态代理排除规则由默认 `ProxySelector`
+  处理；PAC 生效时，Android 会提供 localhost HTTP 转发代理，curl 只连接这个本地端点，PAC 下载、按 URL
+  执行、有序 fallback 和代理变更仍由系统负责。本地端口未就绪或 selector 无法给出单个有效决策时，
+  curl 变为 ineligible，Android 回退 Ktor。
 - `pacUnresolved()` 会让 curl 变为 ineligible。Android/iOS selector 会回退 Ktor；OHOS 以 curl 为
   平台默认，host 必须先把 PAC 解析成固定 URL。
 
@@ -207,9 +211,11 @@ libcurl 不会自动继承 Android/iOS/OHOS 完整的系统 proxy/PAC 合同，�
   [要求](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-network-kit/js-apis-net-connection.md#connectionfindproxyforurl20)
   手机/平板 PAC 执行使用更高版本。兼容 API 12 的消费端不能假定该接口存在。
 
-所以完整 PAC parity 需要按请求调用平台 resolver，把有序重试状态锁定在同一个 `NetworkCall`，并明确
-流式上传在代理连接失败后是否可重放。只把 PAC 第一项传给 `manual(url)` 不算完整 PAC 支持，也不能把
-`NetworkEngineCapabilities.pacProxy` 报成 available。
+Android `androidSystem()` 通过把完整 PAC 决策交给 OS localhost proxy，避免在库内重写这些语义。没有
+这种本地转发代理的平台，如果由 host 自行执行 PAC，仍需按请求调用 resolver，把有序重试状态锁定在
+同一个 `NetworkCall`，并明确流式上传在代理连接失败后是否可重放。只把 PAC 第一项传给 `manual(url)`
+不算完整支持。`NetworkEngineCapabilities.pacProxy` 因此在 Android 可用，在 Apple/OHOS curl delegate
+上仍不可用。
 
 A/B 灰度使用稳定、可回滚的 `NetworkEngineRolloutConfig`，不要在业务层各自实现随机百分比：
 
