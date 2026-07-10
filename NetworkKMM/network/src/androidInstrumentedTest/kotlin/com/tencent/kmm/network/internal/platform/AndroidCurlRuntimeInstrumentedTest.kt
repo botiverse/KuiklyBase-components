@@ -105,9 +105,9 @@ class AndroidCurlRuntimeInstrumentedTest {
     }
 
     @Test
-    fun productionAarPassesAndroidCurlRuntimeGate() {
+    fun committedAndroidCurlArtifactPassesRuntimeGate() {
         runBlocking {
-            assertTrue("AAR native library must load", VBTransportAndroidCurl.nativeAvailable)
+            assertTrue("instrumentation APK must load the committed curl artifact", VBTransportAndroidCurl.nativeAvailable)
             val engine = requireNotNull(AndroidCurlEngineProvider.resolve())
 
             bufferedSelectorRequestUsesCurl()

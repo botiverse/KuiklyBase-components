@@ -1,8 +1,8 @@
 # Builds the PRODUCTION Android curl native artifact (task #24): shared
 # pbcurlwrapper + the task #22 JNI shim, statically linked against
 # cross-compiled OpenSSL/curl, into per-ABI libnetworkkmmcurl.so under
-# NetworkKMM/network/libs/android/<abi>/ — embedded in the network AAR as
-# jniLibs. PR runs verify the native build (this is also the only lane that
+# NetworkKMM/network/libs/android/<abi>/. The default Android AAR excludes the
+# payload; PR runs keep it built and CI-gated (this is also the only lane that
 # COMPILES the JNI shim — see the #66 seam review note); a workflow_dispatch
 # with commit_binaries=true pushes refreshed .so files back to the branch
 # (same committed-binary pattern as networkkmm-ohos-native).

@@ -2,9 +2,10 @@
 # Build the PRODUCTION Android curl native artifact (task #24): the shared
 # pbcurlwrapper + the task #22 JNI shim, statically linked against
 # cross-compiled OpenSSL/curl, into per-ABI libnetworkkmmcurl.so under
-# network/libs/android/<abi>/ — the directory the network AAR embeds as
-# jniLibs. Descended from build-android-curl-spike.sh (task #20), minus the
-# spike app/CA download: the production engine takes an app-provided CA path
+# network/libs/android/<abi>/. The default Android AAR intentionally excludes
+# these artifacts; the instrumentation runtime gate injects them into its test
+# APK. Descended from build-android-curl-spike.sh (task #20), minus the spike
+# app/CA download: the production engine takes an app-provided CA path
 # (SetCurlCaInfo, Phase 3 #25 owns bundle strategy) and stays fail-closed
 # without one.
 set -euo pipefail
