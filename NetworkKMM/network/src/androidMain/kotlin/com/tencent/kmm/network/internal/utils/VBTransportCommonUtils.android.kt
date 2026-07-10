@@ -22,6 +22,7 @@ import io.ktor.client.HttpClient
 import io.ktor.client.engine.android.Android
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
+import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
 
 actual suspend fun readKnownSize(
@@ -71,8 +72,22 @@ internal fun buildTransportHttpClient(okHttpEnabled: Boolean): HttpClient =
 
 // fastFallback = RFC 8305 Happy Eyeballs racing. Explicit rather than relying
 // on the OkHttp 5.x default, so the intent survives dependency bumps.
+// maxRequestsPerHost lifts OkHttp's default of 5. A single origin (the app API
+// edge) carries every request, so the default throttles the app to 5 concurrent
+// calls per host — and because the edge negotiates HTTP/2, those calls multiplex
+// on ONE connection, so the Dispatcher permit cap was strangling h2 rather than
+// protecting connections. task #586 tracing measured this on a signed-in device:
+// the foreground Thread cold burst fires ~10 concurrent requests, the 6th–10th
+// stalled 212–752ms purely in Dispatcher permit wait (dispatcherQueueMs), all
+// h2/reusedConnection=true with DNS/connect/TLS = 0. 16 covers the observed peak
+// (~10) with headroom while keeping the worst case bounded if a connection ever
+// degrades to HTTP/1.1 (where each concurrent call would be its own socket/TLS).
+// Only the per-host cap changes; the global Dispatcher.maxRequests stays at
+// OkHttp's default 64, so h1 degradation / multi-host traffic cannot expand the
+// overall concurrency ceiling.
 internal fun OkHttpClient.Builder.applyTransportOkHttpDefaults(): OkHttpClient.Builder =
     fastFallback(true)
+        .dispatcher(Dispatcher().apply { maxRequestsPerHost = 16 })
         .eventListenerFactory(AndroidTransportPhaseTracer.eventListenerFactory())
         .addInterceptor { chain ->
             val request = chain.request()
