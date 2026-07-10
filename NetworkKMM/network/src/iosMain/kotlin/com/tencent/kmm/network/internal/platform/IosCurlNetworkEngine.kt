@@ -146,7 +146,7 @@ internal class IosCurlNetworkEngine(
         source: NetworkUploadStreamSource
     ): NetworkResponse = coroutineScope {
         if (request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) {
-            return@coroutineScope unsupportedStreamingMethodResponse(request)
+            return@coroutineScope unsupportedStreamingRequestBodyResponse(request)
         }
         val caPath = requiredCaPath() ?: return@coroutineScope missingCaResponse(request)
         val requestId = VBPBRequestIdGenerator.getRequestId()
@@ -242,17 +242,6 @@ internal class IosCurlNetworkEngine(
             errorMsg = "cancelled before iOS curl native start"
         ).toNetworkResponse(request)
 
-    private fun unsupportedStreamingMethodResponse(request: NetworkRequest): NetworkResponse =
-        NetworkResponse(
-            request = request,
-            statusCode = null,
-            headers = emptyMap(),
-            body = NetworkResponseBody(),
-            error = NetworkError(
-                kind = NetworkErrorKind.UNKNOWN,
-                message = "iOS curl does not stream request bodies for ${request.method}."
-            )
-        )
 }
 
 internal class IosCurlUploadPullBridge {

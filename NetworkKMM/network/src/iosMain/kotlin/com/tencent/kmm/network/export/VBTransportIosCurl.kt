@@ -17,11 +17,18 @@
 package com.tencent.kmm.network.export
 
 import com.tencent.kmm.network.internal.platform.IosCurlEngineProvider
+import kotlinx.atomicfu.atomic
 
 /** iOS curl runtime inputs supplied by the host application. */
 object VBTransportIosCurl {
+    private val caInfoPathState = atomic<String?>(null)
+
     /** Absolute path to the app-owned CA bundle required by the curl/OpenSSL delegate. */
-    var caInfoPath: String? = null
+    var caInfoPath: String?
+        get() = caInfoPathState.value
+        set(value) {
+            caInfoPathState.value = value
+        }
 
     /** True when the native artifact is linked and a non-blank CA path is configured. */
     val nativeAvailable: Boolean

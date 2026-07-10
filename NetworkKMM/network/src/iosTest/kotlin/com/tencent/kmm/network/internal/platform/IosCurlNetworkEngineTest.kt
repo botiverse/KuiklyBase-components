@@ -27,6 +27,7 @@ import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.VBTransportElapseStatistics
 import com.tencent.kmm.network.export.VBTransportIosCurl
 import com.tencent.kmm.network.export.VBTransportMethod
+import com.tencent.kmm.network.export.VBTransportResultCode
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngineSelection
 import com.tencent.kmm.network.service.NetworkTransportEngine
@@ -235,7 +236,12 @@ class IosCurlNetworkEngineTest {
             .execute(request, NetworkCall(request))
 
         assertEquals(NetworkErrorKind.UNKNOWN, response.error?.kind)
-        assertEquals("iOS curl does not stream request bodies for GET.", response.error?.message)
+        assertEquals(
+            "streaming request body is not supported for GET " +
+                "(CURLOPT_UPLOAD would rewrite the verb); use POST/PUT/PATCH/DELETE/OPTIONS",
+            response.error?.message
+        )
+        assertEquals(VBTransportResultCode.CODE_NETWORK_ERROR, response.error?.rawCode)
         assertNull(bridge.lastRequest)
     }
 
