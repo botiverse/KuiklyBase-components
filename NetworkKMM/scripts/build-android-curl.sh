@@ -112,15 +112,7 @@ if [[ ! -f "${OPENSSL_PREFIX}/lib/libssl.a" || "$(cat "$OPENSSL_STAMP" 2>/dev/nu
     PATH="${TOOLCHAIN_ROOT}/bin:${PATH}" \
       ./Configure "$OPENSSL_TARGET" \
       -D__ANDROID_API__="$ANDROID_API" \
-      no-shared no-tests no-apps no-docs \
-      # TLS-client prune set (artin, task #245 follow-up): legacy/engine/comp
-      # and non-web-PKI ciphers are dead weight for our HTTPS-only client;
-      # keeps TLS1.2/1.3, AES/ChaCha, EC/RSA, OCSP. curl compile + runtime
-      # gates are the acceptance for every removal.
-      no-legacy no-engine no-comp no-dtls no-srp \
-      no-camellia no-aria no-seed no-bf no-cast no-idea \
-      no-rc2 no-rc4 no-md4 no-mdc2 no-whirlpool \
-      no-sm2 no-sm3 no-sm4 \
+      no-shared no-tests no-apps no-docs no-legacy no-engine no-comp \
       --prefix="$OPENSSL_PREFIX" \
       --openssldir="$OPENSSL_PREFIX/ssl"
     PATH="${TOOLCHAIN_ROOT}/bin:${PATH}" make -j"$JOBS" build_libs
