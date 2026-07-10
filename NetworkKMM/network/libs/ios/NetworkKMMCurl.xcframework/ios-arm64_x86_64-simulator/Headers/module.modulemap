@@ -1,0 +1,4 @@
+module NetworkKMMCurl {
+    header "curl_wrapper.h"
+    export *
+}
