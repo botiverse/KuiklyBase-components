@@ -25,6 +25,18 @@
   Completion diagnostics expose negotiated protocol as `UNKNOWN` until native
   protocol extraction is implemented.
 
+## 0.1.0-raft.20 / 0.1.0-raft.20-ohos (curl rollout gates + Android connection limits)
+
+- curl production rollout gates (#81, task #25): app-owned CA bundle
+  wiring (`ca/curl-ca-bundle.env` pin), rollout/gray seams and docs for
+  taking the curl engines to production — groundwork for the h2/h3 line.
+- Android OkHttp `maxRequestsPerHost` lifted 5 → 16 (#85, task #587):
+  raft.19's tracing evidence showed real permit-wait saturation on burst
+  (6th+ request queueing on cold Home/Thread); dispatcher limits now match
+  actual concurrency. `maxRequests=64` unchanged, pinned by test.
+- curl HTTP/2 (task #30) intentionally NOT in this coordinate — it ships
+  next with its combined-source artifact refresh (PR #83 terminal line).
+
 ## 0.1.0-raft.19 / 0.1.0-raft.19-ohos (transport tracing + contract single-source)
 
 - Transport phase tracing (#82): `VBTransportElapseStatistics` gains
