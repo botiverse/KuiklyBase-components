@@ -388,6 +388,14 @@ class CurlClient {
         if (!ca_info_path_.empty()) {
             curl_easy_setopt(curl_, CURLOPT_CAINFO, ca_info_path_.c_str());
         }
+        // Proxy policy is resolved outside libcurl. Empty means explicit
+        // direct mode, not "consult http_proxy/HTTPS_PROXY". A fixed manual
+        // URL also disables no_proxy environment bypasses so the host's
+        // already-resolved platform decision is the single source of truth.
+        curl_easy_setopt(curl_, CURLOPT_PROXY, proxy_url_.c_str());
+        if (!proxy_url_.empty()) {
+            curl_easy_setopt(curl_, CURLOPT_NOPROXY, "");
+        }
         // 使用curl的内部重定向逻辑
         curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);
 
@@ -717,6 +725,10 @@ class CurlClient {
         ca_info_path_ = caInfoPath == nullptr ? "" : caInfoPath;
     }
 
+    void SetProxy(const char *proxyUrl) {
+        proxy_url_ = proxyUrl == nullptr ? "" : proxyUrl;
+    }
+
  private:
     std::string log_tag_;
     CURL *curl_;
@@ -730,6 +742,7 @@ class CurlClient {
     // all codecs libcurl supports and let it decode transparently.
     std::string accept_encoding_;
     std::string ca_info_path_;
+    std::string proxy_url_;
     // fork #8 streaming: set for the lifetime of a StartStreamRequest call.
     CurlStreamCallback *stream_callback_ = nullptr;
     // issue #8 slice 3: set for the lifetime of a StartUploadRequest call.
@@ -794,4 +807,11 @@ void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath) {
         return;
     }
     reinterpret_cast<CurlClient *>(handle)->SetCaInfo(caInfoPath);
+}
+
+void SetCurlProxy(CurClientHandle handle, const char *proxyUrl) {
+    if (handle == nullptr) {
+        return;
+    }
+    reinterpret_cast<CurlClient *>(handle)->SetProxy(proxyUrl);
 }

@@ -18,11 +18,15 @@ package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkByteStream
+import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
+import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
+import com.tencent.kmm.network.export.NetworkCurlTrustStore
+import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkTransferProgress
-import com.tencent.kmm.network.export.VBTransportIosCurl
+import com.tencent.kmm.network.export.VBTransportCurl
 import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkTransportEngine
@@ -36,6 +40,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import platform.posix.getenv
+import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -45,11 +50,17 @@ import kotlin.test.assertTrue
 
 @OptIn(ExperimentalForeignApi::class)
 class IosCurlRuntimeTest {
+    @AfterTest
+    fun clearCurlRuntime() {
+        VBTransportCurl.clear()
+    }
+
     @Test
     fun productionEnginePerformsExplicitCaHttpsRequest() = runBlocking {
         val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
         val caPath = runtimeCaPath() ?: return@runBlocking
-        VBTransportIosCurl.caInfoPath = caPath
+        val caSha256 = runtimeCaSha256() ?: return@runBlocking
+        configureRuntime(caPath, caSha256)
         try {
             val engine = assertNotNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
             val request = NetworkRequest(url = url).apply {
@@ -61,7 +72,45 @@ class IosCurlRuntimeTest {
             assertTrue(response.body.bytes?.isNotEmpty() == true)
             assertNull(response.error)
         } finally {
-            VBTransportIosCurl.caInfoPath = null
+            VBTransportCurl.clear()
+        }
+    }
+
+    @Test
+    fun productionEngineEnforcesCertificateAcceptanceMatrix() = runBlocking {
+        val trustedUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
+        val unknownUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_UNKNOWN_CA_URL") ?: return@runBlocking
+        val expiredUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_EXPIRED_URL") ?: return@runBlocking
+        val mismatchUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_MISMATCH_URL") ?: return@runBlocking
+        val trustedCaPath = runtimeCaPath() ?: return@runBlocking
+        val trustedCaSha = runtimeCaSha256() ?: return@runBlocking
+        val wrongCaPath = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_WRONG_CA_PATH") ?: return@runBlocking
+        val wrongCaSha = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_WRONG_CA_SHA256") ?: return@runBlocking
+
+        configureRuntime(trustedCaPath, trustedCaSha)
+        val engine = assertNotNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
+        assertTrue(execute(engine, trustedUrl).isSuccess)
+        assertEquals(NetworkErrorKind.TLS, execute(engine, unknownUrl).error?.kind)
+        assertEquals(NetworkErrorKind.TLS, execute(engine, expiredUrl).error?.kind)
+        assertEquals(NetworkErrorKind.TLS, execute(engine, mismatchUrl).error?.kind)
+
+        configureRuntime(wrongCaPath, wrongCaSha)
+        assertEquals(NetworkErrorKind.TLS, execute(engine, trustedUrl).error?.kind)
+        VBTransportCurl.clear()
+    }
+
+    @Test
+    fun productionEngineUsesFixedManualProxy() = runBlocking {
+        val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
+        val caPath = runtimeCaPath() ?: return@runBlocking
+        val caSha = runtimeCaSha256() ?: return@runBlocking
+        val proxyUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_PROXY_URL") ?: return@runBlocking
+        configureRuntime(caPath, caSha, NetworkCurlProxyConfiguration.manual(proxyUrl))
+        try {
+            val engine = assertNotNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
+            assertTrue(execute(engine, url).isSuccess)
+        } finally {
+            VBTransportCurl.clear()
         }
     }
 
@@ -69,6 +118,8 @@ class IosCurlRuntimeTest {
     fun productionBridgeStreamsHttpsResponseAndSuppressesCallbacksAfterFailure() = runBlocking {
         val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
         val caPath = runtimeCaPath() ?: return@runBlocking
+        val caSha = runtimeCaSha256() ?: return@runBlocking
+        configureRuntime(caPath, caSha)
         val chunks = mutableListOf<ByteArray>()
         var responseStarts = 0
 
@@ -103,6 +154,8 @@ class IosCurlRuntimeTest {
     fun productionEngineStreamsUploadsBeyondPerformPoolWidth() = runBlocking {
         val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_UPLOAD_URL") ?: return@runBlocking
         val caPath = runtimeCaPath() ?: return@runBlocking
+        val caSha = runtimeCaSha256() ?: return@runBlocking
+        configureRuntime(caPath, caSha)
         val payload = "NetworkKMM iOS curl streaming upload".encodeToByteArray()
 
         val single = upload(url = url, caPath = caPath, payload = payload)
@@ -130,6 +183,8 @@ class IosCurlRuntimeTest {
     fun productionBridgeHonorsPreStartAndExternalCancellation() = runBlocking {
         val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_CANCEL_URL") ?: return@runBlocking
         val caPath = runtimeCaPath() ?: return@runBlocking
+        val caSha = runtimeCaSha256() ?: return@runBlocking
+        configureRuntime(caPath, caSha)
 
         val preStart = runtimeRequest(900_200, url, caPath).also(IosCurlNativeRequest::cancel)
         val preStartResponse = IosCurlCInteropBridge.execute(preStart)
@@ -167,7 +222,7 @@ class IosCurlRuntimeTest {
             ),
             progress = NetworkProgressCallbacks(uploadProgress = progress::add)
         )
-        return IosCurlNetworkEngine(IosCurlCInteropBridge) { caPath }
+        return IosCurlNetworkEngine(IosCurlCInteropBridge)
             .execute(request, NetworkCall(request))
             .also {
                 assertEquals(payload.size.toLong(), progress.lastOrNull()?.bytesTransferred)
@@ -188,11 +243,37 @@ class IosCurlRuntimeTest {
         headers = headers,
         timeoutMillis = 30_000,
         uploadContentLength = uploadContentLength,
-        caInfoPath = caPath
+        caInfoPath = caPath,
+        proxyUrl = ""
     )
 
     private fun runtimeCaPath(): String? =
         runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_CA_PATH")
+
+    private fun runtimeCaSha256(): String? =
+        runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_CA_SHA256")
+
+    private fun configureRuntime(
+        caPath: String,
+        caSha256: String,
+        proxy: NetworkCurlProxyConfiguration = NetworkCurlProxyConfiguration.direct()
+    ) {
+        val status = VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(caPath, caSha256),
+                proxy = proxy
+            )
+        )
+        assertTrue(status.configured, status.detail)
+    }
+
+    private suspend fun execute(
+        engine: com.tencent.kmm.network.service.NetworkEngine,
+        url: String
+    ): NetworkResponse {
+        val request = NetworkRequest(url = url)
+        return engine.execute(request, NetworkCall(request))
+    }
 
     private fun runtimeEnvironment(name: String): String? =
         getenv(name)?.toKString()?.takeIf(String::isNotBlank)

@@ -107,7 +107,17 @@ class NetworkEngineRoutingTest {
     @Test
     fun selectorCanGrayThenRollbackWithoutRebuildingClient() = runBlocking {
         val ktor = FakeEngine("ktor")
-        val curl = FakeEngine("curl", totalTimeMs = 42.0)
+        val curl = FakeEngine(
+            "curl",
+            timing = VBTransportElapseStatistics(
+                dispatcherQueueTimeMs = 17.0,
+                connectTimeMs = 29.0,
+                sslCostTimeMs = 11.0,
+                totalTimeMs = 42.0,
+                protocol = "h2",
+                connectionAttemptCount = 2
+            )
+        )
         val selected = mutableListOf<NetworkEngineSelectionDiagnostics>()
         val completed = mutableListOf<NetworkEngineExecutionDiagnostics>()
         var rollback = false
@@ -147,7 +157,76 @@ class NetworkEngineRoutingTest {
         )
         assertEquals(NetworkEngineSelectionReason.REMOTE_ROLLBACK, selected.last().reason)
         assertEquals(42.0, completed.first().timing.totalTimeMs)
+        assertEquals(17.0, completed.first().timing.dispatcherQueueTimeMs)
+        assertEquals(29.0, completed.first().timing.connectTimeMs)
+        assertEquals(11.0, completed.first().timing.sslCostTimeMs)
+        assertEquals("h2", completed.first().timing.protocol)
+        assertEquals(2, completed.first().timing.connectionAttemptCount)
         assertEquals(3, completed.size)
+    }
+
+    @Test
+    fun stableRolloutBucketsCohortsAndKeepsRollbackImmediate() {
+        val half = NetworkEngineRolloutConfig(
+            curlBasisPoints = 5_000,
+            curlEnabled = true,
+            salt = "release-42"
+        )
+        val first = half.selectionFor("account-123")
+        val repeated = half.selectionFor("account-123")
+
+        assertEquals(first.rollout?.bucket, repeated.rollout?.bucket)
+        assertEquals(first.requestedEngine, repeated.requestedEngine)
+        assertTrue(requireNotNull(first.rollout).bucket in 0..9_999)
+
+        assertNull(
+            NetworkEngineRolloutConfig(
+                curlBasisPoints = 0,
+                curlEnabled = true
+            ).selectionFor("any").requestedEngine
+        )
+        assertEquals(
+            NetworkTransportEngine.CURL,
+            NetworkEngineRolloutConfig(
+                curlBasisPoints = 10_000,
+                curlEnabled = true
+            ).selectionFor("any").requestedEngine
+        )
+        assertTrue(
+            NetworkEngineRolloutConfig(
+                curlBasisPoints = 10_000,
+                curlEnabled = true,
+                forcePlatformDefault = true
+            ).selectionFor("any").forcePlatformDefault
+        )
+    }
+
+    @Test
+    fun ineligibleRequestedEngineFallsBackWithSpecificReason() {
+        val ktor = FakeEngine("ktor")
+        val curl = FakeEngine(
+            name = "curl",
+            availability = NetworkEngineAvailability.unavailable(
+                NetworkEngineUnavailableReason.PROXY_PAC_UNSUPPORTED,
+                "PAC unresolved"
+            )
+        )
+        val request = NetworkRequest(url = "https://example.test")
+
+        val resolved = resolveNetworkEngine(
+            selection = NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL),
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { engine -> if (engine == NetworkTransportEngine.KTOR) ktor else curl },
+            request = request
+        )
+
+        assertEquals(NetworkTransportEngine.KTOR, resolved.diagnostics.selectedEngine)
+        assertEquals(NetworkEngineSelectionReason.INELIGIBLE, resolved.diagnostics.reason)
+        assertEquals(
+            NetworkEngineUnavailableReason.PROXY_PAC_UNSUPPORTED,
+            resolved.diagnostics.unavailableReason
+        )
+        assertEquals("PAC unresolved", resolved.diagnostics.unavailableDetail)
     }
 
     @Test
@@ -221,9 +300,12 @@ class NetworkEngineRoutingTest {
     private class FakeEngine(
         private val name: String,
         override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(),
-        private val totalTimeMs: Double = 0.0
+        private val timing: VBTransportElapseStatistics = VBTransportElapseStatistics(),
+        private val availability: NetworkEngineAvailability = NetworkEngineAvailability.Available
     ) : NetworkEngine {
         val executed = mutableListOf<String>()
+
+        override fun availability(request: NetworkRequest): NetworkEngineAvailability = availability
 
         override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
             executed += name
@@ -248,7 +330,7 @@ class NetworkEngineRoutingTest {
             statusCode = 200,
             headers = emptyMap(),
             body = NetworkResponseBody(),
-            timing = VBTransportElapseStatistics(totalTimeMs = totalTimeMs)
+            timing = timing
         )
     }
 }

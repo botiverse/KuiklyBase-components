@@ -145,6 +145,31 @@ config.logImpl = logImpl
 VBTransportInitHelper.init(config)
 ```
 
+#### curl runtime 必需配置
+
+Android/iOS 启用 curl 灰度前，以及 OHOS 通过默认 curl engine 发请求前，App 必须安装经过校验的
+CA bundle，并显式给出 proxy 决策：
+
+```kotlin
+val status = VBTransportCurl.configure(
+    NetworkCurlRuntimeConfiguration(
+        trustStore = NetworkCurlTrustStore(
+            path = appOwnedCaAbsolutePath,
+            sha256 = NetworkCurlCaBundleManifest.SHA256
+        ),
+        proxy = NetworkCurlProxyConfiguration.direct()
+    )
+)
+check(status.configured) { status.detail ?: status.failureReason.name }
+```
+
+使用 `scripts/prepare-app-owned-ca-bundle.sh` 生成仓库固定版本的 Mozilla CA 文件；runtime 会拒绝
+缺失或 SHA-256 不匹配的文件。Proxy 必须明确选择 `direct()`、`manual(fixedProxyUrl)`、Android 专用
+`androidSystem()` 或 `pacUnresolved()`。Android 系统 PAC 会走 OS 维护的本地转发代理；其他平台 PAC
+未解析时 curl 会变为 ineligible，不会静默绕过系统代理。CA 轮换、稳定
+A/B 灰度、立即回滚、diagnostics 和当前 HTTPDNS/HTTP3 gate 见
+[NetworkClient 进阶能力](./docs/network-client-advanced-zh.md)。
+
 ### 常用网络请求示例
 在 network/src/commonMain/service/VBTransportServiceTest.kt 中包含一些常用 http get/post/string/byte/自定义 method 类型请求示例,可以参考.
 

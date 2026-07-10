@@ -20,19 +20,23 @@ import com.tencent.kmm.network.curl.contentLength
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
-import com.tencent.kmm.network.export.NetworkEngineCapabilities
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.NetworkTransferProgress
-import com.tencent.kmm.network.export.VBTransportAndroidCurl
 import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngine
+import com.tencent.kmm.network.service.NetworkEngineAvailability
 import com.tencent.kmm.network.service.NetworkUploadStreamSource
+import com.tencent.kmm.network.service.curlNetworkEngineCapabilities
+import com.tencent.kmm.network.service.curlRuntimeFailureResponse
 import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
+import com.tencent.kmm.network.service.prepareCurlRuntime
+import com.tencent.kmm.network.service.preparedCurlCaInfoPath
+import com.tencent.kmm.network.service.preparedCurlProxyUrl
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -44,7 +48,7 @@ internal object AndroidCurlEngineProvider {
     @Volatile
     internal var testBridge: AndroidCurlNativeBridge? = null
 
-    val nativeAvailable: Boolean
+    val nativeLinked: Boolean
         get() = testBridge?.isAvailable ?: AndroidCurlJniBridge.isAvailable
 
     fun resolve(): NetworkEngine? {
@@ -54,18 +58,17 @@ internal object AndroidCurlEngineProvider {
 }
 
 internal class AndroidCurlNetworkEngine(
-    private val bridge: AndroidCurlNativeBridge,
-    private val caInfoPathProvider: () -> String? = { VBTransportAndroidCurl.caInfoPath }
+    private val bridge: AndroidCurlNativeBridge
 ) : NetworkEngine {
-    override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(
-        requestBodyStreaming = true,
-        responseBodyStreaming = true,
-        multipartStreaming = true,
-        uploadProgress = true,
-        downloadProgress = true
-    )
+    override val capabilities
+        get() = curlNetworkEngineCapabilities()
+
+    override fun availability(request: NetworkRequest): NetworkEngineAvailability =
+        prepareCurlRuntime(request)
 
     override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+        val availability = prepareCurlRuntime(request)
+        if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         networkUploadStreamSourceOrNull(request)?.let { source ->
             return executeUpload(request, call, source)
         }
@@ -101,6 +104,8 @@ internal class AndroidCurlNetworkEngine(
         onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
         onChunk: (ByteArray) -> Unit
     ): NetworkResponse {
+        val availability = prepareCurlRuntime(request)
+        if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         val requestId = VBPBRequestIdGenerator.getRequestId()
         val nativeRequest = request.toNativeRequest(requestId = requestId)
         var transferred = 0L
@@ -135,6 +140,8 @@ internal class AndroidCurlNetworkEngine(
         call: NetworkCall,
         source: NetworkUploadStreamSource
     ): NetworkResponse = coroutineScope {
+        val availability = prepareCurlRuntime(request)
+        if (!availability.available) return@coroutineScope curlRuntimeFailureResponse(request, availability)
         if (request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) {
             return@coroutineScope unsupportedStreamingRequestBodyResponse(request)
         }
@@ -207,7 +214,12 @@ internal class AndroidCurlNetworkEngine(
             timeoutMillis = policy.timeoutMillis,
             body = body,
             uploadContentLength = uploadContentLength,
-            caInfoPath = caInfoPathProvider()
+            caInfoPath = checkNotNull(preparedCurlCaInfoPath(this)) {
+                "Curl CA path missing after runtime preparation"
+            },
+            proxyUrl = checkNotNull(preparedCurlProxyUrl(this)) {
+                "Curl proxy decision missing after runtime preparation"
+            }
         )
     }
 

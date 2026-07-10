@@ -50,6 +50,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
+import kotlin.time.TimeSource
+import kotlin.time.TimeMark
 
 interface NetworkRequestMiddleware {
     suspend fun prepare(request: NetworkRequest): NetworkRequest
@@ -117,6 +119,10 @@ interface NetworkEngine {
     val capabilities: NetworkEngineCapabilities
         get() = NetworkEngineCapabilities()
 
+    /** Per-request rollout gate evaluated before this delegate is selected. */
+    fun availability(request: NetworkRequest): NetworkEngineAvailability =
+        NetworkEngineAvailability.Available
+
     suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse
 
     /**
@@ -143,6 +149,9 @@ interface NetworkEngine {
 class NetworkCall internal constructor(
     val originalRequest: NetworkRequest
 ) {
+    private val enqueuedAt = TimeSource.Monotonic.markNow()
+    private var clientQueueTimeMs = 0.0
+    private var requestPreparationTimeMs = 0.0
     private val completion = CompletableDeferred<NetworkResponse>()
     private val cancelHandlers = mutableListOf<() -> Unit>()
     private var job: Job? = null
@@ -158,6 +167,20 @@ class NetworkCall internal constructor(
         if (cancelled) {
             job.cancel()
         }
+    }
+
+    internal fun markClientStarted() {
+        clientQueueTimeMs = enqueuedAt.elapsedNow().inWholeNanoseconds / 1_000_000.0
+    }
+
+    internal fun markRequestPrepared(startedAt: TimeMark) {
+        requestPreparationTimeMs = startedAt.elapsedNow().inWholeNanoseconds / 1_000_000.0
+    }
+
+    internal fun applyClientTiming(response: NetworkResponse): NetworkResponse {
+        response.timing.clientQueueTimeMs = clientQueueTimeMs
+        response.timing.requestPreparationTimeMs = requestPreparationTimeMs
+        return response
     }
 
     internal fun addCancelHandler(handler: () -> Unit) {
@@ -229,7 +252,8 @@ class NetworkClient(
         val call = NetworkCall(request)
         val policy = selectPolicy(request)
         val job = scope.launch(dispatcherFor(policy.dispatcher)) {
-            val response = executeInternal(request.copyMutable(), call, policy)
+            call.markClientStarted()
+            val response = call.applyClientTiming(executeInternal(request.copyMutable(), call, policy))
             call.complete(response)
             callback(response)
         }
@@ -290,12 +314,14 @@ class NetworkClient(
         call: NetworkCall,
         policy: NetworkRequestPolicy
     ): NetworkResponse {
+        val preparationStartedAt = TimeSource.Monotonic.markNow()
         var prepared = request
         config.requestMiddlewares.forEach { middleware ->
             prepared = middleware.prepare(prepared)
         }
         prepared.policy = policy
         applyCurrentAuthToken(prepared)
+        call.markRequestPrepared(preparationStartedAt)
 
         var attempt = 0
         var refreshedAuth = false
@@ -415,17 +441,28 @@ class NetworkClient(
 }
 
 object VBTransportNetworkEngine : NetworkEngine {
-    override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(
-        // issue #8: every current platform has true request streaming
-        // (ktor WriteChannelContent or curl READFUNCTION).
-        requestBodyStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming,
-        responseBodyStreaming = true,
-        multipartStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming,
-        uploadProgress = true,
-        downloadProgress = true
-    )
+    override val capabilities: NetworkEngineCapabilities
+        get() = if (usesCurlPlatformDefault) curlNetworkEngineCapabilities().copy(
+            // issue #8: every current platform has true request streaming
+            // (ktor WriteChannelContent or curl READFUNCTION).
+            requestBodyStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming,
+            multipartStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming
+        ) else NetworkEngineCapabilities(
+            requestBodyStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming,
+            responseBodyStreaming = true,
+            multipartStreaming = com.tencent.kmm.network.internal.platform.platformRequestBodyStreaming,
+            uploadProgress = true,
+            downloadProgress = true
+        )
+
+    override fun availability(request: NetworkRequest): NetworkEngineAvailability =
+        if (usesCurlPlatformDefault) prepareCurlRuntime(request) else NetworkEngineAvailability.Available
 
     override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+        if (usesCurlPlatformDefault) {
+            val availability = prepareCurlRuntime(request)
+            if (!availability.available) return curlRuntimeFailureResponse(request, availability)
+        }
         // issue #8 slice 1: Stream/FileRef bodies go out as a true byte stream
         // on platforms whose transport supports it; everything else (and every
         // body on non-streaming platforms) keeps the buffered path below.
@@ -456,6 +493,8 @@ object VBTransportNetworkEngine : NetworkEngine {
                     }
                 }
                 totalTimeout = request.policy.timeoutMillis
+                curlCaInfoPath = preparedCurlCaInfoPath(request)
+                curlProxyUrl = preparedCurlProxyUrl(request)
                 bodyBytes.bytes?.let { data = it }
             }
 
@@ -479,11 +518,21 @@ object VBTransportNetworkEngine : NetworkEngine {
         onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
         onChunk: (ByteArray) -> Unit
     ): NetworkResponse = suspendCancellableCoroutine { continuation ->
+        if (usesCurlPlatformDefault) {
+            val availability = prepareCurlRuntime(request)
+            if (!availability.available) {
+                return@suspendCancellableCoroutine continuation.resume(
+                    curlRuntimeFailureResponse(request, availability)
+                )
+            }
+        }
         val vbRequest = VBTransportRequest().apply {
             method = request.method
             url = request.resolvedUrl()
             header.putAll(request.headers)
             totalTimeout = request.policy.timeoutMillis
+            curlCaInfoPath = preparedCurlCaInfoPath(request)
+            curlProxyUrl = preparedCurlProxyUrl(request)
         }
         VBTransportService.streamRequest(
             vbRequest,
@@ -526,6 +575,8 @@ object VBTransportNetworkEngine : NetworkEngine {
                     }
                 }
                 totalTimeout = request.policy.timeoutMillis
+                curlCaInfoPath = preparedCurlCaInfoPath(request)
+                curlProxyUrl = preparedCurlProxyUrl(request)
             }
             val writeBody: suspend (NetworkByteStreamSink) -> Unit = { sink ->
                 var sent = 0L
@@ -553,6 +604,10 @@ object VBTransportNetworkEngine : NetworkEngine {
             }
         }
     }
+
+    private val usesCurlPlatformDefault: Boolean
+        get() = com.tencent.kmm.network.internal.platform.platformDefaultNetworkTransportEngine ==
+            NetworkTransportEngine.CURL
 }
 
 internal class NetworkUploadStreamSource(
@@ -637,7 +692,8 @@ private fun NetworkResponse.withoutBody(): NetworkResponse = NetworkResponse(
     body = NetworkResponseBody(),
     error = error,
     rawResponse = rawResponse,
-    timing = timing
+    timing = timing,
+    protocol = protocol
 )
 
 private fun Any?.toResponseBytes(): ByteArray? {

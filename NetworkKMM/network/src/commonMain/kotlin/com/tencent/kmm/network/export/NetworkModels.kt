@@ -236,9 +236,19 @@ class NetworkResponse(
     val body: NetworkResponseBody,
     val error: NetworkError? = null,
     val rawResponse: VBTransportBaseResponse? = null,
-    val timing: VBTransportElapseStatistics = VBTransportElapseStatistics()
+    val timing: VBTransportElapseStatistics = VBTransportElapseStatistics(),
+    /** Actual negotiated wire protocol when the selected engine can report it. */
+    val protocol: NetworkHttpProtocol = NetworkHttpProtocol.UNKNOWN
 ) {
     val isSuccess: Boolean = error == null && (statusCode == null || statusCode < 400)
+}
+
+enum class NetworkHttpProtocol {
+    UNKNOWN,
+    HTTP_1_0,
+    HTTP_1_1,
+    HTTP_2,
+    HTTP_3
 }
 
 enum class NetworkErrorKind {
@@ -261,12 +271,60 @@ class NetworkError(
     val rawCode: Int? = null
 )
 
+enum class NetworkEngineFeatureReason {
+    AVAILABLE,
+    NOT_DECLARED,
+    CONFIGURATION_REQUIRED,
+    PLATFORM_RESOLVER_REQUIRED,
+    PAC_UNSUPPORTED,
+    NOT_IMPLEMENTED,
+    NATIVE_BACKEND_NOT_COMPILED,
+    RUNTIME_UNAVAILABLE
+}
+
+data class NetworkEngineFeatureStatus(
+    val compiledIn: Boolean,
+    val runtimeAvailable: Boolean,
+    val rolloutEligible: Boolean,
+    val reason: NetworkEngineFeatureReason,
+    val detail: String? = null
+) {
+    companion object {
+        fun available(detail: String? = null): NetworkEngineFeatureStatus =
+            NetworkEngineFeatureStatus(
+                compiledIn = true,
+                runtimeAvailable = true,
+                rolloutEligible = true,
+                reason = NetworkEngineFeatureReason.AVAILABLE,
+                detail = detail
+            )
+
+        fun unavailable(
+            reason: NetworkEngineFeatureReason = NetworkEngineFeatureReason.NOT_DECLARED,
+            compiledIn: Boolean = false,
+            runtimeAvailable: Boolean = false,
+            detail: String? = null
+        ): NetworkEngineFeatureStatus = NetworkEngineFeatureStatus(
+            compiledIn = compiledIn,
+            runtimeAvailable = runtimeAvailable,
+            rolloutEligible = false,
+            reason = reason,
+            detail = detail
+        )
+    }
+}
+
 data class NetworkEngineCapabilities(
     val requestBodyStreaming: Boolean = false,
     val responseBodyStreaming: Boolean = false,
     val multipartStreaming: Boolean = false,
     val uploadProgress: Boolean = false,
-    val downloadProgress: Boolean = false
+    val downloadProgress: Boolean = false,
+    val appOwnedTrustStore: NetworkEngineFeatureStatus = NetworkEngineFeatureStatus.unavailable(),
+    val manualProxy: NetworkEngineFeatureStatus = NetworkEngineFeatureStatus.unavailable(),
+    val pacProxy: NetworkEngineFeatureStatus = NetworkEngineFeatureStatus.unavailable(),
+    val httpDns: NetworkEngineFeatureStatus = NetworkEngineFeatureStatus.unavailable(),
+    val http3: NetworkEngineFeatureStatus = NetworkEngineFeatureStatus.unavailable()
 )
 
 enum class NetworkPriority {

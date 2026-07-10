@@ -17,20 +17,25 @@
 package com.tencent.kmm.network.export
 
 import com.tencent.kmm.network.internal.platform.IosCurlEngineProvider
-import kotlinx.atomicfu.atomic
 
 /** iOS curl runtime inputs supplied by the host application. */
 object VBTransportIosCurl {
-    private val caInfoPathState = atomic<String?>(null)
-
-    /** Absolute path to the app-owned CA bundle required by the curl/OpenSSL delegate. */
+    /**
+     * Legacy path-only bridge. Prefer [VBTransportCurl.configure], which pins
+     * the expected SHA-256 and makes proxy policy explicit.
+     */
+    @Deprecated("Use VBTransportCurl.configure with a verified trust store and explicit proxy policy")
     var caInfoPath: String?
-        get() = caInfoPathState.value
+        get() = VBTransportCurl.snapshot()?.trustStore?.path
         set(value) {
-            caInfoPathState.value = value
+            VBTransportCurl.configureLegacyPath(value)
         }
 
-    /** True when the native artifact is linked and a non-blank CA path is configured. */
+    /** True when the cinterop artifact itself is linked, independent of rollout inputs. */
+    val nativeLinked: Boolean
+        get() = IosCurlEngineProvider.nativeLinked
+
+    /** True when native code is linked and an app-owned CA bundle is verified. */
     val nativeAvailable: Boolean
-        get() = IosCurlEngineProvider.nativeAvailable
+        get() = nativeLinked && VBTransportCurl.configured
 }

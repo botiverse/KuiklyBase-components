@@ -28,6 +28,7 @@ import com.tencent.kmm.network.curl.native.CurlStreamCallback
 import com.tencent.kmm.network.curl.native.CurlUploadSource
 import com.tencent.kmm.network.curl.native.DeleteCurlClient
 import com.tencent.kmm.network.curl.native.SetCurlCaInfo
+import com.tencent.kmm.network.curl.native.SetCurlProxy
 import com.tencent.kmm.network.curl.native.StartRequest
 import com.tencent.kmm.network.curl.native.StartStreamRequest
 import com.tencent.kmm.network.curl.native.StartUploadRequest
@@ -96,6 +97,8 @@ internal data class IosCurlNativeRequest(
     val body: ByteArray? = null,
     val uploadContentLength: Long? = null,
     val caInfoPath: String,
+    /** Empty string means explicit direct mode. */
+    val proxyUrl: String,
     val cancellationSignal: IosCurlCancellationSignal = IosCurlCancellationSignal()
 ) {
     fun cancel() {
@@ -206,6 +209,7 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
         )
         try {
             SetCurlCaInfo(handle, request.caInfoPath)
+            SetCurlProxy(handle, request.proxyUrl)
             IosCurlHandleRegistry.publish(request.requestId, handle)
             if (request.cancellationSignal.isCancelled()) {
                 cancelNative(handle)
