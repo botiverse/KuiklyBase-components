@@ -1,0 +1,7 @@
+/build
+.gradle
+.DS_Store
+/iosApp.xcworkspace/xcshareddata/IDEWorkspaceChecks.plist
+/iosApp.xcworkspace/xcuserdata/qizhengchen.xcuserdatad/UserInterfaceState.xcuserstate
+/iosApp.xcodeproj/xcuserdata/qizhengchen.xcuserdatad/xcschemes/xcschememanagement.plist
+/Pods/Pods.xcodeproj/xcuserdata/qizhengchen.xcuserdatad/xcschemes/xcschememanagement.plist

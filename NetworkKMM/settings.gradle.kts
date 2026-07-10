@@ -29,6 +29,7 @@ rootProject.name = "NetworkKMM"
 // selected with `-c settings.ohos.gradle.kts` (kuikly dual-tree convention,
 // task #18). Modules present in both trees pick their build file per tree
 // via buildFileName.
+include(":androidApp")
 include(":network")
 if (gradle.startParameter.projectProperties.containsKey("androidCurlSpike")) {
     include(":android-curl-spike")
