@@ -182,12 +182,21 @@ build_slice_arch() {
     printf '%s' "$build_config" > "$curl_stamp"
   fi
 
-  # HTTP/2 hard gate (same rationale as the Android/OHOS gates): assert the
-  # nghttp2 reference in this slice's libcurl.a so a silent h1-only fallback
-  # fails the build instead of shipping. Here-string, not a pipe.
+  # HTTP/2 hard gate (same rationale as the Android/OHOS gates). Two layers:
+  # generated config as the stable primary (decoupled from symbol names),
+  # archive symbol as the pin-exact supplement. Mach-O prefixes C symbols
+  # with "_" (xcrun nm prints _nghttp2_session_client_new3), so the symbol
+  # match is end-anchored — grep -w can never match the prefixed form
+  # because "_" is a word character. Here-string, not a pipe.
+  if grep -q "#define USE_NGHTTP2 1" "$curl_build/lib/curl_config.h"; then
+    echo "==> [${sdk}/${arch}] curl_config.h USE_NGHTTP2: ENABLED"
+  else
+    echo "[${sdk}/${arch}] curl_config.h USE_NGHTTP2: MISSING" >&2
+    exit 2
+  fi
   local curl_syms
   curl_syms="$(xcrun nm "$curl_build/lib/libcurl.a" 2>/dev/null || true)"
-  if grep -qw "nghttp2_session_client_new3" <<<"$curl_syms"; then
+  if grep -q "nghttp2_session_client_new3$" <<<"$curl_syms"; then
     echo "==> [${sdk}/${arch}] libcurl HTTP/2 (nghttp2): ENABLED"
   else
     echo "[${sdk}/${arch}] libcurl HTTP/2 (nghttp2): MISSING" >&2
