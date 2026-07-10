@@ -23,6 +23,19 @@ import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.VBTransportResultCode
 
+/**
+ * Single-source message for the RFC #67/#68 fail-explicit GET/HEAD streaming-body
+ * caller-contract error. Referenced by every CURL end so the three-end wording
+ * cannot drift: Android/iOS via [unsupportedStreamingRequestBodyResponse]
+ * (NetworkResponse layer), OHOS via `IVBTransportService.requestUploadStream`'s
+ * GET/HEAD branch (VBTransportResponse layer). Caller-contract error, not a
+ * transport failure → no raft.9 cause-tag prefix; plain method semantics.
+ * [method] must already be upper-cased by the caller.
+ */
+internal fun unsupportedStreamingRequestBodyMessage(method: String): String =
+    "streaming request body is not supported for $method " +
+        "(CURLOPT_UPLOAD would rewrite the verb); use POST/PUT/PATCH/DELETE/OPTIONS"
+
 internal fun unsupportedStreamingRequestBodyResponse(request: NetworkRequest): NetworkResponse =
     NetworkResponse(
         request = request,
@@ -31,8 +44,7 @@ internal fun unsupportedStreamingRequestBodyResponse(request: NetworkRequest): N
         body = NetworkResponseBody(),
         error = NetworkError(
             kind = NetworkErrorKind.UNKNOWN,
-            message = "streaming request body is not supported for ${request.method.name.uppercase()} " +
-                "(CURLOPT_UPLOAD would rewrite the verb); use POST/PUT/PATCH/DELETE/OPTIONS",
+            message = unsupportedStreamingRequestBodyMessage(request.method.name.uppercase()),
             rawCode = VBTransportResultCode.CODE_NETWORK_ERROR
         )
     )

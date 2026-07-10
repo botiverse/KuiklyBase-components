@@ -99,12 +99,11 @@ object HmTransportImpl : IVBTransportService {
                 VBTransportResponse().apply {
                     this.request = kmmRequest
                     this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
-                    // No raft.9 cause tag: this is a caller-contract error,
-                    // not a transport failure — message shape matches the
-                    // Android CURL delegate's for the same case (#67).
-                    this.errorMessage = "streaming request body is not supported for " +
-                        "$method (CURLOPT_UPLOAD would rewrite the verb); " +
-                        "use POST/PUT/PATCH/DELETE/OPTIONS"
+                    // Single-source RFC #67/#68 caller-contract message, shared
+                    // with the Android/iOS CURL delegates so the three-end
+                    // wording cannot drift (no raft.9 cause tag — caller error,
+                    // not a transport failure).
+                    this.errorMessage = unsupportedStreamingRequestBodyMessage(method)
                 }
             )
             return
