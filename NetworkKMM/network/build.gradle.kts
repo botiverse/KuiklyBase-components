@@ -150,6 +150,17 @@ android {
         minSdk = 21
         consumerProguardFiles("consumer-rules.pro")
     }
+    sourceSets {
+        // task #24: the AAR embeds the production curl native artifact —
+        // per-ABI libnetworkkmmcurl.so (shared pbcurlwrapper + the #22 JNI
+        // shim), built and committed by scripts/build-android-curl.sh via
+        // the networkkmm-android-native workflow (same committed-binary
+        // pattern as the OHOS .so line). The Android CURL delegate stays
+        // fail-closed when the directory is absent.
+        getByName("main") {
+            jniLibs.srcDir("libs/android")
+        }
+    }
     testOptions {
         // OkHttp's static init logs through android.util.Log; JVM unit tests
         // get the unmocked stub ("not mocked" RuntimeException) without this.

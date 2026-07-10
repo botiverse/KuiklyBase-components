@@ -1,0 +1,125 @@
+# Builds the PRODUCTION Android curl native artifact (task #24): shared
+# pbcurlwrapper + the task #22 JNI shim, statically linked against
+# cross-compiled OpenSSL/curl, into per-ABI libnetworkkmmcurl.so under
+# NetworkKMM/network/libs/android/<abi>/ — embedded in the network AAR as
+# jniLibs. PR runs verify the native build (this is also the only lane that
+# COMPILES the JNI shim — see the #66 seam review note); a workflow_dispatch
+# with commit_binaries=true pushes refreshed .so files back to the branch
+# (same committed-binary pattern as networkkmm-ohos-native).
+name: NetworkKMM Android native (curl)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_binaries:
+        description: "Commit the refreshed native binaries back to the branch"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - "NetworkKMM/network/src/androidMain/cpp/**"
+      - "NetworkKMM/scripts/build-android-curl.sh"
+      - ".github/workflows/networkkmm-android-native.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: networkkmm-android-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NDK_VERSION: "28.0.13004108"
+
+jobs:
+  build:
+    name: Build libnetworkkmmcurl.so (${{ matrix.abi }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        abi: [arm64-v8a, x86_64]
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" >/dev/null
+
+      # OpenSSL/curl cross-compiles dominate the wall clock; cache their build
+      # trees keyed on everything that changes the bits.
+      - name: Cache OpenSSL/curl build trees
+        uses: actions/cache@v4
+        with:
+          path: NetworkKMM/build/android-curl/${{ matrix.abi }}
+          key: android-curl-${{ matrix.abi }}-${{ env.NDK_VERSION }}-${{ hashFiles('NetworkKMM/scripts/build-android-curl.sh') }}
+
+      - name: Build native artifact
+        shell: bash
+        env:
+          ANDROID_ABI: ${{ matrix.abi }}
+        run: bash NetworkKMM/scripts/build-android-curl.sh
+
+      - name: Verify exported JNI surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          so="NetworkKMM/network/libs/android/${{ matrix.abi }}/libnetworkkmmcurl.so"
+          test -f "$so"
+          # JNI_OnLoad must be exported for System.loadLibrary registration;
+          # the wrapper's own entry points are linked statically inside.
+          nm -D "$so" | grep -q "JNI_OnLoad"
+          echo "JNI surface OK: $(du -h "$so" | cut -f1)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: networkkmmcurl-${{ matrix.abi }}
+          if-no-files-found: error
+          path: NetworkKMM/network/libs/android/${{ matrix.abi }}/libnetworkkmmcurl.so
+
+  commit:
+    name: Commit refreshed binaries
+    if: github.event_name == 'workflow_dispatch' && inputs.commit_binaries
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: networkkmmcurl-*
+          path: /tmp/networkkmmcurl
+
+      - name: Place artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          for abi in arm64-v8a x86_64; do
+            mkdir -p "NetworkKMM/network/libs/android/$abi"
+            cp "/tmp/networkkmmcurl/networkkmmcurl-$abi/libnetworkkmmcurl.so" \
+               "NetworkKMM/network/libs/android/$abi/libnetworkkmmcurl.so"
+          done
+
+      - name: Commit refreshed binaries back
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add NetworkKMM/network/libs/android
+          if git diff --cached --quiet; then
+            echo "No binary changes to commit."
+          else
+            git commit -m "ci: refresh NetworkKMM Android curl native binaries [skip ci]"
+            git push
+          fi
