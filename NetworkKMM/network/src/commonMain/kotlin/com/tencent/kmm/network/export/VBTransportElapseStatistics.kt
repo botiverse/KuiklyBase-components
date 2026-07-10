@@ -17,12 +17,21 @@
 package com.tencent.kmm.network.export
 
 data class VBTransportElapseStatistics(
+    /** NetworkClient.execute enqueue -> its coroutine actually starts. */
+    var clientQueueTimeMs: Double = 0.0,
+    /** Request middleware + auth preparation before the first engine invocation. */
+    var requestPreparationTimeMs: Double = 0.0,
+    /** Android transport scope launch -> Ktor/OkHttp callStart. */
+    var transportQueueTimeMs: Double = 0.0,
+    /** OkHttp callStart -> application interceptor entry (Dispatcher permit granted). */
+    var dispatcherQueueTimeMs: Double = 0.0,
     /**
      * DNS 解析耗时
      */
     var nameLookupTimeMs: Double = 0.0,
     /**
-     * 连接耗时
+     * Connection establishment through connectEnd. On HTTPS this includes the
+     * nested TLS phase reported separately by [sslCostTimeMs]; do not add them.
      */
     var connectTimeMs: Double = 0.0,
     /**
@@ -30,14 +39,22 @@ data class VBTransportElapseStatistics(
      */
     var sslCostTimeMs: Double = 0.0,
     /**
-     * 传输准备耗时, 例如发送 HTTP 请求头前的处理时间
+     * Dispatcher start -> request headers start. This is a cumulative umbrella
+     * interval that overlaps DNS/connect/TLS; do not add those child phases.
      */
     var preTransferTime: Double = 0.0,
     /**
-     * 首字节到达耗时（TTFB）
-     * 统计的是 数据发送耗时 和 数据发送完毕到首字节返回耗时 之和
+     * Dispatcher start -> response headers start. This is a cumulative umbrella
+     * interval that overlaps preparation, DNS/connect/TLS, and request send;
+     * do not add those child phases.
      */
     var startTransferTimeMs: Double = 0.0,
+    /** Request headers start -> request headers end. */
+    var requestHeadersTimeMs: Double = 0.0,
+    /** Request body start -> request body end. */
+    var requestBodyTimeMs: Double = 0.0,
+    /** Request headers/body end -> response headers start. */
+    var responseWaitTimeMs: Double = 0.0,
     /**
      * 所有重定向过程的总耗时
      */
@@ -50,4 +67,12 @@ data class VBTransportElapseStatistics(
      * 整个请求的总耗时
      */
     var totalTimeMs: Double = 0.0,
+    /** Transport implementation request id used to join component logs. */
+    var transportRequestId: String? = null,
+    /** Negotiated protocol, for example h2 or http/1.1. */
+    var protocol: String? = null,
+    /** True when the acquired connection existed before this call started. */
+    var reusedConnection: Boolean? = null,
+    /** Number of connection attempts observed for this response. */
+    var connectionAttemptCount: Int = 0,
 )

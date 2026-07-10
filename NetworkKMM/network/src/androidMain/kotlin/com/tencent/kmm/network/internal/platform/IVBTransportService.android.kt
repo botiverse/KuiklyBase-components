@@ -31,6 +31,8 @@ import com.tencent.kmm.network.export.VBTransportStringRequest
 import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.VBPBLog
 import com.tencent.kmm.network.internal.utils.ByteReadChannelWrapper
+import com.tencent.kmm.network.internal.utils.AndroidTransportPhaseTracer
+import com.tencent.kmm.network.internal.utils.NETWORK_KMM_TRACE_HEADER
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.buildResponseAndCallback
 import com.tencent.kmm.network.internal.utils.describeTransportFailure
 import com.tencent.kmm.network.internal.utils.transportConnectTimeoutMillis
@@ -78,8 +80,10 @@ object AndroidTransportImpl : IVBTransportService {
         kmmCallback: (response: VBTransportBaseResponse) -> Unit,
         uploadBody: StreamingUploadBody? = null
     ) {
+        AndroidTransportPhaseTracer.scheduled(request.requestId)
         val job = scope.launch {
             try {
+                AndroidTransportPhaseTracer.transportCoroutineStarted(request.requestId)
                 val client = getHttpClient(request) as HttpClient
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
                 val response = client.request(request.url) {
@@ -95,6 +99,7 @@ object AndroidTransportImpl : IVBTransportService {
                         }
                     }
                     constructRequest(request)
+                    header(NETWORK_KMM_TRACE_HEADER, request.requestId.toString())
                     // issue #8: streaming upload — the body is written to the
                     // engine channel as it is produced, never buffered whole.
                     if (uploadBody != null) {
@@ -146,6 +151,8 @@ object AndroidTransportImpl : IVBTransportService {
                         "totalElapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
                     request.logTag
                 )
+                AndroidTransportPhaseTracer.responseBodyRead(request.requestId)
+                request.transportElapseStatistics = AndroidTransportPhaseTracer.complete(request.requestId)
 
                 buildResponseAndCallback(
                     taskMap,
@@ -159,8 +166,10 @@ object AndroidTransportImpl : IVBTransportService {
             } catch (throwable: Throwable) {
                 if (throwable is CancellationException) {
                     taskMap.remove(request.requestId)
+                    AndroidTransportPhaseTracer.cancel(request.requestId)
                     throw throwable
                 }
+                request.transportElapseStatistics = AndroidTransportPhaseTracer.complete(request.requestId)
                 callbackFailure(request, throwable, kmmCallback)
             }
         }

@@ -73,5 +73,13 @@ internal fun buildTransportHttpClient(okHttpEnabled: Boolean): HttpClient =
 // on the OkHttp 5.x default, so the intent survives dependency bumps.
 internal fun OkHttpClient.Builder.applyTransportOkHttpDefaults(): OkHttpClient.Builder =
     fastFallback(true)
+        .eventListenerFactory(AndroidTransportPhaseTracer.eventListenerFactory())
+        .addInterceptor { chain ->
+            val request = chain.request()
+            request.header(NETWORK_KMM_TRACE_HEADER)?.toIntOrNull()?.let(
+                AndroidTransportPhaseTracer::dispatcherStarted
+            )
+            chain.proceed(request.newBuilder().removeHeader(NETWORK_KMM_TRACE_HEADER).build())
+        }
 
 actual fun getHttpClient(kmmRequest: VBTransportBaseRequest): Any? = sharedHttpClient

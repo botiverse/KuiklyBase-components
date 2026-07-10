@@ -147,6 +147,7 @@ object VBTransportCommonUtils {
         response.errorCode = errorCode
         response.errorMessage = errorMsg
         response.header = headers
+        response.elapseStatis = request.transportElapseStatistics
         when (response) {
             is VBTransportGetResponse -> {
                 response.data = convertDataWithContentType(data, request)
