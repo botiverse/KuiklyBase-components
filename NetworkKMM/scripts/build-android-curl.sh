@@ -16,6 +16,8 @@ CURL_VERSION="${CURL_VERSION:-8.16.0}"
 # build-time downloads in the production line).
 OPENSSL_SHA256="${OPENSSL_SHA256:-967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99}"
 CURL_SHA256="${CURL_SHA256:-a21e20476e39eca5a4fc5cfb00acf84bbc1f5d8443ec3853ad14c26b3c85b970}"
+NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
+NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
 ANDROID_API="${ANDROID_API:-23}"
 ANDROID_ABI="${ANDROID_ABI:-arm64-v8a}"
 NDK_VERSION="${NDK_VERSION:-28.0.13004108}"
@@ -39,10 +41,13 @@ DOWNLOADS_DIR="${BUILD_ROOT}/downloads"
 OPENSSL_SOURCE="${BUILD_ROOT}/openssl-${OPENSSL_VERSION}"
 OPENSSL_PREFIX="${BUILD_ROOT}/openssl-out"
 OPENSSL_STAMP="${OPENSSL_PREFIX}/.android-build-config"
+NGHTTP2_SOURCE="${BUILD_ROOT}/nghttp2-${NGHTTP2_VERSION}"
+NGHTTP2_BUILD="${BUILD_ROOT}/nghttp2-build"
+NGHTTP2_STAMP="${NGHTTP2_BUILD}/.android-build-config"
 CURL_SOURCE="${BUILD_ROOT}/curl-${CURL_VERSION}"
 CURL_BUILD="${BUILD_ROOT}/curl-build"
 CURL_STAMP="${CURL_BUILD}/.android-build-config"
-BUILD_CONFIG="${NDK_VERSION}:${ANDROID_API}:${ANDROID_ABI}:${OPENSSL_VERSION}:${CURL_VERSION}"
+BUILD_CONFIG="${NDK_VERSION}:${ANDROID_API}:${ANDROID_ABI}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}"
 
 if [[ ! -f "$SHIM_SOURCE" ]]; then
   echo "JNI shim not found: $SHIM_SOURCE" >&2
@@ -122,6 +127,27 @@ if [[ ! -f "${OPENSSL_PREFIX}/lib/libssl.a" || "$(cat "$OPENSSL_STAMP" 2>/dev/nu
   printf '%s' "$BUILD_CONFIG" > "$OPENSSL_STAMP"
 fi
 
+echo "==> Building nghttp2 ${NGHTTP2_VERSION} for ${ANDROID_ABI}"
+fetch "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.gz" \
+  "${DOWNLOADS_DIR}/nghttp2-${NGHTTP2_VERSION}.tar.gz" "$NGHTTP2_SHA256"
+if [[ ! -f "${NGHTTP2_BUILD}/lib/libnghttp2.a" || "$(cat "$NGHTTP2_STAMP" 2>/dev/null)" != "$BUILD_CONFIG" ]]; then
+  rm -rf "$NGHTTP2_SOURCE" "$NGHTTP2_BUILD"
+  tar -xzf "${DOWNLOADS_DIR}/nghttp2-${NGHTTP2_VERSION}.tar.gz" -C "$BUILD_ROOT"
+  cmake -S "$NGHTTP2_SOURCE" -B "$NGHTTP2_BUILD" \
+    -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI="$ANDROID_ABI" \
+    -DANDROID_PLATFORM="android-${ANDROID_API}" \
+    -DANDROID_STL=c++_static \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_LIB_ONLY=ON \
+    -DBUILD_SHARED_LIBS=OFF \
+    -DBUILD_STATIC_LIBS=ON \
+    -DENABLE_DOC=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
+  cmake --build "$NGHTTP2_BUILD" -j"$JOBS" >/dev/null
+  printf '%s' "$BUILD_CONFIG" > "$NGHTTP2_STAMP"
+fi
+
 echo "==> Building curl ${CURL_VERSION} for ${ANDROID_ABI}"
 fetch "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/curl-${CURL_VERSION}.tar.gz" "$CURL_SHA256"
@@ -155,11 +181,25 @@ if [[ ! -f "${CURL_BUILD}/lib/libcurl.a" || "$(cat "$CURL_STAMP" 2>/dev/null)" !
     -DCURL_ZLIB=OFF \
     -DCURL_BROTLI=OFF \
     -DCURL_ZSTD=OFF \
-    -DUSE_NGHTTP2=OFF \
+    -DUSE_NGHTTP2=ON \
+    -DNGHTTP2_INCLUDE_DIR="${NGHTTP2_SOURCE}/lib/includes" \
+    -DNGHTTP2_LIBRARY="${NGHTTP2_BUILD}/lib/libnghttp2.a" \
     -DUSE_LIBIDN2=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
   cmake --build "$CURL_BUILD" -j"$JOBS" >/dev/null
   printf '%s' "$BUILD_CONFIG" > "$CURL_STAMP"
+fi
+
+# HTTP/2 hard gate: curl's cmake can silently fall back to h1-only if the
+# nghttp2 detection wobbles — assert the symbol REFERENCE in libcurl.a
+# (the final .so is stripped, so check the archive like the OHOS codec
+# gate). Here-string, not a pipe: grep -q + pipefail SIGPIPE lesson.
+CURL_SYMS="$("${TOOLCHAIN_ROOT}/bin/llvm-nm" "$CURL_BUILD/lib/libcurl.a" 2>/dev/null || true)"
+if grep -qw "nghttp2_session_client_new3" <<<"$CURL_SYMS"; then
+  echo "libcurl HTTP/2 (nghttp2): ENABLED"
+else
+  echo "libcurl HTTP/2 (nghttp2): MISSING — nghttp2_session_client_new not referenced" >&2
+  exit 2
 fi
 
 echo "==> Linking libnetworkkmmcurl.so (${ANDROID_ABI})"
@@ -184,6 +224,7 @@ echo "==> Linking libnetworkkmmcurl.so (${ANDROID_ABI})"
   "$CPP_ROOT/wrapper/src/utils/curl_utils.cpp" \
   "$SHIM_SOURCE" \
   "$CURL_BUILD/lib/libcurl.a" \
+  "$NGHTTP2_BUILD/lib/libnghttp2.a" \
   "$OPENSSL_PREFIX/lib/libssl.a" \
   "$OPENSSL_PREFIX/lib/libcrypto.a" \
   -llog \

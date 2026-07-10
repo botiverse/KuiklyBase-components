@@ -685,6 +685,20 @@ class CurlClient {
         redirectTime = tmpRedirectTime * 1000;
         totalTime = tmpTotalTime * 1000;
 
+        // Negotiated protocol observability (task #30): proves whether the
+        // connection actually ran HTTP/2 after the nghttp2 build-line change.
+        long httpVersion = 0;
+        curl_easy_getinfo(curl_, CURLINFO_HTTP_VERSION, &httpVersion);
+        std::string protocol = "http/1.x";
+        if (httpVersion == CURL_HTTP_VERSION_2_0) {
+            protocol = "h2";
+        } else if (httpVersion == CURL_HTTP_VERSION_3) {
+            protocol = "h3";
+        } else if (httpVersion == CURL_HTTP_VERSION_1_1) {
+            protocol = "http/1.1";
+        }
+        logI(log_tag_, "transport_protocol http_version=" + protocol);
+
         logI(log_tag_, "request statistics, nameLookupTime:" + std::to_string(nameLookupTime) + ", connectTime:"
             + std::to_string(connectTime) + ", sslCostTime:" + std::to_string(sslCostTime) + ", preTransferTime:"
             + std::to_string(preTransferTime) + ", startTransferTime:" + std::to_string(startTransferTime)

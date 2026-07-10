@@ -45,4 +45,5 @@ target_link_libraries(pbcurlwrapper PUBLIC
         ${PB_LIBS_DIR}/libbrotlidec.a
         ${PB_LIBS_DIR}/libbrotlicommon.a
         ${PB_LIBS_DIR}/libzstd.a
+        ${PB_LIBS_DIR}/libnghttp2.a
 )
