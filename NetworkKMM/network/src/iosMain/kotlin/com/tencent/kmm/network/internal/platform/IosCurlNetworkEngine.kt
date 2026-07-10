@@ -21,21 +21,23 @@ import com.tencent.kmm.network.curl.contentLength
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
-import com.tencent.kmm.network.export.NetworkEngineCapabilities
-import com.tencent.kmm.network.export.NetworkError
-import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.NetworkTransferProgress
-import com.tencent.kmm.network.export.VBTransportIosCurl
 import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngine
+import com.tencent.kmm.network.service.NetworkEngineAvailability
 import com.tencent.kmm.network.service.NetworkUploadStreamSource
+import com.tencent.kmm.network.service.curlNetworkEngineCapabilities
+import com.tencent.kmm.network.service.curlRuntimeFailureResponse
 import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
+import com.tencent.kmm.network.service.prepareCurlRuntime
+import com.tencent.kmm.network.service.preparedCurlCaInfoPath
+import com.tencent.kmm.network.service.preparedCurlProxyUrl
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -45,38 +47,30 @@ import kotlin.coroutines.cancellation.CancellationException
 internal object IosCurlEngineProvider {
     internal var testBridge: IosCurlNativeBridge? = null
 
-    private fun configuredCaPath(): String? =
-        VBTransportIosCurl.caInfoPath?.trim()?.takeIf(String::isNotEmpty)
-
-    val nativeAvailable: Boolean
-        get() = (testBridge ?: IosCurlCInteropBridge).isAvailable && configuredCaPath() != null
+    val nativeLinked: Boolean
+        get() = (testBridge ?: IosCurlCInteropBridge).isAvailable
 
     fun resolve(): NetworkEngine? {
         val bridge = testBridge ?: IosCurlCInteropBridge
-        val caPath = configuredCaPath() ?: return null
-        return bridge.takeIf { it.isAvailable }?.let {
-            IosCurlNetworkEngine(it) { caPath }
-        }
+        return bridge.takeIf { it.isAvailable }?.let(::IosCurlNetworkEngine)
     }
 }
 
 internal class IosCurlNetworkEngine(
-    private val bridge: IosCurlNativeBridge,
-    private val caInfoPathProvider: () -> String?
+    private val bridge: IosCurlNativeBridge
 ) : NetworkEngine {
-    override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(
-        requestBodyStreaming = true,
-        responseBodyStreaming = true,
-        multipartStreaming = true,
-        uploadProgress = true,
-        downloadProgress = true
-    )
+    override val capabilities
+        get() = curlNetworkEngineCapabilities()
+
+    override fun availability(request: NetworkRequest): NetworkEngineAvailability =
+        prepareCurlRuntime(request)
 
     override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+        val availability = prepareCurlRuntime(request)
+        if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         networkUploadStreamSourceOrNull(request)?.let { source ->
             return executeUpload(request, call, source)
         }
-        val caPath = requiredCaPath() ?: return missingCaResponse(request)
         val body = request.body.toBytes(request.progress.uploadProgress)
         body.error?.let { error ->
             return NetworkResponse(
@@ -90,7 +84,6 @@ internal class IosCurlNetworkEngine(
         val requestId = VBPBRequestIdGenerator.getRequestId()
         val nativeRequest = request.toNativeRequest(
             requestId = requestId,
-            caPath = caPath,
             body = body.bytes,
             contentType = body.contentType
         )
@@ -110,9 +103,10 @@ internal class IosCurlNetworkEngine(
         onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
         onChunk: (ByteArray) -> Unit
     ): NetworkResponse {
-        val caPath = requiredCaPath() ?: return missingCaResponse(request)
+        val availability = prepareCurlRuntime(request)
+        if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         val requestId = VBPBRequestIdGenerator.getRequestId()
-        val nativeRequest = request.toNativeRequest(requestId = requestId, caPath = caPath)
+        val nativeRequest = request.toNativeRequest(requestId = requestId)
         var transferred = 0L
         var responseLength: Long? = null
         call.addCancelHandler {
@@ -145,15 +139,15 @@ internal class IosCurlNetworkEngine(
         call: NetworkCall,
         source: NetworkUploadStreamSource
     ): NetworkResponse = coroutineScope {
+        val availability = prepareCurlRuntime(request)
+        if (!availability.available) return@coroutineScope curlRuntimeFailureResponse(request, availability)
         if (request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) {
             return@coroutineScope unsupportedStreamingRequestBodyResponse(request)
         }
-        val caPath = requiredCaPath() ?: return@coroutineScope missingCaResponse(request)
         val requestId = VBPBRequestIdGenerator.getRequestId()
         val pullBridge = IosCurlUploadPullBridge()
         val nativeRequest = request.toNativeRequest(
             requestId = requestId,
-            caPath = caPath,
             contentType = source.contentType,
             uploadContentLength = source.contentLength
         )
@@ -199,7 +193,6 @@ internal class IosCurlNetworkEngine(
 
     private fun NetworkRequest.toNativeRequest(
         requestId: Int,
-        caPath: String,
         body: ByteArray? = null,
         contentType: String? = null,
         uploadContentLength: Long? = null
@@ -218,23 +211,14 @@ internal class IosCurlNetworkEngine(
             timeoutMillis = policy.timeoutMillis,
             body = body,
             uploadContentLength = uploadContentLength,
-            caInfoPath = caPath
+            caInfoPath = checkNotNull(preparedCurlCaInfoPath(this)) {
+                "Curl CA path missing after runtime preparation"
+            },
+            proxyUrl = checkNotNull(preparedCurlProxyUrl(this)) {
+                "Curl proxy decision missing after runtime preparation"
+            }
         )
     }
-
-    private fun requiredCaPath(): String? =
-        caInfoPathProvider()?.trim()?.takeIf(String::isNotEmpty)
-
-    private fun missingCaResponse(request: NetworkRequest): NetworkResponse = NetworkResponse(
-        request = request,
-        statusCode = null,
-        headers = emptyMap(),
-        body = NetworkResponseBody(),
-        error = NetworkError(
-            kind = NetworkErrorKind.TLS,
-            message = "iOS curl requires an app-owned CA bundle path."
-        )
-    )
 
     private fun cancelledResponse(request: NetworkRequest): NetworkResponse =
         CurlNativeResponse(

@@ -72,6 +72,9 @@ but it also makes CA updates, revocation policy, pinning, and incident response
 an application responsibility. Android `networkSecurityConfig` and platform
 `TrustManager` behavior are not inherited automatically.
 
-System proxy/PAC discovery is also not inherited. A unified curl transport can
-accept an explicit resolved proxy, but Android platform proxy/PAC resolution
-and the comparison matrix remain implementation work.
+System proxy/PAC discovery is not inherited by libcurl itself. The production
+transport now offers `NetworkCurlProxyConfiguration.androidSystem()`: static
+decisions come from Android's default `ProxySelector`, while PAC connects curl
+to Android's localhost forwarding proxy so the OS retains script evaluation,
+ordered fallback, and proxy-change ownership. The spike remains only build/TLS
+evidence; the production Android runtime matrix is the acceptance source.

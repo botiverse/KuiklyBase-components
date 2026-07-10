@@ -17,17 +17,24 @@
 package com.tencent.kmm.network.internal.platform
 
 import android.util.Log
+import android.util.Base64
+import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkErrorKind
+import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
+import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
+import com.tencent.kmm.network.export.NetworkCurlTrustStore
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkRequestPolicy
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.VBTransportAndroidCurl
+import com.tencent.kmm.network.export.VBTransportCurl
 import com.tencent.kmm.network.export.VBTransportMethod
+import com.tencent.kmm.network.export.networkCurlSha256Hex
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkClient
 import com.tencent.kmm.network.service.NetworkClientConfig
@@ -35,20 +42,28 @@ import com.tencent.kmm.network.service.NetworkEngineDiagnosticsListener
 import com.tencent.kmm.network.service.NetworkEngineSelection
 import com.tencent.kmm.network.service.NetworkEngineSelectionDiagnostics
 import com.tencent.kmm.network.service.NetworkTransportEngine
+import com.tencent.kmm.network.service.AndroidCurlSystemProxyResolver
+import com.tencent.kmm.network.service.CurlSystemProxyResolution
 import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
+import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
 import java.nio.charset.StandardCharsets
+import java.security.KeyStore
 import java.util.Collections
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
+import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLServerSocket
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -70,23 +85,29 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class AndroidCurlRuntimeInstrumentedTest {
     private lateinit var server: RuntimeHttpServer
+    private lateinit var trustStoreFile: File
 
     @Before
     fun setUp() {
-        VBTransportAndroidCurl.caInfoPath = null
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        trustStoreFile = File(context.cacheDir, "networkkmm-runtime-ca.pem")
+        trustStoreFile.writeBytes(decode(AndroidCurlTlsTestMaterial.TRUSTED_CA_PEM_BASE64))
+        configureCurl(trustStoreFile, NetworkCurlProxyConfiguration.direct())
         server = RuntimeHttpServer(concurrentUploadCount = CONCURRENT_UPLOADS)
     }
 
     @After
     fun tearDown() {
         server.close()
-        VBTransportAndroidCurl.caInfoPath = null
+        AndroidCurlSystemProxyResolver.testResolver = null
+        VBTransportCurl.clear()
+        trustStoreFile.delete()
     }
 
     @Test
-    fun productionAarPassesAndroidCurlRuntimeGate() {
+    fun committedAndroidCurlArtifactPassesRuntimeGate() {
         runBlocking {
-            assertTrue("AAR native library must load", VBTransportAndroidCurl.nativeAvailable)
+            assertTrue("instrumentation APK must load the committed curl artifact", VBTransportAndroidCurl.nativeAvailable)
             val engine = requireNotNull(AndroidCurlEngineProvider.resolve())
 
             bufferedSelectorRequestUsesCurl()
@@ -97,11 +118,13 @@ class AndroidCurlRuntimeInstrumentedTest {
             nativePreStartCancelCoversAllThreeEntrypoints()
             callbackFailureAbortsAndSuppressesLaterChunks(engine)
             concurrentUploadsDoNotStarveDispatcher()
+            certificateAcceptanceMatrixAndManualProxy()
 
             Log.i(
                 TAG,
                 "completed passed=true gates=buffered,download,upload,external-cancel," +
-                    "pre-start,cross-thread,callback-failure,concurrent-upload"
+                    "pre-start,cross-thread,callback-failure,concurrent-upload,cert-matrix," +
+                    "manual-proxy,android-system-pac-proxy"
             )
         }
     }
@@ -302,6 +325,73 @@ class AndroidCurlRuntimeInstrumentedTest {
         assertEquals(CONCURRENT_UPLOADS, server.maxConcurrentUploads.get())
     }
 
+    private suspend fun certificateAcceptanceMatrixAndManualProxy() {
+        val valid = RuntimeHttpsServer(AndroidCurlTlsTestMaterial.VALID_PKCS12_BASE64)
+        val unknown = RuntimeHttpsServer(AndroidCurlTlsTestMaterial.UNKNOWN_PKCS12_BASE64)
+        val expired = RuntimeHttpsServer(AndroidCurlTlsTestMaterial.EXPIRED_PKCS12_BASE64)
+        val mismatch = RuntimeHttpsServer(AndroidCurlTlsTestMaterial.MISMATCH_PKCS12_BASE64)
+        try {
+            configureCurl(trustStoreFile, NetworkCurlProxyConfiguration.direct())
+            assertTrue(curlClient().execute(NetworkRequest(url = valid.url())).isSuccess)
+            assertEquals(NetworkErrorKind.TLS, curlClient().execute(NetworkRequest(url = unknown.url())).error?.kind)
+            assertEquals(NetworkErrorKind.TLS, curlClient().execute(NetworkRequest(url = expired.url())).error?.kind)
+            assertEquals(NetworkErrorKind.TLS, curlClient().execute(NetworkRequest(url = mismatch.url())).error?.kind)
+
+            val wrongCa = File(trustStoreFile.parentFile, "networkkmm-runtime-wrong-ca.pem").apply {
+                writeBytes(decode(AndroidCurlTlsTestMaterial.WRONG_CA_PEM_BASE64))
+            }
+            try {
+                configureCurl(wrongCa, NetworkCurlProxyConfiguration.direct())
+                assertEquals(NetworkErrorKind.TLS, curlClient().execute(NetworkRequest(url = valid.url())).error?.kind)
+            } finally {
+                wrongCa.delete()
+            }
+
+            RuntimeConnectProxy().use { proxy ->
+                configureCurl(
+                    trustStoreFile,
+                    NetworkCurlProxyConfiguration.manual("http://127.0.0.1:${proxy.port}")
+                )
+                assertTrue(curlClient().execute(NetworkRequest(url = valid.url())).isSuccess)
+                assertTrue("manual proxy must observe CONNECT", proxy.awaitConnect())
+            }
+
+            RuntimeConnectProxy().use { proxy ->
+                AndroidCurlSystemProxyResolver.testResolver = {
+                    CurlSystemProxyResolution.resolved("http://127.0.0.1:${proxy.port}")
+                }
+                try {
+                    configureCurl(trustStoreFile, NetworkCurlProxyConfiguration.androidSystem())
+                    assertTrue(curlClient().execute(NetworkRequest(url = valid.url())).isSuccess)
+                    assertTrue("Android system PAC proxy must observe CONNECT", proxy.awaitConnect())
+                } finally {
+                    AndroidCurlSystemProxyResolver.testResolver = null
+                }
+            }
+        } finally {
+            valid.close()
+            unknown.close()
+            expired.close()
+            mismatch.close()
+            configureCurl(trustStoreFile, NetworkCurlProxyConfiguration.direct())
+        }
+    }
+
+    private fun configureCurl(file: File, proxy: NetworkCurlProxyConfiguration) {
+        val status = VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = file.absolutePath,
+                    sha256 = networkCurlSha256Hex(file.readBytes())
+                ),
+                proxy = proxy
+            )
+        )
+        assertTrue(status.detail, status.configured)
+    }
+
+    private fun decode(value: String): ByteArray = Base64.decode(value, Base64.DEFAULT)
+
     private fun curlClient(
         selections: MutableList<NetworkEngineSelectionDiagnostics>? = null
     ): NetworkClient = NetworkClient(
@@ -329,13 +419,160 @@ class AndroidCurlRuntimeInstrumentedTest {
         url = server.url(path),
         method = method,
         headers = emptyMap(),
-        timeoutMillis = TIMEOUT_MS
+        timeoutMillis = TIMEOUT_MS,
+        caInfoPath = trustStoreFile.absolutePath,
+        proxyUrl = ""
     )
 
     private fun merge(chunks: List<ByteArray>): ByteArray {
         val output = ByteArrayOutputStream()
         chunks.forEach(output::write)
         return output.toByteArray()
+    }
+
+    private class RuntimeHttpsServer(pkcs12Base64: String) : AutoCloseable {
+        private val executor = Executors.newCachedThreadPool()
+        private val running = java.util.concurrent.atomic.AtomicBoolean(true)
+        private val server: SSLServerSocket
+
+        init {
+            val password = AndroidCurlTlsTestMaterial.PASSWORD.toCharArray()
+            val keyStore = KeyStore.getInstance("PKCS12").apply {
+                load(ByteArrayInputStream(Base64.decode(pkcs12Base64, Base64.DEFAULT)), password)
+            }
+            val keyManagers = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm()).apply {
+                init(keyStore, password)
+            }
+            val sslContext = SSLContext.getInstance("TLS").apply {
+                init(keyManagers.keyManagers, null, null)
+            }
+            server = sslContext.serverSocketFactory.createServerSocket(
+                0,
+                50,
+                InetAddress.getByName("127.0.0.1")
+            ) as SSLServerSocket
+            executor.execute {
+                while (running.get()) {
+                    try {
+                        val socket = server.accept()
+                        executor.execute {
+                            // Negative TLS cases intentionally abort the peer handshake. Keep
+                            // those server-side exceptions contained in the connection worker;
+                            // the curl response assertions remain the source of truth.
+                            runCatching { handle(socket) }
+                        }
+                    } catch (_: Throwable) {
+                        if (running.get()) throw AssertionError("HTTPS accept loop failed")
+                    }
+                }
+            }
+        }
+
+        fun url(): String = "https://127.0.0.1:${server.localPort}/ok"
+
+        override fun close() {
+            running.set(false)
+            runCatching { server.close() }
+            executor.shutdownNow()
+            executor.awaitTermination(5, TimeUnit.SECONDS)
+        }
+
+        private fun handle(socket: Socket) {
+            socket.use { connection ->
+                connection.soTimeout = 10_000
+                val input = BufferedInputStream(connection.getInputStream())
+                val output = BufferedOutputStream(connection.getOutputStream())
+                readLine(input) ?: return
+                while (!readLine(input).isNullOrEmpty()) Unit
+                val body = "tls-ok".encodeToByteArray()
+                output.write(
+                    (
+                        "HTTP/1.1 200 OK\r\nContent-Length: ${body.size}\r\n" +
+                            "Connection: close\r\n\r\n"
+                        ).toByteArray(StandardCharsets.US_ASCII)
+                )
+                output.write(body)
+                output.flush()
+            }
+        }
+
+        private fun readLine(input: BufferedInputStream): String? {
+            val output = ByteArrayOutputStream()
+            while (true) {
+                val next = input.read()
+                if (next < 0) return if (output.size() == 0) null else output.toString("US-ASCII")
+                if (next == '\n'.code) break
+                if (next != '\r'.code) output.write(next)
+            }
+            return output.toString("US-ASCII")
+        }
+    }
+
+    private class RuntimeConnectProxy : AutoCloseable {
+        private val server = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        private val executor = Executors.newCachedThreadPool()
+        private val running = java.util.concurrent.atomic.AtomicBoolean(true)
+        private val connected = CountDownLatch(1)
+        val port: Int = server.localPort
+
+        init {
+            executor.execute {
+                while (running.get()) {
+                    try {
+                        val socket = server.accept()
+                        executor.execute { handle(socket) }
+                    } catch (_: Throwable) {
+                        if (running.get()) throw AssertionError("proxy accept loop failed")
+                    }
+                }
+            }
+        }
+
+        fun awaitConnect(): Boolean = connected.await(5, TimeUnit.SECONDS)
+
+        override fun close() {
+            running.set(false)
+            runCatching { server.close() }
+            executor.shutdownNow()
+            executor.awaitTermination(5, TimeUnit.SECONDS)
+        }
+
+        private fun handle(client: Socket) {
+            client.use { downstream ->
+                downstream.soTimeout = 10_000
+                val input = BufferedInputStream(downstream.getInputStream())
+                val output = BufferedOutputStream(downstream.getOutputStream())
+                val requestLine = readLine(input) ?: return
+                val parts = requestLine.split(' ')
+                if (parts.size < 2 || parts[0] != "CONNECT") return
+                while (!readLine(input).isNullOrEmpty()) Unit
+                val authority = parts[1]
+                val host = authority.substringBeforeLast(':')
+                val targetPort = authority.substringAfterLast(':').toInt()
+                Socket(host, targetPort).use { upstream ->
+                    output.write("HTTP/1.1 200 Connection Established\r\n\r\n".toByteArray())
+                    output.flush()
+                    connected.countDown()
+                    val upstreamToClient = executor.submit {
+                        runCatching { upstream.getInputStream().copyTo(downstream.getOutputStream()) }
+                    }
+                    runCatching { input.copyTo(upstream.getOutputStream()) }
+                    runCatching { upstream.shutdownOutput() }
+                    runCatching { upstreamToClient.get(5, TimeUnit.SECONDS) }
+                }
+            }
+        }
+
+        private fun readLine(input: BufferedInputStream): String? {
+            val output = ByteArrayOutputStream()
+            while (true) {
+                val next = input.read()
+                if (next < 0) return if (output.size() == 0) null else output.toString("US-ASCII")
+                if (next == '\n'.code) break
+                if (next != '\r'.code) output.write(next)
+            }
+            return output.toString("US-ASCII")
+        }
     }
 
     private class RuntimeHttpServer(

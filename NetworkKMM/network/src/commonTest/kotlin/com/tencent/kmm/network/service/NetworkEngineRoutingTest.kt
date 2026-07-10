@@ -166,6 +166,70 @@ class NetworkEngineRoutingTest {
     }
 
     @Test
+    fun stableRolloutBucketsCohortsAndKeepsRollbackImmediate() {
+        val half = NetworkEngineRolloutConfig(
+            curlBasisPoints = 5_000,
+            curlEnabled = true,
+            salt = "release-42"
+        )
+        val first = half.selectionFor("account-123")
+        val repeated = half.selectionFor("account-123")
+
+        assertEquals(first.rollout?.bucket, repeated.rollout?.bucket)
+        assertEquals(first.requestedEngine, repeated.requestedEngine)
+        assertTrue(requireNotNull(first.rollout).bucket in 0..9_999)
+
+        assertNull(
+            NetworkEngineRolloutConfig(
+                curlBasisPoints = 0,
+                curlEnabled = true
+            ).selectionFor("any").requestedEngine
+        )
+        assertEquals(
+            NetworkTransportEngine.CURL,
+            NetworkEngineRolloutConfig(
+                curlBasisPoints = 10_000,
+                curlEnabled = true
+            ).selectionFor("any").requestedEngine
+        )
+        assertTrue(
+            NetworkEngineRolloutConfig(
+                curlBasisPoints = 10_000,
+                curlEnabled = true,
+                forcePlatformDefault = true
+            ).selectionFor("any").forcePlatformDefault
+        )
+    }
+
+    @Test
+    fun ineligibleRequestedEngineFallsBackWithSpecificReason() {
+        val ktor = FakeEngine("ktor")
+        val curl = FakeEngine(
+            name = "curl",
+            availability = NetworkEngineAvailability.unavailable(
+                NetworkEngineUnavailableReason.PROXY_PAC_UNSUPPORTED,
+                "PAC unresolved"
+            )
+        )
+        val request = NetworkRequest(url = "https://example.test")
+
+        val resolved = resolveNetworkEngine(
+            selection = NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL),
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { engine -> if (engine == NetworkTransportEngine.KTOR) ktor else curl },
+            request = request
+        )
+
+        assertEquals(NetworkTransportEngine.KTOR, resolved.diagnostics.selectedEngine)
+        assertEquals(NetworkEngineSelectionReason.INELIGIBLE, resolved.diagnostics.reason)
+        assertEquals(
+            NetworkEngineUnavailableReason.PROXY_PAC_UNSUPPORTED,
+            resolved.diagnostics.unavailableReason
+        )
+        assertEquals("PAC unresolved", resolved.diagnostics.unavailableDetail)
+    }
+
+    @Test
     fun streamingUsesSelectedEngineAndReportsActualCapabilities() = runBlocking {
         val ktor = FakeEngine("ktor")
         val curl = FakeEngine(
@@ -236,9 +300,12 @@ class NetworkEngineRoutingTest {
     private class FakeEngine(
         private val name: String,
         override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(),
-        private val timing: VBTransportElapseStatistics = VBTransportElapseStatistics()
+        private val timing: VBTransportElapseStatistics = VBTransportElapseStatistics(),
+        private val availability: NetworkEngineAvailability = NetworkEngineAvailability.Available
     ) : NetworkEngine {
         val executed = mutableListOf<String>()
+
+        override fun availability(request: NetworkRequest): NetworkEngineAvailability = availability
 
         override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
             executed += name

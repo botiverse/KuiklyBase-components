@@ -127,9 +127,13 @@ void DeleteCurlClient(CurClientHandle handle);
 // 取消 CurClient 请求
 void Cancel(CurClientHandle handle);
 
-// Override the CA bundle for this client. The path is copied. Passing nullptr
-// restores libcurl's compiled default trust path.
+// Override the CA bundle for this client. The path is copied. Production
+// delegates validate and require an app-owned bundle before calling native.
 void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath);
+
+// Set a fixed proxy URL. The value is copied; an empty string explicitly
+// disables environment/system proxy discovery for direct mode.
+void SetCurlProxy(CurClientHandle handle, const char *proxyUrl);
 
 // Curl 发送请求
 void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback);

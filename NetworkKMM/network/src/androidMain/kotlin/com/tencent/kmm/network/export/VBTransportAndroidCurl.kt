@@ -20,10 +20,22 @@ import com.tencent.kmm.network.internal.platform.AndroidCurlEngineProvider
 
 /** Android curl runtime inputs supplied by the host application. */
 object VBTransportAndroidCurl {
-    /** Absolute path to the app-owned CA bundle. Null uses curl's compiled default. */
-    @Volatile
-    var caInfoPath: String? = null
+    /**
+     * Legacy path-only bridge. Prefer [VBTransportCurl.configure], which pins
+     * the expected SHA-256 and makes proxy policy explicit.
+     */
+    @Deprecated("Use VBTransportCurl.configure with a verified trust store and explicit proxy policy")
+    var caInfoPath: String?
+        get() = VBTransportCurl.snapshot()?.trustStore?.path
+        set(value) {
+            VBTransportCurl.configureLegacyPath(value)
+        }
 
+    /** True when the JNI artifact itself is linked, independent of rollout inputs. */
+    val nativeLinked: Boolean
+        get() = AndroidCurlEngineProvider.nativeLinked
+
+    /** True when native code is linked and an app-owned CA bundle is verified. */
     val nativeAvailable: Boolean
-        get() = AndroidCurlEngineProvider.nativeAvailable
+        get() = nativeLinked && VBTransportCurl.configured
 }

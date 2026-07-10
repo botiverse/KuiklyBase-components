@@ -145,6 +145,31 @@ config.logImpl = logImpl
 VBTransportInitHelper.init(config)
 ```
 
+#### Required curl runtime configuration
+
+Before enabling the curl engine on Android/iOS, or before sending requests through the OHOS curl
+platform default, the app must install a verified CA bundle and an explicit proxy decision:
+
+```kotlin
+val status = VBTransportCurl.configure(
+    NetworkCurlRuntimeConfiguration(
+        trustStore = NetworkCurlTrustStore(
+            path = appOwnedCaAbsolutePath,
+            sha256 = NetworkCurlCaBundleManifest.SHA256
+        ),
+        proxy = NetworkCurlProxyConfiguration.direct()
+    )
+)
+check(status.configured) { status.detail ?: status.failureReason.name }
+```
+
+Use `scripts/prepare-app-owned-ca-bundle.sh` to stage the repository-pinned Mozilla snapshot. The
+runtime rejects missing or hash-mismatched files. Choose `direct()`, `manual(fixedProxyUrl)`,
+Android-only `androidSystem()`, or `pacUnresolved()` explicitly. Android system PAC uses the local
+forwarding proxy maintained by the OS; unresolved PAC elsewhere makes curl ineligible rather than
+silently bypassing the platform proxy. See [Advanced NetworkClient features](./docs/network-client-advanced.md) for CA
+rotation, stable A/B rollout, rollback, diagnostics, and the current HTTPDNS/HTTP3 gates.
+
 ### Common Network Request Examples
 Some common HTTP GET/POST/string/byte/custom method request examples can be found in ***network/src/commonMain/service/VBTransportServiceTest.kt*** for your reference.
 

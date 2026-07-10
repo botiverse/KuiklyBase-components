@@ -252,6 +252,7 @@ void NativePerform(
     jbyteArray body,
     jlong upload_content_length,
     jstring ca_info_path,
+    jstring proxy_url,
     jint mode,
     jobject callback
 ) {
@@ -265,6 +266,7 @@ void NativePerform(
     JStringUtfChars url_chars(env, url);
     JStringUtfChars method_chars(env, method);
     JStringUtfChars ca_chars(env, ca_info_path);
+    JStringUtfChars proxy_chars(env, proxy_url);
     if (url_chars.get() == nullptr || method_chars.get() == nullptr) {
         InvokeEngineFailure(&context, "request URL or method is unavailable");
         return;
@@ -322,6 +324,7 @@ void NativePerform(
     }
     context.client = client;
     SetCurlCaInfo(client, ca_chars.get());
+    SetCurlProxy(client, proxy_chars.get());
     {
         std::lock_guard<std::mutex> lock(g_clients_mutex);
         g_clients[request_id] = client;
@@ -384,7 +387,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
             const_cast<char *>("nativePerform"),
             const_cast<char *>(
                 "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;J[BJLjava/lang/String;"
-                "ILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)V"
+                "Ljava/lang/String;ILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)V"
             ),
             reinterpret_cast<void *>(NativePerform)
         },

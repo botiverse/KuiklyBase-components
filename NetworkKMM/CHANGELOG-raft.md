@@ -1,5 +1,30 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased (production curl trust, proxy, and rollout gates)
+
+- All curl delegates now consume one verified `VBTransportCurl` runtime
+  configuration: app-owned CA path + expected SHA-256 and an explicit
+  direct/manual/Android-system/PAC-unresolved proxy decision. Missing,
+  modified, unreadable, or mismatched bundles fail closed; failed
+  reconfiguration clears stale state.
+- The pinned CA staging helper uses the dated Mozilla `2026-05-14` snapshot and
+  verifies SHA-256 before atomically publishing the file. Android emulator and
+  iOS simulator runtime lanes cover valid, unknown, expired,
+  hostname-mismatched, and wrong-CA certificates plus an observed HTTP CONNECT
+  proxy request.
+- `NetworkEngineRolloutConfig` provides stable basis-point cohorts, versioned
+  salt, and immediate platform-default rollback. Selection diagnostics include
+  the cohort bucket, requested/selected engines, and exact ineligibility reason.
+- Curl capabilities now report app-owned trust/manual proxy truth and keep PAC,
+  HTTPDNS, and HTTP/3 fail-explicit. Android `androidSystem()` now reads the
+  current process proxy per request and routes PAC through Android's localhost
+  forwarding proxy, preserving OS-owned script evaluation and fallback without
+  adding a PAC interpreter to libcurl. Apple/OHOS remain explicit-unavailable;
+  a first-result-only PAC mapping is not reported as support. HTTPDNS has no
+  SNI-safe resolver contract yet; current native artifacts have no QUIC backend.
+  Completion diagnostics expose negotiated protocol as `UNKNOWN` until native
+  protocol extraction is implemented.
+
 ## 0.1.0-raft.19 / 0.1.0-raft.19-ohos (transport tracing + contract single-source)
 
 - Transport phase tracing (#82): `VBTransportElapseStatistics` gains

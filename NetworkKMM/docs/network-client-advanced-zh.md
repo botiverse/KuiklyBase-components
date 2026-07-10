@@ -157,22 +157,92 @@ call 就会回退。选择结果会在当前 call 内锁定，auth/policy retry 
 Android/iOS 已提供 production curl delegate，但只有 typed selector 显式请求 curl 且平台 delegate
 可用时才会选中。
 
-iOS curl delegate 必须由 app 提供 CA bundle。启用远程 curl 灰度前，在 app 启动阶段配置绝对路径；
-路径缺失或为空时 curl 保持 unavailable，selector 会 fail-closed 到 Ktor Darwin：
+所有 curl delegate 都要求 App 安装同一份进程级 runtime 配置。先用
+`scripts/prepare-app-owned-ca-bundle.sh` 下载并校验固定版本的 CA bundle，再由 App 打包/复制，
+最后在启用 curl 灰度前传入运行时绝对路径和固定 SHA-256：
 
 ```kotlin
-import com.tencent.kmm.network.export.VBTransportIosCurl
-import platform.Foundation.NSBundle
+val status = VBTransportCurl.configure(
+    NetworkCurlRuntimeConfiguration(
+        trustStore = NetworkCurlTrustStore(
+            path = appOwnedCaAbsolutePath,
+            sha256 = NetworkCurlCaBundleManifest.SHA256
+        ),
+        proxy = NetworkCurlProxyConfiguration.direct()
+    )
+)
+check(status.configured) { status.detail ?: status.failureReason.name }
+```
 
-VBTransportIosCurl.caInfoPath = NSBundle.mainBundle.pathForResource(
-    name = "cacert",
-    ofType = "pem"
+配置发布前会校验文件的真实字节。文件缺失、不可读、被修改或 hash 不匹配都会 fail-closed；
+失败的重新配置还会清掉旧配置，避免错误 CA 轮换继续沿用旧信任材料。CA 更新必须同时修改
+`ca/curl-ca-bundle.env` 和 `NetworkCurlCaBundleManifest` 中的日期 URL、版本和 SHA-256，并作为
+显式 source change 评审，不能在构建时无校验地下载 latest 文件。
+
+libcurl 不会自动继承 Android/iOS/OHOS 完整的系统 proxy/PAC 合同，因此 proxy 决策也必须显式：
+
+- `direct()` 通过空 `CURLOPT_PROXY` 关闭代理，同时禁止继承环境代理。
+- `manual(url)` 接收 App/平台已经解析好的固定 `http(s)` 或 SOCKS URL；环境 `no_proxy` 不能覆盖该决策。
+- `androidSystem()` 会为每个请求读取 Android 当前代理决策。静态代理排除规则由默认 `ProxySelector`
+  处理；PAC 生效时，Android 会提供 localhost HTTP 转发代理，curl 只连接这个本地端点，PAC 下载、按 URL
+  执行、有序 fallback 和代理变更仍由系统负责。本地端口未就绪或 selector 无法给出单个有效决策时，
+  curl 变为 ineligible，Android 回退 Ktor。
+- `pacUnresolved()` 会让 curl 变为 ineligible。Android/iOS selector 会回退 Ktor；OHOS 以 curl 为
+  平台默认，host 必须先把 PAC 解析成固定 URL。
+
+这是 libcurl 的能力边界，不是版本探测问题。curl 当前
+[FAQ](https://github.com/curl/curl/blob/master/docs/FAQ.md#does-curl-support-javascript-or-pac-automated-proxy-config)
+明确说明 libcurl 无法执行 PAC JavaScript；官方
+[proxy failover TODO](https://github.com/curl/curl/blob/master/docs/TODO.md#try-next-proxy-if-one-does-not-work)
+仍在跟踪 `PROXY a; PROXY b; DIRECT` 这类 PAC 有序代理链的失败切换。`CURLOPT_PROXY` 只接收一个
+固定代理，再次设置只会覆盖旧值。
+
+平台 API 可以在 libcurl 外计算有效代理，但结果是按 URL 解析的有序列表：
+
+- Android App 可调用
+  [`ProxySelector.getDefault().select(uri)`](https://developer.android.com/reference/java/net/ProxySelector)。
+  系统安装
+  [PAC selector](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/master/core/java/android/net/PacProxySelector.java)
+  后，返回值可能包含有序的直连、HTTP 和 SOCKS 选项；调用方负责上报连接失败并继续尝试下一项。
+- Apple CFNetwork 提供 `CFNetworkCopyProxiesForURL`
+  （<https://developer.apple.com/documentation/cfnetwork/cfnetworkcopyproxiesforurl(_:_:)>）；
+  如果结果是自动配置 URL，还要异步下载并执行 PAC，最终结果同样是需要按顺序尝试的列表。
+- OHOS 从 API 10 起可读取固定 `getDefaultHttpProxy()`；`findProxyForUrl()` 是 API 20+，且官方设备矩阵
+  [要求](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-network-kit/js-apis-net-connection.md#connectionfindproxyforurl20)
+  手机/平板 PAC 执行使用更高版本。兼容 API 12 的消费端不能假定该接口存在。
+
+Android `androidSystem()` 通过把完整 PAC 决策交给 OS localhost proxy，避免在库内重写这些语义。没有
+这种本地转发代理的平台，如果由 host 自行执行 PAC，仍需按请求调用 resolver，把有序重试状态锁定在
+同一个 `NetworkCall`，并明确流式上传在代理连接失败后是否可重放。只把 PAC 第一项传给 `manual(url)`
+不算完整支持。`NetworkEngineCapabilities.pacProxy` 因此在 Android 可用，在 Apple/OHOS curl delegate
+上仍不可用。
+
+A/B 灰度使用稳定、可回滚的 `NetworkEngineRolloutConfig`，不要在业务层各自实现随机百分比：
+
+```kotlin
+val rollout = NetworkEngineRolloutConfig(
+    curlBasisPoints = remoteCurlBasisPoints,
+    curlEnabled = remoteCurlEnabled,
+    forcePlatformDefault = remoteRollback,
+    salt = "network-curl-v1"
+)
+
+val client = NetworkClient(
+    NetworkClientConfig(
+        engineSelector = { request ->
+            rollout.selectionFor(checkNotNull(request.metadata["accountId"]))
+        }
+    )
 )
 ```
 
-Phase 2 delegate 不会回退到 libcurl 编译时默认信任路径。系统信任桥接（`SecTrust`）、proxy/PAC
-对齐和 pinning 属于后续平台工作。`NetworkEngineSelectionDiagnostics.capabilities` 描述的是
-**实际选中的 engine**，不是请求但未命中的 engine。
+稳定 bucket 和灰度参数会进入 diagnostics，但不会暴露 cohort key；`forcePlatformDefault` 是立即回滚
+开关。HTTPDNS/HTTP3 当前仍是显式 gate：设置 `httpDnsEnabled` 或 `http3Enabled` 会分别以
+`HTTPDNS_UNSUPPORTED` / `HTTP3_UNSUPPORTED` 使 curl ineligible。当前尚无保留原始 host/SNI 的
+自定义 DNS 合同，native artifact 也没有编入 QUIC backend；`NetworkEngineCapabilities.httpDns/http3`
+会报告同一事实，不能仅凭 libcurl 版本推断已支持。
+
+`NetworkEngineSelectionDiagnostics.capabilities` 描述的是**实际选中的 engine**，不是请求但未命中的 engine。
 
 ## 处理稳定错误分类
 

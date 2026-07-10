@@ -127,6 +127,10 @@ open class VBTransportBaseRequest {
     var useCurl: Boolean = true
     internal var transportElapseStatistics: VBTransportElapseStatistics = VBTransportElapseStatistics()
 
+    /** Internal curl inputs prepared and latched by the selected engine. */
+    internal var curlCaInfoPath: String? = null
+    internal var curlProxyUrl: String? = null
+
     internal open fun bodyData(): Any? = null
 }
 

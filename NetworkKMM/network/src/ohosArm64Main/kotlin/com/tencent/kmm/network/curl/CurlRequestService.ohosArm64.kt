@@ -30,6 +30,8 @@ import com.tencent.qqlive.kmm.native.libcurl.CurlCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlRequest
 import com.tencent.qqlive.kmm.native.libcurl.CurlResponse
 import com.tencent.qqlive.kmm.native.libcurl.DeleteCurlClient
+import com.tencent.qqlive.kmm.native.libcurl.SetCurlCaInfo
+import com.tencent.qqlive.kmm.native.libcurl.SetCurlProxy
 import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlUploadSource
 import com.tencent.qqlive.kmm.native.libcurl.StartRequest
@@ -121,6 +123,20 @@ private fun toSafeString(content: CPointer<ByteVar>?): String {
 object CurlRequestServiceHM : ICurlRequestService {
 
     private val taskMap: MutableMap<Int, CPointer<out CPointed>?> = mutableMapOf()
+
+    private fun configureCurlRuntime(
+        handle: CPointer<out CPointed>?,
+        request: VBTransportBaseRequest
+    ) {
+        val caInfoPath = checkNotNull(request.curlCaInfoPath) {
+            "OHOS curl request is missing its verified app-owned CA path"
+        }
+        val proxyUrl = checkNotNull(request.curlProxyUrl) {
+            "OHOS curl request is missing its explicit proxy decision"
+        }
+        SetCurlCaInfo(handle, caInfoPath)
+        SetCurlProxy(handle, proxyUrl)
+    }
 
     override fun initNativeCurlLog(log: IVBPBLog) {
         curlLogNative = log
@@ -340,6 +356,7 @@ object CurlRequestServiceHM : ICurlRequestService {
             val callbackWrapper = CurlCallbackWrapper(callback)
             val callbackWrapperPtr = callbackWrapper.getCallbackNativePtr()
             val handle = CreateCurlClient(logTag)
+            configureCurlRuntime(handle, request)
             taskMap[request.requestId] = handle
             logI("[$logTag] TaskManager add transport task, id:${request.requestId}, handle:${handle}")
             StartRequest(handle, curlRequest, callbackWrapperPtr)
@@ -447,6 +464,7 @@ object CurlRequestServiceHM : ICurlRequestService {
             }
             val wrapper = CurlStreamCallbackWrapper(handler)
             val handle = CreateCurlClient(logTag)
+            configureCurlRuntime(handle, request)
             taskMap[request.requestId] = handle
             logI("[$logTag] stream transport task add, id:${request.requestId}, handle:${handle}")
             StartStreamRequest(handle, curlRequest, wrapper.getCallbackNativePtr())
@@ -520,6 +538,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                         this.totalLength = contentLength ?: -1L
                     }
                     val handle = CreateCurlClient(logTag)
+                    configureCurlRuntime(handle, request)
                     taskMap[request.requestId] = handle
                     logI("[$logTag] upload-stream transport task add, id:${request.requestId}, " +
                             "handle:${handle}, contentLength:${contentLength ?: -1}")

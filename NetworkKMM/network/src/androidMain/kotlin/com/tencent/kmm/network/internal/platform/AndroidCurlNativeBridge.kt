@@ -44,7 +44,9 @@ internal data class AndroidCurlNativeRequest(
     val timeoutMillis: Long,
     val body: ByteArray? = null,
     val uploadContentLength: Long? = null,
-    val caInfoPath: String? = null,
+    val caInfoPath: String,
+    /** Empty string means explicit direct mode. */
+    val proxyUrl: String,
     val cancellationSignal: AndroidCurlCancellationSignal = AndroidCurlCancellationSignal()
 ) {
     fun cancel() {
@@ -139,6 +141,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
                 body = request.body,
                 uploadContentLength = request.uploadContentLength ?: -1L,
                 caInfoPath = request.caInfoPath,
+                proxyUrl = request.proxyUrl,
                 mode = mode,
                 callback = callback
             )
@@ -164,7 +167,8 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
         timeoutMillis: Long,
         body: ByteArray?,
         uploadContentLength: Long,
-        caInfoPath: String?,
+        caInfoPath: String,
+        proxyUrl: String,
         mode: Int,
         callback: AndroidCurlJniCallback
     )
