@@ -38,6 +38,5 @@ include(":network")
 project(":network").buildFileName = ohosBuildFileName
 
 include(":network-host-native-tests")
-include(":network-sample")
 include(":network-ohos-runtime")
 include(":network-ohos-runtime-gradle-plugin")
