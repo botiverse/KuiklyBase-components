@@ -17,6 +17,7 @@
 
 #include "curl_wrapper.h"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <climits>
 #include <cstring>
@@ -190,7 +191,7 @@ class CurlClient {
             logE(gDefaultTag, "StreamWriteCallback, client/callback is nullptr!!!");
             return realsize;
         }
-        if (client->cancel_flag_) {
+        if (client->cancel_flag_.load(std::memory_order_relaxed)) {
             logI(client->log_tag_, "StreamWriteCallback cancel by user.");
             return 0;  // abort the transfer
         }
@@ -227,7 +228,7 @@ class CurlClient {
             logE(gDefaultTag, "UploadReadCallback, client/source is nullptr!!!");
             return CURL_READFUNC_ABORT;
         }
-        if (client->cancel_flag_) {
+        if (client->cancel_flag_.load(std::memory_order_relaxed)) {
             logI(client->log_tag_, "UploadReadCallback cancel by user.");
             return CURL_READFUNC_ABORT;
         }
@@ -264,7 +265,7 @@ class CurlClient {
             logE(gDefaultTag, "ProgressCallback client is nullptr!!!");
             return 0;
         }
-        if (client->cancel_flag_) {
+        if (client->cancel_flag_.load(std::memory_order_relaxed)) {
             logI(gDefaultTag, "ProgressCallback cancel by user.");
             return 1;
         }
@@ -435,6 +436,14 @@ class CurlClient {
         if (!ConfigureRequest(request, method)) {
             return;
         }
+        // Cancel may land in the publish→perform window (RFC D-5): honor a
+        // pre-set flag deterministically instead of relying on the first
+        // progress tick.
+        if (cancel_flag_.load(std::memory_order_relaxed)) {
+            logI(log_tag_, "cancelled before perform started.");
+            FinishBufferedRequest(CURLE_ABORTED_BY_CALLBACK, callback);
+            return;
+        }
         // 响应数据 body 处理
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, DataWriteCallback);
         curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &content_data_);
@@ -452,6 +461,11 @@ class CurlClient {
         upload_source_ = source;
         std::string method;
         if (!ConfigureRequest(request, method)) {
+            return;
+        }
+        if (cancel_flag_.load(std::memory_order_relaxed)) {
+            logI(log_tag_, "upload cancelled before perform started.");
+            FinishBufferedRequest(CURLE_ABORTED_BY_CALLBACK, callback);
             return;
         }
 
@@ -569,6 +583,12 @@ class CurlClient {
             BuildStreamCompletion(CURLE_FAILED_INIT);
             return;
         }
+        if (cancel_flag_.load(std::memory_order_relaxed)) {
+            logI(log_tag_, "stream cancelled before perform started.");
+            DeliverStreamResponseStart();
+            BuildStreamCompletion(CURLE_ABORTED_BY_CALLBACK);
+            return;
+        }
         // 流式 body: 逐块回调, 不缓冲整包
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, StreamWriteCallback);
         curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
@@ -673,9 +693,11 @@ class CurlClient {
     }
 
  public:
-    // Must be initialized: ProgressCallback reads it on every transfer tick,
-    // and an indeterminate value aborts the request (CURLE_ABORTED_BY_CALLBACK).
-    bool cancel_flag_ = false;
+    // Written by Cancel() from arbitrary caller threads while the perform
+    // thread reads it in callbacks — a plain bool here is a C++ data race
+    // (RFC D-5 engine-level invariant). Relaxed ordering suffices: it is a
+    // pure cancel hint and synchronises no other data.
+    std::atomic<bool> cancel_flag_{false};
 
     void SetCaInfo(const char *caInfoPath) {
         ca_info_path_ = caInfoPath == nullptr ? "" : caInfoPath;
@@ -750,7 +772,7 @@ void Cancel(CurClientHandle handle) {
     }
     logI(gDefaultTag, "cancel request");
     CurlClient *curl = reinterpret_cast<CurlClient *>(handle);
-    curl->cancel_flag_ = 1;
+    curl->cancel_flag_.store(true, std::memory_order_relaxed);
 }
 
 void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath) {

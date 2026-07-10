@@ -280,10 +280,15 @@ void NativePerform(
     for (jsize index = 0; index < header_count; ++index) {
         auto *java_name = static_cast<jstring>(env->GetObjectArrayElement(header_names, index));
         auto *java_value = static_cast<jstring>(env->GetObjectArrayElement(header_values, index));
-        JStringUtfChars name_chars(env, java_name);
-        JStringUtfChars value_chars(env, java_value);
-        names.emplace_back(name_chars.get() == nullptr ? "" : name_chars.get());
-        values.emplace_back(value_chars.get() == nullptr ? "" : value_chars.get());
+        {
+            // ReleaseStringUTFChars requires the jstring reference to remain
+            // valid. Keep the RAII wrappers inside this scope so their
+            // destructors run before the local references are deleted.
+            JStringUtfChars name_chars(env, java_name);
+            JStringUtfChars value_chars(env, java_value);
+            names.emplace_back(name_chars.get() == nullptr ? "" : name_chars.get());
+            values.emplace_back(value_chars.get() == nullptr ? "" : value_chars.get());
+        }
         env->DeleteLocalRef(java_name);
         env->DeleteLocalRef(java_value);
     }

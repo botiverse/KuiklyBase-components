@@ -26,6 +26,7 @@ import com.tencent.kmm.network.export.VBTransportPostRequest
 import com.tencent.kmm.network.export.VBTransportPostResponse
 import com.tencent.kmm.network.export.VBTransportRequest
 import com.tencent.kmm.network.export.VBTransportResponse
+import com.tencent.kmm.network.export.VBTransportResultCode
 import com.tencent.kmm.network.export.VBTransportStringRequest
 import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.VBPBLog
@@ -82,8 +83,10 @@ object HmTransportImpl : IVBTransportService {
     }
 
     // issue #8 slice 3: OHOS 原生流式上传 — 请求体经 libcurl READFUNCTION 逐块
-    // 拉取, 不整包进内存; 响应仍整包缓冲。GET/HEAD 带流式体没有 curl 上传语义
-    // (CURLOPT_UPLOAD 会改写动词), 走接口的缓冲默认实现。
+    // 拉取, 不整包进内存; 响应仍整包缓冲。GET/HEAD 带流式体是调用方错误
+    // (CURLOPT_UPLOAD 会改写动词: GET 变 PUT、HEAD 与 upload 冲突), 按 RFC #67
+    // 的三端统一基线显式失败 —— 取代旧的"缓冲回落": 那其实是 silent body drop
+    // (wrapper ConfigureRequest 对 GET/HEAD 根本不设 body, 请求带空体发出)。
     override fun requestUploadStream(
         kmmRequest: VBTransportRequest,
         contentLength: Long?,
@@ -92,7 +95,18 @@ object HmTransportImpl : IVBTransportService {
     ) {
         val method = kmmRequest.method.name.uppercase()
         if (method == "GET" || method == "HEAD") {
-            super.requestUploadStream(kmmRequest, contentLength, writeBody, kmmResponseCallback)
+            kmmResponseCallback(
+                VBTransportResponse().apply {
+                    this.request = kmmRequest
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    // No raft.9 cause tag: this is a caller-contract error,
+                    // not a transport failure — message shape matches the
+                    // Android CURL delegate's for the same case (#67).
+                    this.errorMessage = "streaming request body is not supported for " +
+                        "$method (CURLOPT_UPLOAD would rewrite the verb); " +
+                        "use POST/PUT/PATCH/DELETE/OPTIONS"
+                }
+            )
             return
         }
         val logTag = kmmRequest.logTag + "_" + kmmRequest.requestId
