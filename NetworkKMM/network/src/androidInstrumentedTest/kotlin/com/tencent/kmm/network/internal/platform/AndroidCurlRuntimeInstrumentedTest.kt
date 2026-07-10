@@ -1,0 +1,528 @@
+/*
+ * Tencent is pleased to support the open source community by making KuiklyBase available.
+ * Copyright (C) 2025 Tencent. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.tencent.kmm.network.internal.platform
+
+import android.util.Log
+import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.tencent.kmm.network.export.NetworkBody
+import com.tencent.kmm.network.export.NetworkByteStream
+import com.tencent.kmm.network.export.NetworkByteStreamSink
+import com.tencent.kmm.network.export.NetworkErrorKind
+import com.tencent.kmm.network.export.NetworkProgressCallbacks
+import com.tencent.kmm.network.export.NetworkRequest
+import com.tencent.kmm.network.export.NetworkRequestPolicy
+import com.tencent.kmm.network.export.NetworkTransferProgress
+import com.tencent.kmm.network.export.VBTransportAndroidCurl
+import com.tencent.kmm.network.export.VBTransportMethod
+import com.tencent.kmm.network.service.NetworkCall
+import com.tencent.kmm.network.service.NetworkClient
+import com.tencent.kmm.network.service.NetworkClientConfig
+import com.tencent.kmm.network.service.NetworkEngineDiagnosticsListener
+import com.tencent.kmm.network.service.NetworkEngineSelection
+import com.tencent.kmm.network.service.NetworkEngineSelectionDiagnostics
+import com.tencent.kmm.network.service.NetworkTransportEngine
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.net.SocketException
+import java.nio.charset.StandardCharsets
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
+import org.junit.After
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import org.junit.runner.RunWith
+
+@RunWith(AndroidJUnit4::class)
+class AndroidCurlRuntimeInstrumentedTest {
+    private lateinit var server: RuntimeHttpServer
+
+    @Before
+    fun setUp() {
+        VBTransportAndroidCurl.caInfoPath = null
+        server = RuntimeHttpServer(concurrentUploadCount = CONCURRENT_UPLOADS)
+    }
+
+    @After
+    fun tearDown() {
+        server.close()
+        VBTransportAndroidCurl.caInfoPath = null
+    }
+
+    @Test
+    fun productionAarPassesAndroidCurlRuntimeGate() {
+        runBlocking {
+            assertTrue("AAR native library must load", VBTransportAndroidCurl.nativeAvailable)
+            val engine = requireNotNull(AndroidCurlEngineProvider.resolve())
+
+            bufferedSelectorRequestUsesCurl()
+            streamingDownloadPreservesCallbackThread()
+            streamingUploadUsesNativePullAndProgress()
+            externalCancelStopsBodyCallbacks(engine)
+            highLevelPreCancelNeverStartsNative(engine)
+            nativePreStartCancelCoversAllThreeEntrypoints()
+            callbackFailureAbortsAndSuppressesLaterChunks(engine)
+            concurrentUploadsDoNotStarveDispatcher()
+
+            Log.i(
+                TAG,
+                "completed passed=true gates=buffered,download,upload,external-cancel," +
+                    "pre-start,cross-thread,callback-failure,concurrent-upload"
+            )
+        }
+    }
+
+    private suspend fun bufferedSelectorRequestUsesCurl() {
+        val selections = Collections.synchronizedList(mutableListOf<NetworkEngineSelectionDiagnostics>())
+        val client = curlClient(selections)
+        val request = request("/buffer").setHeader("X-Runtime-Gate", "header-lifetime")
+
+        val response = client.execute(request)
+
+        assertTrue(response.isSuccess)
+        assertEquals(200, response.statusCode)
+        assertEquals("buffer-ok", response.body.text())
+        val selection = selections.single()
+        assertEquals(NetworkTransportEngine.CURL, selection.selectedEngine)
+        assertTrue(selection.capabilities.requestBodyStreaming)
+        assertTrue(selection.capabilities.responseBodyStreaming)
+        assertEquals(1, server.requestCount("/buffer"))
+    }
+
+    private suspend fun streamingDownloadPreservesCallbackThread() {
+        val client = curlClient()
+        val chunks = Collections.synchronizedList(mutableListOf<ByteArray>())
+        val callbackThreads = Collections.synchronizedSet(mutableSetOf<Int>())
+        val started = CompletableDeferred<Pair<Int, Long?>>()
+        val completed = CompletableDeferred<com.tencent.kmm.network.export.NetworkResponse>()
+
+        client.downloadStream(
+            request = request("/stream"),
+            onResponseStart = { status, length, _ ->
+                callbackThreads += System.identityHashCode(Thread.currentThread())
+                started.complete(status to length)
+            },
+            onChunk = { chunk ->
+                callbackThreads += System.identityHashCode(Thread.currentThread())
+                chunks += chunk.copyOf()
+            },
+            onComplete = completed::complete
+        )
+
+        assertEquals(200 to 20L, withTimeout(TIMEOUT_MS) { started.await() })
+        val response = withTimeout(TIMEOUT_MS) { completed.await() }
+        assertTrue(response.isSuccess)
+        assertEquals("stream-onestream-two", merge(chunks).decodeToString())
+        assertEquals("JNI callbacks must stay on the native perform thread", 1, callbackThreads.size)
+    }
+
+    private suspend fun streamingUploadUsesNativePullAndProgress() {
+        val progress = Collections.synchronizedList(mutableListOf<NetworkTransferProgress>())
+        val request = request("/upload").apply {
+            method = VBTransportMethod.POST
+            body = NetworkBody.Stream(
+                stream = NetworkByteStream.fromChunks(contentLength = 6) { sink ->
+                    sink.write("abc".encodeToByteArray())
+                    sink.write("def".encodeToByteArray())
+                },
+                contentType = "application/octet-stream"
+            )
+            this.progress = NetworkProgressCallbacks(uploadProgress = progress::add)
+        }
+
+        val response = curlClient().execute(request)
+
+        assertTrue(response.isSuccess)
+        assertEquals("upload:abcdef", response.body.text())
+        assertEquals(6L, progress.last().bytesTransferred)
+        assertEquals(6L, progress.last().bytesTotal)
+    }
+
+    private suspend fun externalCancelStopsBodyCallbacks(
+        engine: com.tencent.kmm.network.service.NetworkEngine
+    ) = coroutineScope {
+        val request = request("/slow")
+        val call = NetworkCall(request)
+        val callbackEntered = CompletableDeferred<Unit>()
+        val releaseCallback = CountDownLatch(1)
+        val chunks = AtomicInteger(0)
+        val result = async(Dispatchers.Default) {
+            engine.downloadStream(
+                request = request,
+                call = call,
+                onResponseStart = { _, _, _ ->
+                    callbackEntered.complete(Unit)
+                    releaseCallback.await(5, TimeUnit.SECONDS)
+                },
+                onChunk = { chunks.incrementAndGet() }
+            )
+        }
+
+        withTimeout(TIMEOUT_MS) { callbackEntered.await() }
+        call.cancel()
+        releaseCallback.countDown()
+        val response = withTimeout(TIMEOUT_MS) { result.await() }
+
+        assertEquals(NetworkErrorKind.CANCELLED, response.error?.kind)
+        assertEquals("cancel during response-start must suppress body", 0, chunks.get())
+        assertTrue(server.awaitSlowDisconnect())
+    }
+
+    private suspend fun highLevelPreCancelNeverStartsNative(
+        engine: com.tencent.kmm.network.service.NetworkEngine
+    ) {
+        val request = request("/pre-cancel-engine")
+        val call = NetworkCall(request).apply { cancel() }
+
+        val response = engine.execute(request, call)
+
+        assertEquals(NetworkErrorKind.CANCELLED, response.error?.kind)
+        assertEquals(0, server.requestCount("/pre-cancel-engine"))
+    }
+
+    private suspend fun nativePreStartCancelCoversAllThreeEntrypoints() {
+        val buffered = nativeRequest("/native-pre-buffer").apply { cancel() }
+        val bufferedResponse = AndroidCurlJniBridge.execute(buffered)
+        assertEquals(42, bufferedResponse.code)
+        assertNull(bufferedResponse.data)
+        assertEquals(0, server.requestCount("/native-pre-buffer"))
+
+        val streamStarts = AtomicInteger(0)
+        val streamChunks = AtomicInteger(0)
+        val stream = nativeRequest("/native-pre-stream").apply { cancel() }
+        val streamResponse = AndroidCurlJniBridge.downloadStream(
+            request = stream,
+            onResponseStart = { _, _ ->
+                streamStarts.incrementAndGet()
+            },
+            onChunk = { streamChunks.incrementAndGet() }
+        )
+        assertEquals(0, streamStarts.get())
+        assertEquals(0, streamChunks.get())
+        assertEquals(42, streamResponse.code)
+        assertEquals(0, server.requestCount("/native-pre-stream"))
+
+        val uploadReads = AtomicInteger(0)
+        val upload = nativeRequest("/native-pre-upload", method = "POST").copy(
+            uploadContentLength = 4
+        ).apply { cancel() }
+        val uploadResponse = AndroidCurlJniBridge.uploadStream(
+            request = upload,
+            source = AndroidCurlUploadSource {
+                uploadReads.incrementAndGet()
+                "body".encodeToByteArray()
+            }
+        )
+        assertEquals(42, uploadResponse.code)
+        assertEquals(0, uploadReads.get())
+        assertEquals(0, server.requestCount("/native-pre-upload"))
+    }
+
+    private suspend fun callbackFailureAbortsAndSuppressesLaterChunks(
+        engine: com.tencent.kmm.network.service.NetworkEngine
+    ) {
+        val request = request("/callback-failure")
+        val call = NetworkCall(request)
+        val chunks = AtomicInteger(0)
+
+        val response = engine.downloadStream(
+            request = request,
+            call = call,
+            onResponseStart = { _, _, _ -> Unit },
+            onChunk = {
+                chunks.incrementAndGet()
+                error("instrumented consumer failure")
+            }
+        )
+
+        assertEquals(NetworkErrorKind.UNKNOWN, response.error?.kind)
+        assertTrue(response.error?.message.orEmpty().contains("instrumented consumer failure"))
+        assertEquals("later native chunks must be suppressed", 1, chunks.get())
+    }
+
+    private suspend fun concurrentUploadsDoNotStarveDispatcher() = coroutineScope {
+        val client = curlClient()
+        val responses = withTimeout(CONCURRENT_TIMEOUT_MS) {
+            (0 until CONCURRENT_UPLOADS).map { index ->
+                async(Dispatchers.Default) {
+                    val payload = "payload-$index-".repeat(1024).encodeToByteArray()
+                    val upload = request("/upload-delay/$index").apply {
+                        method = VBTransportMethod.POST
+                        body = NetworkBody.Stream(
+                            stream = NetworkByteStream.fromChunks(contentLength = payload.size.toLong()) { sink ->
+                                payload.asList().chunked(2048).forEach { part ->
+                                    sink.write(part.toByteArray())
+                                    delay(2)
+                                }
+                            },
+                            contentType = "application/octet-stream"
+                        )
+                    }
+                    client.execute(upload)
+                }
+            }.awaitAll()
+        }
+
+        assertTrue(responses.all { it.isSuccess })
+        assertEquals(CONCURRENT_UPLOADS, server.concurrentUploadsCompleted.get())
+        assertEquals(CONCURRENT_UPLOADS, server.maxConcurrentUploads.get())
+    }
+
+    private fun curlClient(
+        selections: MutableList<NetworkEngineSelectionDiagnostics>? = null
+    ): NetworkClient = NetworkClient(
+        config = NetworkClientConfig(
+            engineSelector = {
+                NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL)
+            },
+            engineDiagnostics = selections?.let { output ->
+                object : NetworkEngineDiagnosticsListener {
+                    override fun onEngineSelected(diagnostics: NetworkEngineSelectionDiagnostics) {
+                        output += diagnostics
+                    }
+                }
+            }
+        )
+    )
+
+    private fun request(path: String): NetworkRequest = NetworkRequest(
+        url = server.url(path),
+        policy = NetworkRequestPolicy(timeoutMillis = TIMEOUT_MS)
+    )
+
+    private fun nativeRequest(path: String, method: String = "GET") = AndroidCurlNativeRequest(
+        requestId = path.hashCode(),
+        url = server.url(path),
+        method = method,
+        headers = emptyMap(),
+        timeoutMillis = TIMEOUT_MS
+    )
+
+    private fun merge(chunks: List<ByteArray>): ByteArray {
+        val output = ByteArrayOutputStream()
+        chunks.forEach(output::write)
+        return output.toByteArray()
+    }
+
+    private class RuntimeHttpServer(
+        concurrentUploadCount: Int
+    ) : AutoCloseable {
+        private val server = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
+        private val executor = Executors.newCachedThreadPool()
+        private val running = java.util.concurrent.atomic.AtomicBoolean(true)
+        private val counts = ConcurrentHashMap<String, AtomicInteger>()
+        private val uploadBarrier = CountDownLatch(concurrentUploadCount)
+        private val slowDisconnected = CountDownLatch(1)
+        private val activeUploads = AtomicInteger(0)
+        val maxConcurrentUploads = AtomicInteger(0)
+        val concurrentUploadsCompleted = AtomicInteger(0)
+
+        init {
+            executor.execute {
+                while (running.get()) {
+                    try {
+                        val socket = server.accept()
+                        executor.execute { handle(socket) }
+                    } catch (_: Throwable) {
+                        if (running.get()) throw AssertionError("HTTP accept loop failed")
+                    }
+                }
+            }
+        }
+
+        fun url(path: String): String = "http://127.0.0.1:${server.localPort}$path"
+
+        fun requestCount(path: String): Int = counts[path]?.get() ?: 0
+
+        fun awaitSlowDisconnect(): Boolean = slowDisconnected.await(5, TimeUnit.SECONDS)
+
+        override fun close() {
+            running.set(false)
+            runCatching { server.close() }
+            executor.shutdownNow()
+            executor.awaitTermination(5, TimeUnit.SECONDS)
+        }
+
+        private fun handle(socket: Socket) {
+            socket.use { connection ->
+                connection.soTimeout = 15_000
+                val input = BufferedInputStream(connection.getInputStream())
+                val output = BufferedOutputStream(connection.getOutputStream())
+                val requestLine = readLine(input) ?: return
+                val path = requestLine.split(' ').getOrNull(1) ?: "/"
+                counts.computeIfAbsent(path) { AtomicInteger(0) }.incrementAndGet()
+                val headers = linkedMapOf<String, String>()
+                while (true) {
+                    val line = readLine(input) ?: return
+                    if (line.isEmpty()) break
+                    val colon = line.indexOf(':')
+                    if (colon > 0) {
+                        headers[line.substring(0, colon).trim().lowercase()] =
+                            line.substring(colon + 1).trim()
+                    }
+                }
+                val body = readBody(input, headers)
+                when {
+                    path == "/buffer" -> respond(output, "buffer-ok".encodeToByteArray())
+                    path == "/stream" -> stream(output, listOf("stream-one", "stream-two"))
+                    path == "/upload" -> respond(output, "upload:${body.decodeToString()}".encodeToByteArray())
+                    path == "/slow" -> slow(output)
+                    path == "/callback-failure" -> stream(output, listOf("first", "second", "third"))
+                    path.startsWith("/upload-delay/") -> delayedUpload(output, body)
+                    else -> respond(output, "not-found".encodeToByteArray(), status = "404 Not Found")
+                }
+            }
+        }
+
+        private fun delayedUpload(output: BufferedOutputStream, body: ByteArray) {
+            val active = activeUploads.incrementAndGet()
+            maxConcurrentUploads.updateAndGet { current -> maxOf(current, active) }
+            uploadBarrier.countDown()
+            val allArrived = uploadBarrier.await(10, TimeUnit.SECONDS)
+            if (allArrived) {
+                concurrentUploadsCompleted.incrementAndGet()
+                respond(output, "received:${body.size}".encodeToByteArray())
+            } else {
+                respond(output, "barrier-timeout".encodeToByteArray(), status = "500 Internal Server Error")
+            }
+            activeUploads.decrementAndGet()
+        }
+
+        private fun slow(output: BufferedOutputStream) {
+            writeHeaders(output, contentLength = 100_000)
+            try {
+                repeat(1_000) {
+                    output.write("slow-chunk".encodeToByteArray())
+                    output.flush()
+                    Thread.sleep(10)
+                }
+            } catch (_: Throwable) {
+                slowDisconnected.countDown()
+            }
+        }
+
+        private fun stream(output: BufferedOutputStream, chunks: List<String>) {
+            val bytes = chunks.map(String::encodeToByteArray)
+            writeHeaders(output, contentLength = bytes.sumOf { it.size })
+            try {
+                bytes.forEach { chunk ->
+                    output.write(chunk)
+                    output.flush()
+                    Thread.sleep(20)
+                }
+            } catch (_: SocketException) {
+                // Callback-failure coverage intentionally aborts the client
+                // connection before the server has written every chunk.
+            }
+        }
+
+        private fun respond(
+            output: BufferedOutputStream,
+            body: ByteArray,
+            status: String = "200 OK"
+        ) {
+            writeHeaders(output, body.size, status)
+            output.write(body)
+            output.flush()
+        }
+
+        private fun writeHeaders(
+            output: BufferedOutputStream,
+            contentLength: Int,
+            status: String = "200 OK"
+        ) {
+            output.write(
+                (
+                    "HTTP/1.1 $status\r\nContent-Length: $contentLength\r\n" +
+                    "Content-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+                    ).toByteArray(StandardCharsets.US_ASCII)
+            )
+            output.flush()
+        }
+
+        private fun readBody(
+            input: BufferedInputStream,
+            headers: Map<String, String>
+        ): ByteArray {
+            val length = headers["content-length"]?.toIntOrNull()
+            if (length != null) return readExact(input, length)
+            if (headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true) {
+                val output = ByteArrayOutputStream()
+                while (true) {
+                    val size = readLine(input)?.substringBefore(';')?.trim()?.toInt(16) ?: break
+                    if (size == 0) {
+                        while (!readLine(input).isNullOrEmpty()) Unit
+                        break
+                    }
+                    output.write(readExact(input, size))
+                    readLine(input)
+                }
+                return output.toByteArray()
+            }
+            return ByteArray(0)
+        }
+
+        private fun readExact(input: BufferedInputStream, length: Int): ByteArray {
+            val bytes = ByteArray(length)
+            var offset = 0
+            while (offset < length) {
+                val read = input.read(bytes, offset, length - offset)
+                if (read < 0) error("Unexpected EOF after $offset/$length bytes")
+                offset += read
+            }
+            return bytes
+        }
+
+        private fun readLine(input: BufferedInputStream): String? {
+            val output = ByteArrayOutputStream()
+            while (true) {
+                val next = input.read()
+                if (next < 0) return if (output.size() == 0) null else output.toString("US-ASCII")
+                if (next == '\n'.code) break
+                if (next != '\r'.code) output.write(next)
+            }
+            return output.toString("US-ASCII")
+        }
+    }
+
+    companion object {
+        private const val TAG = "NetworkKMMCurlRuntime"
+        private const val TIMEOUT_MS = 10_000L
+        private const val CONCURRENT_TIMEOUT_MS = 30_000L
+        private const val CONCURRENT_UPLOADS = 8
+    }
+}

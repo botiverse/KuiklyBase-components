@@ -149,6 +149,7 @@ android {
     defaultConfig {
         minSdk = 21
         consumerProguardFiles("consumer-rules.pro")
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     sourceSets {
         // task #24: the AAR embeds the production curl native artifact —
@@ -166,6 +167,11 @@ android {
         // get the unmocked stub ("not mocked" RuntimeException) without this.
         unitTests.isReturnDefaultValues = true
     }
+}
+
+dependencies {
+    add("androidTestImplementation", "androidx.test:runner:1.6.2")
+    add("androidTestImplementation", "androidx.test.ext:junit:1.2.1")
 }
 
 // Stub secrets to let the project sync and build without the publication values set up
