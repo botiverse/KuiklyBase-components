@@ -36,6 +36,10 @@ jobs:
   build:
     name: Build libnetworkkmmcurl.so (${{ matrix.abi }})
     runs-on: ubuntu-latest
+    # NDK/cmdline-tools/cmake/zstd/binutils baked in (task #28) — no per-run
+    # SDK downloads. Pin the version tag, never :latest.
+    container:
+      image: ghcr.io/bytemain/kuikly-ci-images/android-ndk:v1.0.1
     strategy:
       fail-fast: false
       matrix:
@@ -43,13 +47,6 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-
-      - name: Install NDK
-        shell: bash
-        run: |
-          set -euo pipefail
-          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "ndk;${NDK_VERSION}" >/dev/null
 
       # OpenSSL/curl cross-compiles dominate the wall clock; cache their build
       # trees keyed on everything that changes the bits.
