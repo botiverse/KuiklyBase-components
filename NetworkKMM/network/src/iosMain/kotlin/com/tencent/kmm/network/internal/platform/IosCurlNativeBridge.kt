@@ -1,0 +1,418 @@
+/*
+ * Tencent is pleased to support the open source community by making KuiklyBase available.
+ * Copyright (C) 2025 Tencent. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *      http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+package com.tencent.kmm.network.internal.platform
+
+import com.tencent.kmm.network.curl.CurlNativeResponse
+import com.tencent.kmm.network.curl.CurlResponseCodec
+import com.tencent.kmm.network.curl.CurlResponseFields
+import com.tencent.kmm.network.curl.native.Cancel as cancelNative
+import com.tencent.kmm.network.curl.native.CreateCurlClient
+import com.tencent.kmm.network.curl.native.CurlCallback
+import com.tencent.kmm.network.curl.native.CurlRequest
+import com.tencent.kmm.network.curl.native.CurlResponse
+import com.tencent.kmm.network.curl.native.CurlStreamCallback
+import com.tencent.kmm.network.curl.native.CurlUploadSource
+import com.tencent.kmm.network.curl.native.DeleteCurlClient
+import com.tencent.kmm.network.curl.native.SetCurlCaInfo
+import com.tencent.kmm.network.curl.native.StartRequest
+import com.tencent.kmm.network.curl.native.StartStreamRequest
+import com.tencent.kmm.network.curl.native.StartUploadRequest
+import com.tencent.kmm.network.curl.native.StringDic
+import com.tencent.kmm.network.curl.native.StringPair
+import com.tencent.kmm.network.export.VBTransportElapseStatistics
+import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
+import kotlinx.cinterop.ByteVar
+import kotlinx.cinterop.COpaquePointer
+import kotlinx.cinterop.CPointer
+import kotlinx.cinterop.CValue
+import kotlinx.cinterop.ExperimentalForeignApi
+import kotlinx.cinterop.MemScope
+import kotlinx.cinterop.StableRef
+import kotlinx.cinterop.addressOf
+import kotlinx.cinterop.alloc
+import kotlinx.cinterop.allocArray
+import kotlinx.cinterop.asStableRef
+import kotlinx.cinterop.cstr
+import kotlinx.cinterop.get
+import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.pointed
+import kotlinx.cinterop.ptr
+import kotlinx.cinterop.readBytes
+import kotlinx.cinterop.readValue
+import kotlinx.cinterop.set
+import kotlinx.cinterop.staticCFunction
+import kotlinx.cinterop.toKString
+import kotlinx.cinterop.usePinned
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.ObsoleteCoroutinesApi
+import kotlinx.coroutines.newFixedThreadPoolContext
+import kotlinx.coroutines.withContext
+
+private const val IOS_CURL_PERFORM_THREADS = 4
+private const val IOS_CURL_UPLOAD_WRITER_THREADS = 2
+
+@OptIn(ObsoleteCoroutinesApi::class, ExperimentalCoroutinesApi::class)
+internal object IosCurlExecutionDispatchers {
+    // Blocking curl performs must never share a bounded pool with upload producers.
+    val perform: CoroutineDispatcher =
+        newFixedThreadPoolContext(IOS_CURL_PERFORM_THREADS, "NetworkKmmIosCurlPerform")
+    val uploadWriter: CoroutineDispatcher =
+        newFixedThreadPoolContext(IOS_CURL_UPLOAD_WRITER_THREADS, "NetworkKmmIosCurlUploadWriter")
+}
+
+internal class IosCurlCancellationSignal {
+    private val cancelled = atomic(false)
+
+    fun cancel() {
+        cancelled.value = true
+    }
+
+    fun isCancelled(): Boolean = cancelled.value
+}
+
+internal data class IosCurlNativeRequest(
+    val requestId: Int,
+    val url: String,
+    val method: String,
+    val headers: Map<String, String>,
+    val timeoutMillis: Long,
+    val body: ByteArray? = null,
+    val uploadContentLength: Long? = null,
+    val caInfoPath: String,
+    val cancellationSignal: IosCurlCancellationSignal = IosCurlCancellationSignal()
+) {
+    fun cancel() {
+        cancellationSignal.cancel()
+    }
+}
+
+internal fun interface IosCurlUploadSource {
+    /** Positive bytes = data, empty = EOF, null = abort. */
+    fun read(maxLength: Int): ByteArray?
+}
+
+internal interface IosCurlNativeBridge {
+    val isAvailable: Boolean
+
+    suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse
+
+    suspend fun downloadStream(
+        request: IosCurlNativeRequest,
+        onResponseStart: (Long, String) -> Unit,
+        onChunk: (ByteArray) -> Unit
+    ): CurlNativeResponse
+
+    suspend fun uploadStream(
+        request: IosCurlNativeRequest,
+        source: IosCurlUploadSource
+    ): CurlNativeResponse
+
+    fun cancel(requestId: Int)
+}
+
+@OptIn(ExperimentalForeignApi::class)
+internal object IosCurlCInteropBridge : IosCurlNativeBridge {
+    override val isAvailable: Boolean = true
+
+    override suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse =
+        perform(request) { handle, callbackContext ->
+            withCurlRequest(request) { nativeRequest ->
+                memScoped {
+                    val callback = alloc<CurlCallback> {
+                        callbackRef = callbackContext.stableRef.asCPointer()
+                        callback = staticCFunction(::iosCurlComplete)
+                    }
+                    StartRequest(handle, nativeRequest, callback.ptr)
+                }
+            }
+        }
+
+    override suspend fun downloadStream(
+        request: IosCurlNativeRequest,
+        onResponseStart: (Long, String) -> Unit,
+        onChunk: (ByteArray) -> Unit
+    ): CurlNativeResponse = perform(
+        request = request,
+        onResponseStart = onResponseStart,
+        onChunk = onChunk
+    ) { handle, callbackContext ->
+        withCurlRequest(request) { nativeRequest ->
+            memScoped {
+                val callback = alloc<CurlStreamCallback>()
+                callback.callbackRef = callbackContext.stableRef.asCPointer()
+                callback.onResponseStart = staticCFunction(::iosCurlResponseStart)
+                callback.onChunk = staticCFunction(::iosCurlChunk)
+                callback.onComplete = staticCFunction(::iosCurlComplete)
+                StartStreamRequest(handle, nativeRequest, callback.ptr)
+            }
+        }
+    }
+
+    override suspend fun uploadStream(
+        request: IosCurlNativeRequest,
+        source: IosCurlUploadSource
+    ): CurlNativeResponse = perform(request, uploadSource = source) { handle, callbackContext ->
+        withCurlRequest(request) { nativeRequest ->
+            memScoped {
+                val callback = alloc<CurlCallback> {
+                    callbackRef = callbackContext.stableRef.asCPointer()
+                    callback = staticCFunction(::iosCurlComplete)
+                }
+                val upload = alloc<CurlUploadSource> {
+                    readRef = callbackContext.stableRef.asCPointer()
+                    readChunk = staticCFunction(::iosCurlReadUploadChunk)
+                    totalLength = request.uploadContentLength ?: -1L
+                }
+                StartUploadRequest(handle, nativeRequest, upload.ptr, callback.ptr)
+            }
+        }
+    }
+
+    override fun cancel(requestId: Int) {
+        IosCurlHandleRegistry.cancel(requestId)
+    }
+
+    private suspend fun perform(
+        request: IosCurlNativeRequest,
+        onResponseStart: ((Long, String) -> Unit)? = null,
+        onChunk: ((ByteArray) -> Unit)? = null,
+        uploadSource: IosCurlUploadSource? = null,
+        start: (COpaquePointer, IosCurlCallbackContext) -> Unit
+    ): CurlNativeResponse = withContext(IosCurlExecutionDispatchers.perform) {
+        val handle = CreateCurlClient("NetworkKMM-iOS-${request.requestId}")
+            ?: return@withContext unavailable("iOS curl failed to create native client")
+        val callbackContext = IosCurlCallbackContext(
+            request = request,
+            onResponseStart = onResponseStart,
+            onChunk = onChunk,
+            uploadSource = uploadSource
+        )
+        try {
+            SetCurlCaInfo(handle, request.caInfoPath)
+            IosCurlHandleRegistry.publish(request.requestId, handle)
+            if (request.cancellationSignal.isCancelled()) {
+                cancelNative(handle)
+            }
+            runCatching { start(handle, callbackContext) }
+                .getOrElse { throwable ->
+                    return@withContext unavailable(
+                        throwable.message ?: "iOS curl cinterop invocation failed"
+                    )
+                }
+            callbackContext.failureMessage()?.let { message ->
+                return@withContext unavailable(message)
+            }
+            callbackContext.response
+                ?: unavailable("iOS curl returned without a completion callback")
+        } finally {
+            IosCurlHandleRegistry.remove(request.requestId, handle)
+            callbackContext.dispose()
+            DeleteCurlClient(handle)
+        }
+    }
+
+    private fun unavailable(message: String) = CurlNativeResponse(code = -1, errorMsg = message)
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private class IosCurlCallbackContext(
+    val request: IosCurlNativeRequest,
+    private val onResponseStart: ((Long, String) -> Unit)?,
+    private val onChunk: ((ByteArray) -> Unit)?,
+    private val uploadSource: IosCurlUploadSource?
+) {
+    val stableRef: StableRef<IosCurlCallbackContext> = StableRef.create(this)
+    var response: CurlNativeResponse? = null
+        private set
+    private val callbackFailure = atomic<Throwable?>(null)
+
+    fun onResponseStart(httpCode: Long, headers: String) {
+        if (shouldSuppressBusinessCallbacks()) return
+        runCatching { onResponseStart?.invoke(httpCode, headers) }
+            .onFailure(::recordFailure)
+    }
+
+    fun onChunk(chunk: ByteArray) {
+        if (shouldSuppressBusinessCallbacks()) return
+        runCatching { onChunk?.invoke(chunk) }
+            .onFailure(::recordFailure)
+    }
+
+    fun readUploadChunk(maxLength: Int): ByteArray? {
+        if (shouldSuppressBusinessCallbacks()) return null
+        return runCatching { uploadSource?.read(maxLength) }
+            .onFailure(::recordFailure)
+            .getOrNull()
+    }
+
+    fun onComplete(nativeResponse: CPointer<CurlResponse>?) {
+        response = nativeResponse.toCurlNativeResponse()
+    }
+
+    fun failureMessage(): String? = callbackFailure.value?.let { failure ->
+        "iOS curl callback failed: ${failure.message ?: failure::class.simpleName.orEmpty()}"
+    }
+
+    fun dispose() {
+        stableRef.dispose()
+    }
+
+    private fun shouldSuppressBusinessCallbacks(): Boolean =
+        request.cancellationSignal.isCancelled() || callbackFailure.value != null
+
+    private fun recordFailure(throwable: Throwable) {
+        if (callbackFailure.compareAndSet(null, throwable)) {
+            request.cancel()
+            IosCurlHandleRegistry.cancel(request.requestId)
+        }
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private object IosCurlHandleRegistry : SynchronizedObject() {
+    private val handles = mutableMapOf<Int, COpaquePointer>()
+
+    fun publish(requestId: Int, handle: COpaquePointer) {
+        synchronized(this) { handles[requestId] = handle }
+    }
+
+    fun remove(requestId: Int, handle: COpaquePointer) {
+        synchronized(this) {
+            if (handles[requestId] == handle) handles.remove(requestId)
+        }
+    }
+
+    fun cancel(requestId: Int) {
+        val handle = synchronized(this) { handles[requestId] }
+        if (handle != null) cancelNative(handle)
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun iosCurlComplete(callbackRef: COpaquePointer?, response: CPointer<CurlResponse>?) {
+    callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onComplete(response)
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun iosCurlResponseStart(
+    callbackRef: COpaquePointer?,
+    httpCode: Long,
+    headers: CPointer<ByteVar>?,
+    headerLength: Int
+) {
+    callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onResponseStart(
+        httpCode = httpCode,
+        headers = headers.readUtf8(headerLength)
+    )
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun iosCurlChunk(callbackRef: COpaquePointer?, data: CPointer<ByteVar>?, length: Int) {
+    if (length <= 0 || data == null) return
+    callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onChunk(data.readBytes(length))
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun iosCurlReadUploadChunk(
+    callbackRef: COpaquePointer?,
+    buffer: CPointer<ByteVar>?,
+    maxLength: Int
+): Int {
+    if (buffer == null || maxLength <= 0) return 0
+    val context = callbackRef?.asStableRef<IosCurlCallbackContext>()?.get() ?: return -1
+    val bytes = context.readUploadChunk(maxLength) ?: return -1
+    if (bytes.isEmpty()) return 0
+    val count = minOf(bytes.size, maxLength)
+    for (index in 0 until count) {
+        buffer[index] = bytes[index]
+    }
+    return count
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun <T> withCurlRequest(
+    request: IosCurlNativeRequest,
+    block: MemScope.(CValue<CurlRequest>) -> T
+): T = memScoped {
+    val entries = request.headers.entries.toList()
+    val pairs = entries.takeIf { it.isNotEmpty() }?.let { allocArray<StringPair>(it.size) }
+    entries.forEachIndexed { index, entry ->
+        val pair = pairs!![index]
+        pair.first = entry.key.cstr.getPointer(this)
+        pair.second = entry.value.cstr.getPointer(this)
+    }
+    val dictionary = alloc<StringDic> {
+        stringPairs = pairs
+        size = entries.size
+    }
+    val nativeRequest = alloc<CurlRequest> {
+        url = request.url.cstr.getPointer(this@memScoped)
+        method = request.method.cstr.getPointer(this@memScoped)
+        headers = dictionary.ptr
+        timeout = request.timeoutMillis
+        postBodyLen = request.body?.size ?: 0
+        postBody = null
+    }
+    val body = request.body
+    if (body == null || body.isEmpty()) {
+        block(nativeRequest.readValue())
+    } else {
+        body.usePinned { pinned ->
+            nativeRequest.postBody = pinned.addressOf(0)
+            block(nativeRequest.readValue())
+        }
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun CPointer<CurlResponse>?.toCurlNativeResponse(): CurlNativeResponse {
+    val native = this?.pointed ?: return CurlNativeResponse(
+        code = -1,
+        errorMsg = "iOS curl returned a null response"
+    )
+    val timing = native.elapse
+    return CurlResponseCodec.decode(
+        CurlResponseFields(
+            code = native.code,
+            httpCode = native.httpCode.toInt(),
+            errorMsg = native.errorMsg.readUtf8(native.errorMsgLen),
+            errorMsgLen = native.errorMsgLen,
+            headers = native.headers.readUtf8(native.headerLen),
+            headerLen = native.headerLen,
+            redirectUrl = native.redirectUrl?.toKString().orEmpty(),
+            data = native.data?.takeIf { native.dataLen > 0 }?.readBytes(native.dataLen),
+            dataLen = native.dataLen,
+            elapse = VBTransportElapseStatistics(
+                nameLookupTimeMs = timing.nameLookupTimeMs,
+                connectTimeMs = timing.connectTimeMs,
+                sslCostTimeMs = timing.sslCostTimeMs,
+                preTransferTime = timing.preTransferTime,
+                startTransferTimeMs = timing.startTransferTimeMs,
+                redirectTime = timing.redirectTime,
+                recvTime = timing.recvTime,
+                totalTimeMs = timing.totalTimeMs
+            )
+        )
+    )
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun CPointer<ByteVar>?.readUtf8(length: Int): String =
+    if (this == null || length <= 0) "" else readBytes(length).decodeToString()

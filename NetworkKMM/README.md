@@ -7,7 +7,7 @@
 ### Introduction
 
 This project is based on Kotlin Multiplatform technology and provides a cross-platform network request (http get/post, etc.) solution, supporting Android, iOS, and HarmonyOS mobile platforms.  
-Currently, the HarmonyOS side uses the open-source library **libcurl** as the network request engine, while the Android/iOS sides temporarily use **ktor**. In the future, all platforms will be unified to use libcurl.
+HarmonyOS uses **libcurl** by default. Android and iOS keep **Ktor** as their platform default and also ship production libcurl delegates for explicit gray rollout and rollback through `NetworkEngineSelection`.
 
 ### Integration
 

@@ -154,8 +154,24 @@ val client = NetworkClient(
 selector 会在每个新 `NetworkCall` 执行，因此远端把 `rollback` 翻开后无需重建 client，下一次
 call 就会回退。选择结果会在当前 call 内锁定，auth/policy retry 不会中途切换 engine。解析失败、
 平台禁用或实现尚未注册时，一律回退到当前平台默认：Android/iOS 为 Ktor，OHOS 为 curl。
-Phase 1 阶段在 Android/iOS 请求 curl 会记录 `UNAVAILABLE` 并继续走 Ktor，直到 production
-JNI/cinterop engine 在后续阶段注册。`NetworkEngineSelectionDiagnostics.capabilities` 描述的是
+Android/iOS 已提供 production curl delegate，但只有 typed selector 显式请求 curl 且平台 delegate
+可用时才会选中。
+
+iOS curl delegate 必须由 app 提供 CA bundle。启用远程 curl 灰度前，在 app 启动阶段配置绝对路径；
+路径缺失或为空时 curl 保持 unavailable，selector 会 fail-closed 到 Ktor Darwin：
+
+```kotlin
+import com.tencent.kmm.network.export.VBTransportIosCurl
+import platform.Foundation.NSBundle
+
+VBTransportIosCurl.caInfoPath = NSBundle.mainBundle.pathForResource(
+    name = "cacert",
+    ofType = "pem"
+)
+```
+
+Phase 2 delegate 不会回退到 libcurl 编译时默认信任路径。系统信任桥接（`SecTrust`）、proxy/PAC
+对齐和 pinning 属于后续平台工作。`NetworkEngineSelectionDiagnostics.capabilities` 描述的是
 **实际选中的 engine**，不是请求但未命中的 engine。
 
 ## 处理稳定错误分类

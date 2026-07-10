@@ -159,8 +159,25 @@ val client = NetworkClient(
 The selector runs for each new `NetworkCall`, so a remote `rollback` change takes effect on the next
 call without rebuilding the client. The decision is latched for that call: auth/policy retries never
 switch engines midway. Resolution always fails closed to the platform's current default: Ktor on
-Android/iOS and curl on OHOS. In Phase 1, requesting curl on Android/iOS reports `UNAVAILABLE` and uses
-Ktor until the production JNI/cinterop engines are registered.
+Android/iOS and curl on OHOS. Android and iOS ship production curl delegates, but they are never
+selected unless the typed selector explicitly requests curl and the platform delegate is available.
+
+The iOS curl delegate requires an app-owned CA bundle. Configure its absolute path during app startup
+before enabling curl in remote rollout state; a missing or blank path leaves curl unavailable and the
+selector fails closed to Ktor Darwin:
+
+```kotlin
+import com.tencent.kmm.network.export.VBTransportIosCurl
+import platform.Foundation.NSBundle
+
+VBTransportIosCurl.caInfoPath = NSBundle.mainBundle.pathForResource(
+    name = "cacert",
+    ofType = "pem"
+)
+```
+
+This Phase 2 delegate deliberately does not fall back to libcurl's compiled trust path. System trust
+bridging (`SecTrust`), proxy/PAC parity, and pinning are separate platform work.
 `NetworkEngineSelectionDiagnostics.capabilities` always describes the engine that was actually
 selected, not the requested engine.
 
