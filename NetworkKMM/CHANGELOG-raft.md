@@ -2,6 +2,17 @@
 
 ## Unreleased (typed selector and Android curl transport)
 
+- Shared wrapper (task #24, RFC D-5): `cancel_flag_` is now `std::atomic<bool>`
+  (relaxed) — `Cancel()` writes from arbitrary threads while the perform
+  thread reads in callbacks; the plain `bool` was a C++ data race. All three
+  entry points also honor a PRE-SET cancel deterministically before perform
+  starts (CURLE_ABORTED_BY_CALLBACK, exactly one callback) instead of relying
+  on the first progress tick.
+- OHOS converges on the RFC #67 fail-explicit baseline: a streaming body on
+  GET/HEAD now returns a classified transport error. This replaces the prior
+  "buffered fallback", which was in fact a silent body drop (the wrapper
+  skips the body for GET/HEAD entirely).
+
 - Added `NetworkTransportEngine.KTOR/CURL` and a typed per-request selector at
   the `NetworkEngine` routing boundary. External `"ktor" | "curl"` values map
   once through `NetworkEngineSelection.fromExternalConfig`; business and

@@ -144,6 +144,34 @@ int main(int argc, char **argv) {
     CHECK(second.connectTimeMs == 0,
           "second request reuses pooled connection (connectTimeMs == 0)");
 
+    // 8b. task #24 (RFC D-5): a cancel that lands BEFORE perform starts must
+    //     fail deterministically with CURLE_ABORTED_BY_CALLBACK and exactly
+    //     one callback — not depend on the first progress tick.
+    {
+        Captured cancelled;
+        StringDic headers{};
+        headers.size = 0;
+        headers.stringPairs = nullptr;
+
+        CurlRequest request{};
+        std::string url = base + "/ok";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        CurlCallback callback{&cancelled, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-test");
+        Cancel(handle);
+        StartRequest(handle, request, &callback);
+        DeleteCurlClient(handle);
+
+        CHECK(cancelled.invoked, "pre-start cancel still delivers a callback");
+        CHECK(cancelled.code == 42,
+              "pre-start cancel reports CURLE_ABORTED_BY_CALLBACK");
+        CHECK(cancelled.data.empty(), "pre-start cancel delivers no body");
+    }
+
     // 8. Upstream issue #28: request headers must not be duplicated on the
     //    wire. Send one custom header and count its occurrences in the echo.
     {
