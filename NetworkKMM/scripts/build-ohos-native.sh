@@ -292,7 +292,7 @@ check_codec() {
 check_codec "zlib (gzip/deflate)" "inflate"
 check_codec "brotli" "BrotliDecoderDecompressStream"
 check_codec "zstd" "ZSTD_decompressStream"
-check_codec "nghttp2 (HTTP/2)" "nghttp2_session_client_new"
+check_codec "nghttp2 (HTTP/2)" "nghttp2_session_client_new3"
 if [[ "$codec_missing" -ne 0 ]]; then
   echo "One or more content-encoding codecs are missing from libcurl.a" >&2
   exit 1

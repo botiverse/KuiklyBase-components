@@ -185,7 +185,7 @@ build_slice_arch() {
   # fails the build instead of shipping. Here-string, not a pipe.
   local curl_syms
   curl_syms="$(xcrun nm "$curl_build/lib/libcurl.a" 2>/dev/null || true)"
-  if grep -qw "nghttp2_session_client_new" <<<"$curl_syms"; then
+  if grep -qw "nghttp2_session_client_new3" <<<"$curl_syms"; then
     echo "==> [${sdk}/${arch}] libcurl HTTP/2 (nghttp2): ENABLED"
   else
     echo "[${sdk}/${arch}] libcurl HTTP/2 (nghttp2): MISSING" >&2

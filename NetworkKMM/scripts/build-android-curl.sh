@@ -194,7 +194,7 @@ fi
 # (the final .so is stripped, so check the archive like the OHOS codec
 # gate). Here-string, not a pipe: grep -q + pipefail SIGPIPE lesson.
 CURL_SYMS="$("${TOOLCHAIN_ROOT}/bin/llvm-nm" "$CURL_BUILD/lib/libcurl.a" 2>/dev/null || true)"
-if grep -qw "nghttp2_session_client_new" <<<"$CURL_SYMS"; then
+if grep -qw "nghttp2_session_client_new3" <<<"$CURL_SYMS"; then
   echo "libcurl HTTP/2 (nghttp2): ENABLED"
 else
   echo "libcurl HTTP/2 (nghttp2): MISSING — nghttp2_session_client_new not referenced" >&2
