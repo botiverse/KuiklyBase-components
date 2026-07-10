@@ -70,7 +70,10 @@ jobs:
           test -f "$so"
           # JNI_OnLoad must be exported for System.loadLibrary registration;
           # the wrapper's own entry points are linked statically inside.
-          nm -D "$so" | grep -q "JNI_OnLoad"
+          # grep without -q: it must consume all of nm's output — grep -q
+          # exits on first match and the SIGPIPE kills the pipeline under
+          # pipefail (exit 141; bit us in-container where GNU nm dies on it).
+          nm -D "$so" | grep "JNI_OnLoad" >/dev/null
           echo "JNI surface OK: $(du -h "$so" | cut -f1)"
 
       - name: Upload artifact
