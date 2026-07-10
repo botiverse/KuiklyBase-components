@@ -21,8 +21,6 @@ import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
-import com.tencent.kmm.network.export.NetworkError
-import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
@@ -138,7 +136,7 @@ internal class AndroidCurlNetworkEngine(
         source: NetworkUploadStreamSource
     ): NetworkResponse = coroutineScope {
         if (request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) {
-            return@coroutineScope unsupportedStreamingMethodResponse(request)
+            return@coroutineScope unsupportedStreamingRequestBodyResponse(request)
         }
         val requestId = VBPBRequestIdGenerator.getRequestId()
         val pullBridge = AndroidCurlUploadPullBridge()
@@ -219,17 +217,6 @@ internal class AndroidCurlNetworkEngine(
             errorMsg = "cancelled before Android curl native start"
         ).toNetworkResponse(request)
 
-    private fun unsupportedStreamingMethodResponse(request: NetworkRequest): NetworkResponse =
-        NetworkResponse(
-            request = request,
-            statusCode = null,
-            headers = emptyMap(),
-            body = NetworkResponseBody(),
-            error = NetworkError(
-                kind = NetworkErrorKind.UNKNOWN,
-                message = "Android curl does not stream request bodies for ${request.method}."
-            )
-        )
 }
 
 internal class AndroidCurlUploadPullBridge {

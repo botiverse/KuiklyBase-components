@@ -300,8 +300,9 @@ private object IosCurlHandleRegistry : SynchronizedObject() {
     }
 
     fun cancel(requestId: Int) {
-        val handle = synchronized(this) { handles[requestId] }
-        if (handle != null) cancelNative(handle)
+        synchronized(this) {
+            handles[requestId]?.let(::cancelNative)
+        }
     }
 }
 
