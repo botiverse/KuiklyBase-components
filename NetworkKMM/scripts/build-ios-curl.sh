@@ -220,14 +220,16 @@ echo "==> Verify exported wrapper surface"
 for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
            "$XCFRAMEWORK"/ios-arm64_x86_64-simulator/libNetworkKMMCurl.a; do
   test -f "$lib"
-  # --defined-only + -j: one defined symbol name per line, external only.
-  syms="$(xcrun nm -g --defined-only -j -arch arm64 "$lib" 2>/dev/null || true)"
+  # nm -g --defined-only prints "ADDR T _Name" lines (format verified in CI
+  # diagnostics on 2026-07-10); -j is NOT portable across Xcode nm versions
+  # and fails silently, so match the full-line format instead.
+  syms="$(xcrun nm -g --defined-only -arch arm64 "$lib" 2>/dev/null || true)"
   for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo \
              _StartRequest _StartStreamRequest _StartUploadRequest; do
-    printf '%s\n' "$syms" | grep -qx "$sym" || {
+    printf '%s\n' "$syms" | grep -q " T ${sym}\$" || {
       echo "Missing exported symbol ${sym} in ${lib}" >&2
-      echo "-- nearby defined globals in the wrapper member:" >&2
-      xcrun nm -g --defined-only -arch arm64 "$lib" 2>/dev/null | grep -i "curl" | head -40 >&2 || true
+      echo "-- exported entry-point-family globals:" >&2
+      printf '%s\n' "$syms" | grep -E "Start|Cancel|CurlClient|SetCurl" | head -30 >&2 || true
       exit 2
     }
   done
