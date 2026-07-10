@@ -573,15 +573,25 @@ of a chat thread.
   cinterop (iOS). **#24 (Cata, native core)**: generalise `pbcurlwrapper` into
   the shared three-end C core (on #60's ownership/header cleanup) + the
   per-platform `.so`/XCFramework artifacts and publish pipeline.
-- **Phase 3 — #25**: app-owned CA/cert matrix (bundled OpenSSL + self-signed
-  per D-1) + system proxy + A/B gray rollout, then the HttpDNS / HTTP-3 gates
-  (D-2 capability payoff) on the unified core.
+- **Phase 3 — #25 (implemented, pending merge)**: one app-owned CA contract on
+  all curl ends, with a dated Mozilla snapshot and reviewed SHA-256 pin;
+  runtime byte verification; valid/unknown/expired/hostname-mismatch/wrong-CA
+  runtime matrices on Android and iOS; explicit direct/manual/PAC-unresolved
+  proxy modes with observed CONNECT-proxy gates; stable basis-point cohorts
+  and immediate rollback; and fail-explicit HttpDNS/HTTP-3 capability gates.
+  PAC execution is intentionally not claimed: the host must resolve it to a
+  fixed proxy URL. HTTPDNS remains unavailable until a resolver preserves the
+  original host for SNI/certificate verification, and HTTP/3 remains
+  unavailable until the native artifacts compile and test a QUIC backend.
 
 ### Acceptance
 
 Each `CURL`-branch end is accepted against the **D-5 rubric** (transport /
-bundled-OpenSSL trust + self-signed accept-reject / system proxy), on the real
-runtime CI lanes (Android emulator + iOS simulator, both asserting connection
-reuse). The selector's own acceptance: default stays byte-for-byte on the
-current engine (no regression when `curl` is off), and per-platform + remote
-flip both take effect without a release.
+bundled-OpenSSL trust + positive and negative certificate matrix / explicit
+proxy), on real runtime CI lanes (Android emulator + iOS simulator). “System
+proxy” in this phase means the app/platform bridge has resolved the effective
+decision and passes either direct or one fixed proxy URL; native PAC discovery
+is outside the accepted surface. The selector's own acceptance: default stays
+on the current engine when curl is off, a cohort decision is stable, remote
+rollback affects the next call without switching an in-flight retry, and every
+fallback reports a precise reason.

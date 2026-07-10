@@ -24,9 +24,15 @@ import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkTransferProgress
+import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
+import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
+import com.tencent.kmm.network.export.NetworkCurlTrustStore
+import com.tencent.kmm.network.export.NetworkCurlConfigurationFailureReason
 import com.tencent.kmm.network.export.VBTransportElapseStatistics
+import com.tencent.kmm.network.export.VBTransportCurl
 import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.VBTransportResultCode
+import com.tencent.kmm.network.export.networkCurlSha256Hex
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngineSelection
 import com.tencent.kmm.network.service.NetworkTransportEngine
@@ -34,7 +40,9 @@ import com.tencent.kmm.network.service.resolveNetworkEngine
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import java.io.File
 import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -45,9 +53,30 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 class AndroidCurlNetworkEngineTest {
+    private lateinit var trustStoreFile: File
+
+    @BeforeTest
+    fun configureCurlRuntime() {
+        trustStoreFile = File.createTempFile("networkkmm-test-ca", ".pem").apply {
+            writeText("unit-test-ca")
+        }
+        val bytes = trustStoreFile.readBytes()
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(bytes)
+                ),
+                proxy = NetworkCurlProxyConfiguration.direct()
+            )
+        )
+    }
+
     @AfterTest
     fun resetBridge() {
         AndroidCurlEngineProvider.testBridge = null
+        VBTransportCurl.clear()
+        trustStoreFile.delete()
     }
 
     @Test
@@ -62,7 +91,7 @@ class AndroidCurlNetworkEngineTest {
             )
         }
         val progress = mutableListOf<NetworkTransferProgress>()
-        val engine = AndroidCurlNetworkEngine(bridge) { "/tmp/test-ca.pem" }
+        val engine = AndroidCurlNetworkEngine(bridge)
         val request = NetworkRequest(
             method = VBTransportMethod.POST,
             url = "https://example.test",
@@ -88,7 +117,71 @@ class AndroidCurlNetworkEngineTest {
         assertEquals("application/json", nativeRequest.headers["Content-Type"])
         assertEquals("value", nativeRequest.headers["X-Request"])
         assertContentEquals("{\"ok\":true}".encodeToByteArray(), nativeRequest.body)
-        assertEquals("/tmp/test-ca.pem", nativeRequest.caInfoPath)
+        assertEquals(trustStoreFile.absolutePath, nativeRequest.caInfoPath)
+        assertEquals("", nativeRequest.proxyUrl)
+    }
+
+    @Test
+    fun manualProxyIsLatchedIntoNativeRequest() = runBlocking {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.manual("http://127.0.0.1:8888")
+            )
+        )
+        val bridge = FakeBridge()
+        val request = NetworkRequest(url = "https://example.test")
+
+        AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals("http://127.0.0.1:8888", bridge.lastRequest?.proxyUrl)
+    }
+
+    @Test
+    fun trustStoreHashMismatchFailsClosedBeforeNativeStart() = runBlocking {
+        val status = VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = "0".repeat(64)
+                ),
+                proxy = NetworkCurlProxyConfiguration.direct()
+            )
+        )
+        val bridge = FakeBridge()
+        val request = NetworkRequest(url = "https://example.test")
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertFalse(status.configured)
+        assertEquals(NetworkCurlConfigurationFailureReason.TRUST_STORE_HASH_MISMATCH, status.failureReason)
+        assertEquals(NetworkErrorKind.TLS, response.error?.kind)
+        assertNull(bridge.lastRequest)
+    }
+
+    @Test
+    fun invalidManualProxyFailsClosedAsConnectBeforeNativeStart() = runBlocking {
+        val status = VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.manual("ftp://127.0.0.1:8888")
+            )
+        )
+        val bridge = FakeBridge()
+        val request = NetworkRequest(url = "https://example.test")
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertFalse(status.configured)
+        assertEquals(NetworkCurlConfigurationFailureReason.PROXY_URL_INVALID, status.failureReason)
+        assertEquals(NetworkErrorKind.CONNECT, response.error?.kind)
+        assertNull(bridge.lastRequest)
     }
 
     @Test

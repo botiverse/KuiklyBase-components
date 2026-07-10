@@ -162,22 +162,64 @@ switch engines midway. Resolution always fails closed to the platform's current 
 Android/iOS and curl on OHOS. Android and iOS ship production curl delegates, but they are never
 selected unless the typed selector explicitly requests curl and the platform delegate is available.
 
-The iOS curl delegate requires an app-owned CA bundle. Configure its absolute path during app startup
-before enabling curl in remote rollout state; a missing or blank path leaves curl unavailable and the
-selector fails closed to Ktor Darwin:
+Every curl delegate requires one process-wide, app-owned runtime configuration. Stage the pinned bundle
+with `scripts/prepare-app-owned-ca-bundle.sh`, package/copy it through the app, then install its absolute
+runtime path and pinned SHA-256 before curl rollout is enabled:
 
 ```kotlin
-import com.tencent.kmm.network.export.VBTransportIosCurl
-import platform.Foundation.NSBundle
+val status = VBTransportCurl.configure(
+    NetworkCurlRuntimeConfiguration(
+        trustStore = NetworkCurlTrustStore(
+            path = appOwnedCaAbsolutePath,
+            sha256 = NetworkCurlCaBundleManifest.SHA256
+        ),
+        proxy = NetworkCurlProxyConfiguration.direct()
+    )
+)
+check(status.configured) { status.detail ?: status.failureReason.name }
+```
 
-VBTransportIosCurl.caInfoPath = NSBundle.mainBundle.pathForResource(
-    name = "cacert",
-    ofType = "pem"
+Configuration verifies the exact file bytes before publishing them to requests. Missing, unreadable,
+modified, or hash-mismatched bundles fail closed. A failed reconfiguration also clears the previous
+configuration, so a bad CA rotation cannot leave stale trust material active. Update the dated URL,
+version, and SHA-256 together in `ca/curl-ca-bundle.env` and `NetworkCurlCaBundleManifest`; CA rotation
+is an explicit reviewed source change, never an unpinned build-time download.
+
+Proxy behavior is also explicit because libcurl does not inherit the complete Android/iOS/OHOS proxy
+and PAC contract:
+
+- `direct()` sets an empty `CURLOPT_PROXY`, including disabling environment proxy inheritance.
+- `manual(url)` accepts a fixed `http(s)` or SOCKS URL already resolved by the host and passes it through
+  `CURLOPT_PROXY`; environment `no_proxy` cannot override that host decision.
+- `pacUnresolved()` makes curl ineligible. The selector falls back to Ktor on Android/iOS; an OHOS host
+  must resolve PAC to a fixed URL before using its curl platform default.
+
+Use `NetworkEngineRolloutConfig` for stable, reversible A/B cohorts instead of ad-hoc percentages:
+
+```kotlin
+val rollout = NetworkEngineRolloutConfig(
+    curlBasisPoints = remoteCurlBasisPoints,
+    curlEnabled = remoteCurlEnabled,
+    forcePlatformDefault = remoteRollback,
+    salt = "network-curl-v1"
+)
+
+val client = NetworkClient(
+    NetworkClientConfig(
+        engineSelector = { request ->
+            rollout.selectionFor(checkNotNull(request.metadata["accountId"]))
+        }
+    )
 )
 ```
 
-This Phase 2 delegate deliberately does not fall back to libcurl's compiled trust path. System trust
-bridging (`SecTrust`), proxy/PAC parity, and pinning are separate platform work.
+The stable bucket and rollout inputs are available in selection diagnostics without exposing the cohort
+key. `forcePlatformDefault` is the immediate rollback switch. HTTPDNS and HTTP/3 remain explicit gates:
+setting `httpDnsEnabled` or `http3Enabled` makes curl ineligible with `HTTPDNS_UNSUPPORTED` or
+`HTTP3_UNSUPPORTED`. Current artifacts do not implement an SNI-safe custom resolver and are not built
+with a QUIC backend. `NetworkEngineCapabilities` reports the same truth through `httpDns` and `http3`;
+do not infer support from the libcurl version alone.
+
 `NetworkEngineSelectionDiagnostics.capabilities` always describes the engine that was actually
 selected, not the requested engine.
 

@@ -12,6 +12,24 @@ permissions:
   contents: read
 
 jobs:
+  ca-bundle-contract:
+    name: App-owned CA bundle pin
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Stage and verify pinned CA bundle
+        shell: bash
+        run: |
+          source NetworkKMM/ca/curl-ca-bundle.env
+          RUNTIME_MANIFEST=NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/export/NetworkCurlRuntime.kt
+          grep -Fq "const val VERSION: String = \"$NETWORKKMM_CURL_CA_VERSION\"" "$RUNTIME_MANIFEST"
+          grep -Fq "const val SOURCE_URL: String = \"$NETWORKKMM_CURL_CA_SOURCE_URL\"" "$RUNTIME_MANIFEST"
+          grep -Fq "const val SHA256: String = \"$NETWORKKMM_CURL_CA_SHA256\"" "$RUNTIME_MANIFEST"
+          NetworkKMM/scripts/prepare-app-owned-ca-bundle.sh /tmp/networkkmm-cacert.pem
+          test -s /tmp/networkkmm-cacert.pem
+
   android-unit-tests:
     name: Android unit tests (:network)
     runs-on: ubuntu-latest
@@ -43,6 +61,42 @@ jobs:
         with:
           name: network-test-reports
           path: NetworkKMM/network/build/reports/tests/
+
+  android-curl-runtime-tests:
+    name: Android curl runtime tests (emulator x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Run production Android curl runtime gate
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
+          script: >-
+            cd NetworkKMM &&
+            ./gradlew :network:connectedDebugAndroidTest
+            -Pandroid.testInstrumentationRunnerArguments.class=com.tencent.kmm.network.internal.platform.AndroidCurlRuntimeInstrumentedTest
+            --no-daemon --stacktrace
 
   darwin-behavior-tests:
     name: Darwin engine behavior tests (macosArm64)

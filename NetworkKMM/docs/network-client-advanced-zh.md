@@ -157,22 +157,61 @@ call 就会回退。选择结果会在当前 call 内锁定，auth/policy retry 
 Android/iOS 已提供 production curl delegate，但只有 typed selector 显式请求 curl 且平台 delegate
 可用时才会选中。
 
-iOS curl delegate 必须由 app 提供 CA bundle。启用远程 curl 灰度前，在 app 启动阶段配置绝对路径；
-路径缺失或为空时 curl 保持 unavailable，selector 会 fail-closed 到 Ktor Darwin：
+所有 curl delegate 都要求 App 安装同一份进程级 runtime 配置。先用
+`scripts/prepare-app-owned-ca-bundle.sh` 下载并校验固定版本的 CA bundle，再由 App 打包/复制，
+最后在启用 curl 灰度前传入运行时绝对路径和固定 SHA-256：
 
 ```kotlin
-import com.tencent.kmm.network.export.VBTransportIosCurl
-import platform.Foundation.NSBundle
+val status = VBTransportCurl.configure(
+    NetworkCurlRuntimeConfiguration(
+        trustStore = NetworkCurlTrustStore(
+            path = appOwnedCaAbsolutePath,
+            sha256 = NetworkCurlCaBundleManifest.SHA256
+        ),
+        proxy = NetworkCurlProxyConfiguration.direct()
+    )
+)
+check(status.configured) { status.detail ?: status.failureReason.name }
+```
 
-VBTransportIosCurl.caInfoPath = NSBundle.mainBundle.pathForResource(
-    name = "cacert",
-    ofType = "pem"
+配置发布前会校验文件的真实字节。文件缺失、不可读、被修改或 hash 不匹配都会 fail-closed；
+失败的重新配置还会清掉旧配置，避免错误 CA 轮换继续沿用旧信任材料。CA 更新必须同时修改
+`ca/curl-ca-bundle.env` 和 `NetworkCurlCaBundleManifest` 中的日期 URL、版本和 SHA-256，并作为
+显式 source change 评审，不能在构建时无校验地下载 latest 文件。
+
+libcurl 不会自动继承 Android/iOS/OHOS 完整的系统 proxy/PAC 合同，因此 proxy 决策也必须显式：
+
+- `direct()` 通过空 `CURLOPT_PROXY` 关闭代理，同时禁止继承环境代理。
+- `manual(url)` 接收 App/平台已经解析好的固定 `http(s)` 或 SOCKS URL；环境 `no_proxy` 不能覆盖该决策。
+- `pacUnresolved()` 会让 curl 变为 ineligible。Android/iOS selector 会回退 Ktor；OHOS 以 curl 为
+  平台默认，host 必须先把 PAC 解析成固定 URL。
+
+A/B 灰度使用稳定、可回滚的 `NetworkEngineRolloutConfig`，不要在业务层各自实现随机百分比：
+
+```kotlin
+val rollout = NetworkEngineRolloutConfig(
+    curlBasisPoints = remoteCurlBasisPoints,
+    curlEnabled = remoteCurlEnabled,
+    forcePlatformDefault = remoteRollback,
+    salt = "network-curl-v1"
+)
+
+val client = NetworkClient(
+    NetworkClientConfig(
+        engineSelector = { request ->
+            rollout.selectionFor(checkNotNull(request.metadata["accountId"]))
+        }
+    )
 )
 ```
 
-Phase 2 delegate 不会回退到 libcurl 编译时默认信任路径。系统信任桥接（`SecTrust`）、proxy/PAC
-对齐和 pinning 属于后续平台工作。`NetworkEngineSelectionDiagnostics.capabilities` 描述的是
-**实际选中的 engine**，不是请求但未命中的 engine。
+稳定 bucket 和灰度参数会进入 diagnostics，但不会暴露 cohort key；`forcePlatformDefault` 是立即回滚
+开关。HTTPDNS/HTTP3 当前仍是显式 gate：设置 `httpDnsEnabled` 或 `http3Enabled` 会分别以
+`HTTPDNS_UNSUPPORTED` / `HTTP3_UNSUPPORTED` 使 curl ineligible。当前尚无保留原始 host/SNI 的
+自定义 DNS 合同，native artifact 也没有编入 QUIC backend；`NetworkEngineCapabilities.httpDns/http3`
+会报告同一事实，不能仅凭 libcurl 版本推断已支持。
+
+`NetworkEngineSelectionDiagnostics.capabilities` 描述的是**实际选中的 engine**，不是请求但未命中的 engine。
 
 ## 处理稳定错误分类
 

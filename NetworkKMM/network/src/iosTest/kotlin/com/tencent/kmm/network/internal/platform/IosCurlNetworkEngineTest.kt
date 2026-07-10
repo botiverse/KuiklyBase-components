@@ -24,10 +24,14 @@ import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkTransferProgress
+import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
+import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
+import com.tencent.kmm.network.export.NetworkCurlTrustStore
 import com.tencent.kmm.network.export.VBTransportElapseStatistics
-import com.tencent.kmm.network.export.VBTransportIosCurl
+import com.tencent.kmm.network.export.VBTransportCurl
 import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.VBTransportResultCode
+import com.tencent.kmm.network.export.networkCurlSha256Hex
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngineSelection
 import com.tencent.kmm.network.service.NetworkTransportEngine
@@ -36,7 +40,16 @@ import com.tencent.kmm.network.service.resolveNetworkEngine
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.cinterop.ExperimentalForeignApi
+import kotlinx.cinterop.addressOf
+import kotlinx.cinterop.convert
+import kotlinx.cinterop.usePinned
+import platform.posix.fclose
+import platform.posix.fopen
+import platform.posix.fwrite
+import platform.posix.remove
 import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -46,26 +59,50 @@ import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
+@OptIn(ExperimentalForeignApi::class)
 class IosCurlNetworkEngineTest {
+    private val trustStorePath = "/tmp/networkkmm-ios-unit-ca.pem"
+
+    @BeforeTest
+    fun configureCurlRuntime() {
+        val bytes = "unit-test-ca".encodeToByteArray()
+        val file = checkNotNull(fopen(trustStorePath, "wb"))
+        try {
+            bytes.usePinned { pinned ->
+                check(fwrite(pinned.addressOf(0), 1.convert(), bytes.size.convert(), file).toInt() == bytes.size)
+            }
+        } finally {
+            fclose(file)
+        }
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(trustStorePath, networkCurlSha256Hex(bytes)),
+                proxy = NetworkCurlProxyConfiguration.direct()
+            )
+        )
+    }
+
     @AfterTest
     fun resetBridge() {
         IosCurlEngineProvider.testBridge = null
-        VBTransportIosCurl.caInfoPath = null
+        VBTransportCurl.clear()
+        remove(trustStorePath)
     }
 
     @Test
-    fun providerRequiresNativeArtifactAndExplicitCaPath() {
+    fun providerRequiresNativeArtifactAndVerifiedRuntimeConfiguration() {
         IosCurlEngineProvider.testBridge = FakeBridge(isAvailable = false)
-        VBTransportIosCurl.caInfoPath = "/tmp/ca.pem"
         assertNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
 
         IosCurlEngineProvider.testBridge = FakeBridge(isAvailable = true)
-        VBTransportIosCurl.caInfoPath = null
-        assertNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
+        VBTransportCurl.clear()
+        val curl = assertNotNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
+        assertFalse(VBTransportCurl.configured)
+        assertFalse(curl.availability(NetworkRequest()).available)
 
-        VBTransportIosCurl.caInfoPath = "  /tmp/ca.pem  "
+        configureCurlRuntime()
         assertNotNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
-        assertTrue(VBTransportIosCurl.nativeAvailable)
+        assertTrue(VBTransportCurl.configured)
     }
 
     @Test
@@ -89,7 +126,7 @@ class IosCurlNetworkEngineTest {
             )
         }
         val progress = mutableListOf<NetworkTransferProgress>()
-        val engine = IosCurlNetworkEngine(bridge) { "/tmp/test-ca.pem" }
+        val engine = IosCurlNetworkEngine(bridge)
         val request = NetworkRequest(
             method = VBTransportMethod.POST,
             url = "https://example.test",
@@ -115,13 +152,14 @@ class IosCurlNetworkEngineTest {
         assertEquals("application/json", nativeRequest.headers["Content-Type"])
         assertEquals("value", nativeRequest.headers["X-Request"])
         assertContentEquals("{\"ok\":true}".encodeToByteArray(), nativeRequest.body)
-        assertEquals("/tmp/test-ca.pem", nativeRequest.caInfoPath)
+        assertEquals(trustStorePath, nativeRequest.caInfoPath)
+        assertEquals("", nativeRequest.proxyUrl)
     }
 
     @Test
     fun responseTaxonomyPreservesHttpAndCurlFailures() = runBlocking {
         val bridge = FakeBridge()
-        val engine = IosCurlNetworkEngine(bridge) { "/tmp/ca.pem" }
+        val engine = IosCurlNetworkEngine(bridge)
         val request = NetworkRequest(url = "https://example.test")
 
         bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 401)
@@ -164,7 +202,7 @@ class IosCurlNetworkEngineTest {
         val starts = mutableListOf<Triple<Int, Long?, Map<String, List<String>>>>()
         val chunks = mutableListOf<ByteArray>()
 
-        val response = IosCurlNetworkEngine(bridge) { "/tmp/ca.pem" }.downloadStream(
+        val response = IosCurlNetworkEngine(bridge).downloadStream(
             request = request,
             call = NetworkCall(request),
             onResponseStart = { status, length, headers -> starts += Triple(status, length, headers) },
@@ -202,7 +240,7 @@ class IosCurlNetworkEngineTest {
             progress = NetworkProgressCallbacks(uploadProgress = progress::add)
         )
 
-        val response = IosCurlNetworkEngine(bridge) { "/tmp/ca.pem" }
+        val response = IosCurlNetworkEngine(bridge)
             .execute(request, NetworkCall(request))
 
         assertEquals("done", response.body.text())
@@ -232,7 +270,7 @@ class IosCurlNetworkEngineTest {
             )
         )
 
-        val response = IosCurlNetworkEngine(bridge) { "/tmp/ca.pem" }
+        val response = IosCurlNetworkEngine(bridge)
             .execute(request, NetworkCall(request))
 
         assertEquals(NetworkErrorKind.UNKNOWN, response.error?.kind)
@@ -254,7 +292,7 @@ class IosCurlNetworkEngineTest {
 
         val job = launch {
             result.complete(
-                IosCurlNetworkEngine(bridge) { "/tmp/ca.pem" }
+                IosCurlNetworkEngine(bridge)
                     .execute(request, call).error?.kind
             )
         }
@@ -273,7 +311,7 @@ class IosCurlNetworkEngineTest {
         val request = NetworkRequest(url = "https://example.test/cancelled")
         val call = NetworkCall(request).apply { cancel() }
 
-        val response = IosCurlNetworkEngine(bridge) { "/tmp/ca.pem" }.execute(request, call)
+        val response = IosCurlNetworkEngine(bridge).execute(request, call)
 
         assertEquals(NetworkErrorKind.CANCELLED, response.error?.kind)
         assertNull(bridge.lastRequest)
@@ -282,7 +320,7 @@ class IosCurlNetworkEngineTest {
 
     @Test
     fun selectedDelegateReportsItsOwnCapabilities() {
-        val curl = IosCurlNetworkEngine(FakeBridge()) { "/tmp/ca.pem" }
+        val curl = IosCurlNetworkEngine(FakeBridge())
         val ktorCapabilities = NetworkEngineCapabilities(responseBodyStreaming = false)
         val ktor = object : com.tencent.kmm.network.service.NetworkEngine {
             override val capabilities = ktorCapabilities

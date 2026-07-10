@@ -18,6 +18,7 @@ package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
 import com.tencent.kmm.network.export.NetworkErrorKind
+import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.VBTransportElapseStatistics
@@ -49,7 +50,8 @@ data class NetworkEngineSelection(
     val requestedEngine: NetworkTransportEngine? = null,
     val allowedEngines: Set<NetworkTransportEngine> = NetworkTransportEngine.entries.toSet(),
     val forcePlatformDefault: Boolean = false,
-    val externalValueValid: Boolean = true
+    val externalValueValid: Boolean = true,
+    val rollout: NetworkEngineRolloutDiagnostics? = null
 ) {
     companion object {
         /**
@@ -78,6 +80,47 @@ data class NetworkEngineSelection(
     }
 }
 
+/** Stable cohort input for reversible curl A/B rollout. */
+data class NetworkEngineRolloutConfig(
+    /** 0..10_000 basis points. 10_000 requests curl for every eligible cohort. */
+    val curlBasisPoints: Int,
+    val curlEnabled: Boolean,
+    val forcePlatformDefault: Boolean = false,
+    /** Versioned salt lets a host intentionally reshuffle cohorts. */
+    val salt: String = "v1"
+) {
+    init {
+        require(curlBasisPoints in 0..10_000) { "curlBasisPoints must be in 0..10_000" }
+    }
+
+    fun selectionFor(cohortKey: String): NetworkEngineSelection {
+        val bucket = stableRolloutBucket("$salt:$cohortKey")
+        val requestsCurl = curlEnabled && bucket < curlBasisPoints
+        return NetworkEngineSelection(
+            requestedEngine = NetworkTransportEngine.CURL.takeIf { requestsCurl },
+            allowedEngines = if (curlEnabled) {
+                NetworkTransportEngine.entries.toSet()
+            } else {
+                setOf(NetworkTransportEngine.KTOR)
+            },
+            forcePlatformDefault = forcePlatformDefault,
+            rollout = NetworkEngineRolloutDiagnostics(
+                curlBasisPoints = curlBasisPoints,
+                bucket = bucket,
+                requestedCurl = requestsCurl,
+                salt = salt
+            )
+        )
+    }
+}
+
+data class NetworkEngineRolloutDiagnostics(
+    val curlBasisPoints: Int,
+    val bucket: Int,
+    val requestedCurl: Boolean,
+    val salt: String
+)
+
 enum class NetworkEngineSelectionReason {
     PLATFORM_DEFAULT,
     REQUESTED,
@@ -85,7 +128,38 @@ enum class NetworkEngineSelectionReason {
     DISALLOWED,
     UNAVAILABLE,
     INVALID_EXTERNAL_VALUE,
-    SELECTOR_ERROR
+    SELECTOR_ERROR,
+    INELIGIBLE
+}
+
+enum class NetworkEngineUnavailableReason {
+    NATIVE_UNAVAILABLE,
+    TRUST_STORE_NOT_CONFIGURED,
+    TRUST_STORE_INVALID,
+    PROXY_RESOLUTION_REQUIRED,
+    PROXY_PAC_UNSUPPORTED,
+    PROXY_INVALID,
+    HTTPDNS_UNSUPPORTED,
+    HTTP3_UNSUPPORTED
+}
+
+data class NetworkEngineAvailability(
+    val available: Boolean,
+    val reason: NetworkEngineUnavailableReason? = null,
+    val detail: String? = null
+) {
+    companion object {
+        val Available = NetworkEngineAvailability(available = true)
+
+        fun unavailable(
+            reason: NetworkEngineUnavailableReason,
+            detail: String
+        ): NetworkEngineAvailability = NetworkEngineAvailability(
+            available = false,
+            reason = reason,
+            detail = detail
+        )
+    }
 }
 
 data class NetworkEngineSelectionDiagnostics(
@@ -93,14 +167,18 @@ data class NetworkEngineSelectionDiagnostics(
     val selectedEngine: NetworkTransportEngine,
     val platformDefaultEngine: NetworkTransportEngine,
     val reason: NetworkEngineSelectionReason,
-    val capabilities: NetworkEngineCapabilities
+    val capabilities: NetworkEngineCapabilities,
+    val unavailableReason: NetworkEngineUnavailableReason? = null,
+    val unavailableDetail: String? = null,
+    val rollout: NetworkEngineRolloutDiagnostics? = null
 )
 
 data class NetworkEngineExecutionDiagnostics(
     val selection: NetworkEngineSelectionDiagnostics,
     val statusCode: Int?,
     val errorKind: NetworkErrorKind?,
-    val timing: VBTransportElapseStatistics
+    val timing: VBTransportElapseStatistics,
+    val negotiatedProtocol: NetworkHttpProtocol = NetworkHttpProtocol.UNKNOWN
 )
 
 /** Diagnostics callbacks run on the request dispatcher and must stay non-blocking. */
@@ -155,7 +233,8 @@ internal class RoutingNetworkEngine(
                 selection = selection,
                 platformDefault = platformDefault,
                 resolver = resolver,
-                selectorFailed = selectionResult.isFailure
+                selectorFailed = selectionResult.isFailure,
+                request = request
             )
         }
     }
@@ -176,7 +255,8 @@ internal class RoutingNetworkEngine(
                     selection = selection,
                     statusCode = response.statusCode,
                     errorKind = response.error?.kind,
-                    timing = response.timing.copy()
+                    timing = response.timing.copy(),
+                    negotiatedProtocol = response.protocol
                 )
             )
         }
@@ -187,7 +267,8 @@ internal fun resolveNetworkEngine(
     selection: NetworkEngineSelection,
     platformDefault: NetworkTransportEngine,
     resolver: (NetworkTransportEngine) -> NetworkEngine?,
-    selectorFailed: Boolean = false
+    selectorFailed: Boolean = false,
+    request: NetworkRequest? = null
 ): ResolvedNetworkEngine {
     val defaultEngine = checkNotNull(resolver(platformDefault)) {
         "Platform default engine $platformDefault is not registered"
@@ -196,6 +277,8 @@ internal fun resolveNetworkEngine(
     val reason: NetworkEngineSelectionReason
     val selected: NetworkTransportEngine
     val delegate: NetworkEngine
+    var unavailableReason: NetworkEngineUnavailableReason? = null
+    var unavailableDetail: String? = null
 
     when {
         selectorFailed -> {
@@ -229,10 +312,22 @@ internal fun resolveNetworkEngine(
                 selected = platformDefault
                 delegate = defaultEngine
                 reason = NetworkEngineSelectionReason.UNAVAILABLE
+                unavailableReason = NetworkEngineUnavailableReason.NATIVE_UNAVAILABLE
+                unavailableDetail = "Requested engine $requested is not registered on this platform."
             } else {
-                selected = requested
-                delegate = requestedEngine
-                reason = NetworkEngineSelectionReason.REQUESTED
+                val availability = request?.let(requestedEngine::availability)
+                    ?: NetworkEngineAvailability.Available
+                if (!availability.available) {
+                    selected = platformDefault
+                    delegate = defaultEngine
+                    reason = NetworkEngineSelectionReason.INELIGIBLE
+                    unavailableReason = availability.reason
+                    unavailableDetail = availability.detail
+                } else {
+                    selected = requested
+                    delegate = requestedEngine
+                    reason = NetworkEngineSelectionReason.REQUESTED
+                }
             }
         }
     }
@@ -244,7 +339,18 @@ internal fun resolveNetworkEngine(
             selectedEngine = selected,
             platformDefaultEngine = platformDefault,
             reason = reason,
-            capabilities = delegate.capabilities
+            capabilities = delegate.capabilities,
+            unavailableReason = unavailableReason,
+            unavailableDetail = unavailableDetail,
+            rollout = selection.rollout
         )
     )
+}
+
+private fun stableRolloutBucket(value: String): Int {
+    var hash = 0x811c9dc5u
+    value.encodeToByteArray().forEach { byte ->
+        hash = (hash xor byte.toUByte().toUInt()) * 0x01000193u
+    }
+    return (hash % 10_000u).toInt()
 }
