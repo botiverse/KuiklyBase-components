@@ -189,6 +189,18 @@ if [[ ! -f "${CURL_BUILD}/lib/libcurl.a" || "$(cat "$CURL_STAMP" 2>/dev/null)" !
   printf '%s' "$BUILD_CONFIG" > "$CURL_STAMP"
 fi
 
+# HTTP/2 hard gate: curl's cmake can silently fall back to h1-only if the
+# nghttp2 detection wobbles — assert the symbol REFERENCE in libcurl.a
+# (the final .so is stripped, so check the archive like the OHOS codec
+# gate). Here-string, not a pipe: grep -q + pipefail SIGPIPE lesson.
+CURL_SYMS="$("${TOOLCHAIN_ROOT}/bin/llvm-nm" "$CURL_BUILD/lib/libcurl.a" 2>/dev/null || true)"
+if grep -qw "nghttp2_session_client_new" <<<"$CURL_SYMS"; then
+  echo "libcurl HTTP/2 (nghttp2): ENABLED"
+else
+  echo "libcurl HTTP/2 (nghttp2): MISSING — nghttp2_session_client_new not referenced" >&2
+  exit 2
+fi
+
 echo "==> Linking libnetworkkmmcurl.so (${ANDROID_ABI})"
 "$CXX" \
   -shared \

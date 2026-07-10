@@ -180,6 +180,18 @@ build_slice_arch() {
     printf '%s' "$build_config" > "$curl_stamp"
   fi
 
+  # HTTP/2 hard gate (same rationale as the Android/OHOS gates): assert the
+  # nghttp2 reference in this slice's libcurl.a so a silent h1-only fallback
+  # fails the build instead of shipping. Here-string, not a pipe.
+  local curl_syms
+  curl_syms="$(xcrun nm "$curl_build/lib/libcurl.a" 2>/dev/null || true)"
+  if grep -qw "nghttp2_session_client_new" <<<"$curl_syms"; then
+    echo "==> [${sdk}/${arch}] libcurl HTTP/2 (nghttp2): ENABLED"
+  else
+    echo "[${sdk}/${arch}] libcurl HTTP/2 (nghttp2): MISSING" >&2
+    exit 2
+  fi
+
   echo "==> [${sdk}/${arch}] pbcurlwrapper + merge"
   local common_flags=(
     -arch "$arch"
