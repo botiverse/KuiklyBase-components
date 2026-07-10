@@ -540,9 +540,13 @@ of a chat thread.
   verbs (`GET` becomes `PUT`; `HEAD` conflicts with an upload). All CURL ends
   (#22 Android, #23 iOS, OHOS) **reject streaming `GET`/`HEAD` with a classified
   transport error** rather than silently changing or dropping the body
-  (Android #22 returns `NetworkErrorKind.UNKNOWN` with an explicit method
-  message; OHOS uses the `describeTransportFailure` vocabulary — there is no
-  public `ENGINE` error kind);
+  (a *caller-contract* error surfaced through the transport error channel —
+  Android #22 returns `NetworkErrorKind.UNKNOWN`, OHOS returns
+  `CODE_NETWORK_ERROR` — carrying a plain method-semantics message with **no
+  cause-tag prefix**: the `describeTransportFailure` tags (`[timeout]`/`[dns]`/…)
+  classify transport *causes*, and a caller error is none of them; there is no
+  public `ENGINE` kind either. The message text is shape-aligned across ends so
+  #23 iOS reproduces the same contract);
   `POST`/`PUT`/`PATCH`/`DELETE`/`OPTIONS` streaming stays supported. This is a
   conscious **upward** convergence, not an alignment-down: it supersedes OHOS's
   prior "buffered fallback", which is in fact a *silent body drop* —
@@ -552,8 +556,9 @@ of a chat thread.
   that existing silent drop, so the "align to the OHOS baseline" rule (the CURL
   branch mirrors OHOS's shipped behaviour) does **not** apply here — the baseline
   itself is corrected upward. OHOS converges in #24 (batched with the
-  `cancel_flag_` atomic and the same `.so`/publish cadence), emitting a
-  `describeTransportFailure`-classified error with a method-semantics note.
+  `cancel_flag_` atomic and the same `.so`/publish cadence), returning
+  `CODE_NETWORK_ERROR` with the same prefix-free method-semantics message
+  (landed in #24 c1).
   Verified 2026-07-09: **zero** streaming-body consumers on mobile `main`
   (`NetworkBody.Stream`/`FileRef`/`uploadStream` unused; attachments still ride
   the existing multipart path), so the OHOS flip carries no regression risk.
