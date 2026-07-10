@@ -1,6 +1,12 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased (typed selector and Android curl transport)
+## 0.1.0-raft.17 / 0.1.0-raft.17-ohos (typed selector and Android curl transport)
+
+- JNI shim: header-loop `JStringUtfChars` RAII wrappers now release their
+  chars before `DeleteLocalRef` runs (ART CheckJNI aborts on the reversed
+  order); caught by the task #22 real-emulator gate, which is now permanent
+  connected coverage (all eight runtime acceptance cases on a 16 KB arm64
+  AVD).
 
 - Shared wrapper (task #24, RFC D-5): `cancel_flag_` is now `std::atomic<bool>`
   (relaxed) — `Cancel()` writes from arbitrary threads while the perform
