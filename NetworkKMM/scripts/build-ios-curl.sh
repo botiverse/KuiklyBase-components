@@ -107,6 +107,14 @@ build_slice_arch() {
       LDFLAGS="-arch ${arch} $(min_flag "$sdk")" \
         ./Configure "$openssl_target" \
         no-shared no-tests no-apps no-docs \
+        # TLS-client prune set (artin, task #245 follow-up): legacy/engine/comp
+        # and non-web-PKI ciphers are dead weight for our HTTPS-only client;
+        # keeps TLS1.2/1.3, AES/ChaCha, EC/RSA, OCSP. curl compile + runtime
+        # gates are the acceptance for every removal.
+        no-legacy no-engine no-comp no-dtls no-srp \
+        no-camellia no-aria no-seed no-bf no-cast no-idea \
+        no-rc2 no-rc4 no-md4 no-mdc2 no-whirlpool \
+        no-sm2 no-sm3 no-sm4 \
         --prefix="$openssl_prefix" \
         --openssldir="$openssl_prefix/ssl"
       make -j"$JOBS" build_libs
