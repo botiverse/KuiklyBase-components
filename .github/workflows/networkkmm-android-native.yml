@@ -39,7 +39,7 @@ jobs:
     # NDK/cmdline-tools/cmake/zstd/binutils baked in (task #28) — no per-run
     # SDK downloads. Pin the version tag, never :latest.
     container:
-      image: ghcr.io/bytemain/kuikly-ci-images/android-ndk:v1.0.1
+      image: ghcr.io/bytemain/kuikly-ci-images/android-ndk:v1.1.0
     strategy:
       fail-fast: false
       matrix:
@@ -55,6 +55,18 @@ jobs:
         with:
           path: NetworkKMM/build/android-curl/${{ matrix.abi }}
           key: android-curl-${{ matrix.abi }}-${{ env.NDK_VERSION }}-${{ hashFiles('NetworkKMM/scripts/build-android-curl.sh') }}
+
+      # Seed the pinned OpenSSL/curl source tarballs baked into the image
+      # (v1.1.0, build-time verified + labeled). fetch() sees them present,
+      # skips the network, and still runs its unconditional SHA-256 check —
+      # the image is a transport, never a trust root. -n keeps any
+      # cache-restored copies (byte-identical by pin).
+      - name: Seed pinned source tarballs from image
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "NetworkKMM/build/android-curl/${{ matrix.abi }}/downloads"
+          cp -n /opt/curl-src/*.tar.gz "NetworkKMM/build/android-curl/${{ matrix.abi }}/downloads/"
 
       - name: Build native artifact
         shell: bash
