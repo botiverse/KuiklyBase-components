@@ -14,17 +14,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package com.tencent.kmm.network.internal.platform
+package com.tencent.kmm.network.export
 
-import com.tencent.kmm.network.service.NetworkEngine
-import com.tencent.kmm.network.service.NetworkTransportEngine
-import com.tencent.kmm.network.service.VBTransportNetworkEngine
+import com.tencent.kmm.network.internal.platform.IosCurlEngineProvider
 
-internal actual val platformDefaultNetworkTransportEngine: NetworkTransportEngine =
-    NetworkTransportEngine.KTOR
+/** iOS curl runtime inputs supplied by the host application. */
+object VBTransportIosCurl {
+    /** Absolute path to the app-owned CA bundle required by the curl/OpenSSL delegate. */
+    var caInfoPath: String? = null
 
-internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine): NetworkEngine? =
-    when (engine) {
-        NetworkTransportEngine.KTOR -> VBTransportNetworkEngine
-        NetworkTransportEngine.CURL -> IosCurlEngineProvider.resolve()
-    }
+    /** True when the native artifact is linked and a non-blank CA path is configured. */
+    val nativeAvailable: Boolean
+        get() = IosCurlEngineProvider.nativeAvailable
+}

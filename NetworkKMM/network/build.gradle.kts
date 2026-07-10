@@ -4,6 +4,7 @@ import org.gradle.kotlin.dsl.`maven-publish`
 import org.gradle.kotlin.dsl.signing
 import org.gradle.plugins.signing.SigningExtension
 import org.jetbrains.kotlin.gradle.plugin.KotlinHierarchyTemplate
+import org.jetbrains.kotlin.gradle.plugin.mpp.KotlinNativeTarget
 import java.util.*
 
 plugins {
@@ -17,6 +18,22 @@ plugins {
 @OptIn(org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi::class)
 kotlin {
     val iosCurlSpikeEnabled = providers.gradleProperty("iosCurlSpike").isPresent
+    val iosCurlDefinition = project.file("src/iosMain/c_interop/ios_curl.def")
+    val iosCurlFrameworkRoot = project.file("libs/ios/NetworkKMMCurl.xcframework")
+
+    fun KotlinNativeTarget.configureIosCurlInterop() {
+        val slice = when (name) {
+            "iosArm64" -> "ios-arm64"
+            "iosX64", "iosSimulatorArm64" -> "ios-arm64_x86_64-simulator"
+            else -> error("Unsupported iOS curl target: $name")
+        }
+        val sliceRoot = iosCurlFrameworkRoot.resolve(slice)
+        compilations.getByName("main").cinterops.create("iosCurl") {
+            definitionFile.set(iosCurlDefinition)
+            includeDirs(sliceRoot.resolve("Headers"))
+            extraOpts("-libraryPath", sliceRoot.absolutePath)
+        }
+    }
 
     // 使用默认层级结构模板
     KotlinHierarchyTemplate.default
@@ -36,6 +53,7 @@ kotlin {
 
     // iOS平台
     iosX64 {
+        configureIosCurlInterop()
         if (iosCurlSpikeEnabled) {
             val main by compilations.getting
             main.cinterops.create("iosCurlSpike") {
@@ -44,8 +62,11 @@ kotlin {
             }
         }
     }
-    iosArm64()
+    iosArm64 {
+        configureIosCurlInterop()
+    }
     iosSimulatorArm64 {
+        configureIosCurlInterop()
         if (iosCurlSpikeEnabled) {
             val main by compilations.getting
             main.cinterops.create("iosCurlSpike") {
@@ -116,6 +137,9 @@ kotlin {
         val iosX64Main by getting
         val iosArm64Main by getting
         val iosSimulatorArm64Main by getting
+        val iosX64Test by getting
+        val iosArm64Test by getting
+        val iosSimulatorArm64Test by getting
         if (iosCurlSpikeEnabled) {
             iosX64Main.kotlin.srcDir("src/iosCurlSpikeMain/kotlin")
             iosSimulatorArm64Main.kotlin.srcDir("src/iosCurlSpikeMain/kotlin")
@@ -131,11 +155,27 @@ kotlin {
                 implementation(libs.ktor.client.darwin)
             }
         }
+        val iosTest by creating {
+            dependsOn(commonTest)
+            iosX64Test.dependsOn(this)
+            iosArm64Test.dependsOn(this)
+            iosSimulatorArm64Test.dependsOn(this)
+        }
 
 
         if (providers.gradleProperty("darwinBehaviorTests").isPresent) {
-            val iosMain = getByName("iosMain")
-            getByName("macosArm64Main").dependsOn(iosMain)
+            val macosArm64Main by getting {
+                kotlin.srcDir("src/iosMain/kotlin")
+                kotlin.srcDir("src/darwinBehaviorMain/kotlin")
+                kotlin.exclude("com/tencent/kmm/network/export/VBTransportIosCurl.kt")
+                kotlin.exclude("com/tencent/kmm/network/internal/platform/IosCurlNativeBridge.kt")
+                kotlin.exclude("com/tencent/kmm/network/internal/platform/IosCurlNetworkEngine.kt")
+                kotlin.exclude("com/tencent/kmm/network/internal/platform/PlatformNetworkEngines.ios.kt")
+                dependencies {
+                    implementation(libs.ktor.ktor.client.core)
+                    implementation(libs.ktor.client.darwin)
+                }
+            }
         }
 
     }

@@ -7,7 +7,7 @@
 ### 简介
 
 本项目基于Kotlin Multiplatform技术，构建了一套跨平台网络请求(http get/post 等)解决方案,支持Android、iOS及HarmonyOS三大移动端平台.
-目前HarmonyOS端底层使用开源库libcurl作为网络请求引擎,Android/iOS端目前暂时使用ktor实现,后续会统一使用libcurl.
+HarmonyOS 端默认使用 libcurl；Android/iOS 端仍以 Ktor 为平台默认引擎，同时提供生产 libcurl delegate，可通过 `NetworkEngineSelection` 显式灰度和回滚。
 
 ### 接入
 

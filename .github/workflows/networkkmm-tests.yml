@@ -83,6 +83,23 @@ jobs:
         shell: bash
         run: kill "$(cat /tmp/test-server.pid)" 2>/dev/null || true
 
+  ios-curl-runtime-tests:
+    name: iOS curl runtime tests (Simulator arm64)
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Run production iOS curl runtime tests
+        shell: bash
+        run: NetworkKMM/scripts/run-ios-curl-runtime-tests.sh
+
   ohos-tree:
     name: OHOS tree compile & publication metadata (:network)
     runs-on: ubuntu-latest
