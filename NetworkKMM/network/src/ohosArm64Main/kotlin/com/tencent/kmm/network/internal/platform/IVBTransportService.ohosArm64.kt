@@ -99,7 +99,10 @@ object HmTransportImpl : IVBTransportService {
                 VBTransportResponse().apply {
                     this.request = kmmRequest
                     this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
-                    this.errorMessage = "[engine] streaming request body is not supported for " +
+                    // No raft.9 cause tag: this is a caller-contract error,
+                    // not a transport failure — message shape matches the
+                    // Android CURL delegate's for the same case (#67).
+                    this.errorMessage = "streaming request body is not supported for " +
                         "$method (CURLOPT_UPLOAD would rewrite the verb); " +
                         "use POST/PUT/PATCH/DELETE/OPTIONS"
                 }
