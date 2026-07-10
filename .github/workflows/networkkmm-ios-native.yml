@@ -1,0 +1,113 @@
+# Builds the PRODUCTION iOS curl native artifact (task #24, consumed by the
+# task #23 cinterop): shared pbcurlwrapper merged with static OpenSSL/curl
+# into NetworkKMM/network/libs/ios/NetworkKMMCurl.xcframework (ios-arm64 +
+# ios-arm64_x86_64-simulator, single static library per slice, wrapper
+# headers + modulemap exposed). PR runs verify the native build; a
+# workflow_dispatch with commit_binaries=true pushes the refreshed
+# xcframework back to the branch (same committed-binary pattern as the
+# Android/OHOS native lines).
+name: NetworkKMM iOS native (curl)
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_binaries:
+        description: "Commit the refreshed xcframework back to the branch"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - "NetworkKMM/scripts/build-ios-curl.sh"
+      - ".github/workflows/networkkmm-ios-native.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: networkkmm-ios-native-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build NetworkKMMCurl.xcframework
+    runs-on: macos-14
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # OpenSSL/curl cross-compiles dominate the wall clock (3 slices); cache
+      # the per-slice build trees keyed on everything that changes the bits.
+      - name: Cache OpenSSL/curl build trees
+        uses: actions/cache@v4
+        with:
+          path: NetworkKMM/build/ios-curl
+          key: ios-curl-${{ hashFiles('NetworkKMM/scripts/build-ios-curl.sh') }}
+
+      - name: Build xcframework
+        shell: bash
+        run: bash NetworkKMM/scripts/build-ios-curl.sh
+
+      # The script already nm-verifies the exported wrapper surface per slice;
+      # re-check the layout contract the task #23 cinterop .def relies on.
+      - name: Verify xcframework layout contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="NetworkKMM/network/libs/ios/NetworkKMMCurl.xcframework"
+          for slice in ios-arm64 ios-arm64_x86_64-simulator; do
+            test -f "$root/$slice/libNetworkKMMCurl.a"
+            test -f "$root/$slice/Headers/curl_wrapper.h"
+            test -f "$root/$slice/Headers/module.modulemap"
+          done
+          lipo -info "$root/ios-arm64_x86_64-simulator/libNetworkKMMCurl.a" | grep -q "x86_64" || {
+            echo "Simulator slice is not fat (missing x86_64)." >&2
+            exit 1
+          }
+          echo "Layout OK: $(du -sh "$root" | cut -f1)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: networkkmmcurl-xcframework
+          if-no-files-found: error
+          path: NetworkKMM/network/libs/ios/NetworkKMMCurl.xcframework
+
+  commit:
+    name: Commit refreshed binaries
+    if: github.event_name == 'workflow_dispatch' && inputs.commit_binaries
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: networkkmmcurl-xcframework
+          path: /tmp/networkkmmcurl-xcframework
+
+      - name: Place artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf NetworkKMM/network/libs/ios/NetworkKMMCurl.xcframework
+          mkdir -p NetworkKMM/network/libs/ios
+          cp -R /tmp/networkkmmcurl-xcframework NetworkKMM/network/libs/ios/NetworkKMMCurl.xcframework
+
+      - name: Commit refreshed binaries back
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add NetworkKMM/network/libs/ios
+          if git diff --cached --quiet; then
+            echo "No binary changes to commit."
+          else
+            git commit -m "ci: refresh NetworkKMM iOS curl native binaries [skip ci]"
+            git push
+          fi
