@@ -128,6 +128,7 @@ build_slice_arch() {
     tar -xzf "${DOWNLOADS_DIR}/nghttp2-${NGHTTP2_VERSION}.tar.gz" -C "$slice_root"
     cmake -S "$nghttp2_source" -B "$nghttp2_build" \
       -DCMAKE_SYSTEM_NAME=iOS \
+      -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
       -DCMAKE_OSX_SYSROOT="$sdk" \
       -DCMAKE_OSX_ARCHITECTURES="$arch" \
       -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
@@ -149,6 +150,7 @@ build_slice_arch() {
     # find-root rerooting swallows OPENSSL_ROOT_DIR there; harmless here).
     cmake -S "$curl_source" -B "$curl_build" \
       -DCMAKE_SYSTEM_NAME=iOS \
+      -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
       -DCMAKE_OSX_SYSROOT="$sdk" \
       -DCMAKE_OSX_ARCHITECTURES="$arch" \
       -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
@@ -175,7 +177,7 @@ build_slice_arch() {
       -DNGHTTP2_INCLUDE_DIR="${nghttp2_source}/lib/includes" \
       -DNGHTTP2_LIBRARY="${nghttp2_build}/lib/libnghttp2.a" \
       -DUSE_LIBIDN2=OFF \
-      -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     cmake --build "$curl_build" -j"$JOBS" >/dev/null
     printf '%s' "$build_config" > "$curl_stamp"
   fi
