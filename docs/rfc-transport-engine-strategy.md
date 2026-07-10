@@ -151,11 +151,36 @@ Android to libcurl would *lose* user-CA trust the current stack has.
 
 #### C-2. System proxy integration (where this whole bug class lives)
 
-- libcurl does not read platform proxy settings; it wants explicit
-  `CURLOPT_PROXY`. Android proxy comes from `ProxySelector`/connectivity
-  (WiFi proxy, per-network config); a bridge must read and map it
-  per-request, and **PAC scripts are not supported by libcurl at all** (the
-  platform evaluates PAC; curl takes a fixed proxy URL).
+- libcurl does not read platform proxy settings; it wants one explicit
+  `CURLOPT_PROXY`. Its current
+  [FAQ](https://github.com/curl/curl/blob/master/docs/FAQ.md#does-curl-support-javascript-or-pac-automated-proxy-config)
+  explicitly says PAC JavaScript is unsupported, and ordered proxy failover
+  remains a [TODO](https://github.com/curl/curl/blob/master/docs/TODO.md#try-next-proxy-if-one-does-not-work).
+  Repeated `CURLOPT_PROXY` calls replace the previous value rather than install
+  `PROXY a; PROXY b; DIRECT` fallback semantics.
+- Platform evaluators are usable but return a **per-URL ordered decision**, not
+  one process-wide proxy:
+  - Android exposes
+    [`ProxySelector.getDefault().select(uri)`](https://developer.android.com/reference/java/net/ProxySelector).
+    The platform
+    [PAC selector](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/master/core/java/android/net/PacProxySelector.java)
+    returns ordered direct, HTTP, and SOCKS entries; the caller must try the
+    next entry and notify `connectFailed` when appropriate.
+  - iOS exposes `CFNetworkCopySystemProxySettings` and
+    `CFNetworkCopyProxiesForURL`
+    (<https://developer.apple.com/documentation/cfnetwork/cfnetworkcopyproxiesforurl(_:_:)>).
+    The latter can still return a PAC URL, which must be loaded/evaluated
+    through the asynchronous CFNetwork PAC API before it yields the ordered
+    proxy list.
+  - OHOS exposes fixed `getDefaultHttpProxy()` from API 10 and
+    [`findProxyForUrl()`](https://github.com/openharmony/docs/blob/master/en/application-dev/reference/apis-network-kit/js-apis-net-connection.md#connectionfindproxyforurl20)
+    from API 20. Current NetworkKMM OHOS consumers declare compatibility with
+    API 12, and the official PAC device matrix requires newer phone/tablet
+    releases, so PAC resolution cannot be unconditional.
+- A complete bridge must latch the ordered proxy plan to one `NetworkCall`,
+  retry connection establishment in order, preserve a final `DIRECT` entry,
+  and define replay behavior for streaming request bodies. Mapping only the
+  first PAC entry to `CURLOPT_PROXY` is not PAC support.
 - VPN-type proxies (ClashMeta in TUN mode) are transparent at socket level
   and unaffected; HTTP-proxy/PAC setups are the exposure.
 - Required validation: the proxy test matrix (WiFi proxy, PAC, VPN/TUN,

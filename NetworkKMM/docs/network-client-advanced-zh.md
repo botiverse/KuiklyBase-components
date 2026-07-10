@@ -186,6 +186,31 @@ libcurl 不会自动继承 Android/iOS/OHOS 完整的系统 proxy/PAC 合同，�
 - `pacUnresolved()` 会让 curl 变为 ineligible。Android/iOS selector 会回退 Ktor；OHOS 以 curl 为
   平台默认，host 必须先把 PAC 解析成固定 URL。
 
+这是 libcurl 的能力边界，不是版本探测问题。curl 当前
+[FAQ](https://github.com/curl/curl/blob/master/docs/FAQ.md#does-curl-support-javascript-or-pac-automated-proxy-config)
+明确说明 libcurl 无法执行 PAC JavaScript；官方
+[proxy failover TODO](https://github.com/curl/curl/blob/master/docs/TODO.md#try-next-proxy-if-one-does-not-work)
+仍在跟踪 `PROXY a; PROXY b; DIRECT` 这类 PAC 有序代理链的失败切换。`CURLOPT_PROXY` 只接收一个
+固定代理，再次设置只会覆盖旧值。
+
+平台 API 可以在 libcurl 外计算有效代理，但结果是按 URL 解析的有序列表：
+
+- Android App 可调用
+  [`ProxySelector.getDefault().select(uri)`](https://developer.android.com/reference/java/net/ProxySelector)。
+  系统安装
+  [PAC selector](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/master/core/java/android/net/PacProxySelector.java)
+  后，返回值可能包含有序的直连、HTTP 和 SOCKS 选项；调用方负责上报连接失败并继续尝试下一项。
+- Apple CFNetwork 提供 `CFNetworkCopyProxiesForURL`
+  （<https://developer.apple.com/documentation/cfnetwork/cfnetworkcopyproxiesforurl(_:_:)>）；
+  如果结果是自动配置 URL，还要异步下载并执行 PAC，最终结果同样是需要按顺序尝试的列表。
+- OHOS 从 API 10 起可读取固定 `getDefaultHttpProxy()`；`findProxyForUrl()` 是 API 20+，且官方设备矩阵
+  [要求](https://github.com/openharmony/docs/blob/master/zh-cn/application-dev/reference/apis-network-kit/js-apis-net-connection.md#connectionfindproxyforurl20)
+  手机/平板 PAC 执行使用更高版本。兼容 API 12 的消费端不能假定该接口存在。
+
+所以完整 PAC parity 需要按请求调用平台 resolver，把有序重试状态锁定在同一个 `NetworkCall`，并明确
+流式上传在代理连接失败后是否可重放。只把 PAC 第一项传给 `manual(url)` 不算完整 PAC 支持，也不能把
+`NetworkEngineCapabilities.pacProxy` 报成 available。
+
 A/B 灰度使用稳定、可回滚的 `NetworkEngineRolloutConfig`，不要在业务层各自实现随机百分比：
 
 ```kotlin

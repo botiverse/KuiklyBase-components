@@ -194,6 +194,35 @@ and PAC contract:
 - `pacUnresolved()` makes curl ineligible. The selector falls back to Ktor on Android/iOS; an OHOS host
   must resolve PAC to a fixed URL before using its curl platform default.
 
+This is a libcurl boundary, not a version probe. The current curl
+[FAQ](https://github.com/curl/curl/blob/master/docs/FAQ.md#does-curl-support-javascript-or-pac-automated-proxy-config)
+states that libcurl cannot evaluate PAC JavaScript, and its
+[proxy failover TODO](https://github.com/curl/curl/blob/master/docs/TODO.md#try-next-proxy-if-one-does-not-work)
+still tracks support for a PAC-style ordered list such as `PROXY a; PROXY b; DIRECT`.
+`CURLOPT_PROXY` accepts one fixed proxy; setting it again replaces the previous value.
+
+Platform APIs can evaluate the effective proxy outside libcurl, but the result is per URL and ordered:
+
+- Android applications can call
+  [`ProxySelector.getDefault().select(uri)`](https://developer.android.com/reference/java/net/ProxySelector).
+  When Android installs its
+  [PAC selector](https://android.googlesource.com/platform/frameworks/base/+/refs/heads/master/core/java/android/net/PacProxySelector.java),
+  the result can contain ordered direct, HTTP, and SOCKS choices. The caller owns connection failure
+  notification and trying the next entry.
+- Apple CFNetwork exposes `CFNetworkCopyProxiesForURL`
+  (<https://developer.apple.com/documentation/cfnetwork/cfnetworkcopyproxiesforurl(_:_:)>);
+  a returned auto-configuration URL must be loaded and evaluated with the asynchronous PAC API. Its
+  result is also an ordered list to try in sequence.
+- OHOS exposes fixed `getDefaultHttpProxy()` data from API 10. `findProxyForUrl()` is API 20+, while the
+  [official device matrix](https://github.com/openharmony/docs/blob/master/en/application-dev/reference/apis-network-kit/js-apis-net-connection.md#connectionfindproxyforurl20)
+  requires newer releases for phone/tablet PAC evaluation; consumers compatible with API 12 cannot
+  assume it exists.
+
+Full PAC parity therefore needs a per-request platform resolver and ordered retry state latched to one
+`NetworkCall`. It must also define whether a streaming upload can be replayed after a proxy connection
+failure. Passing only the first PAC result to `manual(url)` is not full PAC support and must not be
+reported through `NetworkEngineCapabilities.pacProxy`.
+
 Use `NetworkEngineRolloutConfig` for stable, reversible A/B cohorts instead of ad-hoc percentages:
 
 ```kotlin

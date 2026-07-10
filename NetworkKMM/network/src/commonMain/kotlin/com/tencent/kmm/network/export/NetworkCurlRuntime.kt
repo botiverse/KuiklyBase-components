@@ -39,7 +39,11 @@ enum class NetworkCurlProxyMode {
     /** A fixed proxy URL already resolved by the host platform bridge. */
     MANUAL,
 
-    /** A PAC/system proxy exists but has not been resolved to a fixed URL. */
+    /**
+     * A PAC/system proxy exists but has not been resolved for this request.
+     * PAC can return an ordered proxy chain, so taking only its first entry is
+     * not equivalent to supporting the platform proxy contract.
+     */
     PAC_UNRESOLVED
 }
 

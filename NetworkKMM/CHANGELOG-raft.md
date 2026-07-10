@@ -15,10 +15,12 @@
   salt, and immediate platform-default rollback. Selection diagnostics include
   the cohort bucket, requested/selected engines, and exact ineligibility reason.
 - Curl capabilities now report app-owned trust/manual proxy truth and keep PAC,
-  HTTPDNS, and HTTP/3 fail-explicit. PAC must be resolved by the host; HTTPDNS
-  has no SNI-safe resolver contract yet; current native artifacts have no QUIC
-  backend. Completion diagnostics expose negotiated protocol as `UNKNOWN`
-  until native protocol extraction is implemented.
+  HTTPDNS, and HTTP/3 fail-explicit. PAC is per-URL and may return an ordered
+  proxy chain; libcurl evaluates neither the script nor multi-proxy failover,
+  so a first-result-only mapping is not reported as support. HTTPDNS has no
+  SNI-safe resolver contract yet; current native artifacts have no QUIC backend.
+  Completion diagnostics expose negotiated protocol as `UNKNOWN` until native
+  protocol extraction is implemented.
 
 ## 0.1.0-raft.18 / 0.1.0-raft.18-ohos (production iOS curl transport)
 
