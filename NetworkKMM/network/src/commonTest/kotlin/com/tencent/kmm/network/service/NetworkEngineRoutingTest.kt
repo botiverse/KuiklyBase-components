@@ -107,7 +107,17 @@ class NetworkEngineRoutingTest {
     @Test
     fun selectorCanGrayThenRollbackWithoutRebuildingClient() = runBlocking {
         val ktor = FakeEngine("ktor")
-        val curl = FakeEngine("curl", totalTimeMs = 42.0)
+        val curl = FakeEngine(
+            "curl",
+            timing = VBTransportElapseStatistics(
+                dispatcherQueueTimeMs = 17.0,
+                connectTimeMs = 29.0,
+                sslCostTimeMs = 11.0,
+                totalTimeMs = 42.0,
+                protocol = "h2",
+                connectionAttemptCount = 2
+            )
+        )
         val selected = mutableListOf<NetworkEngineSelectionDiagnostics>()
         val completed = mutableListOf<NetworkEngineExecutionDiagnostics>()
         var rollback = false
@@ -147,6 +157,11 @@ class NetworkEngineRoutingTest {
         )
         assertEquals(NetworkEngineSelectionReason.REMOTE_ROLLBACK, selected.last().reason)
         assertEquals(42.0, completed.first().timing.totalTimeMs)
+        assertEquals(17.0, completed.first().timing.dispatcherQueueTimeMs)
+        assertEquals(29.0, completed.first().timing.connectTimeMs)
+        assertEquals(11.0, completed.first().timing.sslCostTimeMs)
+        assertEquals("h2", completed.first().timing.protocol)
+        assertEquals(2, completed.first().timing.connectionAttemptCount)
         assertEquals(3, completed.size)
     }
 
@@ -221,7 +236,7 @@ class NetworkEngineRoutingTest {
     private class FakeEngine(
         private val name: String,
         override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(),
-        private val totalTimeMs: Double = 0.0
+        private val timing: VBTransportElapseStatistics = VBTransportElapseStatistics()
     ) : NetworkEngine {
         val executed = mutableListOf<String>()
 
@@ -248,7 +263,7 @@ class NetworkEngineRoutingTest {
             statusCode = 200,
             headers = emptyMap(),
             body = NetworkResponseBody(),
-            timing = VBTransportElapseStatistics(totalTimeMs = totalTimeMs)
+            timing = timing
         )
     }
 }

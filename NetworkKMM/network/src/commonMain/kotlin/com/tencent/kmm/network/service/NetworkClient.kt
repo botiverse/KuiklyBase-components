@@ -50,6 +50,8 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlin.coroutines.resume
+import kotlin.time.TimeSource
+import kotlin.time.TimeMark
 
 interface NetworkRequestMiddleware {
     suspend fun prepare(request: NetworkRequest): NetworkRequest
@@ -143,6 +145,9 @@ interface NetworkEngine {
 class NetworkCall internal constructor(
     val originalRequest: NetworkRequest
 ) {
+    private val enqueuedAt = TimeSource.Monotonic.markNow()
+    private var clientQueueTimeMs = 0.0
+    private var requestPreparationTimeMs = 0.0
     private val completion = CompletableDeferred<NetworkResponse>()
     private val cancelHandlers = mutableListOf<() -> Unit>()
     private var job: Job? = null
@@ -158,6 +163,20 @@ class NetworkCall internal constructor(
         if (cancelled) {
             job.cancel()
         }
+    }
+
+    internal fun markClientStarted() {
+        clientQueueTimeMs = enqueuedAt.elapsedNow().inWholeNanoseconds / 1_000_000.0
+    }
+
+    internal fun markRequestPrepared(startedAt: TimeMark) {
+        requestPreparationTimeMs = startedAt.elapsedNow().inWholeNanoseconds / 1_000_000.0
+    }
+
+    internal fun applyClientTiming(response: NetworkResponse): NetworkResponse {
+        response.timing.clientQueueTimeMs = clientQueueTimeMs
+        response.timing.requestPreparationTimeMs = requestPreparationTimeMs
+        return response
     }
 
     internal fun addCancelHandler(handler: () -> Unit) {
@@ -229,7 +248,8 @@ class NetworkClient(
         val call = NetworkCall(request)
         val policy = selectPolicy(request)
         val job = scope.launch(dispatcherFor(policy.dispatcher)) {
-            val response = executeInternal(request.copyMutable(), call, policy)
+            call.markClientStarted()
+            val response = call.applyClientTiming(executeInternal(request.copyMutable(), call, policy))
             call.complete(response)
             callback(response)
         }
@@ -290,12 +310,14 @@ class NetworkClient(
         call: NetworkCall,
         policy: NetworkRequestPolicy
     ): NetworkResponse {
+        val preparationStartedAt = TimeSource.Monotonic.markNow()
         var prepared = request
         config.requestMiddlewares.forEach { middleware ->
             prepared = middleware.prepare(prepared)
         }
         prepared.policy = policy
         applyCurrentAuthToken(prepared)
+        call.markRequestPrepared(preparationStartedAt)
 
         var attempt = 0
         var refreshedAuth = false
