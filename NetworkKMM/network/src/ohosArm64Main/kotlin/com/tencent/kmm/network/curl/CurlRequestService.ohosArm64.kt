@@ -128,13 +128,18 @@ object CurlRequestServiceHM : ICurlRequestService {
         handle: CPointer<out CPointed>?,
         request: VBTransportBaseRequest
     ) {
-        val caInfoPath = checkNotNull(request.curlCaInfoPath) {
-            "OHOS curl request is missing its verified app-owned CA path"
+        // App-owned trust: preparation staged a verified CA path. Absent path
+        // = platform-default trust — skip SetCurlCaInfo so the compiled
+        // CURL_CA_BUNDLE (/etc/ssl/certs/cacert.pem) applies. The proxy URL
+        // is always present ("" = explicit direct, disabling libcurl's
+        // environment proxies), so proxy semantics stay deterministic in
+        // both trust modes.
+        request.curlCaInfoPath?.let { caInfoPath ->
+            SetCurlCaInfo(handle, caInfoPath)
         }
         val proxyUrl = checkNotNull(request.curlProxyUrl) {
             "OHOS curl request is missing its explicit proxy decision"
         }
-        SetCurlCaInfo(handle, caInfoPath)
         SetCurlProxy(handle, proxyUrl)
     }
 

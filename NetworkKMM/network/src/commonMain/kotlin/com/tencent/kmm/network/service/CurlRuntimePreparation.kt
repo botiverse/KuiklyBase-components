@@ -18,6 +18,7 @@ package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.export.NetworkCurlConfigurationFailureReason
 import com.tencent.kmm.network.export.NetworkCurlProxyMode
+import com.tencent.kmm.network.export.NetworkCurlTrustMode
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
 import com.tencent.kmm.network.export.NetworkEngineFeatureReason
 import com.tencent.kmm.network.export.NetworkEngineFeatureStatus
@@ -31,6 +32,22 @@ import com.tencent.kmm.network.export.VBTransportCurl
 private const val CURL_RUNTIME_READY = "com.tencent.kmm.network.curl.runtime.ready"
 private const val CURL_RUNTIME_CA_PATH = "com.tencent.kmm.network.curl.runtime.ca_path"
 private const val CURL_RUNTIME_PROXY_URL = "com.tencent.kmm.network.curl.runtime.proxy_url"
+private const val CURL_RUNTIME_TRUST = "com.tencent.kmm.network.curl.runtime.trust"
+
+internal const val CURL_RUNTIME_TRUST_PLATFORM_DEFAULT = "platform_default"
+internal const val CURL_RUNTIME_TRUST_APP_OWNED = "app_owned"
+
+/**
+ * Whether this platform's compiled libcurl default CA is a verified trust
+ * source. Where it is (OHOS), unconfigured curl runs on the platform default;
+ * where it is not, curl stays gated until the app configures explicitly.
+ */
+internal data class CurlPlatformDefaultTrust(
+    val available: Boolean,
+    val detail: String
+)
+
+internal expect val curlPlatformDefaultTrust: CurlPlatformDefaultTrust
 
 internal data class CurlSystemProxySupport(
     val available: Boolean,
@@ -62,12 +79,31 @@ internal expect val curlSystemProxySupport: CurlSystemProxySupport
 
 internal expect fun resolveCurlSystemProxy(url: String): CurlSystemProxyResolution
 
-internal fun prepareCurlRuntime(request: NetworkRequest): NetworkEngineAvailability {
+internal fun prepareCurlRuntime(request: NetworkRequest): NetworkEngineAvailability =
+    prepareCurlRuntime(request, curlPlatformDefaultTrust)
+
+internal fun prepareCurlRuntime(
+    request: NetworkRequest,
+    platformDefaultTrust: CurlPlatformDefaultTrust
+): NetworkEngineAvailability {
     if (request.metadata[CURL_RUNTIME_READY] == "true") {
         return NetworkEngineAvailability.Available
     }
     val configuration = VBTransportCurl.snapshot()
     if (configuration == null) {
+        if (VBTransportCurl.trustMode == NetworkCurlTrustMode.PLATFORM_DEFAULT &&
+            platformDefaultTrust.available
+        ) {
+            // Never explicitly configured: run on the platform's verified
+            // compiled CA default. No CA path is handed to the wrapper (the
+            // compiled CURL_CA_BUNDLE applies) and the proxy is pinned to
+            // explicit direct ("" disables libcurl's environment proxies),
+            // so the default's semantics are deterministic, not ambient.
+            request.metadata[CURL_RUNTIME_PROXY_URL] = ""
+            request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_PLATFORM_DEFAULT
+            request.metadata[CURL_RUNTIME_READY] = "true"
+            return NetworkEngineAvailability.Available
+        }
         val status = VBTransportCurl.configurationStatus
         val reason = when (status.failureReason) {
             NetworkCurlConfigurationFailureReason.TRUST_STORE_PATH_BLANK ->
@@ -122,9 +158,13 @@ internal fun prepareCurlRuntime(request: NetworkRequest): NetworkEngineAvailabil
     }
     request.metadata[CURL_RUNTIME_CA_PATH] = configuration.trustStore.path
     request.metadata[CURL_RUNTIME_PROXY_URL] = proxyUrl
+    request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_APP_OWNED
     request.metadata[CURL_RUNTIME_READY] = "true"
     return NetworkEngineAvailability.Available
 }
+
+internal fun preparedCurlTrustSource(request: NetworkRequest): String? =
+    request.metadata[CURL_RUNTIME_TRUST]
 
 internal fun preparedCurlCaInfoPath(request: NetworkRequest): String? =
     request.metadata[CURL_RUNTIME_CA_PATH]?.takeIf(String::isNotBlank)
@@ -163,14 +203,21 @@ internal fun curlRuntimeFailureResponse(
 }
 
 internal fun curlNetworkEngineCapabilities(): NetworkEngineCapabilities {
-    val trustStatus = if (VBTransportCurl.configured) {
-        NetworkEngineFeatureStatus.available("App-owned CA bundle verified by SHA-256 before activation.")
-    } else {
-        NetworkEngineFeatureStatus.unavailable(
-            reason = NetworkEngineFeatureReason.CONFIGURATION_REQUIRED,
-            compiledIn = true,
-            detail = VBTransportCurl.configurationStatus.detail
-        )
+    val trustStatus = when {
+        VBTransportCurl.configured ->
+            NetworkEngineFeatureStatus.available("App-owned CA bundle verified by SHA-256 before activation.")
+        VBTransportCurl.trustMode == NetworkCurlTrustMode.PLATFORM_DEFAULT &&
+            curlPlatformDefaultTrust.available ->
+            NetworkEngineFeatureStatus.available(
+                "Platform default trust store: ${curlPlatformDefaultTrust.detail} " +
+                    "Call VBTransportCurl.configure() to install an app-owned override."
+            )
+        else ->
+            NetworkEngineFeatureStatus.unavailable(
+                reason = NetworkEngineFeatureReason.CONFIGURATION_REQUIRED,
+                compiledIn = true,
+                detail = VBTransportCurl.configurationStatus.detail
+            )
     }
     return NetworkEngineCapabilities(
         requestBodyStreaming = true,
