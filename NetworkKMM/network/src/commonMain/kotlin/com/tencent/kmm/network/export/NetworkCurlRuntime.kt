@@ -106,16 +106,37 @@ data class NetworkCurlConfigurationStatus(
     val detail: String? = null
 )
 
+/**
+ * Which trust source curl requests run with.
+ *
+ * PLATFORM_DEFAULT is the state before any [VBTransportCurl.configure] call
+ * (and after [VBTransportCurl.clear]): on platforms whose compiled libcurl
+ * default CA is verified (OHOS: `CURL_CA_BUNDLE=/etc/ssl/certs/cacert.pem`),
+ * requests proceed with that default and no proxy. APP_OWNED means a verified
+ * app configuration is active. FAILED_CLOSED means an explicit configure
+ * attempt failed — requests are refused and never silently fall back to the
+ * platform default, because the app has declared an intent it could not honor.
+ */
+enum class NetworkCurlTrustMode {
+    PLATFORM_DEFAULT,
+    APP_OWNED,
+    FAILED_CLOSED
+}
+
 /** Shared, verified curl runtime configuration used by every platform delegate. */
 object VBTransportCurl {
     private val configurationState = atomic<NetworkCurlRuntimeConfiguration?>(null)
     private val statusState = atomic(missingConfigurationStatus())
+    private val trustModeState = atomic(NetworkCurlTrustMode.PLATFORM_DEFAULT)
 
     val configurationStatus: NetworkCurlConfigurationStatus
         get() = statusState.value
 
     val configured: Boolean
         get() = configurationState.value != null
+
+    val trustMode: NetworkCurlTrustMode
+        get() = trustModeState.value
 
     /**
      * Verifies the declared SHA-256 against the staged file before making the
@@ -133,16 +154,20 @@ object VBTransportCurl {
                 ),
                 proxy = configuration.proxy.copy(url = configuration.proxy.url?.trim())
             )
+            trustModeState.value = NetworkCurlTrustMode.APP_OWNED
         } else {
             configurationState.value = null
+            trustModeState.value = NetworkCurlTrustMode.FAILED_CLOSED
         }
         statusState.value = validation
         return validation
     }
 
+    /** Returns to the platform-default trust source (pre-configure state). */
     fun clear() {
         configurationState.value = null
         statusState.value = missingConfigurationStatus()
+        trustModeState.value = NetworkCurlTrustMode.PLATFORM_DEFAULT
     }
 
     internal fun snapshot(): NetworkCurlRuntimeConfiguration? = configurationState.value
