@@ -1,6 +1,29 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased (production curl trust, proxy, and rollout gates)
+## 0.1.0-raft.23 / 0.1.0-raft.23-ohos (platform-default curl trust restored)
+
+- **Compatibility fix**: raft.20 made `VBTransportCurl.configure(...)` mandatory,
+  which regressed OHOS — the only curl-default platform — where libcurl's
+  compiled `CURL_CA_BUNDLE=/etc/ssl/certs/cacert.pem` was a device-verified,
+  working trust source throughout the pre-raft.20 production line. Unconfigured
+  apps shipped unable to network.
+- Two-layer trust contract replaces the mandatory gate
+  (`NetworkCurlTrustMode`): never-configured runs on the platform default
+  where it is verified (OHOS only; Android/iOS keep the strict gate — their
+  curl builds have no verified default). In default mode no CA path is handed
+  to the wrapper and the proxy is pinned to explicit direct (`""` disables
+  libcurl environment proxies), so semantics are deterministic.
+- Explicit `configure()` is unchanged where it succeeds (app-owned verified
+  CA/pin/proxy per request) and a FAILED configure now moves to a distinct
+  `FAILED_CLOSED` state: requests stay refused and **never silently fall back
+  to the platform default**. `clear()` returns to platform-default trust.
+- Requests and engine capabilities carry the trust source
+  (`platform_default` / `app_owned`) for diagnostics. Contract tests pin all
+  four transitions; real-device default-CA HTTPS evidence is the mobile
+  task #253 HOP-AL10 acceptance matrix (CI lanes cannot exercise the OHOS
+  compiled default by construction).
+
+## Shipped with 0.1.0-raft.20 (production curl trust, proxy, and rollout gates)
 
 - All curl delegates now consume one verified `VBTransportCurl` runtime
   configuration: app-owned CA path + expected SHA-256 and an explicit
