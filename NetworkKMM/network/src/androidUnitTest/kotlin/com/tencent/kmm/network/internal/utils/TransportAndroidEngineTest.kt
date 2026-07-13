@@ -290,4 +290,40 @@ class TransportAndroidEngineTest {
             firstWave.forEach(AndroidTransportClientLease::close)
         }
     }
+
+    @Test
+    fun rateLimitedStaleShardIsQuarantinedWhileHealthySlotsExist() {
+        val manager = AndroidTransportClientGenerationManager(nowMillis = { 1_000L })
+        val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 5)
+
+        fun acquireShardZero(): AndroidTransportClientLease {
+            repeat(10) { index ->
+                val lease = manager.acquire("https://api.example.test/seek/$index", recovery)
+                if (lease.shard == 0) return lease
+                lease.close()
+            }
+            error("round-robin never selected shard zero")
+        }
+
+        repeat(5) {
+            acquireShardZero().use { lease ->
+                assertTrue(lease.drainGeneration().initiated)
+            }
+        }
+        acquireShardZero().use { lease ->
+            val limited = lease.drainGeneration()
+            assertTrue(limited.rateLimited)
+            assertTrue(!limited.observedGenerationDraining)
+        }
+
+        val subsequent = List(8) {
+            manager.acquire("https://api.example.test/healthy/$it", recovery)
+        }
+        try {
+            assertTrue(subsequent.none { it.shard == 0 })
+            assertEquals(setOf(1, 2, 3, 4), subsequent.map { it.shard }.toSet())
+        } finally {
+            subsequent.forEach(AndroidTransportClientLease::close)
+        }
+    }
 }

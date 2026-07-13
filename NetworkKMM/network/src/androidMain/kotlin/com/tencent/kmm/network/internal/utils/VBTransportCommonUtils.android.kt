@@ -222,6 +222,7 @@ internal class AndroidTransportClientGenerationManager(
             state.rolloverTimes.removeFirst()
         }
         if (state.rolloverTimes.size >= recovery.clientShardCount) {
+            shard.quarantined = true
             return@synchronized AndroidTransportGenerationRollover(
                 generation = shard.current.id,
                 initiated = false,
@@ -246,6 +247,7 @@ internal class AndroidTransportClientGenerationManager(
         retired.draining = true
         state.retired += retired
         shard.current = newGeneration(recovery)
+        shard.quarantined = false
         closeIfDrainedLocked(state, retired)
     }
 
@@ -296,6 +298,17 @@ internal class AndroidTransportClientGenerationManager(
         val rolloverTimes = ArrayDeque<Long>()
 
         fun selectShard(avoidShard: Int?): Int {
+            // Prefer healthy/uninitialized slots. A rate-limited stale slot is
+            // quarantined from new work while any alternative remains.
+            repeat(shards.size) {
+                val candidate = nextShard
+                nextShard = (nextShard + 1) % shards.size
+                val avoided = shards.size > 1 && candidate == avoidShard
+                val quarantined = shards[candidate]?.quarantined == true
+                if (!avoided && !quarantined) return candidate
+            }
+            // All alternatives are quarantined. Keep traffic bounded to the
+            // configured slots rather than creating another client.
             repeat(shards.size) {
                 val candidate = nextShard
                 nextShard = (nextShard + 1) % shards.size
@@ -305,7 +318,10 @@ internal class AndroidTransportClientGenerationManager(
         }
     }
 
-    private class ShardState(var current: Generation)
+    private class ShardState(
+        var current: Generation,
+        var quarantined: Boolean = false,
+    )
 
     private class Generation(
         val id: Long,
