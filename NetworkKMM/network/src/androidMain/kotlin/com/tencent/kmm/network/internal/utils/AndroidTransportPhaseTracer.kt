@@ -28,12 +28,92 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 
 internal const val NETWORK_KMM_TRACE_HEADER = "X-NetworkKMM-Trace-Id"
 
+private class PhysicalConnectionKey(private val connection: Any) {
+    override fun equals(other: Any?): Boolean =
+        other is PhysicalConnectionKey && connection === other.connection
+
+    override fun hashCode(): Int = System.identityHashCode(connection)
+}
+
+internal class AndroidStalledConnectionRegistry {
+    private val lock = Any()
+    private val callsByConnection =
+        mutableMapOf<Any, MutableMap<String, Entry>>()
+
+    private class Entry(
+        val onStale: (Int) -> Unit,
+        var matured: Boolean = false,
+    )
+
+    fun register(connection: Any, callKey: String, onStale: (Int) -> Unit) {
+        synchronized(lock) {
+            callsByConnection.getOrPut(connection) { mutableMapOf() }[callKey] = Entry(onStale)
+        }
+    }
+
+    fun unregister(connection: Any, callKey: String) {
+        synchronized(lock) {
+            callsByConnection[connection]?.let { calls ->
+                calls.remove(callKey)
+                if (calls.isEmpty()) callsByConnection.remove(connection)
+            }
+        }
+    }
+
+    fun matureAndTriggerIfAtLeast(connection: Any, callKey: String, minimum: Int) {
+        val keys = synchronized(lock) {
+            val calls = callsByConnection[connection]
+            calls?.get(callKey)?.matured = true
+            val maturedKeys = calls?.filterValues { it.matured }?.keys?.toList().orEmpty()
+            if (maturedKeys.size < minimum) {
+                emptyList()
+            } else {
+                maturedKeys
+            }
+        }
+        keys.forEach { key ->
+            val current = synchronized(lock) {
+                val matured = callsByConnection[connection]
+                    ?.filterValues { it.matured }
+                    .orEmpty()
+                if (matured.size < minimum) {
+                    null
+                } else {
+                    matured[key]?.onStale?.let { callback -> callback to matured.size }
+                }
+            }
+            current?.first?.invoke(current.second)
+        }
+    }
+
+    internal fun count(connection: Any): Int = synchronized(lock) {
+        callsByConnection[connection]?.size ?: 0
+    }
+
+    internal fun clear() {
+        synchronized(lock) { callsByConnection.clear() }
+    }
+}
+
+internal inline fun cancelStalledCallIfReplaySafe(
+    canFreshRetry: Boolean,
+    cancel: () -> Unit,
+) {
+    if (canFreshRetry) cancel()
+}
+
 internal object AndroidTransportPhaseTracer {
     private val traces = ConcurrentHashMap<Int, Trace>()
+    private val watchdogExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "networkkmm-h2-watchdog").apply { isDaemon = true }
+    }
+    private val stalledRegistry = AndroidStalledConnectionRegistry()
     internal var nanoTime: () -> Long = System::nanoTime
 
     fun scheduled(requestId: Int) {
@@ -42,6 +122,46 @@ internal object AndroidTransportPhaseTracer {
 
     fun transportCoroutineStarted(requestId: Int) {
         update(requestId) { transportCoroutineStartedNanos = nanoTime() }
+    }
+
+    fun beginAttempt(
+        requestId: Int,
+        lease: AndroidTransportClientLease,
+        watchdogMillis: Long,
+        watchdogEnabled: Boolean,
+        minimumConcurrentStalledRequests: Int,
+        canFreshRetry: Boolean,
+    ): Int {
+        val trace = traces.getOrPut(requestId) {
+            Trace(requestId = requestId, scheduledNanos = nanoTime())
+        }
+        return synchronized(trace) {
+            trace.beginAttempt(
+                origin = lease.origin,
+                shard = lease.shard,
+                generation = lease.generation,
+                watchdogMillis = watchdogMillis,
+                watchdogEnabled = watchdogEnabled,
+                minimumConcurrentStalledRequests = minimumConcurrentStalledRequests,
+                canFreshRetry = canFreshRetry,
+                onDrain = lease::drainGeneration,
+            )
+        }
+    }
+
+    fun watchdogTriggered(requestId: Int, attemptToken: Int): Boolean =
+        traces[requestId]?.let { trace ->
+            synchronized(trace) { trace.triggeredAttemptToken == attemptToken }
+        } ?: false
+
+    fun markFreshRetry(requestId: Int) {
+        update(requestId) { freshRetry = true }
+    }
+
+    fun markFreshRetryResult(requestId: Int, success: Boolean) {
+        update(requestId) {
+            if (freshRetry) freshRetryResult = if (success) "success" else "failure"
+        }
     }
 
     internal fun callStarted(requestId: Int) {
@@ -57,32 +177,48 @@ internal object AndroidTransportPhaseTracer {
     }
 
     fun cancel(requestId: Int) {
-        traces.remove(requestId)
+        traces.remove(requestId)?.let { trace ->
+            synchronized(trace) { trace.cancelWatchdog() }
+        }
     }
 
     internal fun resetForTests() {
         traces.clear()
+        stalledRegistry.clear()
         nanoTime = System::nanoTime
     }
 
     fun complete(requestId: Int): VBTransportElapseStatistics {
         val trace = traces.remove(requestId)
             ?: return VBTransportElapseStatistics(transportRequestId = requestId.toString())
-        return synchronized(trace) { trace.snapshot() }
+        return synchronized(trace) {
+            trace.cancelWatchdog()
+            trace.snapshot()
+        }
     }
 
     fun eventListenerFactory(): EventListener.Factory = EventListener.Factory { call ->
         val requestId = call.request().header(NETWORK_KMM_TRACE_HEADER)?.toIntOrNull()
-        if (requestId == null) EventListener.NONE else TraceEventListener(requestId)
+        if (requestId == null) {
+            EventListener.NONE
+        } else {
+            val attemptToken = traces[requestId]?.let { synchronized(it) { it.attemptToken } } ?: 0
+            TraceEventListener(requestId, attemptToken)
+        }
     }
 
     private inline fun update(requestId: Int, block: Trace.() -> Unit) {
         traces[requestId]?.let { trace -> synchronized(trace) { trace.block() } }
     }
 
-    private class TraceEventListener(private val requestId: Int) : EventListener() {
+    private class TraceEventListener(
+        private val requestId: Int,
+        private val attemptToken: Int,
+    ) : EventListener() {
         private inline fun update(block: Trace.() -> Unit) {
-            this@AndroidTransportPhaseTracer.update(requestId, block)
+            this@AndroidTransportPhaseTracer.update(requestId) {
+                if (this.attemptToken == this@TraceEventListener.attemptToken) block()
+            }
         }
 
         override fun callStart(call: Call) = callStarted(requestId)
@@ -132,6 +268,14 @@ internal object AndroidTransportPhaseTracer {
         override fun connectionAcquired(call: Call, connection: Connection) = update {
             protocolName = connection.protocol().toString()
             reusedConnection = connectAttempts == 0
+            physicalConnectionKey = PhysicalConnectionKey(connection)
+            if (!staleH2Detected) {
+                connectionIdentity = buildString {
+                    append(Integer.toHexString(System.identityHashCode(connection)))
+                    append('@')
+                    append(connection.route().socketAddress)
+                }
+            }
         }
 
         override fun requestHeadersStart(call: Call) = update {
@@ -141,6 +285,7 @@ internal object AndroidTransportPhaseTracer {
         override fun requestHeadersEnd(call: Call, request: Request) = update {
             requestHeadersEndNanos = nanoTime()
             requestHeadersTimeNanos += elapsedBetween(requestHeadersStartNanos, requestHeadersEndNanos)
+            if (request.body == null) scheduleWatchdog(call, attemptToken)
         }
 
         override fun requestBodyStart(call: Call) = update {
@@ -150,9 +295,11 @@ internal object AndroidTransportPhaseTracer {
         override fun requestBodyEnd(call: Call, byteCount: Long) = update {
             requestBodyEndNanos = nanoTime()
             requestBodyTimeNanos += elapsedBetween(requestBodyStartNanos, requestBodyEndNanos)
+            scheduleWatchdog(call, attemptToken)
         }
 
         override fun responseHeadersStart(call: Call) = update {
+            cancelWatchdog()
             responseHeadersStartNanos = nanoTime()
             val requestEnd = requestBodyEndNanos.takeIf { it > 0L } ?: requestHeadersEndNanos
             responseWaitTimeNanos += elapsedBetween(requestEnd, responseHeadersStartNanos)
@@ -167,9 +314,15 @@ internal object AndroidTransportPhaseTracer {
             responseBodyEndNanos = nanoTime()
         }
 
-        override fun callEnd(call: Call) = update { callEndNanos = nanoTime() }
+        override fun callEnd(call: Call) = update {
+            cancelWatchdog()
+            callEndNanos = nanoTime()
+        }
 
-        override fun callFailed(call: Call, ioe: IOException) = update { callEndNanos = nanoTime() }
+        override fun callFailed(call: Call, ioe: IOException) = update {
+            cancelWatchdog()
+            callEndNanos = nanoTime()
+        }
     }
 
     private class Trace(
@@ -200,6 +353,147 @@ internal object AndroidTransportPhaseTracer {
         var connectAttempts = 0
         var protocolName: String? = null
         var reusedConnection: Boolean? = null
+        var connectionOrigin: String? = null
+        var connectionGeneration: Long? = null
+        var connectionShard: Int? = null
+        var connectionIdentity: String? = null
+        var connectionDraining = false
+        var connectionRolloverRateLimited = false
+        var staleH2Detected = false
+        var noResponseHeadersDurationNanos = 0L
+        var staleH2ConcurrentRequestCount = 0
+        var freshRetry = false
+        var freshRetryResult: String? = null
+        var attemptToken = 0
+        var maturedAttemptToken = 0
+        var triggeredAttemptToken = 0
+        private var watchdogMillis = 0L
+        private var watchdogEnabled = false
+        private var minimumConcurrentStalledRequests = 2
+        private var canFreshRetry = false
+        private var onDrain: (() -> AndroidTransportGenerationRollover)? = null
+        private var watchdogFuture: ScheduledFuture<*>? = null
+        var physicalConnectionKey: Any? = null
+        private var stalledRegistryConnection: Any? = null
+        private var stalledRegistryCallKey: String? = null
+
+        fun beginAttempt(
+            origin: String,
+            shard: Int,
+            generation: Long,
+            watchdogMillis: Long,
+            watchdogEnabled: Boolean,
+            minimumConcurrentStalledRequests: Int,
+            canFreshRetry: Boolean,
+            onDrain: () -> AndroidTransportGenerationRollover,
+        ): Int {
+            cancelWatchdog()
+            attemptToken += 1
+            // Once a stale connection is identified, retain the identity of
+            // the generation that triggered recovery rather than replacing it
+            // with the fresh retry's connection.
+            if (!staleH2Detected) {
+                connectionOrigin = origin
+                connectionShard = shard
+                connectionGeneration = generation
+            }
+            this.watchdogMillis = watchdogMillis
+            this.watchdogEnabled = watchdogEnabled
+            this.minimumConcurrentStalledRequests = minimumConcurrentStalledRequests
+            this.canFreshRetry = canFreshRetry
+            this.onDrain = onDrain
+            connectAttempts = 0
+            protocolName = null
+            reusedConnection = null
+            if (!staleH2Detected) connectionIdentity = null
+            physicalConnectionKey = null
+            requestHeadersStartNanos = 0L
+            requestHeadersEndNanos = 0L
+            requestBodyStartNanos = 0L
+            requestBodyEndNanos = 0L
+            responseHeadersStartNanos = 0L
+            responseHeadersEndNanos = 0L
+            callEndNanos = 0L
+            return attemptToken
+        }
+
+        fun scheduleWatchdog(call: Call, token: Int) {
+            if (!watchdogEnabled || watchdogFuture != null || token != attemptToken) return
+            if (protocolName != "h2" || reusedConnection != true) return
+            val connection = physicalConnectionKey ?: return
+            val sentNanos = requestBodyEndNanos.takeIf { it > 0L } ?: requestHeadersEndNanos
+            if (sentNanos == 0L) return
+            val callKey = "$requestId:$token"
+            stalledRegistry.register(connection, callKey) { concurrentStalled ->
+                triggerStaleIfCurrent(call, token, sentNanos, concurrentStalled)
+            }
+            stalledRegistryConnection = connection
+            stalledRegistryCallKey = callKey
+            watchdogFuture = watchdogExecutor.schedule(
+                {
+                    val matured = synchronized(this) {
+                        if (
+                            token != attemptToken ||
+                            responseHeadersStartNanos > 0L ||
+                            protocolName != "h2" ||
+                            reusedConnection != true
+                        ) {
+                            false
+                        } else {
+                            maturedAttemptToken = token
+                            true
+                        }
+                    }
+                    if (matured) {
+                        stalledRegistry.matureAndTriggerIfAtLeast(
+                            connection,
+                            callKey,
+                            minimumConcurrentStalledRequests,
+                        )
+                    }
+                },
+                watchdogMillis,
+                TimeUnit.MILLISECONDS,
+            )
+        }
+
+        private fun triggerStaleIfCurrent(
+            call: Call,
+            token: Int,
+            sentNanos: Long,
+            concurrentStalled: Int,
+        ) {
+            synchronized(this) {
+                if (
+                    token != attemptToken ||
+                    maturedAttemptToken != token ||
+                    responseHeadersStartNanos > 0L ||
+                    protocolName != "h2" ||
+                    reusedConnection != true
+                ) {
+                    return
+                }
+                staleH2Detected = true
+                staleH2ConcurrentRequestCount = concurrentStalled
+                triggeredAttemptToken = token
+                noResponseHeadersDurationNanos = elapsedSince(sentNanos)
+                onDrain?.invoke()?.let { rollover ->
+                    connectionDraining = rollover.observedGenerationDraining
+                    connectionRolloverRateLimited = rollover.rateLimited
+                }
+                cancelStalledCallIfReplaySafe(canFreshRetry, call::cancel)
+            }
+        }
+
+        fun cancelWatchdog() {
+            watchdogFuture?.cancel(false)
+            watchdogFuture = null
+            val connection = stalledRegistryConnection
+            val callKey = stalledRegistryCallKey
+            if (connection != null && callKey != null) stalledRegistry.unregister(connection, callKey)
+            stalledRegistryConnection = null
+            stalledRegistryCallKey = null
+        }
 
         fun elapsedSince(start: Long): Long =
             if (start == 0L) 0L else (nanoTime() - start).coerceAtLeast(0L)
@@ -227,7 +521,18 @@ internal object AndroidTransportPhaseTracer {
                 transportRequestId = requestId.toString(),
                 protocol = protocolName,
                 reusedConnection = reusedConnection,
-                connectionAttemptCount = connectAttempts
+                connectionAttemptCount = connectAttempts,
+                staleH2Detected = staleH2Detected,
+                connectionOrigin = connectionOrigin,
+                connectionGeneration = connectionGeneration,
+                connectionShard = connectionShard,
+                connectionIdentity = connectionIdentity,
+                connectionDraining = connectionDraining,
+                connectionRolloverRateLimited = connectionRolloverRateLimited,
+                freshRetry = freshRetry,
+                freshRetryResult = freshRetryResult,
+                noResponseHeadersDurationMs = millis(noResponseHeadersDurationNanos),
+                staleH2ConcurrentRequestCount = staleH2ConcurrentRequestCount,
             )
         }
     }

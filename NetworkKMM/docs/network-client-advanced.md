@@ -281,6 +281,46 @@ I/O. Android and iOS still select OkHttp/Darwin by default, while OHOS remains t
 `NetworkEngineSelectionDiagnostics.capabilities` always describes the engine that was actually
 selected, not the requested engine.
 
+## Recover a stalled reused Android HTTP/2 connection
+
+Android's default Ktor-OkHttp transport can optionally detect a reused h2 connection that accepted a
+request but produced no response headers. The policy is default-off and should be enabled through a
+stable remote-config cohort:
+
+```kotlin
+VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
+    enabled = remoteStaleH2RecoveryEnabled,
+    clientShardCount = 5,
+    responseHeadersWatchdogMillis = 7_000,
+    minimumConcurrentStalledRequests = 2,
+    pingIntervalMillis = 3_000 // Alpha first-line liveness check
+)
+```
+
+The five slots are independent OkHttp clients and connection pools, selected round-robin for the same
+origin. This bounds a single bad reused connection's normal blast radius instead of putting the entire
+foreground burst on one pool. The watchdog starts only after request headers/body have been sent. It
+requires both `h2`, a reused connection, and at least two concurrently sent calls on the same physical
+OkHttp connection with no response headers. A single legitimately slow endpoint therefore does not
+retire a healthy pool. Once the connection-level condition is met, all waiting GET/HEAD calls registered
+on that connection are cancelled for their one sequential retry, and only the affected slot's generation
+is atomically drained.
+The replacement is a newly constructed OkHttp client and connection pool; the other slots do not change.
+The old generation closes only after its in-flight calls finish, so POST/PUT/PATCH/upload calls are never
+cancelled or replayed. Bodyless GET/HEAD may make one sequential retry on a different slot within the original
+total timeout; this is not a hedge, so an old completion cannot race and overwrite the fresh result.
+At most `clientShardCount` replacement clients may be created for one origin in a rolling 30-second
+window. If several freshly created slots also stall, the churn breaker suppresses further replacement
+until the window expires instead of creating clients without bound.
+
+`pingIntervalMillis` can detect a connection that also stopped answering PING, but it does not replace
+the response-headers watchdog. Inspect `VBTransportElapseStatistics.staleH2Detected`,
+`connectionOrigin`, `connectionShard`, `connectionGeneration`, `connectionIdentity`, `connectionDraining`,
+`connectionRolloverRateLimited`, `freshRetry`,
+`freshRetryResult`, `noResponseHeadersDurationMs`, and `staleH2ConcurrentRequestCount` during rollout.
+Changing or disabling the recovery configuration publishes a new monotonic epoch: old in-flight calls
+may finish, but cannot recreate or reset the new pool configuration, and idle recovery pools drain.
+
 ## Handle stable error kinds
 
 Use `NetworkError.kind` for business/UI branching and keep raw codes/messages for diagnostics:

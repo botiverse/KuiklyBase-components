@@ -75,4 +75,26 @@ data class VBTransportElapseStatistics(
     var reusedConnection: Boolean? = null,
     /** Number of connection attempts observed for this response. */
     var connectionAttemptCount: Int = 0,
+    /** Reused HTTP/2 request-send -> response-headers watchdog fired. */
+    var staleH2Detected: Boolean = false,
+    /** Scheme/host/port only; never contains a path, query, or credentials. */
+    var connectionOrigin: String? = null,
+    /** NetworkKMM-managed Android OkHttp client/pool generation. */
+    var connectionGeneration: Long? = null,
+    /** Zero-based independent Android OkHttp client/pool slot. */
+    var connectionShard: Int? = null,
+    /** Process-local diagnostic identity for the acquired OkHttp connection. */
+    var connectionIdentity: String? = null,
+    /** The observed generation was retired for new requests. */
+    var connectionDraining: Boolean = false,
+    /** Pool replacement was suppressed by the per-origin churn breaker. */
+    var connectionRolloverRateLimited: Boolean = false,
+    /** This logical request made its one allowed fresh-generation retry. */
+    var freshRetry: Boolean = false,
+    /** `success`, `failure`, or null when no fresh retry occurred. */
+    var freshRetryResult: String? = null,
+    /** Duration observed when the stale-h2 watchdog fired. */
+    var noResponseHeadersDurationMs: Double = 0.0,
+    /** Concurrent no-headers calls observed on the same reused h2 connection. */
+    var staleH2ConcurrentRequestCount: Int = 0,
 )
