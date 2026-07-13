@@ -285,7 +285,7 @@ VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
 没有 response headers` 同时成立；单个合法慢 endpoint 不会误退休健康 pool。连接级条件命中后，该连接上
 所有等待中的 GET/HEAD 都会取消并进入各自唯一一次串行 retry。只把对应槽位的 generation 标记为
 draining，并新建该槽位的 OkHttp client/ConnectionPool；其他 4 个槽位不变。旧 generation 等所有
-在途调用自然结束后才关闭，因此 POST/PUT/PATCH/上传不会被取消或自动重放。GET/HEAD 在原 total timeout
+在途调用自然结束后才关闭，因此 POST/PUT/PATCH/上传不会被取消或自动重放。无 body 的 GET/HEAD 在原 total timeout
 剩余预算内最多到另一个槽位串行 fresh retry 一次；它不是 hedge，所以旧 completion 不会与新结果竞争覆盖。
 同一 origin 的 30 秒滚动窗口内最多创建 `clientShardCount` 个 replacement client；如果新建的多个槽位也
 继续卡住，churn breaker 会暂时抑制继续 replacement，而不是无上限创建 client，窗口过后再允许自愈。
@@ -294,6 +294,8 @@ draining，并新建该槽位的 OkHttp client/ConnectionPool；其他 4 个槽�
 `VBTransportElapseStatistics.staleH2Detected`、`connectionOrigin`、`connectionShard`、`connectionGeneration`、
 `connectionIdentity`、`connectionDraining`、`connectionRolloverRateLimited`、`freshRetry`、`freshRetryResult` 和
 `noResponseHeadersDurationMs` 和 `staleH2ConcurrentRequestCount`。
+修改或关闭 recovery 配置会发布新的单调 epoch：旧在途请求可以自然结束，但不能重新创建或回滚新配置的
+连接池；空闲 recovery pool 会立即 drain。
 
 ## 处理稳定错误分类
 

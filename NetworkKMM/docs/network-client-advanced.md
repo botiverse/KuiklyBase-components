@@ -307,7 +307,7 @@ on that connection are cancelled for their one sequential retry, and only the af
 is atomically drained.
 The replacement is a newly constructed OkHttp client and connection pool; the other slots do not change.
 The old generation closes only after its in-flight calls finish, so POST/PUT/PATCH/upload calls are never
-cancelled or replayed. GET/HEAD may make one sequential retry on a different slot within the original
+cancelled or replayed. Bodyless GET/HEAD may make one sequential retry on a different slot within the original
 total timeout; this is not a hedge, so an old completion cannot race and overwrite the fresh result.
 At most `clientShardCount` replacement clients may be created for one origin in a rolling 30-second
 window. If several freshly created slots also stall, the churn breaker suppresses further replacement
@@ -318,6 +318,8 @@ the response-headers watchdog. Inspect `VBTransportElapseStatistics.staleH2Detec
 `connectionOrigin`, `connectionShard`, `connectionGeneration`, `connectionIdentity`, `connectionDraining`,
 `connectionRolloverRateLimited`, `freshRetry`,
 `freshRetryResult`, `noResponseHeadersDurationMs`, and `staleH2ConcurrentRequestCount` during rollout.
+Changing or disabling the recovery configuration publishes a new monotonic epoch: old in-flight calls
+may finish, but cannot recreate or reset the new pool configuration, and idle recovery pools drain.
 
 ## Handle stable error kinds
 

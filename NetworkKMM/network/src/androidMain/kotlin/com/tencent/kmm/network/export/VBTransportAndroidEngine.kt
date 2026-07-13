@@ -16,6 +16,8 @@
  */
 package com.tencent.kmm.network.export
 
+import com.tencent.kmm.network.internal.utils.AndroidTransportClientProvider
+
 /**
  * Android transport engine selection.
  *
@@ -32,6 +34,10 @@ package com.tencent.kmm.network.export
 object VBTransportAndroidEngine {
     @Volatile
     var okHttpEnabled: Boolean = true
+        set(value) {
+            field = value
+            AndroidTransportClientProvider.configurationChanged()
+        }
 
     /**
      * Opt-in recovery for a reused HTTP/2 connection that accepts a request
@@ -51,6 +57,10 @@ object VBTransportAndroidEngine {
     @Volatile
     var reusedHttp2Recovery: VBTransportReusedHttp2Recovery =
         VBTransportReusedHttp2Recovery()
+        set(value) {
+            field = value
+            AndroidTransportClientProvider.configurationChanged()
+        }
 }
 
 data class VBTransportReusedHttp2Recovery(

@@ -142,8 +142,13 @@ internal data class AndroidTransportGenerationRollover(
 )
 
 /** Per-logical-request replay safety gate; retries are sequential, never hedged. */
-internal class AndroidReusedH2RetryState(method: VBTransportMethod) {
-    private val retryable = method == VBTransportMethod.GET || method == VBTransportMethod.HEAD
+internal class AndroidReusedH2RetryState(
+    method: VBTransportMethod,
+    hasReplayUnsafeBody: Boolean = false,
+) {
+    private val retryable =
+        (method == VBTransportMethod.GET || method == VBTransportMethod.HEAD) &&
+            !hasReplayUnsafeBody
     var attempted: Boolean = false
         private set
 
@@ -168,44 +173,64 @@ internal class AndroidTransportClientGenerationManager(
 ) {
     private val lock = Any()
     private val origins = mutableMapOf<String, OriginState>()
+    private val openGenerations = mutableSetOf<Generation>()
     private var nextGeneration = 1L
+    private var activeEpoch = 1L
+
+    fun activateConfiguration(epoch: Long) {
+        synchronized(lock) {
+            if (epoch <= activeEpoch) return
+            origins.values.forEach(::deactivateStateLocked)
+            origins.clear()
+            activeEpoch = epoch
+        }
+    }
 
     fun acquire(
         url: String,
         recovery: VBTransportReusedHttp2Recovery,
         avoidShard: Int? = null,
+        epoch: Long = activeEpoch,
     ): AndroidTransportClientLease {
         val origin = transportOrigin(url)
-        val (shardIndex, generation) = synchronized(lock) {
+        val acquired = synchronized(lock) {
+            check(epoch == activeEpoch) { "stale Android transport configuration epoch" }
             val state = origins.getOrPut(origin) {
-                OriginState(recovery)
-            }
-            if (state.recovery != recovery) {
-                resetConfigurationLocked(state, recovery)
+                OriginState(recovery, epoch)
             }
             val selectedShard = state.selectShard(avoidShard, nowMillis())
             val shard = state.shards[selectedShard] ?: ShardState(newGeneration(recovery)).also {
                 state.shards[selectedShard] = it
             }
-            selectedShard to shard.current.also { it.inFlight += 1 }
+            Triple(state, selectedShard, shard.current.also { it.inFlight += 1 })
         }
+        val state = acquired.first
+        val shardIndex = acquired.second
+        val generation = acquired.third
         return AndroidTransportClientLease(
             client = generation.client,
             origin = origin,
             shard = shardIndex,
             generation = generation.id,
-            onRelease = { release(origin, generation) },
-            onDrain = { drain(origin, shardIndex, generation.id, recovery) },
+            onRelease = { release(state, generation) },
+            onDrain = { drain(state, epoch, shardIndex, generation.id, recovery) },
         )
     }
 
     private fun drain(
-        origin: String,
+        state: OriginState,
+        epoch: Long,
         shardIndex: Int,
         observedGeneration: Long,
         recovery: VBTransportReusedHttp2Recovery,
     ): AndroidTransportGenerationRollover = synchronized(lock) {
-        val state = origins.getValue(origin)
+        if (!state.active || epoch != activeEpoch) {
+            return@synchronized AndroidTransportGenerationRollover(
+                generation = observedGeneration,
+                initiated = false,
+                observedGenerationDraining = true,
+            )
+        }
         val shard = state.shards.getOrNull(shardIndex)
         if (shard == null || shard.current.id != observedGeneration) {
             return@synchronized AndroidTransportGenerationRollover(
@@ -251,27 +276,20 @@ internal class AndroidTransportClientGenerationManager(
         closeIfDrainedLocked(state, retired)
     }
 
-    private fun resetConfigurationLocked(
-        state: OriginState,
-        recovery: VBTransportReusedHttp2Recovery,
-    ) {
+    private fun deactivateStateLocked(state: OriginState) {
+        state.active = false
         state.shards.filterNotNull().forEach { shard ->
             val retired = shard.current
             retired.draining = true
             state.retired += retired
             closeIfDrainedLocked(state, retired)
         }
-        state.recovery = recovery
-        state.shards = MutableList(recovery.clientShardCount) { null }
-        state.nextShard = 0
-        state.rolloverTimes.clear()
     }
 
-    private fun release(origin: String, generation: Generation) {
+    private fun release(state: OriginState, generation: Generation) {
         synchronized(lock) {
             generation.inFlight -= 1
             check(generation.inFlight >= 0) { "negative generation lease count" }
-            val state = origins[origin] ?: return
             closeIfDrainedLocked(state, generation)
         }
     }
@@ -279,6 +297,7 @@ internal class AndroidTransportClientGenerationManager(
     private fun closeIfDrainedLocked(state: OriginState, generation: Generation) {
         if (generation.draining && generation.inFlight == 0) {
             state.retired.remove(generation)
+            openGenerations.remove(generation)
             generation.client.close()
         }
     }
@@ -288,10 +307,17 @@ internal class AndroidTransportClientGenerationManager(
             id = nextGeneration++,
             client = clientFactory(recovery),
             recovery = recovery,
-        )
+        ).also(openGenerations::add)
 
-    private class OriginState(initialRecovery: VBTransportReusedHttp2Recovery) {
-        var recovery: VBTransportReusedHttp2Recovery = initialRecovery
+    internal fun openGenerationCountForTests(): Int = synchronized(lock) {
+        openGenerations.size
+    }
+
+    private class OriginState(
+        initialRecovery: VBTransportReusedHttp2Recovery,
+        val epoch: Long,
+    ) {
+        var active: Boolean = true
         var shards: MutableList<ShardState?> = MutableList(initialRecovery.clientShardCount) { null }
         var nextShard: Int = 0
         val retired = mutableSetOf<Generation>()
@@ -336,25 +362,80 @@ internal class AndroidTransportClientGenerationManager(
 
 internal object AndroidTransportClientProvider {
     private val generationManager = AndroidTransportClientGenerationManager()
+    private val configurationLock = Any()
+    private var configurationEpoch = 1L
+    private var configurationKey = currentConfigurationKey()
+
+    internal data class ConfigurationSnapshot(
+        val epoch: Long,
+        val okHttpEnabled: Boolean,
+        val recovery: VBTransportReusedHttp2Recovery,
+    )
+
+    fun configurationChanged() {
+        synchronized(configurationLock) { publishCurrentConfigurationLocked() }
+    }
+
+    fun snapshot(): ConfigurationSnapshot = synchronized(configurationLock) {
+        publishCurrentConfigurationLocked()
+        ConfigurationSnapshot(
+            epoch = configurationEpoch,
+            okHttpEnabled = configurationKey.okHttpEnabled,
+            recovery = configurationKey.recovery,
+        )
+    }
+
+    fun isCurrent(snapshot: ConfigurationSnapshot): Boolean = synchronized(configurationLock) {
+        publishCurrentConfigurationLocked()
+        snapshot.epoch == configurationEpoch
+    }
+
+    internal fun openGenerationCountForTests(): Int =
+        generationManager.openGenerationCountForTests()
 
     fun acquire(
         request: VBTransportBaseRequest,
-        okHttpEnabled: Boolean = VBTransportAndroidEngine.okHttpEnabled,
-        recovery: VBTransportReusedHttp2Recovery = VBTransportAndroidEngine.reusedHttp2Recovery,
+        configuration: ConfigurationSnapshot = snapshot(),
         avoidShard: Int? = null,
-    ): AndroidTransportClientLease {
-        if (!okHttpEnabled || !recovery.enabled) {
-            return AndroidTransportClientLease(
-                client = sharedHttpClient,
-                origin = transportOrigin(request.url),
-                shard = 0,
-                generation = 0L,
-                onRelease = {},
-                onDrain = { AndroidTransportGenerationRollover(0L, initiated = false) },
-            )
+    ): AndroidTransportClientLease = synchronized(configurationLock) {
+        check(configuration.epoch == configurationEpoch) {
+            "stale Android transport configuration snapshot"
         }
-        return generationManager.acquire(request.url, recovery, avoidShard)
+        if (!configuration.okHttpEnabled || !configuration.recovery.enabled) {
+            return@synchronized AndroidTransportClientLease(
+                    client = sharedHttpClient,
+                    origin = transportOrigin(request.url),
+                    shard = 0,
+                    generation = 0L,
+                    onRelease = {},
+                    onDrain = { AndroidTransportGenerationRollover(0L, initiated = false) },
+                )
+        }
+        generationManager.acquire(
+                url = request.url,
+                recovery = configuration.recovery,
+                avoidShard = avoidShard,
+                epoch = configuration.epoch,
+            )
     }
+
+    private fun publishCurrentConfigurationLocked() {
+        val next = currentConfigurationKey()
+        if (next == configurationKey) return
+        configurationEpoch += 1
+        configurationKey = next
+        generationManager.activateConfiguration(configurationEpoch)
+    }
+
+    private data class ConfigurationKey(
+        val okHttpEnabled: Boolean,
+        val recovery: VBTransportReusedHttp2Recovery,
+    )
+
+    private fun currentConfigurationKey(): ConfigurationKey = ConfigurationKey(
+        okHttpEnabled = VBTransportAndroidEngine.okHttpEnabled,
+        recovery = VBTransportAndroidEngine.reusedHttp2Recovery,
+    )
 }
 
 internal fun transportOrigin(url: String): String {

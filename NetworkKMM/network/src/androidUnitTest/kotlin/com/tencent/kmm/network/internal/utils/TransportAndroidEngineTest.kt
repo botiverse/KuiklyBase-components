@@ -3,12 +3,16 @@ package com.tencent.kmm.network.internal.utils
 import com.tencent.kmm.network.export.VBTransportAndroidEngine
 import com.tencent.kmm.network.export.VBTransportReusedHttp2Recovery
 import com.tencent.kmm.network.export.VBTransportMethod
+import com.tencent.kmm.network.internal.platform.AndroidRequestTimeoutBudget
+import com.tencent.kmm.network.internal.platform.androidRequestTimeoutBudget
+import com.tencent.kmm.network.internal.platform.requireAndroidRequestTimeoutBudget
 import io.ktor.client.engine.android.AndroidClientEngine
 import io.ktor.client.engine.okhttp.OkHttpEngine
 import okhttp3.OkHttpClient
 import kotlin.test.Test
 import kotlin.test.assertIs
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import java.util.Collections
 import java.util.concurrent.CountDownLatch
@@ -173,6 +177,15 @@ class TransportAndroidEngineTest {
             val state = AndroidReusedH2RetryState(method)
             assertTrue(!state.claimRetry(watchdogTriggered = true, hasBudget = true))
             assertTrue(!state.attempted)
+        }
+    }
+
+    @Test
+    fun getAndHeadBodiesAreNeverAutomaticallyReplayed() {
+        listOf(VBTransportMethod.GET, VBTransportMethod.HEAD).forEach { method ->
+            val bufferedBody = AndroidReusedH2RetryState(method, hasReplayUnsafeBody = true)
+            assertTrue(!bufferedBody.claimRetry(watchdogTriggered = true, hasBudget = true))
+            assertTrue(!bufferedBody.attempted)
         }
     }
 
@@ -343,17 +356,21 @@ class TransportAndroidEngineTest {
         val registry = AndroidStalledConnectionRegistry()
         val triggered = mutableListOf<String>()
         registry.register("connection-a", "request-1") { triggered += "one:$it" }
-        registry.triggerIfAtLeast("connection-a", minimum = 2)
+        registry.matureAndTriggerIfAtLeast("connection-a", "request-1", minimum = 2)
         assertTrue(triggered.isEmpty())
 
         registry.register("connection-b", "request-other") { triggered += "other:$it" }
-        registry.triggerIfAtLeast("connection-a", minimum = 2)
+        registry.matureAndTriggerIfAtLeast("connection-b", "request-other", minimum = 2)
         assertTrue(triggered.isEmpty())
 
         // The key is the physical OkHttp Connection identity, not origin. Two
         // coalesced-origin calls on the same connection therefore share count.
         registry.register("connection-a", "request-2-other-origin") { triggered += "two:$it" }
-        registry.triggerIfAtLeast("connection-a", minimum = 2)
+        registry.matureAndTriggerIfAtLeast(
+            "connection-a",
+            "request-2-other-origin",
+            minimum = 2,
+        )
         assertEquals(setOf("one:2", "two:2"), triggered.toSet())
     }
 
@@ -365,12 +382,116 @@ class TransportAndroidEngineTest {
         registry.register("connection-a", "request-2") { triggerCount += 1 }
         assertEquals(2, registry.count("connection-a"))
 
+        registry.matureAndTriggerIfAtLeast("connection-a", "request-1", minimum = 2)
         registry.unregister("connection-a", "request-1")
         assertEquals(1, registry.count("connection-a"))
-        registry.triggerIfAtLeast("connection-a", minimum = 2)
+        registry.matureAndTriggerIfAtLeast("connection-a", "request-2", minimum = 2)
         assertEquals(0, triggerCount)
 
         registry.unregister("connection-a", "request-2")
         assertEquals(0, registry.count("connection-a"))
+    }
+
+    @Test
+    fun totalTimeoutBudgetDistinguishesUnlimitedRemainingAndExpired() {
+        assertEquals(
+            AndroidRequestTimeoutBudget.Unlimited,
+            androidRequestTimeoutBudget(totalTimeoutMillis = 0L, elapsedMillis = 99_000L),
+        )
+        assertEquals(
+            AndroidRequestTimeoutBudget.Remaining(1L),
+            androidRequestTimeoutBudget(totalTimeoutMillis = 1L, elapsedMillis = 0L),
+        )
+        assertEquals(
+            AndroidRequestTimeoutBudget.Expired,
+            androidRequestTimeoutBudget(totalTimeoutMillis = 1L, elapsedMillis = 1L),
+        )
+        assertEquals(
+            AndroidRequestTimeoutBudget.Expired,
+            androidRequestTimeoutBudget(totalTimeoutMillis = 1L, elapsedMillis = 2L),
+        )
+
+        var acquisitions = 0
+        assertFailsWith<java.net.SocketTimeoutException> {
+            requireAndroidRequestTimeoutBudget(AndroidRequestTimeoutBudget.Expired)
+            acquisitions += 1
+        }
+        assertEquals(0, acquisitions)
+        requireAndroidRequestTimeoutBudget(AndroidRequestTimeoutBudget.Remaining(1L))
+        acquisitions += 1
+        assertEquals(1, acquisitions)
+    }
+
+    @Test
+    fun oldConfigurationCannotRollBackCurrentEpochAndDisableDrainsPools() {
+        val manager = AndroidTransportClientGenerationManager()
+        val oldConfig = VBTransportReusedHttp2Recovery(
+            enabled = true,
+            clientShardCount = 1,
+            responseHeadersWatchdogMillis = 7_000L,
+        )
+        val newConfig = oldConfig.copy(responseHeadersWatchdogMillis = 9_000L)
+        val oldLease = manager.acquire(
+            url = "https://api.example.test/old",
+            recovery = oldConfig,
+            epoch = 1L,
+        )
+        assertEquals(1, manager.openGenerationCountForTests())
+
+        manager.activateConfiguration(epoch = 2L)
+        assertEquals(1, manager.openGenerationCountForTests())
+        assertFailsWith<IllegalStateException> {
+            manager.acquire(
+                url = "https://api.example.test/stale-retry",
+                recovery = oldConfig,
+                epoch = 1L,
+            )
+        }
+
+        val newLease = manager.acquire(
+            url = "https://api.example.test/new",
+            recovery = newConfig,
+            epoch = 2L,
+        )
+        assertEquals(2, manager.openGenerationCountForTests())
+        val staleDrain = oldLease.drainGeneration()
+        assertTrue(!staleDrain.initiated)
+        assertTrue(staleDrain.observedGenerationDraining)
+
+        oldLease.close()
+        assertEquals(1, manager.openGenerationCountForTests())
+
+        // An enabled -> disabled or OkHttp -> legacy switch publishes another
+        // epoch. The active recovery client drains immediately when idle.
+        newLease.close()
+        manager.activateConfiguration(epoch = 3L)
+        assertEquals(0, manager.openGenerationCountForTests())
+    }
+
+    @Test
+    fun publicDisablePublishesNewEpochAndClosesIdleRecoveryPools() {
+        val originalEngine = VBTransportAndroidEngine.okHttpEnabled
+        val originalRecovery = VBTransportAndroidEngine.reusedHttp2Recovery
+        try {
+            VBTransportAndroidEngine.okHttpEnabled = true
+            VBTransportAndroidEngine.reusedHttp2Recovery =
+                VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 1)
+            val enabledSnapshot = AndroidTransportClientProvider.snapshot()
+            val request = com.tencent.kmm.network.export.VBTransportGetRequest().apply {
+                url = "https://api.example.test/config-lifecycle"
+            }
+            AndroidTransportClientProvider.acquire(request, enabledSnapshot).use { }
+            assertEquals(1, AndroidTransportClientProvider.openGenerationCountForTests())
+
+            VBTransportAndroidEngine.reusedHttp2Recovery = originalRecovery.copy(enabled = false)
+            assertTrue(!AndroidTransportClientProvider.isCurrent(enabledSnapshot))
+            assertEquals(0, AndroidTransportClientProvider.openGenerationCountForTests())
+            assertFailsWith<IllegalStateException> {
+                AndroidTransportClientProvider.acquire(request, enabledSnapshot)
+            }
+        } finally {
+            VBTransportAndroidEngine.reusedHttp2Recovery = originalRecovery
+            VBTransportAndroidEngine.okHttpEnabled = originalEngine
+        }
     }
 }

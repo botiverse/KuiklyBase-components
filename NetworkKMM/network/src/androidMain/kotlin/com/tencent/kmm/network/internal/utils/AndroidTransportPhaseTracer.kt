@@ -44,11 +44,16 @@ private class PhysicalConnectionKey(private val connection: Any) {
 internal class AndroidStalledConnectionRegistry {
     private val lock = Any()
     private val callsByConnection =
-        mutableMapOf<Any, MutableMap<String, (Int) -> Unit>>()
+        mutableMapOf<Any, MutableMap<String, Entry>>()
+
+    private class Entry(
+        val onStale: (Int) -> Unit,
+        var matured: Boolean = false,
+    )
 
     fun register(connection: Any, callKey: String, onStale: (Int) -> Unit) {
         synchronized(lock) {
-            callsByConnection.getOrPut(connection) { mutableMapOf() }[callKey] = onStale
+            callsByConnection.getOrPut(connection) { mutableMapOf() }[callKey] = Entry(onStale)
         }
     }
 
@@ -61,16 +66,30 @@ internal class AndroidStalledConnectionRegistry {
         }
     }
 
-    fun triggerIfAtLeast(connection: Any, minimum: Int) {
-        val (count, callbacks) = synchronized(lock) {
+    fun matureAndTriggerIfAtLeast(connection: Any, callKey: String, minimum: Int) {
+        val keys = synchronized(lock) {
             val calls = callsByConnection[connection]
-            if (calls == null || calls.size < minimum) {
-                0 to emptyList()
+            calls?.get(callKey)?.matured = true
+            val maturedKeys = calls?.filterValues { it.matured }?.keys?.toList().orEmpty()
+            if (maturedKeys.size < minimum) {
+                emptyList()
             } else {
-                calls.size to calls.values.toList()
+                maturedKeys
             }
         }
-        callbacks.forEach { it(count) }
+        keys.forEach { key ->
+            val current = synchronized(lock) {
+                val matured = callsByConnection[connection]
+                    ?.filterValues { it.matured }
+                    .orEmpty()
+                if (matured.size < minimum) {
+                    null
+                } else {
+                    matured[key]?.onStale?.let { callback -> callback to matured.size }
+                }
+            }
+            current?.first?.invoke(current.second)
+        }
     }
 
     internal fun count(connection: Any): Int = synchronized(lock) {
@@ -399,10 +418,26 @@ internal object AndroidTransportPhaseTracer {
             stalledRegistryCallKey = callKey
             watchdogFuture = watchdogExecutor.schedule(
                 {
-                    stalledRegistry.triggerIfAtLeast(
-                        connection,
-                        minimumConcurrentStalledRequests,
-                    )
+                    val matured = synchronized(this) {
+                        if (
+                            token != attemptToken ||
+                            responseHeadersStartNanos > 0L ||
+                            protocolName != "h2" ||
+                            reusedConnection != true
+                        ) {
+                            false
+                        } else {
+                            watchdogAttemptToken = token
+                            true
+                        }
+                    }
+                    if (matured) {
+                        stalledRegistry.matureAndTriggerIfAtLeast(
+                            connection,
+                            callKey,
+                            minimumConcurrentStalledRequests,
+                        )
+                    }
                 },
                 watchdogMillis,
                 TimeUnit.MILLISECONDS,
@@ -418,6 +453,7 @@ internal object AndroidTransportPhaseTracer {
             synchronized(this) {
                 if (
                     token != attemptToken ||
+                    watchdogAttemptToken != token ||
                     responseHeadersStartNanos > 0L ||
                     protocolName != "h2" ||
                     reusedConnection != true

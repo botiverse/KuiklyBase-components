@@ -73,6 +73,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import java.net.SocketTimeoutException
 
 private val scope = CoroutineScope(Dispatchers.IO)
 private val taskMap: MutableMap<Int, Job> = mutableMapOf()
@@ -85,6 +86,31 @@ private class AndroidResponseLease(
     private val clientLease: AndroidTransportClientLease,
 ) : AutoCloseable {
     override fun close() = clientLease.close()
+}
+
+internal sealed interface AndroidRequestTimeoutBudget {
+    data object Unlimited : AndroidRequestTimeoutBudget
+    data object Expired : AndroidRequestTimeoutBudget
+    data class Remaining(val millis: Long) : AndroidRequestTimeoutBudget
+}
+
+internal fun androidRequestTimeoutBudget(
+    totalTimeoutMillis: Long,
+    elapsedMillis: Long,
+): AndroidRequestTimeoutBudget {
+    if (totalTimeoutMillis <= 0L) return AndroidRequestTimeoutBudget.Unlimited
+    val remaining = totalTimeoutMillis - elapsedMillis
+    return if (remaining <= 0L) {
+        AndroidRequestTimeoutBudget.Expired
+    } else {
+        AndroidRequestTimeoutBudget.Remaining(remaining)
+    }
+}
+
+internal fun requireAndroidRequestTimeoutBudget(budget: AndroidRequestTimeoutBudget) {
+    if (budget == AndroidRequestTimeoutBudget.Expired) {
+        throw SocketTimeoutException("Request total timeout budget exhausted")
+    }
 }
 
 object AndroidTransportImpl : IVBTransportService {
@@ -336,15 +362,23 @@ object AndroidTransportImpl : IVBTransportService {
     ): AndroidResponseLease {
         // Sample rollout settings once: a mid-request flag change must not send
         // the recovery attempt back through the retired shared pool.
-        val okHttpEnabled = VBTransportAndroidEngine.okHttpEnabled
-        val recovery = VBTransportAndroidEngine.reusedHttp2Recovery
-        val retryState = AndroidReusedH2RetryState(request.method)
+        val transportConfiguration = AndroidTransportClientProvider.snapshot()
+        val okHttpEnabled = transportConfiguration.okHttpEnabled
+        val recovery = transportConfiguration.recovery
+        val retryState = AndroidReusedH2RetryState(
+            method = request.method,
+            hasReplayUnsafeBody = uploadBody != null || request.bodyData() != null,
+        )
         var avoidShard: Int? = null
         while (true) {
+            val budget = androidRequestTimeoutBudget(
+                request.totalTimeout,
+                overallStart.elapsedNow().inWholeMilliseconds,
+            )
+            requireAndroidRequestTimeoutBudget(budget)
             val lease = AndroidTransportClientProvider.acquire(
                 request = request,
-                okHttpEnabled = okHttpEnabled,
-                recovery = recovery,
+                configuration = transportConfiguration,
                 avoidShard = avoidShard,
             )
             val attemptToken = AndroidTransportPhaseTracer.beginAttempt(
@@ -355,14 +389,18 @@ object AndroidTransportImpl : IVBTransportService {
                 minimumConcurrentStalledRequests = recovery.minimumConcurrentStalledRequests,
             )
             try {
-                val remainingTimeout = remainingRequestTimeout(request.totalTimeout, overallStart)
+                val requestBudget = androidRequestTimeoutBudget(
+                    request.totalTimeout,
+                    overallStart.elapsedNow().inWholeMilliseconds,
+                )
+                requireAndroidRequestTimeoutBudget(requestBudget)
                 val response = lease.client.request(request.url) {
                     method = HttpMethod(request.method.name)
-                    if (remainingTimeout > 0L) {
+                    if (requestBudget is AndroidRequestTimeoutBudget.Remaining) {
                         timeout {
-                            requestTimeoutMillis = remainingTimeout
-                            connectTimeoutMillis = transportConnectTimeoutMillis(remainingTimeout)
-                            socketTimeoutMillis = remainingTimeout
+                            requestTimeoutMillis = requestBudget.millis
+                            connectTimeoutMillis = transportConnectTimeoutMillis(requestBudget.millis)
+                            socketTimeoutMillis = requestBudget.millis
                         }
                     }
                     constructRequest(request)
@@ -377,8 +415,19 @@ object AndroidTransportImpl : IVBTransportService {
                 currentCoroutineContext().ensureActive()
                 val watchdogTriggered =
                     AndroidTransportPhaseTracer.watchdogTriggered(request.requestId, attemptToken)
-                val hasBudget = request.totalTimeout <= 0L ||
-                    remainingRequestTimeout(request.totalTimeout, overallStart) > 0L
+                if (watchdogTriggered && !AndroidTransportClientProvider.isCurrent(transportConfiguration)) {
+                    lease.close()
+                    throw throwable
+                }
+                val retryBudget = androidRequestTimeoutBudget(
+                    request.totalTimeout,
+                    overallStart.elapsedNow().inWholeMilliseconds,
+                )
+                if (watchdogTriggered && retryBudget == AndroidRequestTimeoutBudget.Expired) {
+                    lease.close()
+                    throw SocketTimeoutException("Request total timeout budget exhausted")
+                }
+                val hasBudget = retryBudget != AndroidRequestTimeoutBudget.Expired
                 if (retryState.claimRetry(watchdogTriggered, hasBudget)) {
                     avoidShard = lease.shard
                     AndroidTransportPhaseTracer.markFreshRetry(request.requestId)
@@ -397,11 +446,6 @@ object AndroidTransportImpl : IVBTransportService {
                 throw throwable
             }
         }
-    }
-
-    private fun remainingRequestTimeout(totalTimeout: Long, start: kotlin.time.TimeMark): Long {
-        if (totalTimeout <= 0L) return 0L
-        return (totalTimeout - start.elapsedNow().inWholeMilliseconds).coerceAtLeast(0L)
     }
 
     private fun HttpRequestBuilder.constructRequest(kmmRequest: VBTransportBaseRequest) {
