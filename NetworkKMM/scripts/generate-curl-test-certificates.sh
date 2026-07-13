@@ -19,15 +19,21 @@ create_ca() {
   mkdir -p "$dir/newcerts"
   : > "$dir/index.txt"
   printf '1000\n' > "$dir/serial"
-  # Android commits the generated PKCS#12 fixtures, so positive/mismatch
-  # certificates need a long lifetime instead of expiring after the CI run.
-  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -sha256 \
-    -subj "/CN=${subject}" \
-    -addext "basicConstraints=critical,CA:TRUE" \
-    -addext "keyUsage=critical,keyCertSign,cRLSign" \
-    -keyout "$dir/ca-key.pem" \
-    -out "$dir/ca.pem" >/dev/null 2>&1
   cat > "$dir/openssl.cnf" <<OPENSSLCONFIG
+[req]
+distinguished_name = ca_subject
+x509_extensions = ca_extensions
+prompt = no
+
+[ca_subject]
+CN = $subject
+
+[ca_extensions]
+basicConstraints = critical,CA:TRUE
+keyUsage = critical,keyCertSign,cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+
 [ca]
 default_ca = local_ca
 
@@ -41,26 +47,41 @@ private_key = \$dir/ca-key.pem
 default_md = sha256
 default_days = 3650
 policy = signing_policy
-copy_extensions = copy
 unique_subject = no
 
 [signing_policy]
 commonName = supplied
 OPENSSLCONFIG
+
+  # Android commits the generated PKCS#12 fixtures, so positive/mismatch
+  # certificates need a long lifetime instead of expiring after the CI run.
+  # Keep extensions in the config instead of relying on req -addext so hosted
+  # OpenSSL and LibreSSL apply the same issuer contract as `openssl ca`.
+  openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -sha256 \
+    -config "$dir/openssl.cnf" \
+    -keyout "$dir/ca-key.pem" \
+    -out "$dir/ca.pem" >/dev/null 2>&1
 }
 
 create_server() {
   local name="$1" ca_name="$2" common_name="$3" san="$4"
   local start_date="${5:-}" end_date="${6:-}"
   local ca_dir="${OUTPUT_DIR}/${ca_name}"
+  local extensions_path="${OUTPUT_DIR}/${name}-extensions.cnf"
   openssl req -new -newkey rsa:2048 -nodes -sha256 \
     -subj "/CN=${common_name}" \
-    -addext "subjectAltName=${san}" \
-    -addext "basicConstraints=critical,CA:FALSE" \
-    -addext "keyUsage=critical,digitalSignature,keyEncipherment" \
-    -addext "extendedKeyUsage=serverAuth" \
     -keyout "${OUTPUT_DIR}/${name}-key.pem" \
     -out "${OUTPUT_DIR}/${name}.csr" >/dev/null 2>&1
+
+  cat > "$extensions_path" <<SERVEREXTENSIONS
+[server_certificate]
+subjectAltName = $san
+basicConstraints = critical,CA:FALSE
+keyUsage = critical,digitalSignature,keyEncipherment
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+SERVEREXTENSIONS
 
   local date_args=()
   if [[ -n "$start_date" ]]; then
@@ -69,10 +90,12 @@ create_server() {
     date_args+=("-days" "3650")
   fi
   openssl ca -batch -config "$ca_dir/openssl.cnf" \
+    -extfile "$extensions_path" \
+    -extensions server_certificate \
     -in "${OUTPUT_DIR}/${name}.csr" \
     -out "${OUTPUT_DIR}/${name}.pem" \
     "${date_args[@]}" >/dev/null 2>&1
-  rm -f "${OUTPUT_DIR}/${name}.csr"
+  rm -f "${OUTPUT_DIR}/${name}.csr" "$extensions_path"
 }
 
 create_ca trusted-ca "NetworkKMM Test Root"
