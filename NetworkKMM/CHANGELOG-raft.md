@@ -1,6 +1,6 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased (explicit HTTP/3/QUIC curl gray lane)
+## 0.1.0-raft.24 / 0.1.0-raft.24-ohos (explicit HTTP/3/QUIC curl gray lane)
 
 - Android, iOS, and OHOS curl artifacts now build pinned nghttp3 1.17.0
   (`9635173e...b8f5`) beside curl 8.16.0 and OpenSSL 3.5.4, enabling the
