@@ -91,22 +91,25 @@ class IosCurlRuntimeTest {
         val engine = assertNotNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
 
         configureRuntime(caPath, caSha, http3Enabled = true)
-        val h3 = execute(engine, h3Url)
-        val h3Diagnostic = h3.runtimeDiagnostic("h3", h3Url)
+        val h3Attempt = executeExternal(engine, h3Url)
+        val h3 = h3Attempt.response
+        val h3Diagnostic = h3.runtimeDiagnostic("h3", h3Url, h3Attempt.attempts)
         assertTrue(h3.isSuccess, h3Diagnostic)
         assertEquals(NetworkHttpProtocol.HTTP_3, h3.protocol, h3Diagnostic)
 
         // The h3 connection above remains pooled. Default traffic must use
         // the separate h2/h1 pool instead of silently reusing that connection.
         configureRuntime(caPath, caSha)
-        val defaultH2 = execute(engine, h3Url)
-        val defaultDiagnostic = defaultH2.runtimeDiagnostic("default", h3Url)
+        val defaultAttempt = executeExternal(engine, h3Url)
+        val defaultH2 = defaultAttempt.response
+        val defaultDiagnostic = defaultH2.runtimeDiagnostic("default", h3Url, defaultAttempt.attempts)
         assertTrue(defaultH2.isSuccess, defaultDiagnostic)
         assertEquals(NetworkHttpProtocol.HTTP_2, defaultH2.protocol, defaultDiagnostic)
 
         configureRuntime(caPath, caSha, http3Enabled = true)
-        val fallback = execute(engine, fallbackUrl)
-        val fallbackDiagnostic = fallback.runtimeDiagnostic("fallback", fallbackUrl)
+        val fallbackAttempt = executeExternal(engine, fallbackUrl)
+        val fallback = fallbackAttempt.response
+        val fallbackDiagnostic = fallback.runtimeDiagnostic("fallback", fallbackUrl, fallbackAttempt.attempts)
         assertTrue(fallback.isSuccess, fallbackDiagnostic)
         assertEquals(NetworkHttpProtocol.HTTP_2, fallback.protocol, fallbackDiagnostic)
 
@@ -318,10 +321,36 @@ class IosCurlRuntimeTest {
         return engine.execute(request, NetworkCall(request))
     }
 
-    private fun NetworkResponse.runtimeDiagnostic(label: String, url: String): String =
-        "$label url=$url status=$statusCode protocol=$protocol " +
+    private suspend fun executeExternal(
+        engine: com.tencent.kmm.network.service.NetworkEngine,
+        url: String
+    ): RuntimeAttempt {
+        for (attempt in 1..6) {
+            val response = execute(engine, url)
+            if (response.error?.kind != NetworkErrorKind.DNS || attempt == 6) {
+                return RuntimeAttempt(response, attempt)
+            }
+            // The hosted iOS simulator can launch before its external resolver
+            // is ready. Retry only DNS readiness; all transport/protocol results
+            // leave this loop immediately and remain strict assertions above.
+            delay(1_000)
+        }
+        error("unreachable")
+    }
+
+    private fun NetworkResponse.runtimeDiagnostic(
+        label: String,
+        url: String,
+        attempts: Int = 1
+    ): String =
+        "$label url=$url attempts=$attempts status=$statusCode protocol=$protocol " +
             "errorKind=${error?.kind} error=${error?.message}"
 
     private fun runtimeEnvironment(name: String): String? =
         getenv(name)?.toKString()?.takeIf(String::isNotBlank)
+
+    private data class RuntimeAttempt(
+        val response: NetworkResponse,
+        val attempts: Int
+    )
 }
