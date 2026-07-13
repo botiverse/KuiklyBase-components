@@ -183,7 +183,7 @@ internal class AndroidTransportClientGenerationManager(
             if (state.recovery != recovery) {
                 resetConfigurationLocked(state, recovery)
             }
-            val selectedShard = state.selectShard(avoidShard)
+            val selectedShard = state.selectShard(avoidShard, nowMillis())
             val shard = state.shards[selectedShard] ?: ShardState(newGeneration(recovery)).also {
                 state.shards[selectedShard] = it
             }
@@ -222,7 +222,7 @@ internal class AndroidTransportClientGenerationManager(
             state.rolloverTimes.removeFirst()
         }
         if (state.rolloverTimes.size >= recovery.clientShardCount) {
-            shard.quarantined = true
+            shard.quarantinedAtMillis = now
             return@synchronized AndroidTransportGenerationRollover(
                 generation = shard.current.id,
                 initiated = false,
@@ -247,7 +247,7 @@ internal class AndroidTransportClientGenerationManager(
         retired.draining = true
         state.retired += retired
         shard.current = newGeneration(recovery)
-        shard.quarantined = false
+        shard.quarantinedAtMillis = null
         closeIfDrainedLocked(state, retired)
     }
 
@@ -297,14 +297,16 @@ internal class AndroidTransportClientGenerationManager(
         val retired = mutableSetOf<Generation>()
         val rolloverTimes = ArrayDeque<Long>()
 
-        fun selectShard(avoidShard: Int?): Int {
+        fun selectShard(avoidShard: Int?, now: Long): Int {
             // Prefer healthy/uninitialized slots. A rate-limited stale slot is
             // quarantined from new work while any alternative remains.
             repeat(shards.size) {
                 val candidate = nextShard
                 nextShard = (nextShard + 1) % shards.size
                 val avoided = shards.size > 1 && candidate == avoidShard
-                val quarantined = shards[candidate]?.quarantined == true
+                val quarantined = shards[candidate]?.quarantinedAtMillis?.let {
+                    now - it < ORIGIN_ROLLOVER_WINDOW_MILLIS
+                } == true
                 if (!avoided && !quarantined) return candidate
             }
             // All alternatives are quarantined. Keep traffic bounded to the
@@ -320,7 +322,7 @@ internal class AndroidTransportClientGenerationManager(
 
     private class ShardState(
         var current: Generation,
-        var quarantined: Boolean = false,
+        var quarantinedAtMillis: Long? = null,
     )
 
     private class Generation(

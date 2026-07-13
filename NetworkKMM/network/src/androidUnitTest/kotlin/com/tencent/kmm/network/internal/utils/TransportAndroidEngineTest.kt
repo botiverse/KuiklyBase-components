@@ -293,7 +293,8 @@ class TransportAndroidEngineTest {
 
     @Test
     fun rateLimitedStaleShardIsQuarantinedWhileHealthySlotsExist() {
-        val manager = AndroidTransportClientGenerationManager(nowMillis = { 1_000L })
+        var now = 1_000L
+        val manager = AndroidTransportClientGenerationManager(nowMillis = { now })
         val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 5)
 
         fun acquireShardZero(): AndroidTransportClientLease {
@@ -324,6 +325,16 @@ class TransportAndroidEngineTest {
             assertEquals(setOf(1, 2, 3, 4), subsequent.map { it.shard }.toSet())
         } finally {
             subsequent.forEach(AndroidTransportClientLease::close)
+        }
+
+        now += 30_000L
+        val afterCooldown = List(5) {
+            manager.acquire("https://api.example.test/probe/$it", recovery)
+        }
+        try {
+            assertTrue(afterCooldown.any { it.shard == 0 })
+        } finally {
+            afterCooldown.forEach(AndroidTransportClientLease::close)
         }
     }
 }
