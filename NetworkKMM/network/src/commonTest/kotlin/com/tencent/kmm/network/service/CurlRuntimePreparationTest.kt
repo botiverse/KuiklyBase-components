@@ -73,6 +73,7 @@ class CurlRuntimePreparationTest {
         // Proxy pinned to explicit direct — "" disables environment proxies.
         assertEquals("", preparedCurlProxyUrl(request))
         assertEquals(CURL_RUNTIME_TRUST_PLATFORM_DEFAULT, preparedCurlTrustSource(request))
+        assertFalse(preparedCurlHttp3Enabled(request))
     }
 
     @Test
@@ -128,5 +129,11 @@ class CurlRuntimePreparationTest {
         val request = NetworkRequest(url = "https://example.com/api")
         assertTrue(prepareCurlRuntime(request, verifiedDefault).available)
         assertEquals(CURL_RUNTIME_TRUST_PLATFORM_DEFAULT, preparedCurlTrustSource(request))
+    }
+
+    @Test
+    fun capabilitiesReportTheLinkedHttp3FeatureBit() {
+        assertTrue(curlNetworkEngineCapabilities(nativeHttp3Supported = true).http3.rolloutEligible)
+        assertFalse(curlNetworkEngineCapabilities(nativeHttp3Supported = false).http3.rolloutEligible)
     }
 }

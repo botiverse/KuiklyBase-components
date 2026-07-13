@@ -70,6 +70,25 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     return captured;
 }
 
+static Captured FetchWithResolve(const std::string &url, const std::string &resolveEntry) {
+    Captured captured;
+    StringDic headers{};
+    CurlRequest request{};
+    request.url = url.c_str();
+    request.method = "GET";
+    request.headers = &headers;
+    request.timeout = 5000;
+
+    CurlCallback callback{&captured, OnResponse};
+    CurClientHandle handle = CreateCurlClient("wrapper-resolve-test");
+    SetCurlProxy(handle, "");
+    CHECK(SetCurlResolve(handle, resolveEntry.c_str()) == 1,
+          "per-client resolve entry is accepted");
+    StartRequest(handle, request, &callback);
+    DeleteCurlClient(handle);
+    return captured;
+}
+
 static bool HasCurlFeature(long feature) {
     curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
     return info != nullptr && (info->features & feature) != 0;
@@ -98,6 +117,35 @@ static void CheckDecodedContentEncoding(const std::string &base,
 
 int main(int argc, char **argv) {
     std::string base = argc > 1 ? argv[1] : "http://127.0.0.1:18923";
+
+    // HTTP/3 control surface is additive and must fail closed against a host
+    // libcurl without the feature while leaving the default path available.
+    {
+        CurClientHandle handle = CreateCurlClient("wrapper-http3-contract");
+        CHECK(handle != nullptr, "HTTP/3 contract probe creates a client");
+        CHECK(SetCurlHttp3Enabled(handle, 0) == 1,
+              "default h2/h1 mode is available regardless of HTTP/3 support");
+        const int supportsHttp3 = CurlSupportsHttp3();
+        CHECK(SetCurlHttp3Enabled(handle, 1) == (supportsHttp3 != 0 ? 1 : 0),
+              "HTTP/3 enable result matches the linked feature bit");
+        CHECK(std::strcmp(GetCurlNegotiatedProtocol(handle), "unknown") == 0,
+              "protocol is unknown before a request completes");
+        DeleteCurlClient(handle);
+    }
+
+    // CURLOPT_RESOLVE keeps the URL hostname while bypassing the process DNS
+    // resolver. Use the reserved .invalid TLD so success proves the override.
+    {
+        const size_t portSeparator = base.rfind(':');
+        CHECK(portSeparator != std::string::npos, "test server base URL has a port");
+        const std::string port = base.substr(portSeparator + 1);
+        const std::string alias = "networkkmm.invalid";
+        Captured resolved = FetchWithResolve(
+            "http://" + alias + ":" + port + "/ok",
+            alias + ":" + port + ":127.0.0.1");
+        CHECK(resolved.code == 0, "resolve override bypasses DNS");
+        CHECK(resolved.httpCode == 200, "resolve override reaches the intended server");
+    }
 
     // 1. Plain success: transfer ok, HTTP 200, body delivered.
     Captured ok = Fetch(base + "/ok");

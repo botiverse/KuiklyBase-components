@@ -21,6 +21,8 @@ OPENSSL_SHA256="${OPENSSL_SHA256:-967311f84955316969bdb1d8d4b983718ef42338639c62
 CURL_SHA256="${CURL_SHA256:-a21e20476e39eca5a4fc5cfb00acf84bbc1f5d8443ec3853ad14c26b3c85b970}"
 NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
 NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
+NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.17.0}"
+NGHTTP3_SHA256="${NGHTTP3_SHA256:-9635173e703174a41f9abd0d790e70562c74ec3805064403477db5a1ef94b8f5}"
 IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-12.0}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -63,6 +65,8 @@ fetch "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/curl-${CURL_VERSION}.tar.gz" "$CURL_SHA256"
 fetch "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/nghttp2-${NGHTTP2_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/nghttp2-${NGHTTP2_VERSION}.tar.gz" "$NGHTTP2_SHA256"
+fetch "https://github.com/ngtcp2/nghttp3/releases/download/v${NGHTTP3_VERSION}/nghttp3-${NGHTTP3_VERSION}.tar.gz" \
+  "${DOWNLOADS_DIR}/nghttp3-${NGHTTP3_VERSION}.tar.gz" "$NGHTTP3_SHA256"
 
 # min-version flag differs between device and simulator compilations.
 min_flag() {
@@ -89,9 +93,13 @@ build_slice_arch() {
   local nghttp2_source="${slice_root}/nghttp2-${NGHTTP2_VERSION}"
   local nghttp2_build="${slice_root}/nghttp2-build"
   local nghttp2_stamp="${nghttp2_build}/.build-config"
+  local nghttp3_source="${slice_root}/nghttp3-${NGHTTP3_VERSION}"
+  local nghttp3_build="${slice_root}/nghttp3-build"
+  local nghttp3_prefix="${slice_root}/nghttp3-out"
+  local nghttp3_stamp="${nghttp3_prefix}/.build-config"
   local wrapper_build="${slice_root}/wrapper-build"
   local merged="${slice_root}/libNetworkKMMCurl.a"
-  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}"
+  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}"
   local sdk_path
   sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
 
@@ -142,6 +150,27 @@ build_slice_arch() {
     printf '%s' "$build_config" > "$nghttp2_stamp"
   fi
 
+  echo "==> [${sdk}/${arch}] nghttp3 ${NGHTTP3_VERSION}"
+  if [[ ! -f "${nghttp3_prefix}/lib/libnghttp3.a" || "$(cat "$nghttp3_stamp" 2>/dev/null)" != "$build_config" ]]; then
+    rm -rf "$nghttp3_source" "$nghttp3_build" "$nghttp3_prefix"
+    tar -xzf "${DOWNLOADS_DIR}/nghttp3-${NGHTTP3_VERSION}.tar.gz" -C "$slice_root"
+    cmake -S "$nghttp3_source" -B "$nghttp3_build" \
+      -DCMAKE_SYSTEM_NAME=iOS \
+      -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+      -DCMAKE_OSX_SYSROOT="$sdk" \
+      -DCMAKE_OSX_ARCHITECTURES="$arch" \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX="$nghttp3_prefix" \
+      -DENABLE_LIB_ONLY=ON \
+      -DENABLE_SHARED_LIB=OFF \
+      -DENABLE_STATIC_LIB=ON \
+      -DBUILD_TESTING=OFF \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
+    cmake --build "$nghttp3_build" -j"$JOBS" --target install >/dev/null
+    printf '%s' "$build_config" > "$nghttp3_stamp"
+  fi
+
   echo "==> [${sdk}/${arch}] curl ${CURL_VERSION}"
   if [[ ! -f "${curl_build}/lib/libcurl.a" || "$(cat "$curl_stamp" 2>/dev/null)" != "$build_config" ]]; then
     rm -rf "$curl_source" "$curl_build"
@@ -176,32 +205,43 @@ build_slice_arch() {
       -DUSE_NGHTTP2=ON \
       -DNGHTTP2_INCLUDE_DIR="${nghttp2_source}/lib/includes" \
       -DNGHTTP2_LIBRARY="${nghttp2_build}/lib/libnghttp2.a" \
+      -DUSE_OPENSSL_QUIC=ON \
+      -DNGHTTP3_INCLUDE_DIR="${nghttp3_prefix}/include" \
+      -DNGHTTP3_LIBRARY="${nghttp3_prefix}/lib/libnghttp3.a" \
       -DUSE_LIBIDN2=OFF \
       -DCMAKE_POSITION_INDEPENDENT_CODE=ON
     cmake --build "$curl_build" -j"$JOBS" >/dev/null
     printf '%s' "$build_config" > "$curl_stamp"
   fi
 
-  # HTTP/2 hard gate (same rationale as the Android/OHOS gates). Two layers:
-  # generated config as the stable primary (decoupled from symbol names),
-  # archive symbol as the pin-exact supplement. Mach-O prefixes C symbols
-  # with "_" (xcrun nm prints _nghttp2_session_client_new3), so the symbol
-  # match is end-anchored — grep -w can never match the prefixed form
-  # because "_" is a word character. Here-string, not a pipe.
-  if grep -q "#define USE_NGHTTP2 1" "$curl_build/lib/curl_config.h"; then
-    echo "==> [${sdk}/${arch}] curl_config.h USE_NGHTTP2: ENABLED"
-  else
-    echo "[${sdk}/${arch}] curl_config.h USE_NGHTTP2: MISSING" >&2
-    exit 2
-  fi
+  # HTTP/2 + HTTP/3 hard gates. Generated config is the stable primary;
+  # Mach-O archive references are pin-exact supplements. xcrun nm prefixes C
+  # symbols with "_", so every symbol match is end-anchored.
+  local define
+  for define in USE_NGHTTP2 USE_OPENSSL_QUIC USE_NGHTTP3; do
+    if grep -q "#define ${define} 1" "$curl_build/lib/curl_config.h"; then
+      echo "==> [${sdk}/${arch}] curl_config.h ${define}: ENABLED"
+    else
+      echo "[${sdk}/${arch}] curl_config.h ${define}: MISSING" >&2
+      exit 2
+    fi
+  done
   local curl_syms
   curl_syms="$(xcrun nm "$curl_build/lib/libcurl.a" 2>/dev/null || true)"
-  if grep -q "nghttp2_session_client_new3$" <<<"$curl_syms"; then
-    echo "==> [${sdk}/${arch}] libcurl HTTP/2 (nghttp2): ENABLED"
-  else
-    echo "[${sdk}/${arch}] libcurl HTTP/2 (nghttp2): MISSING" >&2
-    exit 2
-  fi
+  local label symbol
+  while IFS='|' read -r label symbol; do
+    if grep -q "${symbol}$" <<<"$curl_syms"; then
+      echo "==> [${sdk}/${arch}] libcurl ${label}: ENABLED (${symbol})"
+    else
+      echo "[${sdk}/${arch}] libcurl ${label}: MISSING (${symbol})" >&2
+      exit 2
+    fi
+  done <<'HTTP_FEATURE_SYMBOLS'
+HTTP/2 (nghttp2)|nghttp2_session_client_new3
+HTTP/3 (nghttp3)|nghttp3_conn_client_new_versioned
+HTTP/3 (OpenSSL stream)|SSL_new_stream
+HTTP/3 (OpenSSL QUIC method)|OSSL_QUIC_client_method
+HTTP_FEATURE_SYMBOLS
 
   echo "==> [${sdk}/${arch}] pbcurlwrapper + merge"
   local common_flags=(
@@ -232,6 +272,7 @@ build_slice_arch() {
     "$wrapper_build/curl_utils.o" \
     "$curl_build/lib/libcurl.a" \
     "$nghttp2_build/lib/libnghttp2.a" \
+    "$nghttp3_prefix/lib/libnghttp3.a" \
     "$openssl_prefix/lib/libssl.a" \
     "$openssl_prefix/lib/libcrypto.a"
   echo "    $(du -h "$merged" | cut -f1)  $merged"
@@ -276,7 +317,8 @@ for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
   # diagnostics on 2026-07-10); -j is NOT portable across Xcode nm versions
   # and fails silently, so match the full-line format instead.
   syms="$(xcrun nm -g --defined-only -arch arm64 "$lib" 2>/dev/null || true)"
-  for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo _SetCurlProxy \
+  for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo _SetCurlProxy _SetCurlResolve \
+             _CurlSupportsHttp3 _SetCurlHttp3Enabled _GetCurlNegotiatedProtocol \
              _StartRequest _StartStreamRequest _StartUploadRequest; do
     # herestring, not a pipe: grep -q exits on first match and pipefail
     # would turn printf's SIGPIPE into a pipeline failure.

@@ -28,3 +28,6 @@ internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine)
         NetworkTransportEngine.KTOR -> VBTransportNetworkEngine
         NetworkTransportEngine.CURL -> IosCurlEngineProvider.resolve()
     }
+
+internal actual fun platformCurlSupportsHttp3(): Boolean =
+    IosCurlEngineProvider.nativeSupportsHttp3

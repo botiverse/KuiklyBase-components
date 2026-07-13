@@ -30,3 +30,5 @@ internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine)
         NetworkTransportEngine.KTOR -> VBTransportNetworkEngine
         NetworkTransportEngine.CURL -> null
     }
+
+internal actual fun platformCurlSupportsHttp3(): Boolean = false

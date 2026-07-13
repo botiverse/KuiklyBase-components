@@ -21,14 +21,18 @@ import com.tencent.kmm.network.curl.CurlResponseCodec
 import com.tencent.kmm.network.curl.CurlResponseFields
 import com.tencent.kmm.network.curl.native.Cancel as cancelNative
 import com.tencent.kmm.network.curl.native.CreateCurlClient
+import com.tencent.kmm.network.curl.native.CurlSupportsHttp3
 import com.tencent.kmm.network.curl.native.CurlCallback
 import com.tencent.kmm.network.curl.native.CurlRequest
 import com.tencent.kmm.network.curl.native.CurlResponse
 import com.tencent.kmm.network.curl.native.CurlStreamCallback
 import com.tencent.kmm.network.curl.native.CurlUploadSource
 import com.tencent.kmm.network.curl.native.DeleteCurlClient
+import com.tencent.kmm.network.curl.native.GetCurlNegotiatedProtocol
 import com.tencent.kmm.network.curl.native.SetCurlCaInfo
+import com.tencent.kmm.network.curl.native.SetCurlHttp3Enabled
 import com.tencent.kmm.network.curl.native.SetCurlProxy
+import com.tencent.kmm.network.curl.native.SetCurlResolve
 import com.tencent.kmm.network.curl.native.StartRequest
 import com.tencent.kmm.network.curl.native.StartStreamRequest
 import com.tencent.kmm.network.curl.native.StartUploadRequest
@@ -99,6 +103,8 @@ internal data class IosCurlNativeRequest(
     val caInfoPath: String,
     /** Empty string means explicit direct mode. */
     val proxyUrl: String,
+    val http3Enabled: Boolean = false,
+    val resolveEntry: String? = null,
     val cancellationSignal: IosCurlCancellationSignal = IosCurlCancellationSignal()
 ) {
     fun cancel() {
@@ -113,6 +119,7 @@ internal fun interface IosCurlUploadSource {
 
 internal interface IosCurlNativeBridge {
     val isAvailable: Boolean
+    val supportsHttp3: Boolean
 
     suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse
 
@@ -133,6 +140,8 @@ internal interface IosCurlNativeBridge {
 @OptIn(ExperimentalForeignApi::class)
 internal object IosCurlCInteropBridge : IosCurlNativeBridge {
     override val isAvailable: Boolean = true
+    override val supportsHttp3: Boolean
+        get() = CurlSupportsHttp3() != 0
 
     override suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse =
         perform(request) { handle, callbackContext ->
@@ -208,8 +217,18 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             uploadSource = uploadSource
         )
         try {
+            if (SetCurlHttp3Enabled(handle, if (request.http3Enabled) 1 else 0) == 0) {
+                return@withContext unavailable(
+                    "HTTP/3 requested but iOS curl backend is unavailable"
+                )
+            }
             SetCurlCaInfo(handle, request.caInfoPath)
             SetCurlProxy(handle, request.proxyUrl)
+            request.resolveEntry?.let { entry ->
+                if (SetCurlResolve(handle, entry) == 0) {
+                    return@withContext unavailable("iOS curl failed to apply resolve entry")
+                }
+            }
             IosCurlHandleRegistry.publish(request.requestId, handle)
             if (request.cancellationSignal.isCancelled()) {
                 cancelNative(handle)
@@ -223,8 +242,12 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             callbackContext.failureMessage()?.let { message ->
                 return@withContext unavailable(message)
             }
-            callbackContext.response
-                ?: unavailable("iOS curl returned without a completion callback")
+            val response = callbackContext.response
+                ?: return@withContext unavailable("iOS curl returned without a completion callback")
+            response.elapse.protocol = GetCurlNegotiatedProtocol(handle)
+                ?.toKString()
+                ?.takeIf { it != "unknown" }
+            response
         } finally {
             IosCurlHandleRegistry.remove(request.requestId, handle)
             callbackContext.dispose()

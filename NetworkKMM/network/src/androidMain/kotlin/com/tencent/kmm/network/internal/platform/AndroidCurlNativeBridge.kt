@@ -47,6 +47,7 @@ internal data class AndroidCurlNativeRequest(
     val caInfoPath: String,
     /** Empty string means explicit direct mode. */
     val proxyUrl: String,
+    val http3Enabled: Boolean = false,
     val cancellationSignal: AndroidCurlCancellationSignal = AndroidCurlCancellationSignal()
 ) {
     fun cancel() {
@@ -61,6 +62,7 @@ internal fun interface AndroidCurlUploadSource {
 
 internal interface AndroidCurlNativeBridge {
     val isAvailable: Boolean
+    val supportsHttp3: Boolean
 
     suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse
 
@@ -89,6 +91,9 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
 
     override val isAvailable: Boolean
         get() = loaded
+
+    override val supportsHttp3: Boolean
+        get() = loaded && runCatching { nativeSupportsHttp3() }.getOrDefault(false)
 
     override suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse =
         perform(request, MODE_BUFFERED, null, null, null)
@@ -142,6 +147,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
                 uploadContentLength = request.uploadContentLength ?: -1L,
                 caInfoPath = request.caInfoPath,
                 proxyUrl = request.proxyUrl,
+                http3Enabled = request.http3Enabled,
                 mode = mode,
                 callback = callback
             )
@@ -169,12 +175,16 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
         uploadContentLength: Long,
         caInfoPath: String,
         proxyUrl: String,
+        http3Enabled: Boolean,
         mode: Int,
         callback: AndroidCurlJniCallback
     )
 
     @JvmStatic
     private external fun nativeCancel(requestId: Int)
+
+    @JvmStatic
+    private external fun nativeSupportsHttp3(): Boolean
 }
 
 internal class AndroidCurlJniCallback(
@@ -227,6 +237,7 @@ internal class AndroidCurlJniCallback(
         headers: String,
         redirectUrl: String,
         data: ByteArray?,
+        protocol: String,
         nameLookupTimeMs: Double,
         connectTimeMs: Double,
         sslCostTimeMs: Double,
@@ -249,6 +260,7 @@ internal class AndroidCurlJniCallback(
                     data = data,
                     dataLen = data?.size ?: 0,
                     elapse = VBTransportElapseStatistics(
+                        protocol = protocol.takeIf { it != "unknown" },
                         nameLookupTimeMs = nameLookupTimeMs,
                         connectTimeMs = connectTimeMs,
                         sslCostTimeMs = sslCostTimeMs,

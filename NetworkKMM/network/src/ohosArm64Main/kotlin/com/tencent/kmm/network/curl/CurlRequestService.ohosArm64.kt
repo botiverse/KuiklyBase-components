@@ -26,11 +26,13 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapRequest
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringCallback
 import com.tencent.qqlive.kmm.native.libcurl.Cancel
 import com.tencent.qqlive.kmm.native.libcurl.CreateCurlClient
+import com.tencent.qqlive.kmm.native.libcurl.GetCurlNegotiatedProtocol
 import com.tencent.qqlive.kmm.native.libcurl.CurlCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlRequest
 import com.tencent.qqlive.kmm.native.libcurl.CurlResponse
 import com.tencent.qqlive.kmm.native.libcurl.DeleteCurlClient
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlCaInfo
+import com.tencent.qqlive.kmm.native.libcurl.SetCurlHttp3Enabled
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlProxy
 import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlUploadSource
@@ -141,6 +143,18 @@ object CurlRequestServiceHM : ICurlRequestService {
             "OHOS curl request is missing its explicit proxy decision"
         }
         SetCurlProxy(handle, proxyUrl)
+        check(SetCurlHttp3Enabled(handle, if (request.curlHttp3Enabled) 1 else 0) != 0) {
+            "HTTP/3 requested but OHOS curl backend is unavailable"
+        }
+    }
+
+    private fun applyNegotiatedProtocol(
+        response: CurlNativeResponse,
+        handle: CPointer<out CPointed>?
+    ): CurlNativeResponse = response.apply {
+        elapse.protocol = GetCurlNegotiatedProtocol(handle)
+            ?.toKString()
+            ?.takeIf { it != "unknown" }
     }
 
     override fun initNativeCurlLog(log: IVBPBLog) {
@@ -351,24 +365,35 @@ object CurlRequestServiceHM : ICurlRequestService {
             val headers = toStringDic(buildRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
             var nativeResponse = CurlNativeResponse()
-            val callback = object : ICurlCallback {
-                override fun onResponse(result: CurlResponse) {
-                    nativeResponse = handleCurlNativeResponse(result, logTag)
-                }
+            val handle = checkNotNull(CreateCurlClient(logTag)) {
+                "CreateCurlClient failed"
             }
+            try {
+                configureCurlRuntime(handle, request)
+                val callback = object : ICurlCallback {
+                    override fun onResponse(result: CurlResponse) {
+                        nativeResponse = applyNegotiatedProtocol(
+                            handleCurlNativeResponse(result, logTag),
+                            handle
+                        )
+                    }
+                }
 
-            // 使用 libcurl 发起请求
-            val callbackWrapper = CurlCallbackWrapper(callback)
-            val callbackWrapperPtr = callbackWrapper.getCallbackNativePtr()
-            val handle = CreateCurlClient(logTag)
-            configureCurlRuntime(handle, request)
-            taskMap[request.requestId] = handle
-            logI("[$logTag] TaskManager add transport task, id:${request.requestId}, handle:${handle}")
-            StartRequest(handle, curlRequest, callbackWrapperPtr)
-            DeleteCurlClient(handle)
-            taskMap.remove(request.requestId)
-
-            callbackWrapper.release()
+                // 使用 libcurl 发起请求
+                val callbackWrapper = CurlCallbackWrapper(callback)
+                try {
+                    taskMap[request.requestId] = handle
+                    logI("[$logTag] TaskManager add transport task, id:${request.requestId}, handle:${handle}")
+                    StartRequest(handle, curlRequest, callbackWrapper.getCallbackNativePtr())
+                } finally {
+                    if (taskMap[request.requestId] == handle) {
+                        taskMap.remove(request.requestId)
+                    }
+                    callbackWrapper.release()
+                }
+            } finally {
+                DeleteCurlClient(handle)
+            }
 
             // 构造回调信息
             buildResponseAndCallback(request, nativeResponse, responseCallback)
@@ -449,33 +474,46 @@ object CurlRequestServiceHM : ICurlRequestService {
             // gzip here (chunks would arrive compressed and undecodable).
             val headers = toStringDic(buildStreamRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
-            val handler = object : IStreamHandler {
-                override fun onResponseStart(httpCode: Long, headers: String) {
-                    onResponseStart(httpCode.toInt(), parseCurlHeaders(headers))
-                }
-
-                override fun onChunk(chunk: ByteArray) {
-                    onChunk(chunk)
-                }
-
-                override fun onComplete(result: CurlResponse) {
-                    val nativeResponse = handleCurlNativeResponse(result, logTag)
-                    onComplete(
-                        VBTransportResponse().apply {
-                            updateResponse(request.logTag, nativeResponse, request, this)
-                        }
-                    )
-                }
+            val handle = checkNotNull(CreateCurlClient(logTag)) {
+                "CreateCurlClient failed"
             }
-            val wrapper = CurlStreamCallbackWrapper(handler)
-            val handle = CreateCurlClient(logTag)
-            configureCurlRuntime(handle, request)
-            taskMap[request.requestId] = handle
-            logI("[$logTag] stream transport task add, id:${request.requestId}, handle:${handle}")
-            StartStreamRequest(handle, curlRequest, wrapper.getCallbackNativePtr())
-            DeleteCurlClient(handle)
-            taskMap.remove(request.requestId)
-            wrapper.release()
+            try {
+                configureCurlRuntime(handle, request)
+                val handler = object : IStreamHandler {
+                    override fun onResponseStart(httpCode: Long, headers: String) {
+                        onResponseStart(httpCode.toInt(), parseCurlHeaders(headers))
+                    }
+
+                    override fun onChunk(chunk: ByteArray) {
+                        onChunk(chunk)
+                    }
+
+                    override fun onComplete(result: CurlResponse) {
+                        val nativeResponse = applyNegotiatedProtocol(
+                            handleCurlNativeResponse(result, logTag),
+                            handle
+                        )
+                        onComplete(
+                            VBTransportResponse().apply {
+                                updateResponse(request.logTag, nativeResponse, request, this)
+                            }
+                        )
+                    }
+                }
+                val wrapper = CurlStreamCallbackWrapper(handler)
+                try {
+                    taskMap[request.requestId] = handle
+                    logI("[$logTag] stream transport task add, id:${request.requestId}, handle:${handle}")
+                    StartStreamRequest(handle, curlRequest, wrapper.getCallbackNativePtr())
+                } finally {
+                    if (taskMap[request.requestId] == handle) {
+                        taskMap.remove(request.requestId)
+                    }
+                    wrapper.release()
+                }
+            } finally {
+                DeleteCurlClient(handle)
+            }
         }
     }
 
@@ -529,30 +567,40 @@ object CurlRequestServiceHM : ICurlRequestService {
                 val headers = toStringDic(buildRequestHeader(request), memScope)
                 val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
                 var nativeResponse = CurlNativeResponse()
-                val callback = object : ICurlCallback {
-                    override fun onResponse(result: CurlResponse) {
-                        nativeResponse = handleCurlNativeResponse(result, logTag)
-                    }
+                val handle = checkNotNull(CreateCurlClient(logTag)) {
+                    "CreateCurlClient failed"
                 }
-                val callbackWrapper = CurlCallbackWrapper(callback)
-                val bridgeRef = StableRef.create(bridge)
                 try {
-                    val source = memScope.alloc<CurlUploadSource> {
-                        this.readRef = bridgeRef.asCPointer()
-                        this.readChunk = staticCFunction(::uploadReadChunk)
-                        this.totalLength = contentLength ?: -1L
-                    }
-                    val handle = CreateCurlClient(logTag)
                     configureCurlRuntime(handle, request)
-                    taskMap[request.requestId] = handle
-                    logI("[$logTag] upload-stream transport task add, id:${request.requestId}, " +
-                            "handle:${handle}, contentLength:${contentLength ?: -1}")
-                    StartUploadRequest(handle, curlRequest, source.ptr, callbackWrapper.getCallbackNativePtr())
-                    DeleteCurlClient(handle)
-                    taskMap.remove(request.requestId)
+                    val callback = object : ICurlCallback {
+                        override fun onResponse(result: CurlResponse) {
+                            nativeResponse = applyNegotiatedProtocol(
+                                handleCurlNativeResponse(result, logTag),
+                                handle
+                            )
+                        }
+                    }
+                    val callbackWrapper = CurlCallbackWrapper(callback)
+                    val bridgeRef = StableRef.create(bridge)
+                    try {
+                        val source = memScope.alloc<CurlUploadSource> {
+                            this.readRef = bridgeRef.asCPointer()
+                            this.readChunk = staticCFunction(::uploadReadChunk)
+                            this.totalLength = contentLength ?: -1L
+                        }
+                        taskMap[request.requestId] = handle
+                        logI("[$logTag] upload-stream transport task add, id:${request.requestId}, " +
+                                "handle:${handle}, contentLength:${contentLength ?: -1}")
+                        StartUploadRequest(handle, curlRequest, source.ptr, callbackWrapper.getCallbackNativePtr())
+                    } finally {
+                        if (taskMap[request.requestId] == handle) {
+                            taskMap.remove(request.requestId)
+                        }
+                        bridgeRef.dispose()
+                        callbackWrapper.release()
+                    }
                 } finally {
-                    bridgeRef.dispose()
-                    callbackWrapper.release()
+                    DeleteCurlClient(handle)
                 }
                 // Built inline (like streamRequest's onComplete): responseCallback
                 // is typed (VBTransportResponse) -> Unit, narrower than

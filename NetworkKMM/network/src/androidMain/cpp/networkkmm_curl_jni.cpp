@@ -188,6 +188,7 @@ void OnComplete(void *callback_ref, CurlResponse *response) {
     jstring java_headers = NewString(context->env, headers.c_str());
     jstring java_redirect = NewString(context->env, value->redirectUrl);
     jbyteArray java_data = NewByteArray(context->env, value->data, value->dataLen);
+    jstring java_protocol = NewString(context->env, GetCurlNegotiatedProtocol(context->client));
 
     context->env->CallVoidMethod(
         context->callback,
@@ -198,6 +199,7 @@ void OnComplete(void *callback_ref, CurlResponse *response) {
         java_headers,
         java_redirect,
         java_data,
+        java_protocol,
         static_cast<jdouble>(value->elapse.nameLookupTimeMs),
         static_cast<jdouble>(value->elapse.connectTimeMs),
         static_cast<jdouble>(value->elapse.sslCostTimeMs),
@@ -211,6 +213,7 @@ void OnComplete(void *callback_ref, CurlResponse *response) {
     context->env->DeleteLocalRef(java_error);
     context->env->DeleteLocalRef(java_headers);
     context->env->DeleteLocalRef(java_redirect);
+    context->env->DeleteLocalRef(java_protocol);
     if (java_data != nullptr) {
         context->env->DeleteLocalRef(java_data);
     }
@@ -225,7 +228,7 @@ bool PopulateCallbackMethods(JNIEnv *env, jobject callback, CallbackContext *con
     context->on_complete = env->GetMethodID(
         callback_class,
         "onComplete",
-        "(IJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[BDDDDDDDD)V"
+        "(IJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[BLjava/lang/String;DDDDDDDD)V"
     );
     env->DeleteLocalRef(callback_class);
     return !env->ExceptionCheck() && context->on_response_start != nullptr && context->on_chunk != nullptr &&
@@ -253,6 +256,7 @@ void NativePerform(
     jlong upload_content_length,
     jstring ca_info_path,
     jstring proxy_url,
+    jboolean http3_enabled,
     jint mode,
     jobject callback
 ) {
@@ -325,6 +329,12 @@ void NativePerform(
     context.client = client;
     SetCurlCaInfo(client, ca_chars.get());
     SetCurlProxy(client, proxy_chars.get());
+    if (SetCurlHttp3Enabled(client, http3_enabled == JNI_TRUE ? 1 : 0) == 0) {
+        InvokeEngineFailure(&context, "HTTP/3 requested but native curl backend is unavailable");
+        context.client = nullptr;
+        DeleteCurlClient(client);
+        return;
+    }
     {
         std::lock_guard<std::mutex> lock(g_clients_mutex);
         g_clients[request_id] = client;
@@ -371,6 +381,10 @@ void NativeCancel(JNIEnv *, jclass, jint request_id) {
     }
 }
 
+jboolean NativeSupportsHttp3(JNIEnv *, jclass) {
+    return CurlSupportsHttp3() != 0 ? JNI_TRUE : JNI_FALSE;
+}
+
 }  // namespace
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
@@ -387,7 +401,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
             const_cast<char *>("nativePerform"),
             const_cast<char *>(
                 "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;J[BJLjava/lang/String;"
-                "Ljava/lang/String;ILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)V"
+                "Ljava/lang/String;ZILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)V"
             ),
             reinterpret_cast<void *>(NativePerform)
         },
@@ -395,6 +409,11 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
             const_cast<char *>("nativeCancel"),
             const_cast<char *>("(I)V"),
             reinterpret_cast<void *>(NativeCancel)
+        },
+        {
+            const_cast<char *>("nativeSupportsHttp3"),
+            const_cast<char *>("()Z"),
+            reinterpret_cast<void *>(NativeSupportsHttp3)
         }
     };
     const jint result = env->RegisterNatives(bridge_class, methods, sizeof(methods) / sizeof(methods[0]));

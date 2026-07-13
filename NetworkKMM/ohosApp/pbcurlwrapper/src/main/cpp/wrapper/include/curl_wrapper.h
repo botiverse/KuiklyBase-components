@@ -135,6 +135,27 @@ void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath);
 // disables environment/system proxy discovery for direct mode.
 void SetCurlProxy(CurClientHandle handle, const char *proxyUrl);
 
+// Add one libcurl CURLOPT_RESOLVE entry for this client. The entry is copied
+// and follows libcurl's "host:port:address[,address]" format. This preserves
+// the URL hostname for TLS SNI/verification while allowing a caller to supply
+// an already-resolved address. Empty clears the override.
+int SetCurlResolve(CurClientHandle handle, const char *resolveEntry);
+
+// Runtime artifact capability probe. Version numbers alone are insufficient:
+// this checks libcurl's compiled feature bits for an actual HTTP/3 backend.
+int CurlSupportsHttp3(void);
+
+// Select explicit HTTP/3-with-fallback for this client. Disabled clients are
+// pinned to HTTP/2-over-TLS with HTTP/1.1 fallback and use a separate shared
+// connection pool, so an earlier gray request cannot upgrade default traffic
+// through connection reuse. Returns 0 only when HTTP/3 was requested but the
+// linked artifact lacks the backend.
+int SetCurlHttp3Enabled(CurClientHandle handle, int enabled);
+
+// Actual protocol negotiated by the completed request. The returned pointer
+// is a process-lifetime string literal ("h3", "h2", "http/1.1", etc.).
+const char *GetCurlNegotiatedProtocol(CurClientHandle handle);
+
 // Curl 发送请求
 void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback);
 

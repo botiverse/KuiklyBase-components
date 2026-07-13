@@ -22,6 +22,7 @@ import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.NetworkTransferProgress
+import com.tencent.kmm.network.export.toNetworkHttpProtocol
 import com.tencent.kmm.network.service.classifyNetworkErrorKind
 
 internal fun CurlNativeResponse.toNetworkResponse(request: NetworkRequest): NetworkResponse {
@@ -63,7 +64,8 @@ internal fun CurlNativeResponse.toNetworkResponse(request: NetworkRequest): Netw
             }
         ),
         error = error,
-        timing = elapse
+        timing = elapse,
+        protocol = elapse.protocol.toNetworkHttpProtocol()
     )
 }
 

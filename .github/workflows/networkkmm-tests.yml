@@ -84,6 +84,15 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      - name: Stage pinned public CA for HTTP/3 runtime gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_dir="NetworkKMM/network/src/androidTest/assets"
+          mkdir -p "$asset_dir"
+          NetworkKMM/scripts/prepare-app-owned-ca-bundle.sh \
+            "$asset_dir/networkkmm-cacert.pem"
+
       - name: Run committed Android curl artifact runtime gate
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -138,7 +147,7 @@ jobs:
         run: kill "$(cat /tmp/test-server.pid)" 2>/dev/null || true
 
   ios-curl-runtime-tests:
-    name: iOS curl runtime tests (Simulator arm64)
+    name: iOS curl runtime tests (Simulator)
     runs-on: macos-latest
     steps:
       - name: Check out repository
@@ -153,6 +162,17 @@ jobs:
       - name: Run production iOS curl runtime tests
         shell: bash
         run: NetworkKMM/scripts/run-ios-curl-runtime-tests.sh
+
+      - name: Upload iOS curl test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-ios-curl-test-reports
+          path: |
+            NetworkKMM/network/build/reports/tests/iosSimulatorArm64Test/
+            NetworkKMM/network/build/test-results/iosSimulatorArm64Test/
+            NetworkKMM/network/build/reports/tests/iosX64Test/
+            NetworkKMM/network/build/test-results/iosX64Test/
 
   ohos-tree:
     name: OHOS tree compile & publication metadata (:network)

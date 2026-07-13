@@ -165,6 +165,7 @@ jobs:
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libopenssl.so
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libc++_shared.so
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libcurl.a
+            NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libnghttp3.a
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
 
       - name: Commit refreshed binaries back

@@ -86,7 +86,7 @@ data class NetworkCurlRuntimeConfiguration(
     val proxy: NetworkCurlProxyConfiguration,
     /** Reserved gate. Custom DNS is rejected until a SNI-safe resolver contract lands. */
     val httpDnsEnabled: Boolean = false,
-    /** Reserved gate. Current native artifacts contain no QUIC/HTTP3 backend. */
+    /** Explicit gray gate. Native capability is probed before a request can use HTTP/3. */
     val http3Enabled: Boolean = false
 )
 

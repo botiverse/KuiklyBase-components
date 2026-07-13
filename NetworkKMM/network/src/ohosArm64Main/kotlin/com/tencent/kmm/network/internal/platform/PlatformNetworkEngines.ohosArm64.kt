@@ -16,9 +16,11 @@
  */
 package com.tencent.kmm.network.internal.platform
 
+import com.tencent.qqlive.kmm.native.libcurl.CurlSupportsHttp3
 import com.tencent.kmm.network.service.NetworkEngine
 import com.tencent.kmm.network.service.NetworkTransportEngine
 import com.tencent.kmm.network.service.VBTransportNetworkEngine
+import kotlinx.cinterop.ExperimentalForeignApi
 
 internal actual val platformDefaultNetworkTransportEngine: NetworkTransportEngine =
     NetworkTransportEngine.CURL
@@ -28,3 +30,6 @@ internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine)
         NetworkTransportEngine.KTOR -> null
         NetworkTransportEngine.CURL -> VBTransportNetworkEngine
     }
+
+@OptIn(ExperimentalForeignApi::class)
+internal actual fun platformCurlSupportsHttp3(): Boolean = CurlSupportsHttp3() != 0

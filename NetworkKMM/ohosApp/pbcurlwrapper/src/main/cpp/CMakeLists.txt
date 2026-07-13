@@ -36,7 +36,6 @@ set(PB_LIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../libs/arm64-v8a)
 # must precede it in link order. These replace the old system libz.so link,
 # which was vestigial while libcurl had CURL_ZLIB=OFF.
 target_link_libraries(pbcurlwrapper PUBLIC
-        ${PB_LIBS_DIR}/libopenssl.so
         libhilog_ndk.z.so
         "-Wl,-Bsymbolic,--gc-sections,--whole-archive"
         ${PB_LIBS_DIR}/libcurl.a
@@ -46,4 +45,6 @@ target_link_libraries(pbcurlwrapper PUBLIC
         ${PB_LIBS_DIR}/libbrotlicommon.a
         ${PB_LIBS_DIR}/libzstd.a
         ${PB_LIBS_DIR}/libnghttp2.a
+        ${PB_LIBS_DIR}/libnghttp3.a
+        ${PB_LIBS_DIR}/libopenssl.so
 )

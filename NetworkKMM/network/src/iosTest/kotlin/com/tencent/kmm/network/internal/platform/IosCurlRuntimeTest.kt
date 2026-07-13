@@ -22,6 +22,7 @@ import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
 import com.tencent.kmm.network.export.NetworkCurlTrustStore
 import com.tencent.kmm.network.export.NetworkErrorKind
+import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
@@ -44,6 +45,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -74,6 +76,56 @@ class IosCurlRuntimeTest {
         } finally {
             VBTransportCurl.clear()
         }
+    }
+
+    @Test
+    fun productionEngineNegotiatesHttp3AndPreservesFallbackContract() = runBlocking {
+        val h3Url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_HTTP3_URL") ?: return@runBlocking
+        val fallbackUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_H2_FALLBACK_URL")
+            ?: return@runBlocking
+        val totalFailureUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_TOTAL_FAILURE_URL")
+            ?: return@runBlocking
+        val caPath = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_PUBLIC_CA_PATH") ?: return@runBlocking
+        val caSha = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_PUBLIC_CA_SHA256") ?: return@runBlocking
+        assertTrue(IosCurlCInteropBridge.supportsHttp3)
+        val resolveEntries = buildMap {
+            runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_HTTP3_RESOLVE")?.let { put(h3Url, it) }
+            runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_H2_FALLBACK_RESOLVE")?.let {
+                put(fallbackUrl, it)
+            }
+        }
+        val engine = IosCurlNetworkEngine(
+            IosCurlResolveOverrideBridge(IosCurlCInteropBridge, resolveEntries)
+        )
+
+        configureRuntime(caPath, caSha, http3Enabled = true)
+        val h3Attempt = executeExternal(engine, h3Url)
+        val h3 = h3Attempt.response
+        val h3Diagnostic = h3.runtimeDiagnostic("h3", h3Url, h3Attempt.attempts)
+        assertTrue(h3.isSuccess, h3Diagnostic)
+        assertEquals(NetworkHttpProtocol.HTTP_3, h3.protocol, h3Diagnostic)
+
+        // The h3 connection above remains pooled. Default traffic must use
+        // the separate h2/h1 pool instead of silently reusing that connection.
+        configureRuntime(caPath, caSha)
+        val defaultAttempt = executeExternal(engine, h3Url)
+        val defaultH2 = defaultAttempt.response
+        val defaultDiagnostic = defaultH2.runtimeDiagnostic("default", h3Url, defaultAttempt.attempts)
+        assertTrue(defaultH2.isSuccess, defaultDiagnostic)
+        assertEquals(NetworkHttpProtocol.HTTP_2, defaultH2.protocol, defaultDiagnostic)
+
+        configureRuntime(caPath, caSha, http3Enabled = true)
+        val fallbackAttempt = executeExternal(engine, fallbackUrl)
+        val fallback = fallbackAttempt.response
+        val fallbackDiagnostic = fallback.runtimeDiagnostic("fallback", fallbackUrl, fallbackAttempt.attempts)
+        assertTrue(fallback.isSuccess, fallbackDiagnostic)
+        assertEquals(NetworkHttpProtocol.HTTP_2, fallback.protocol, fallbackDiagnostic)
+
+        val totalFailure = execute(engine, totalFailureUrl)
+        val failureDiagnostic = totalFailure.runtimeDiagnostic("total-failure", totalFailureUrl)
+        assertFalse(totalFailure.isSuccess, failureDiagnostic)
+        assertEquals(NetworkErrorKind.CONNECT, totalFailure.error?.kind, failureDiagnostic)
+        assertEquals(NetworkHttpProtocol.UNKNOWN, totalFailure.protocol, failureDiagnostic)
     }
 
     @Test
@@ -256,12 +308,14 @@ class IosCurlRuntimeTest {
     private fun configureRuntime(
         caPath: String,
         caSha256: String,
-        proxy: NetworkCurlProxyConfiguration = NetworkCurlProxyConfiguration.direct()
+        proxy: NetworkCurlProxyConfiguration = NetworkCurlProxyConfiguration.direct(),
+        http3Enabled: Boolean = false
     ) {
         val status = VBTransportCurl.configure(
             NetworkCurlRuntimeConfiguration(
                 trustStore = NetworkCurlTrustStore(caPath, caSha256),
-                proxy = proxy
+                proxy = proxy,
+                http3Enabled = http3Enabled
             )
         )
         assertTrue(status.configured, status.detail)
@@ -275,6 +329,67 @@ class IosCurlRuntimeTest {
         return engine.execute(request, NetworkCall(request))
     }
 
+    private suspend fun executeExternal(
+        engine: com.tencent.kmm.network.service.NetworkEngine,
+        url: String
+    ): RuntimeAttempt {
+        for (attempt in 1..6) {
+            val response = execute(engine, url)
+            if (response.error?.kind != NetworkErrorKind.DNS || attempt == 6) {
+                return RuntimeAttempt(response, attempt)
+            }
+            // The hosted iOS simulator can launch before its external resolver
+            // is ready. Retry only DNS readiness; all transport/protocol results
+            // leave this loop immediately and remain strict assertions above.
+            delay(1_000)
+        }
+        error("unreachable")
+    }
+
+    private fun NetworkResponse.runtimeDiagnostic(
+        label: String,
+        url: String,
+        attempts: Int = 1
+    ): String =
+        "$label url=$url attempts=$attempts status=$statusCode protocol=$protocol " +
+            "errorKind=${error?.kind} error=${error?.message}"
+
     private fun runtimeEnvironment(name: String): String? =
         getenv(name)?.toKString()?.takeIf(String::isNotBlank)
+
+    private data class RuntimeAttempt(
+        val response: NetworkResponse,
+        val attempts: Int
+    )
+
+    private class IosCurlResolveOverrideBridge(
+        private val delegate: IosCurlNativeBridge,
+        private val entriesByUrl: Map<String, String>
+    ) : IosCurlNativeBridge {
+        override val isAvailable: Boolean
+            get() = delegate.isAvailable
+        override val supportsHttp3: Boolean
+            get() = delegate.supportsHttp3
+
+        override suspend fun execute(request: IosCurlNativeRequest) =
+            delegate.execute(request.withResolveEntry())
+
+        override suspend fun downloadStream(
+            request: IosCurlNativeRequest,
+            onResponseStart: (Long, String) -> Unit,
+            onChunk: (ByteArray) -> Unit
+        ) = delegate.downloadStream(request.withResolveEntry(), onResponseStart, onChunk)
+
+        override suspend fun uploadStream(
+            request: IosCurlNativeRequest,
+            source: IosCurlUploadSource
+        ) = delegate.uploadStream(request.withResolveEntry(), source)
+
+        override fun cancel(requestId: Int) {
+            delegate.cancel(requestId)
+        }
+
+        private fun IosCurlNativeRequest.withResolveEntry(): IosCurlNativeRequest =
+            copy(resolveEntry = entriesByUrl[url])
+    }
 }
