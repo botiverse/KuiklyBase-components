@@ -15,6 +15,19 @@ MISMATCH_PORT=$((PORT + 3))
 PROXY_PORT=$((PORT + 4))
 PROXY_MARKER="${RUNTIME_ROOT}/proxy-connect.log"
 
+case "$(uname -m)" in
+  arm64)
+    IOS_CURL_TEST_TASK="iosSimulatorArm64Test"
+    ;;
+  x86_64)
+    IOS_CURL_TEST_TASK="iosX64Test"
+    ;;
+  *)
+    echo "Unsupported macOS runner architecture: $(uname -m)" >&2
+    exit 2
+    ;;
+esac
+
 boot_ios_simulator() {
   local device_id
   device_id="$(xcrun simctl list devices available -j | python3 -c '
@@ -115,8 +128,9 @@ export SIMCTL_CHILD_NETWORKKMM_IOS_CURL_RUNTIME_MISMATCH_URL="$NETWORKKMM_IOS_CU
 export SIMCTL_CHILD_NETWORKKMM_IOS_CURL_RUNTIME_PROXY_URL="$NETWORKKMM_IOS_CURL_RUNTIME_PROXY_URL"
 
 cd "$NETWORK_ROOT"
+echo "running ${IOS_CURL_TEST_TASK} on $(uname -m)"
 ./gradlew \
-  :network:iosSimulatorArm64Test \
+  ":network:${IOS_CURL_TEST_TASK}" \
   --tests 'com.tencent.kmm.network.internal.platform.IosCurlRuntimeTest' \
   --rerun-tasks \
   --no-daemon \

@@ -147,8 +147,12 @@ jobs:
         run: kill "$(cat /tmp/test-server.pid)" 2>/dev/null || true
 
   ios-curl-runtime-tests:
-    name: iOS curl runtime tests (Simulator arm64)
-    runs-on: macos-latest
+    name: iOS curl runtime tests (Simulator x86_64)
+    # macos-latest currently resolves to the macOS 26 arm64 preview image,
+    # whose booted simulator has persistently failed external DNS. The
+    # production XCFramework contains both simulator architectures, so run
+    # the external protocol gate on the supported Intel image instead.
+    runs-on: macos-15-intel
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -171,6 +175,8 @@ jobs:
           path: |
             NetworkKMM/network/build/reports/tests/iosSimulatorArm64Test/
             NetworkKMM/network/build/test-results/iosSimulatorArm64Test/
+            NetworkKMM/network/build/reports/tests/iosX64Test/
+            NetworkKMM/network/build/test-results/iosX64Test/
 
   ohos-tree:
     name: OHOS tree compile & publication metadata (:network)
