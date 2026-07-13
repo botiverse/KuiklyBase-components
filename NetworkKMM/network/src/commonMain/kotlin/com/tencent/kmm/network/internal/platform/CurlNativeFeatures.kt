@@ -16,19 +16,5 @@
  */
 package com.tencent.kmm.network.internal.platform
 
-import com.tencent.kmm.network.service.NetworkEngine
-import com.tencent.kmm.network.service.NetworkTransportEngine
-import com.tencent.kmm.network.service.VBTransportNetworkEngine
-
-// The conditional macOS target exists only to run the iOS Darwin behavior
-// suite natively. iOS-only curl cinterop is intentionally outside this lane.
-internal actual val platformDefaultNetworkTransportEngine: NetworkTransportEngine =
-    NetworkTransportEngine.KTOR
-
-internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine): NetworkEngine? =
-    when (engine) {
-        NetworkTransportEngine.KTOR -> VBTransportNetworkEngine
-        NetworkTransportEngine.CURL -> null
-    }
-
-internal actual fun platformCurlSupportsHttp3(): Boolean = false
+/** True only when the linked curl artifact reports CURL_VERSION_HTTP3. */
+internal expect fun platformCurlSupportsHttp3(): Boolean

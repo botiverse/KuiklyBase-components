@@ -250,11 +250,33 @@ val client = NetworkClient(
 ```
 
 The stable bucket and rollout inputs are available in selection diagnostics without exposing the cohort
-key. `forcePlatformDefault` is the immediate rollback switch. HTTPDNS and HTTP/3 remain explicit gates:
-setting `httpDnsEnabled` or `http3Enabled` makes curl ineligible with `HTTPDNS_UNSUPPORTED` or
-`HTTP3_UNSUPPORTED`. Current artifacts do not implement an SNI-safe custom resolver and are not built
-with a QUIC backend. `NetworkEngineCapabilities` reports the same truth through `httpDns` and `http3`;
-do not infer support from the libcurl version alone.
+key. `forcePlatformDefault` is the immediate rollback switch. HTTPDNS remains unavailable because there
+is no SNI-safe custom resolver contract; setting `httpDnsEnabled` makes curl ineligible with
+`HTTPDNS_UNSUPPORTED`.
+
+HTTP/3 is an explicit native curl gray gate. The current Android, iOS, and OHOS curl artifacts build
+curl 8.16.0 with OpenSSL 3.5.4 QUIC and nghttp3 1.17.0. Enable it only in the verified curl runtime
+configuration:
+
+```kotlin
+VBTransportCurl.configure(
+    NetworkCurlRuntimeConfiguration(
+        trustStore = NetworkCurlTrustStore(caPath, caSha256),
+        proxy = NetworkCurlProxyConfiguration.direct(),
+        http3Enabled = remoteHttp3GrayEnabled
+    )
+)
+```
+
+`http3Enabled = false` remains the default and pins requests to h2-over-TLS with h1.1 fallback.
+Explicit h3 requests use `CURL_HTTP_VERSION_3`, not `3ONLY`, so a server or network without QUIC falls
+back to h2/h1.1. Default and h3 traffic use separate native connection pools; a live gray h3 connection
+cannot silently upgrade a later default request. `NetworkResponse.protocol` reports the actual result
+(`HTTP_3`, `HTTP_2`, and so on). Runtime eligibility is based on `CURL_VERSION_HTTP3` from the linked
+artifact, not the libcurl version string; a stale artifact fails with `HTTP3_UNSUPPORTED` before native
+I/O. Android and iOS still select OkHttp/Darwin by default, while OHOS remains the default curl consumer.
+
+`NetworkEngineCapabilities` reports the same runtime truth through `httpDns` and `http3`.
 
 `NetworkEngineSelectionDiagnostics.capabilities` always describes the engine that was actually
 selected, not the requested engine.

@@ -35,13 +35,40 @@
 
 using namespace std;
 
-bool curlGlobalInited = false;
+static std::once_flag gCurlGlobalInitFlag;
+static CURLcode gCurlGlobalInitResult = CURLE_FAILED_INIT;
 
-// Connection pooling across the per-request easy handles: a process-wide
-// share handle pools connections, DNS entries, and TLS sessions, so a fresh
-// easy handle per request no longer means a fresh TCP+TLS handshake each
-// time. Guarded by per-lock-kind mutexes as libcurl requires.
-static CURLSH *gCurlShare = nullptr;
+static bool EnsureCurlGlobalInit() {
+    std::call_once(gCurlGlobalInitFlag, []() {
+        gCurlGlobalInitResult = curl_global_init(CURL_GLOBAL_DEFAULT);
+    });
+    return gCurlGlobalInitResult == CURLE_OK;
+}
+
+static const char *CurlProtocolName(long httpVersion) {
+    if (httpVersion == CURL_HTTP_VERSION_3 || httpVersion == CURL_HTTP_VERSION_3ONLY) {
+        return "h3";
+    }
+    if (httpVersion == CURL_HTTP_VERSION_2_0) {
+        return "h2";
+    }
+    if (httpVersion == CURL_HTTP_VERSION_1_1) {
+        return "http/1.1";
+    }
+    if (httpVersion == CURL_HTTP_VERSION_1_0) {
+        return "http/1.0";
+    }
+    return "unknown";
+}
+
+// Connection pooling across the per-request easy handles. libcurl documents
+// CURLOPT_HTTP_VERSION as a preference and may otherwise reuse a connection
+// negotiated at another version. Keep default h2/h1 traffic and explicit h3
+// gray traffic in separate connection caches so a prior h3 request cannot
+// silently upgrade a default request. DNS/TLS sharing remains pooled within
+// each cohort. Guarded by per-lock-kind mutexes as libcurl requires.
+static CURLSH *gCurlDefaultShare = nullptr;
+static CURLSH *gCurlHttp3Share = nullptr;
 static std::mutex gShareInitMutex;
 static std::mutex gShareDataMutexes[CURL_LOCK_DATA_LAST];
 
@@ -57,29 +84,29 @@ static void ShareUnlockCallback(CURL *handle, curl_lock_data data, void *userptr
     }
 }
 
-static CURLSH *GetCurlShare() {
+static CURLSH *GetCurlShare(bool http3Enabled) {
     std::lock_guard<std::mutex> guard(gShareInitMutex);
-    if (gCurlShare == nullptr) {
-        gCurlShare = curl_share_init();
-        if (gCurlShare != nullptr) {
-            curl_share_setopt(gCurlShare, CURLSHOPT_LOCKFUNC, ShareLockCallback);
-            curl_share_setopt(gCurlShare, CURLSHOPT_UNLOCKFUNC, ShareUnlockCallback);
-            curl_share_setopt(gCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
-            curl_share_setopt(gCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
-            curl_share_setopt(gCurlShare, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
+    CURLSH **slot = http3Enabled ? &gCurlHttp3Share : &gCurlDefaultShare;
+    if (*slot == nullptr) {
+        *slot = curl_share_init();
+        if (*slot != nullptr) {
+            curl_share_setopt(*slot, CURLSHOPT_LOCKFUNC, ShareLockCallback);
+            curl_share_setopt(*slot, CURLSHOPT_UNLOCKFUNC, ShareUnlockCallback);
+            curl_share_setopt(*slot, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
+            curl_share_setopt(*slot, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
+            curl_share_setopt(*slot, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
         }
     }
-    return gCurlShare;
+    return *slot;
 }
 class CurlClient {
  public:
     explicit CurlClient(std::string logTag) {
         log_tag_ = logTag;
         logI(log_tag_, "CurlClient() execute.");
-        // 初始化 curl
-        if (!curlGlobalInited) {
-            curl_global_init(CURL_GLOBAL_DEFAULT);
-            curlGlobalInited = true;
+        if (!EnsureCurlGlobalInit()) {
+            logE(log_tag_, "curl_global_init() failed: " + std::to_string(gCurlGlobalInitResult));
+            return;
         }
         curl_ = curl_easy_init();
 
@@ -373,9 +400,20 @@ class CurlClient {
         curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
         curl_easy_setopt(curl_, CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200L);
         // Pool connections/DNS/TLS sessions across per-request easy handles.
-        CURLSH *share = GetCurlShare();
+        CURLSH *share = GetCurlShare(http3_enabled_);
         if (share != nullptr) {
             curl_easy_setopt(curl_, CURLOPT_SHARE, share);
+        }
+        // Default requests are explicitly capped at h2/h1.1. Gray HTTP/3
+        // requests use CURL_HTTP_VERSION_3, whose documented semantics race
+        // QUIC and fall back to h2/h1.1; 3ONLY is intentionally never used.
+        const long requestedHttpVersion = http3_enabled_
+            ? CURL_HTTP_VERSION_3
+            : CURL_HTTP_VERSION_2TLS;
+        CURLcode httpVersionResult = curl_easy_setopt(curl_, CURLOPT_HTTP_VERSION, requestedHttpVersion);
+        if (httpVersionResult != CURLE_OK) {
+            logE(log_tag_, "CURLOPT_HTTP_VERSION failed: " + std::to_string(httpVersionResult));
+            return false;
         }
 
         // SSL: verify the server certificate chain and hostname (raft.2). The
@@ -689,15 +727,7 @@ class CurlClient {
         // connection actually ran HTTP/2 after the nghttp2 build-line change.
         long httpVersion = 0;
         curl_easy_getinfo(curl_, CURLINFO_HTTP_VERSION, &httpVersion);
-        std::string protocol = "http/1.x";
-        if (httpVersion == CURL_HTTP_VERSION_2_0) {
-            protocol = "h2";
-        } else if (httpVersion == CURL_HTTP_VERSION_3) {
-            protocol = "h3";
-        } else if (httpVersion == CURL_HTTP_VERSION_1_1) {
-            protocol = "http/1.1";
-        }
-        logI(log_tag_, "transport_protocol http_version=" + protocol);
+        logI(log_tag_, std::string("transport_protocol http_version=") + CurlProtocolName(httpVersion));
 
         logI(log_tag_, "request statistics, nameLookupTime:" + std::to_string(nameLookupTime) + ", connectTime:"
             + std::to_string(connectTime) + ", sslCostTime:" + std::to_string(sslCostTime) + ", preTransferTime:"
@@ -729,9 +759,28 @@ class CurlClient {
         proxy_url_ = proxyUrl == nullptr ? "" : proxyUrl;
     }
 
+    bool SetHttp3Enabled(bool enabled) {
+        if (enabled && !CurlSupportsHttp3()) {
+            return false;
+        }
+        http3_enabled_ = enabled;
+        return true;
+    }
+
+    const char *GetNegotiatedProtocol() {
+        if (curl_ == nullptr) {
+            return "unknown";
+        }
+        long httpVersion = 0;
+        if (curl_easy_getinfo(curl_, CURLINFO_HTTP_VERSION, &httpVersion) != CURLE_OK) {
+            return "unknown";
+        }
+        return CurlProtocolName(httpVersion);
+    }
+
  private:
     std::string log_tag_;
-    CURL *curl_;
+    CURL *curl_ = nullptr;
     struct curl_slist *header_list_ = nullptr;
     char curl_error_msg_[CURL_ERROR_SIZE];
     std::string headers_;
@@ -751,6 +800,7 @@ class CurlClient {
     // Streaming forces Accept-Encoding: identity so Content-Length matches the
     // bytes delivered to onChunk (determinate progress, no transparent decode).
     bool stream_mode_ = false;
+    bool http3_enabled_ = false;
 };
 
 void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback) {
@@ -814,4 +864,26 @@ void SetCurlProxy(CurClientHandle handle, const char *proxyUrl) {
         return;
     }
     reinterpret_cast<CurlClient *>(handle)->SetProxy(proxyUrl);
+}
+
+int CurlSupportsHttp3(void) {
+    if (!EnsureCurlGlobalInit()) {
+        return 0;
+    }
+    const curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
+    return info != nullptr && (info->features & CURL_VERSION_HTTP3) != 0 ? 1 : 0;
+}
+
+int SetCurlHttp3Enabled(CurClientHandle handle, int enabled) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    return reinterpret_cast<CurlClient *>(handle)->SetHttp3Enabled(enabled != 0) ? 1 : 0;
+}
+
+const char *GetCurlNegotiatedProtocol(CurClientHandle handle) {
+    if (handle == nullptr) {
+        return "unknown";
+    }
+    return reinterpret_cast<CurlClient *>(handle)->GetNegotiatedProtocol();
 }

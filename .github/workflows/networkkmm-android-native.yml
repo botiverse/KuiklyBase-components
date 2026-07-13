@@ -48,9 +48,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      # OpenSSL/curl cross-compiles dominate the wall clock; cache their build
-      # trees keyed on everything that changes the bits.
-      - name: Cache OpenSSL/curl build trees
+      # OpenSSL/curl/nghttp2/nghttp3 cross-compiles dominate the wall clock;
+      # cache their build trees keyed on everything that changes the bits.
+      - name: Cache native dependency build trees
         uses: actions/cache@v4
         with:
           path: NetworkKMM/build/android-curl/${{ matrix.abi }}

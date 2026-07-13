@@ -37,6 +37,7 @@ import com.tencent.kmm.network.service.curlRuntimeFailureResponse
 import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
 import com.tencent.kmm.network.service.prepareCurlRuntime
 import com.tencent.kmm.network.service.preparedCurlCaInfoPath
+import com.tencent.kmm.network.service.preparedCurlHttp3Enabled
 import com.tencent.kmm.network.service.preparedCurlProxyUrl
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -50,6 +51,9 @@ internal object IosCurlEngineProvider {
     val nativeLinked: Boolean
         get() = (testBridge ?: IosCurlCInteropBridge).isAvailable
 
+    val nativeSupportsHttp3: Boolean
+        get() = (testBridge ?: IosCurlCInteropBridge).supportsHttp3
+
     fun resolve(): NetworkEngine? {
         val bridge = testBridge ?: IosCurlCInteropBridge
         return bridge.takeIf { it.isAvailable }?.let(::IosCurlNetworkEngine)
@@ -60,13 +64,13 @@ internal class IosCurlNetworkEngine(
     private val bridge: IosCurlNativeBridge
 ) : NetworkEngine {
     override val capabilities
-        get() = curlNetworkEngineCapabilities()
+        get() = curlNetworkEngineCapabilities(bridge.supportsHttp3)
 
     override fun availability(request: NetworkRequest): NetworkEngineAvailability =
-        prepareCurlRuntime(request)
+        prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
 
     override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
-        val availability = prepareCurlRuntime(request)
+        val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         networkUploadStreamSourceOrNull(request)?.let { source ->
             return executeUpload(request, call, source)
@@ -103,7 +107,7 @@ internal class IosCurlNetworkEngine(
         onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
         onChunk: (ByteArray) -> Unit
     ): NetworkResponse {
-        val availability = prepareCurlRuntime(request)
+        val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         val requestId = VBPBRequestIdGenerator.getRequestId()
         val nativeRequest = request.toNativeRequest(requestId = requestId)
@@ -139,7 +143,7 @@ internal class IosCurlNetworkEngine(
         call: NetworkCall,
         source: NetworkUploadStreamSource
     ): NetworkResponse = coroutineScope {
-        val availability = prepareCurlRuntime(request)
+        val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
         if (!availability.available) return@coroutineScope curlRuntimeFailureResponse(request, availability)
         if (request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) {
             return@coroutineScope unsupportedStreamingRequestBodyResponse(request)
@@ -216,7 +220,8 @@ internal class IosCurlNetworkEngine(
             },
             proxyUrl = checkNotNull(preparedCurlProxyUrl(this)) {
                 "Curl proxy decision missing after runtime preparation"
-            }
+            },
+            http3Enabled = preparedCurlHttp3Enabled(this)
         )
     }
 

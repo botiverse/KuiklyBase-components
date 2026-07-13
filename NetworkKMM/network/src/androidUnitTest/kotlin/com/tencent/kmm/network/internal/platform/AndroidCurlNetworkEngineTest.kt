@@ -21,6 +21,7 @@ import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
 import com.tencent.kmm.network.export.NetworkErrorKind
+import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkTransferProgress
@@ -149,6 +150,58 @@ class AndroidCurlNetworkEngineTest {
         AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
 
         assertEquals("http://127.0.0.1:8888", bridge.lastRequest?.proxyUrl)
+    }
+
+    @Test
+    fun http3OptInRequiresNativeFeatureAndReachesTheRequest() = runBlocking {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.direct(),
+                http3Enabled = true
+            )
+        )
+        val bridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(
+                code = 0,
+                httpCode = 200,
+                elapse = VBTransportElapseStatistics(protocol = "h3")
+            )
+        }
+        val request = NetworkRequest(url = "https://example.test")
+        val engine = AndroidCurlNetworkEngine(bridge)
+
+        val response = engine.execute(request, NetworkCall(request))
+
+        assertTrue(assertNotNull(bridge.lastRequest).http3Enabled)
+        assertTrue(engine.capabilities.http3.rolloutEligible)
+        assertEquals(NetworkHttpProtocol.HTTP_3, response.protocol)
+    }
+
+    @Test
+    fun http3OptInFailsClosedWhenArtifactLacksFeature() = runBlocking {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.direct(),
+                http3Enabled = true
+            )
+        )
+        val bridge = FakeBridge(supportsHttp3 = false)
+        val request = NetworkRequest(url = "https://example.test")
+        val engine = AndroidCurlNetworkEngine(bridge)
+
+        val response = engine.execute(request, NetworkCall(request))
+
+        assertNull(bridge.lastRequest)
+        assertFalse(engine.capabilities.http3.rolloutEligible)
+        assertTrue(response.error?.message?.contains("CURL_VERSION_HTTP3") == true)
     }
 
     @Test
@@ -556,7 +609,8 @@ class AndroidCurlNetworkEngineTest {
     }
 
     private open class FakeBridge(
-        override val isAvailable: Boolean = true
+        override val isAvailable: Boolean = true,
+        override val supportsHttp3: Boolean = false
     ) : AndroidCurlNativeBridge {
         var executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
         var streamResponse = CurlNativeResponse(code = 0, httpCode = 200)

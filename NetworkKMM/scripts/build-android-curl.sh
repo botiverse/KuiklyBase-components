@@ -18,6 +18,8 @@ OPENSSL_SHA256="${OPENSSL_SHA256:-967311f84955316969bdb1d8d4b983718ef42338639c62
 CURL_SHA256="${CURL_SHA256:-a21e20476e39eca5a4fc5cfb00acf84bbc1f5d8443ec3853ad14c26b3c85b970}"
 NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
 NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
+NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.17.0}"
+NGHTTP3_SHA256="${NGHTTP3_SHA256:-9635173e703174a41f9abd0d790e70562c74ec3805064403477db5a1ef94b8f5}"
 ANDROID_API="${ANDROID_API:-23}"
 ANDROID_ABI="${ANDROID_ABI:-arm64-v8a}"
 NDK_VERSION="${NDK_VERSION:-28.0.13004108}"
@@ -44,10 +46,14 @@ OPENSSL_STAMP="${OPENSSL_PREFIX}/.android-build-config"
 NGHTTP2_SOURCE="${BUILD_ROOT}/nghttp2-${NGHTTP2_VERSION}"
 NGHTTP2_BUILD="${BUILD_ROOT}/nghttp2-build"
 NGHTTP2_STAMP="${NGHTTP2_BUILD}/.android-build-config"
+NGHTTP3_SOURCE="${BUILD_ROOT}/nghttp3-${NGHTTP3_VERSION}"
+NGHTTP3_BUILD="${BUILD_ROOT}/nghttp3-build"
+NGHTTP3_PREFIX="${BUILD_ROOT}/nghttp3-out"
+NGHTTP3_STAMP="${NGHTTP3_PREFIX}/.android-build-config"
 CURL_SOURCE="${BUILD_ROOT}/curl-${CURL_VERSION}"
 CURL_BUILD="${BUILD_ROOT}/curl-build"
 CURL_STAMP="${CURL_BUILD}/.android-build-config"
-BUILD_CONFIG="${NDK_VERSION}:${ANDROID_API}:${ANDROID_ABI}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}"
+BUILD_CONFIG="${NDK_VERSION}:${ANDROID_API}:${ANDROID_ABI}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}"
 
 if [[ ! -f "$SHIM_SOURCE" ]]; then
   echo "JNI shim not found: $SHIM_SOURCE" >&2
@@ -148,6 +154,28 @@ if [[ ! -f "${NGHTTP2_BUILD}/lib/libnghttp2.a" || "$(cat "$NGHTTP2_STAMP" 2>/dev
   printf '%s' "$BUILD_CONFIG" > "$NGHTTP2_STAMP"
 fi
 
+echo "==> Building nghttp3 ${NGHTTP3_VERSION} for ${ANDROID_ABI}"
+fetch "https://github.com/ngtcp2/nghttp3/releases/download/v${NGHTTP3_VERSION}/nghttp3-${NGHTTP3_VERSION}.tar.gz" \
+  "${DOWNLOADS_DIR}/nghttp3-${NGHTTP3_VERSION}.tar.gz" "$NGHTTP3_SHA256"
+if [[ ! -f "${NGHTTP3_PREFIX}/lib/libnghttp3.a" || "$(cat "$NGHTTP3_STAMP" 2>/dev/null)" != "$BUILD_CONFIG" ]]; then
+  rm -rf "$NGHTTP3_SOURCE" "$NGHTTP3_BUILD" "$NGHTTP3_PREFIX"
+  tar -xzf "${DOWNLOADS_DIR}/nghttp3-${NGHTTP3_VERSION}.tar.gz" -C "$BUILD_ROOT"
+  cmake -S "$NGHTTP3_SOURCE" -B "$NGHTTP3_BUILD" \
+    -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI="$ANDROID_ABI" \
+    -DANDROID_PLATFORM="android-${ANDROID_API}" \
+    -DANDROID_STL=c++_static \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$NGHTTP3_PREFIX" \
+    -DENABLE_LIB_ONLY=ON \
+    -DENABLE_SHARED_LIB=OFF \
+    -DENABLE_STATIC_LIB=ON \
+    -DBUILD_TESTING=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
+  cmake --build "$NGHTTP3_BUILD" -j"$JOBS" --target install >/dev/null
+  printf '%s' "$BUILD_CONFIG" > "$NGHTTP3_STAMP"
+fi
+
 echo "==> Building curl ${CURL_VERSION} for ${ANDROID_ABI}"
 fetch "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/curl-${CURL_VERSION}.tar.gz" "$CURL_SHA256"
@@ -184,23 +212,40 @@ if [[ ! -f "${CURL_BUILD}/lib/libcurl.a" || "$(cat "$CURL_STAMP" 2>/dev/null)" !
     -DUSE_NGHTTP2=ON \
     -DNGHTTP2_INCLUDE_DIR="${NGHTTP2_SOURCE}/lib/includes" \
     -DNGHTTP2_LIBRARY="${NGHTTP2_BUILD}/lib/libnghttp2.a" \
+    -DUSE_OPENSSL_QUIC=ON \
+    -DNGHTTP3_INCLUDE_DIR="${NGHTTP3_PREFIX}/include" \
+    -DNGHTTP3_LIBRARY="${NGHTTP3_PREFIX}/lib/libnghttp3.a" \
     -DUSE_LIBIDN2=OFF \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
   cmake --build "$CURL_BUILD" -j"$JOBS" >/dev/null
   printf '%s' "$BUILD_CONFIG" > "$CURL_STAMP"
 fi
 
-# HTTP/2 hard gate: curl's cmake can silently fall back to h1-only if the
-# nghttp2 detection wobbles — assert the symbol REFERENCE in libcurl.a
-# (the final .so is stripped, so check the archive like the OHOS codec
-# gate). Here-string, not a pipe: grep -q + pipefail SIGPIPE lesson.
+# HTTP/2 + HTTP/3 hard gates: curl's cmake can silently drop an optional
+# backend if cross-compilation detection wobbles. Treat generated config as
+# the stable primary gate and pin-exact archive references as supplements.
+for define in USE_NGHTTP2 USE_OPENSSL_QUIC USE_NGHTTP3; do
+  if grep -q "#define ${define} 1" "$CURL_BUILD/lib/curl_config.h"; then
+    echo "curl_config.h ${define}: ENABLED"
+  else
+    echo "curl_config.h ${define}: MISSING" >&2
+    exit 2
+  fi
+done
 CURL_SYMS="$("${TOOLCHAIN_ROOT}/bin/llvm-nm" "$CURL_BUILD/lib/libcurl.a" 2>/dev/null || true)"
-if grep -qw "nghttp2_session_client_new3" <<<"$CURL_SYMS"; then
-  echo "libcurl HTTP/2 (nghttp2): ENABLED"
-else
-  echo "libcurl HTTP/2 (nghttp2): MISSING — nghttp2_session_client_new not referenced" >&2
-  exit 2
-fi
+check_curl_reference() {
+  local label="$1" symbol="$2"
+  if grep -qw "$symbol" <<<"$CURL_SYMS"; then
+    echo "libcurl ${label}: ENABLED (${symbol} referenced)"
+  else
+    echo "libcurl ${label}: MISSING — ${symbol} not referenced" >&2
+    exit 2
+  fi
+}
+check_curl_reference "HTTP/2 (nghttp2)" "nghttp2_session_client_new3"
+check_curl_reference "HTTP/3 (nghttp3)" "nghttp3_conn_client_new_versioned"
+check_curl_reference "HTTP/3 (OpenSSL stream)" "SSL_new_stream"
+check_curl_reference "HTTP/3 (OpenSSL QUIC method)" "OSSL_QUIC_client_method"
 
 echo "==> Linking libnetworkkmmcurl.so (${ANDROID_ABI})"
 "$CXX" \
@@ -225,6 +270,7 @@ echo "==> Linking libnetworkkmmcurl.so (${ANDROID_ABI})"
   "$SHIM_SOURCE" \
   "$CURL_BUILD/lib/libcurl.a" \
   "$NGHTTP2_BUILD/lib/libnghttp2.a" \
+  "$NGHTTP3_PREFIX/lib/libnghttp3.a" \
   "$OPENSSL_PREFIX/lib/libssl.a" \
   "$OPENSSL_PREFIX/lib/libcrypto.a" \
   -llog \

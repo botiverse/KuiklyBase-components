@@ -99,6 +99,21 @@ static void CheckDecodedContentEncoding(const std::string &base,
 int main(int argc, char **argv) {
     std::string base = argc > 1 ? argv[1] : "http://127.0.0.1:18923";
 
+    // HTTP/3 control surface is additive and must fail closed against a host
+    // libcurl without the feature while leaving the default path available.
+    {
+        CurClientHandle handle = CreateCurlClient("wrapper-http3-contract");
+        CHECK(handle != nullptr, "HTTP/3 contract probe creates a client");
+        CHECK(SetCurlHttp3Enabled(handle, 0) == 1,
+              "default h2/h1 mode is available regardless of HTTP/3 support");
+        const int supportsHttp3 = CurlSupportsHttp3();
+        CHECK(SetCurlHttp3Enabled(handle, 1) == (supportsHttp3 != 0 ? 1 : 0),
+              "HTTP/3 enable result matches the linked feature bit");
+        CHECK(std::strcmp(GetCurlNegotiatedProtocol(handle), "unknown") == 0,
+              "protocol is unknown before a request completes");
+        DeleteCurlClient(handle);
+    }
+
     // 1. Plain success: transfer ok, HTTP 200, body delivered.
     Captured ok = Fetch(base + "/ok");
     CHECK(ok.invoked, "callback invoked for /ok");

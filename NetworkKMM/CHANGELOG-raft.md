@@ -1,5 +1,25 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased (explicit HTTP/3/QUIC curl gray lane)
+
+- Android, iOS, and OHOS curl artifacts now build pinned nghttp3 1.17.0
+  (`9635173e...b8f5`) beside curl 8.16.0 and OpenSSL 3.5.4, enabling the
+  OpenSSL QUIC backend. Each build hard-gates `USE_NGHTTP2`,
+  `USE_OPENSSL_QUIC`, and `USE_NGHTTP3`, then checks the pin-exact nghttp3 and
+  OpenSSL QUIC references so an h2-only artifact cannot pass silently.
+- `http3Enabled` is now a real explicit rollout gate. Runtime eligibility uses
+  the linked artifact's `CURL_VERSION_HTTP3` feature bit; stale artifacts fail
+  closed. Enabled requests use `CURL_HTTP_VERSION_3` (never `3ONLY`) and retain
+  h2/h1.1 fallback. Disabled requests remain h2/h1.1 and use a separate shared
+  connection pool so a previous h3 request cannot upgrade default traffic by
+  connection reuse.
+- The additive C wrapper surface reports capability and actual negotiated
+  protocol without changing `CurlRequest` or `CurlResponse` layouts. Android
+  JNI, iOS cinterop, and the OHOS VBTransport path propagate the explicit h3
+  bit and expose the final protocol through `NetworkResponse.protocol`.
+- Exact-artifact runtime gates cover real h3, a default h2 request after a live
+  h3 connection, h3-to-h2 fallback, and the QUIC+TCP total-failure path.
+
 ## 0.1.0-raft.23 / 0.1.0-raft.23-ohos (platform-default curl trust restored)
 
 - **Compatibility fix**: raft.20 made `VBTransportCurl.configure(...)` mandatory,

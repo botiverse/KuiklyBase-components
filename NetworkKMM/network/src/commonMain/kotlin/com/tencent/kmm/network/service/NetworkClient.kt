@@ -35,6 +35,7 @@ import com.tencent.kmm.network.export.VBTransportResponse
 import com.tencent.kmm.network.export.VBTransportResultCode
 import com.tencent.kmm.network.export.cancel
 import com.tencent.kmm.network.export.toBytes
+import com.tencent.kmm.network.export.toNetworkHttpProtocol
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
@@ -495,6 +496,7 @@ object VBTransportNetworkEngine : NetworkEngine {
                 totalTimeout = request.policy.timeoutMillis
                 curlCaInfoPath = preparedCurlCaInfoPath(request)
                 curlProxyUrl = preparedCurlProxyUrl(request)
+                curlHttp3Enabled = preparedCurlHttp3Enabled(request)
                 bodyBytes.bytes?.let { data = it }
             }
 
@@ -533,6 +535,7 @@ object VBTransportNetworkEngine : NetworkEngine {
             totalTimeout = request.policy.timeoutMillis
             curlCaInfoPath = preparedCurlCaInfoPath(request)
             curlProxyUrl = preparedCurlProxyUrl(request)
+            curlHttp3Enabled = preparedCurlHttp3Enabled(request)
         }
         VBTransportService.streamRequest(
             vbRequest,
@@ -577,6 +580,7 @@ object VBTransportNetworkEngine : NetworkEngine {
                 totalTimeout = request.policy.timeoutMillis
                 curlCaInfoPath = preparedCurlCaInfoPath(request)
                 curlProxyUrl = preparedCurlProxyUrl(request)
+                curlHttp3Enabled = preparedCurlHttp3Enabled(request)
             }
             val writeBody: suspend (NetworkByteStreamSink) -> Unit = { sink ->
                 var sent = 0L
@@ -681,7 +685,8 @@ private fun VBTransportBaseResponse.toNetworkResponse(request: NetworkRequest): 
         ),
         error = error,
         rawResponse = this,
-        timing = elapseStatis
+        timing = elapseStatis,
+        protocol = elapseStatis.protocol.toNetworkHttpProtocol()
     )
 }
 

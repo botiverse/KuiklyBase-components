@@ -22,6 +22,7 @@ import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
 import com.tencent.kmm.network.export.NetworkCurlTrustStore
 import com.tencent.kmm.network.export.NetworkErrorKind
+import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
@@ -44,6 +45,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -74,6 +76,41 @@ class IosCurlRuntimeTest {
         } finally {
             VBTransportCurl.clear()
         }
+    }
+
+    @Test
+    fun productionEngineNegotiatesHttp3AndPreservesFallbackContract() = runBlocking {
+        val h3Url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_HTTP3_URL") ?: return@runBlocking
+        val fallbackUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_H2_FALLBACK_URL")
+            ?: return@runBlocking
+        val totalFailureUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_TOTAL_FAILURE_URL")
+            ?: return@runBlocking
+        val caPath = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_PUBLIC_CA_PATH") ?: return@runBlocking
+        val caSha = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_PUBLIC_CA_SHA256") ?: return@runBlocking
+        assertTrue(IosCurlCInteropBridge.supportsHttp3)
+        val engine = assertNotNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
+
+        configureRuntime(caPath, caSha, http3Enabled = true)
+        val h3 = execute(engine, h3Url)
+        assertTrue(h3.isSuccess, h3.error?.message)
+        assertEquals(NetworkHttpProtocol.HTTP_3, h3.protocol)
+
+        // The h3 connection above remains pooled. Default traffic must use
+        // the separate h2/h1 pool instead of silently reusing that connection.
+        configureRuntime(caPath, caSha)
+        val defaultH2 = execute(engine, h3Url)
+        assertTrue(defaultH2.isSuccess, defaultH2.error?.message)
+        assertEquals(NetworkHttpProtocol.HTTP_2, defaultH2.protocol)
+
+        configureRuntime(caPath, caSha, http3Enabled = true)
+        val fallback = execute(engine, fallbackUrl)
+        assertTrue(fallback.isSuccess, fallback.error?.message)
+        assertEquals(NetworkHttpProtocol.HTTP_2, fallback.protocol)
+
+        val totalFailure = execute(engine, totalFailureUrl)
+        assertFalse(totalFailure.isSuccess)
+        assertEquals(NetworkErrorKind.CONNECT, totalFailure.error?.kind)
+        assertEquals(NetworkHttpProtocol.UNKNOWN, totalFailure.protocol)
     }
 
     @Test
@@ -256,12 +293,14 @@ class IosCurlRuntimeTest {
     private fun configureRuntime(
         caPath: String,
         caSha256: String,
-        proxy: NetworkCurlProxyConfiguration = NetworkCurlProxyConfiguration.direct()
+        proxy: NetworkCurlProxyConfiguration = NetworkCurlProxyConfiguration.direct(),
+        http3Enabled: Boolean = false
     ) {
         val status = VBTransportCurl.configure(
             NetworkCurlRuntimeConfiguration(
                 trustStore = NetworkCurlTrustStore(caPath, caSha256),
-                proxy = proxy
+                proxy = proxy,
+                http3Enabled = http3Enabled
             )
         )
         assertTrue(status.configured, status.detail)

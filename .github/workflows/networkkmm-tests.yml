@@ -84,6 +84,15 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
+      - name: Stage pinned public CA for HTTP/3 runtime gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_dir="NetworkKMM/network/src/androidTest/assets"
+          mkdir -p "$asset_dir"
+          NetworkKMM/scripts/prepare-app-owned-ca-bundle.sh \
+            "$asset_dir/networkkmm-cacert.pem"
+
       - name: Run committed Android curl artifact runtime gate
         uses: reactivecircus/android-emulator-runner@v2
         with:

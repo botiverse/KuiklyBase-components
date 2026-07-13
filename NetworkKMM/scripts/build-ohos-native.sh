@@ -29,6 +29,8 @@ NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
 # nghttp2 publishes no sibling .sha256 — hard-pinned (verified against the
 # real release download; same discipline as the android/ios lines).
 NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
+NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.17.0}"
+NGHTTP3_SHA256="${NGHTTP3_SHA256:-9635173e703174a41f9abd0d790e70562c74ec3805064403477db5a1ef94b8f5}"
 OHOS_ARCH="arm64-v8a"
 OHOS_TRIPLE="aarch64-linux-ohos"
 
@@ -212,6 +214,23 @@ else
   rm -f "$DEPS_PREFIX"/lib/libnghttp2.so*
 fi
 
+NGHTTP3_STAMP="$DEPS_PREFIX/.nghttp3-version"
+if [[ -f "$DEPS_PREFIX/lib/libnghttp3.a" && "$(cat "$NGHTTP3_STAMP" 2>/dev/null)" == "$NGHTTP3_VERSION" ]]; then
+  echo "==> nghttp3 already built, reusing"
+else
+  echo "==> Fetching nghttp3 ${NGHTTP3_VERSION}"
+  fetch "https://github.com/ngtcp2/nghttp3/releases/download/v${NGHTTP3_VERSION}/nghttp3-${NGHTTP3_VERSION}.tar.gz" \
+    "nghttp3-${NGHTTP3_VERSION}.tar.gz"
+  echo "${NGHTTP3_SHA256}  nghttp3-${NGHTTP3_VERSION}.tar.gz" | sha256sum -c -
+  rm -rf "nghttp3-${NGHTTP3_VERSION}" nghttp3-build
+  tar xf "nghttp3-${NGHTTP3_VERSION}.tar.gz"
+  echo "==> Building nghttp3 (static)"
+  cmake_cross "nghttp3-${NGHTTP3_VERSION}" nghttp3-build \
+    -DENABLE_LIB_ONLY=ON -DENABLE_SHARED_LIB=OFF -DENABLE_STATIC_LIB=ON -DBUILD_TESTING=OFF
+  rm -f "$DEPS_PREFIX"/lib/libnghttp3.so*
+  printf '%s' "$NGHTTP3_VERSION" > "$NGHTTP3_STAMP"
+fi
+
 echo "==> Fetching curl ${CURL_VERSION}"
 fetch_and_verify \
   "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
@@ -252,6 +271,9 @@ cmake -S "curl-${CURL_VERSION}" -B curl-build \
   -DUSE_NGHTTP2=ON \
   -DNGHTTP2_INCLUDE_DIR="$DEPS_PREFIX/include" \
   -DNGHTTP2_LIBRARY="$DEPS_PREFIX/lib/libnghttp2.a" \
+  -DUSE_OPENSSL_QUIC=ON \
+  -DNGHTTP3_INCLUDE_DIR="$DEPS_PREFIX/include" \
+  -DNGHTTP3_LIBRARY="$DEPS_PREFIX/lib/libnghttp3.a" \
   -DUSE_LIBIDN2=OFF \
   -DCURL_DISABLE_LDAP=ON \
   -DCURL_DISABLE_WEBSOCKETS=OFF \
@@ -266,35 +288,47 @@ if [[ -z "$CURL_STATIC_LIB" ]]; then
   exit 1
 fi
 
-# Confirm libcurl was actually compiled with each content-encoding codec. If a
-# CURL_ZLIB/BROTLI/ZSTD flag silently failed to find its lib, curl falls back to
-# identity-only and compressed responses fail at runtime with CURLE_BAD_CONTENT_
-# ENCODING (61) — the raft.6 login regression. A codec-using libcurl.a carries an
-# undefined reference to the decoder entrypoint (resolved later against the
-# staged static archive).
-echo "==> Checking libcurl content-encoding codecs"
-codec_missing=0
+echo "==> Checking libcurl HTTP/2 + HTTP/3 configuration"
+for define in USE_NGHTTP2 USE_OPENSSL_QUIC USE_NGHTTP3; do
+  if grep -q "#define ${define} 1" curl-build/lib/curl_config.h; then
+    echo "curl_config.h ${define}: ENABLED"
+  else
+    echo "curl_config.h ${define}: MISSING" >&2
+    exit 1
+  fi
+done
+
+# Confirm libcurl was actually compiled with every optional dependency. If a
+# CURL_ZLIB/BROTLI/ZSTD flag silently failed, compressed responses regress; if
+# an HTTP/2 or HTTP/3 backend silently dropped, the artifact cannot satisfy its
+# transport contract. A feature-using libcurl.a carries an undefined reference
+# resolved later against the staged static/dynamic dependency.
+echo "==> Checking libcurl optional dependency references"
+dependency_missing=0
 # Capture the full symbol table once. Piping llvm-nm directly into `grep -q`
 # under `set -o pipefail` makes grep close the pipe on first match, killing
 # llvm-nm with SIGPIPE and turning a real match into a pipeline failure.
 CURL_SYMBOLS="$("$LLVM_BIN/llvm-nm" "$CURL_STATIC_LIB" 2>/dev/null || true)"
-check_codec() {
+check_reference() {
   local name="$1" symbol="$2"
   # Here-string (not a pipe): grep -q short-circuiting can't SIGPIPE a producer
   # and trip pipefail into a false negative.
   if grep -qw "$symbol" <<<"$CURL_SYMBOLS"; then
-    echo "libcurl codec ${name}: ENABLED (${symbol} referenced)"
+    echo "libcurl ${name}: ENABLED (${symbol} referenced)"
   else
-    echo "libcurl codec ${name}: MISSING — ${symbol} not referenced" >&2
-    codec_missing=1
+    echo "libcurl ${name}: MISSING — ${symbol} not referenced" >&2
+    dependency_missing=1
   fi
 }
-check_codec "zlib (gzip/deflate)" "inflate"
-check_codec "brotli" "BrotliDecoderDecompressStream"
-check_codec "zstd" "ZSTD_decompressStream"
-check_codec "nghttp2 (HTTP/2)" "nghttp2_session_client_new3"
-if [[ "$codec_missing" -ne 0 ]]; then
-  echo "One or more content-encoding codecs are missing from libcurl.a" >&2
+check_reference "zlib (gzip/deflate)" "inflate"
+check_reference "brotli" "BrotliDecoderDecompressStream"
+check_reference "zstd" "ZSTD_decompressStream"
+check_reference "nghttp2 (HTTP/2)" "nghttp2_session_client_new3"
+check_reference "nghttp3 (HTTP/3)" "nghttp3_conn_client_new_versioned"
+check_reference "OpenSSL HTTP/3 stream" "SSL_new_stream"
+check_reference "OpenSSL QUIC method" "OSSL_QUIC_client_method"
+if [[ "$dependency_missing" -ne 0 ]]; then
+  echo "One or more optional dependencies are missing from libcurl.a" >&2
   exit 1
 fi
 
@@ -305,7 +339,7 @@ cp -f "$BUILD_ROOT/libopenssl.so" "$WRAPPER_LIBS_DIR/libopenssl.so"
 # libcurl.a is static, so the content-encoding codecs it references must be
 # provided at the final libpbcurlwrapper.so link. Stage their static archives
 # next to libcurl.a; the wrapper CMakeLists links them.
-for codec in libz.a libbrotlidec.a libbrotlicommon.a libzstd.a libnghttp2.a; do
+for codec in libz.a libbrotlidec.a libbrotlicommon.a libzstd.a libnghttp2.a libnghttp3.a; do
   if [[ ! -f "$DEPS_PREFIX/lib/$codec" ]]; then
     echo "missing codec archive: $DEPS_PREFIX/lib/$codec" >&2
     exit 1
@@ -328,6 +362,17 @@ if [[ -z "$WRAPPER_SO" ]]; then
   echo "libpbcurlwrapper.so not produced" >&2
   exit 1
 fi
+
+echo "==> Checking wrapper HTTP/3 control surface"
+WRAPPER_SYMBOLS="$("$LLVM_BIN/llvm-nm" -D "$WRAPPER_SO" 2>/dev/null || true)"
+for symbol in CurlSupportsHttp3 SetCurlHttp3Enabled GetCurlNegotiatedProtocol; do
+  if grep -Eq " [TW] ${symbol}$" <<<"$WRAPPER_SYMBOLS"; then
+    echo "wrapper ${symbol}: EXPORTED"
+  else
+    echo "wrapper ${symbol}: MISSING" >&2
+    exit 1
+  fi
+done
 
 echo "==> Publishing outputs into repo library directories"
 for dir in "$ENTRY_LIBS_DIR" "$NETWORK_LIBS_DIR"; do
@@ -359,6 +404,7 @@ fi
 echo "==> Result"
 echo "openssl: ${OPENSSL_VERSION}"
 echo "curl:    ${CURL_VERSION}"
+echo "nghttp3: ${NGHTTP3_VERSION}"
 sha256sum \
   "$ENTRY_LIBS_DIR/libpbcurlwrapper.so" \
   "$ENTRY_LIBS_DIR/libopenssl.so" \

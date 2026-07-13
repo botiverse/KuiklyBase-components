@@ -28,11 +28,13 @@ import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.VBTransportCurl
+import com.tencent.kmm.network.internal.platform.platformCurlSupportsHttp3
 
 private const val CURL_RUNTIME_READY = "com.tencent.kmm.network.curl.runtime.ready"
 private const val CURL_RUNTIME_CA_PATH = "com.tencent.kmm.network.curl.runtime.ca_path"
 private const val CURL_RUNTIME_PROXY_URL = "com.tencent.kmm.network.curl.runtime.proxy_url"
 private const val CURL_RUNTIME_TRUST = "com.tencent.kmm.network.curl.runtime.trust"
+private const val CURL_RUNTIME_HTTP3 = "com.tencent.kmm.network.curl.runtime.http3"
 
 internal const val CURL_RUNTIME_TRUST_PLATFORM_DEFAULT = "platform_default"
 internal const val CURL_RUNTIME_TRUST_APP_OWNED = "app_owned"
@@ -79,12 +81,10 @@ internal expect val curlSystemProxySupport: CurlSystemProxySupport
 
 internal expect fun resolveCurlSystemProxy(url: String): CurlSystemProxyResolution
 
-internal fun prepareCurlRuntime(request: NetworkRequest): NetworkEngineAvailability =
-    prepareCurlRuntime(request, curlPlatformDefaultTrust)
-
 internal fun prepareCurlRuntime(
     request: NetworkRequest,
-    platformDefaultTrust: CurlPlatformDefaultTrust
+    platformDefaultTrust: CurlPlatformDefaultTrust = curlPlatformDefaultTrust,
+    nativeHttp3Supported: Boolean = platformCurlSupportsHttp3()
 ): NetworkEngineAvailability {
     if (request.metadata[CURL_RUNTIME_READY] == "true") {
         return NetworkEngineAvailability.Available
@@ -101,6 +101,7 @@ internal fun prepareCurlRuntime(
             // so the default's semantics are deterministic, not ambient.
             request.metadata[CURL_RUNTIME_PROXY_URL] = ""
             request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_PLATFORM_DEFAULT
+            request.metadata[CURL_RUNTIME_HTTP3] = "false"
             request.metadata[CURL_RUNTIME_READY] = "true"
             return NetworkEngineAvailability.Available
         }
@@ -131,10 +132,12 @@ internal fun prepareCurlRuntime(
         )
     }
     if (configuration.http3Enabled) {
-        return NetworkEngineAvailability.unavailable(
-            reason = NetworkEngineUnavailableReason.HTTP3_UNSUPPORTED,
-            detail = "HTTP/3 is not eligible: current curl artifacts contain no QUIC backend and runtime feature probe."
-        )
+        if (!nativeHttp3Supported) {
+            return NetworkEngineAvailability.unavailable(
+                reason = NetworkEngineUnavailableReason.HTTP3_UNSUPPORTED,
+                detail = "HTTP/3 is not eligible: the linked curl artifact does not report CURL_VERSION_HTTP3."
+            )
+        }
     }
     val proxyUrl = when (configuration.proxy.mode) {
         NetworkCurlProxyMode.DIRECT -> ""
@@ -159,6 +162,7 @@ internal fun prepareCurlRuntime(
     request.metadata[CURL_RUNTIME_CA_PATH] = configuration.trustStore.path
     request.metadata[CURL_RUNTIME_PROXY_URL] = proxyUrl
     request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_APP_OWNED
+    request.metadata[CURL_RUNTIME_HTTP3] = configuration.http3Enabled.toString()
     request.metadata[CURL_RUNTIME_READY] = "true"
     return NetworkEngineAvailability.Available
 }
@@ -172,6 +176,9 @@ internal fun preparedCurlCaInfoPath(request: NetworkRequest): String? =
 /** Empty means explicit direct mode and is still passed to CURLOPT_PROXY. */
 internal fun preparedCurlProxyUrl(request: NetworkRequest): String? =
     request.metadata[CURL_RUNTIME_PROXY_URL]
+
+internal fun preparedCurlHttp3Enabled(request: NetworkRequest): Boolean =
+    request.metadata[CURL_RUNTIME_HTTP3] == "true"
 
 internal fun curlRuntimeFailureResponse(
     request: NetworkRequest,
@@ -202,7 +209,9 @@ internal fun curlRuntimeFailureResponse(
     )
 }
 
-internal fun curlNetworkEngineCapabilities(): NetworkEngineCapabilities {
+internal fun curlNetworkEngineCapabilities(
+    nativeHttp3Supported: Boolean = platformCurlSupportsHttp3()
+): NetworkEngineCapabilities {
     val trustStatus = when {
         VBTransportCurl.configured ->
             NetworkEngineFeatureStatus.available("App-owned CA bundle verified by SHA-256 before activation.")
@@ -242,9 +251,15 @@ internal fun curlNetworkEngineCapabilities(): NetworkEngineCapabilities {
             reason = NetworkEngineFeatureReason.NOT_IMPLEMENTED,
             detail = "No custom resolver contract currently preserves original-host SNI and certificate verification."
         ),
-        http3 = NetworkEngineFeatureStatus.unavailable(
-            reason = NetworkEngineFeatureReason.NATIVE_BACKEND_NOT_COMPILED,
-            detail = "Native artifacts ship without ngtcp2/quiche/msh3 and therefore cannot negotiate HTTP/3."
-        )
+        http3 = if (nativeHttp3Supported) {
+            NetworkEngineFeatureStatus.available(
+                "Linked curl artifact reports CURL_VERSION_HTTP3; rollout remains explicit through http3Enabled."
+            )
+        } else {
+            NetworkEngineFeatureStatus.unavailable(
+                reason = NetworkEngineFeatureReason.NATIVE_BACKEND_NOT_COMPILED,
+                detail = "Linked curl artifact does not report CURL_VERSION_HTTP3."
+            )
+        }
     )
 }

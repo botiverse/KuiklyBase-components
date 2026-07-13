@@ -130,6 +130,7 @@ open class VBTransportBaseRequest {
     /** Internal curl inputs prepared and latched by the selected engine. */
     internal var curlCaInfoPath: String? = null
     internal var curlProxyUrl: String? = null
+    internal var curlHttp3Enabled: Boolean = false
 
     internal open fun bodyData(): Any? = null
 }

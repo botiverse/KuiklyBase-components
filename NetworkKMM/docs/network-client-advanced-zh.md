@@ -237,10 +237,30 @@ val client = NetworkClient(
 ```
 
 稳定 bucket 和灰度参数会进入 diagnostics，但不会暴露 cohort key；`forcePlatformDefault` 是立即回滚
-开关。HTTPDNS/HTTP3 当前仍是显式 gate：设置 `httpDnsEnabled` 或 `http3Enabled` 会分别以
-`HTTPDNS_UNSUPPORTED` / `HTTP3_UNSUPPORTED` 使 curl ineligible。当前尚无保留原始 host/SNI 的
-自定义 DNS 合同，native artifact 也没有编入 QUIC backend；`NetworkEngineCapabilities.httpDns/http3`
-会报告同一事实，不能仅凭 libcurl 版本推断已支持。
+开关。HTTPDNS 仍不可用，因为当前没有保留原始 host/SNI 的安全 resolver 合同；设置
+`httpDnsEnabled` 会以 `HTTPDNS_UNSUPPORTED` 使 curl ineligible。
+
+HTTP/3 是 native curl 的显式灰度 gate。当前 Android、iOS、OHOS curl 产物使用 curl 8.16.0、
+OpenSSL 3.5.4 QUIC 和 nghttp3 1.17.0；只能在已验证的 curl runtime 配置中开启：
+
+```kotlin
+VBTransportCurl.configure(
+    NetworkCurlRuntimeConfiguration(
+        trustStore = NetworkCurlTrustStore(caPath, caSha256),
+        proxy = NetworkCurlProxyConfiguration.direct(),
+        http3Enabled = remoteHttp3GrayEnabled
+    )
+)
+```
+
+`http3Enabled = false` 仍是默认值，请求固定走 TLS 上的 h2，并保留 h1.1 回退。显式 h3 请求使用
+`CURL_HTTP_VERSION_3` 而不是 `3ONLY`，因此服务端或网络不支持 QUIC 时会无感回退 h2/h1.1。
+默认流量与 h3 灰度流量使用独立 native 连接池，已有 h3 连接不能通过复用把后续默认请求静默升级。
+`NetworkResponse.protocol` 返回真实协商结果（`HTTP_3`、`HTTP_2` 等）。runtime eligibility 读取链接
+产物的 `CURL_VERSION_HTTP3` feature bit，而不是只看 libcurl 版本号；旧产物会在 native I/O 前以
+`HTTP3_UNSUPPORTED` fail closed。Android/iOS 默认 engine 仍分别是 OkHttp/Darwin，OHOS 仍默认消费 curl。
+
+`NetworkEngineCapabilities.httpDns/http3` 会报告同一 runtime 事实。
 
 `NetworkEngineSelectionDiagnostics.capabilities` 描述的是**实际选中的 engine**，不是请求但未命中的 engine。
 
