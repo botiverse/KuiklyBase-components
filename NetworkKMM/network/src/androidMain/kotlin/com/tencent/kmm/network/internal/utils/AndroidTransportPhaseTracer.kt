@@ -61,6 +61,7 @@ internal object AndroidTransportPhaseTracer {
         return synchronized(trace) {
             trace.beginAttempt(
                 origin = lease.origin,
+                shard = lease.shard,
                 generation = lease.generation,
                 watchdogMillis = watchdogMillis,
                 watchdogEnabled = watchdogEnabled,
@@ -273,8 +274,10 @@ internal object AndroidTransportPhaseTracer {
         var reusedConnection: Boolean? = null
         var connectionOrigin: String? = null
         var connectionGeneration: Long? = null
+        var connectionShard: Int? = null
         var connectionIdentity: String? = null
         var connectionDraining = false
+        var connectionRolloverRateLimited = false
         var staleH2Detected = false
         var noResponseHeadersDurationNanos = 0L
         var freshRetry = false
@@ -288,6 +291,7 @@ internal object AndroidTransportPhaseTracer {
 
         fun beginAttempt(
             origin: String,
+            shard: Int,
             generation: Long,
             watchdogMillis: Long,
             watchdogEnabled: Boolean,
@@ -300,6 +304,7 @@ internal object AndroidTransportPhaseTracer {
             // with the fresh retry's connection.
             if (!staleH2Detected) {
                 connectionOrigin = origin
+                connectionShard = shard
                 connectionGeneration = generation
             }
             this.watchdogMillis = watchdogMillis
@@ -337,8 +342,10 @@ internal object AndroidTransportPhaseTracer {
                         staleH2Detected = true
                         watchdogAttemptToken = token
                         noResponseHeadersDurationNanos = elapsedSince(sentNanos)
-                        onDrain?.invoke()
-                        connectionDraining = true
+                        onDrain?.invoke()?.let { rollover ->
+                            connectionDraining = rollover.observedGenerationDraining
+                            connectionRolloverRateLimited = rollover.rateLimited
+                        }
                         val method = call.request().method
                         if (method == "GET" || method == "HEAD") call.cancel()
                     }
@@ -383,8 +390,10 @@ internal object AndroidTransportPhaseTracer {
                 staleH2Detected = staleH2Detected,
                 connectionOrigin = connectionOrigin,
                 connectionGeneration = connectionGeneration,
+                connectionShard = connectionShard,
                 connectionIdentity = connectionIdentity,
                 connectionDraining = connectionDraining,
+                connectionRolloverRateLimited = connectionRolloverRateLimited,
                 freshRetry = freshRetry,
                 freshRetryResult = freshRetryResult,
                 noResponseHeadersDurationMs = millis(noResponseHeadersDurationNanos),

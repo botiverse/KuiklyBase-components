@@ -290,21 +290,28 @@ stable remote-config cohort:
 ```kotlin
 VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
     enabled = remoteStaleH2RecoveryEnabled,
+    clientShardCount = 5,
     responseHeadersWatchdogMillis = 7_000,
     pingIntervalMillis = 15_000 // optional first-line liveness check
 )
 ```
 
-The watchdog starts only after request headers/body have been sent. It requires both `h2` and a reused
-connection, then atomically drains that origin's current client generation. New requests use a newly
-constructed OkHttp client and connection pool. The old generation closes only after its in-flight calls
-finish, so POST/PUT/PATCH/upload calls are never cancelled or replayed. GET/HEAD may make one sequential
-fresh-generation retry within the original total timeout; this is not a hedge, so an old completion
-cannot race and overwrite the fresh result.
+The five slots are independent OkHttp clients and connection pools, selected round-robin for the same
+origin. This bounds a single bad reused connection's normal blast radius instead of putting the entire
+foreground burst on one pool. The watchdog starts only after request headers/body have been sent. It
+requires both `h2` and a reused connection, then atomically drains only the affected slot's generation.
+The replacement is a newly constructed OkHttp client and connection pool; the other slots do not change.
+The old generation closes only after its in-flight calls finish, so POST/PUT/PATCH/upload calls are never
+cancelled or replayed. GET/HEAD may make one sequential retry on a different slot within the original
+total timeout; this is not a hedge, so an old completion cannot race and overwrite the fresh result.
+At most `clientShardCount` replacement clients may be created for one origin in a rolling 30-second
+window. If several freshly created slots also stall, the churn breaker suppresses further replacement
+until the window expires instead of creating clients without bound.
 
 `pingIntervalMillis` can detect a connection that also stopped answering PING, but it does not replace
 the response-headers watchdog. Inspect `VBTransportElapseStatistics.staleH2Detected`,
-`connectionOrigin`, `connectionGeneration`, `connectionIdentity`, `connectionDraining`, `freshRetry`,
+`connectionOrigin`, `connectionShard`, `connectionGeneration`, `connectionIdentity`, `connectionDraining`,
+`connectionRolloverRateLimited`, `freshRetry`,
 `freshRetryResult`, and `noResponseHeadersDurationMs` during rollout.
 
 ## Handle stable error kinds

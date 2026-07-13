@@ -272,20 +272,24 @@ Android 默认 Ktor-OkHttp transport 可选检测“请求已经发出，但复�
 ```kotlin
 VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
     enabled = remoteStaleH2RecoveryEnabled,
+    clientShardCount = 5,
     responseHeadersWatchdogMillis = 7_000,
     pingIntervalMillis = 15_000 // 可选的第一层存活探测
 )
 ```
 
-watchdog 只从 request headers/body 发送完毕后开始计时，并且只在 `h2 + reused connection` 同时成立时
-命中。命中者会原子地把该 origin 当前 client generation 标记为 draining；后续请求使用新建的
-OkHttp client 与全新 ConnectionPool。旧 generation 等所有在途调用自然结束后才关闭，因此
-POST/PUT/PATCH/上传不会被取消或自动重放。GET/HEAD 在原 total timeout 剩余预算内最多串行 fresh retry
-一次；它不是 hedge，所以旧 completion 不会与新结果竞争覆盖。
+同一 origin 的 5 个槽位分别持有独立 OkHttp client 与 ConnectionPool，请求轮询分配；一条坏复用连接
+只会影响其中一份，而不是把整批前台请求压在同一个 pool。watchdog 只从 request headers/body 发送完毕
+后开始计时，并且只在 `h2 + reused connection` 同时成立时命中。命中者只把对应槽位的 generation 标记
+为 draining，并新建该槽位的 OkHttp client/ConnectionPool；其他 4 个槽位不变。旧 generation 等所有
+在途调用自然结束后才关闭，因此 POST/PUT/PATCH/上传不会被取消或自动重放。GET/HEAD 在原 total timeout
+剩余预算内最多到另一个槽位串行 fresh retry 一次；它不是 hedge，所以旧 completion 不会与新结果竞争覆盖。
+同一 origin 的 30 秒滚动窗口内最多创建 `clientShardCount` 个 replacement client；如果新建的多个槽位也
+继续卡住，churn breaker 会暂时抑制继续 replacement，而不是无上限创建 client，窗口过后再允许自愈。
 
 `pingIntervalMillis` 能发现连 PING 都不再应答的连接，但不能替代 response-headers watchdog。灰度时检查
-`VBTransportElapseStatistics.staleH2Detected`、`connectionOrigin`、`connectionGeneration`、
-`connectionIdentity`、`connectionDraining`、`freshRetry`、`freshRetryResult` 和
+`VBTransportElapseStatistics.staleH2Detected`、`connectionOrigin`、`connectionShard`、`connectionGeneration`、
+`connectionIdentity`、`connectionDraining`、`connectionRolloverRateLimited`、`freshRetry`、`freshRetryResult` 和
 `noResponseHeadersDurationMs`。
 
 ## 处理稳定错误分类

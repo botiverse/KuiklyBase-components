@@ -337,8 +337,14 @@ object AndroidTransportImpl : IVBTransportService {
         val okHttpEnabled = VBTransportAndroidEngine.okHttpEnabled
         val recovery = VBTransportAndroidEngine.reusedHttp2Recovery
         val retryState = AndroidReusedH2RetryState(request.method)
+        var avoidShard: Int? = null
         while (true) {
-            val lease = AndroidTransportClientProvider.acquire(request, okHttpEnabled, recovery)
+            val lease = AndroidTransportClientProvider.acquire(
+                request = request,
+                okHttpEnabled = okHttpEnabled,
+                recovery = recovery,
+                avoidShard = avoidShard,
+            )
             val attemptToken = AndroidTransportPhaseTracer.beginAttempt(
                 requestId = request.requestId,
                 lease = lease,
@@ -367,10 +373,11 @@ object AndroidTransportImpl : IVBTransportService {
                 val hasBudget = request.totalTimeout <= 0L ||
                     remainingRequestTimeout(request.totalTimeout, overallStart) > 0L
                 if (retryState.claimRetry(watchdogTriggered, hasBudget)) {
+                    avoidShard = lease.shard
                     AndroidTransportPhaseTracer.markFreshRetry(request.requestId)
                     logI(
                         "stale reused h2 detected, id:${request.requestId}, origin:${lease.origin}, " +
-                            "generation:${lease.generation}, freshRetry:true",
+                            "shard:${lease.shard}, generation:${lease.generation}, freshRetry:true",
                         request.logTag,
                     )
                     lease.close()

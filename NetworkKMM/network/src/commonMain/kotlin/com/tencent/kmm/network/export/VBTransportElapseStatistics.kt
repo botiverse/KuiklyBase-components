@@ -81,10 +81,14 @@ data class VBTransportElapseStatistics(
     var connectionOrigin: String? = null,
     /** NetworkKMM-managed Android OkHttp client/pool generation. */
     var connectionGeneration: Long? = null,
+    /** Zero-based independent Android OkHttp client/pool slot. */
+    var connectionShard: Int? = null,
     /** Process-local diagnostic identity for the acquired OkHttp connection. */
     var connectionIdentity: String? = null,
     /** The observed generation was retired for new requests. */
     var connectionDraining: Boolean = false,
+    /** Pool replacement was suppressed by the per-origin churn breaker. */
+    var connectionRolloverRateLimited: Boolean = false,
     /** This logical request made its one allowed fresh-generation retry. */
     var freshRetry: Boolean = false,
     /** `success`, `failure`, or null when no fresh retry occurred. */

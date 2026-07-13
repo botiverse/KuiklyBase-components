@@ -41,8 +41,8 @@ object VBTransportAndroidEngine {
      * enabled, NetworkKMM watches from request-send completion to
      * `responseHeadersStart`. A reused h2 call that exceeds
      * [VBTransportReusedHttp2Recovery.responseHeadersWatchdogMillis] drains
-     * its origin's current client generation. GET/HEAD may retry once on the
-     * new generation; methods with replay-unsafe bodies are never retried.
+     * its origin's affected client slot generation. GET/HEAD may retry once
+     * on a different slot; methods with replay-unsafe bodies are never retried.
      *
      * This value is sampled at the beginning of each request. Changing it does
      * not mutate an already-running request.
@@ -55,6 +55,8 @@ object VBTransportAndroidEngine {
 data class VBTransportReusedHttp2Recovery(
     /** Default-off rollout gate. */
     val enabled: Boolean = false,
+    /** Independent OkHttp client/pool shards maintained for each origin. */
+    val clientShardCount: Int = 5,
     /** No-response-headers interval after the request has been sent. */
     val responseHeadersWatchdogMillis: Long = 7_000L,
     /**
@@ -64,6 +66,7 @@ data class VBTransportReusedHttp2Recovery(
     val pingIntervalMillis: Long = 0L,
 ) {
     init {
+        require(clientShardCount in 1..8) { "clientShardCount must be between 1 and 8" }
         require(responseHeadersWatchdogMillis > 0L) {
             "responseHeadersWatchdogMillis must be positive"
         }

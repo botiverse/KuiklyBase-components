@@ -33,6 +33,7 @@ class TransportAndroidEngineTest {
     fun reusedHttp2RecoveryIsDefaultOffAndValidatesDurations() {
         val defaults = VBTransportReusedHttp2Recovery()
         assertTrue(!defaults.enabled)
+        assertEquals(5, defaults.clientShardCount)
         assertEquals(7_000L, defaults.responseHeadersWatchdogMillis)
         assertEquals(0L, defaults.pingIntervalMillis)
     }
@@ -92,11 +93,13 @@ class TransportAndroidEngineTest {
     @Test
     fun concurrentDrainOfOneOriginGenerationRollsOverExactlyOnce() {
         val clientsCreated = AtomicInteger()
-        val manager = AndroidTransportClientGenerationManager {
-            clientsCreated.incrementAndGet()
-            buildTransportHttpClient(okHttpEnabled = true, recovery = it)
-        }
-        val recovery = VBTransportReusedHttp2Recovery(enabled = true)
+        val manager = AndroidTransportClientGenerationManager(
+            clientFactory = {
+                clientsCreated.incrementAndGet()
+                buildTransportHttpClient(okHttpEnabled = true, recovery = it)
+            },
+        )
+        val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 1)
         val leases = List(10) {
             manager.acquire("https://api.example.test/v1/messages?request=$it", recovery)
         }
@@ -135,7 +138,7 @@ class TransportAndroidEngineTest {
     @Test
     fun originsRollOverIndependently() {
         val manager = AndroidTransportClientGenerationManager()
-        val recovery = VBTransportReusedHttp2Recovery(enabled = true)
+        val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 1)
         manager.acquire("https://one.example.test/a", recovery).use { one ->
             manager.acquire("https://two.example.test/a", recovery).use { two ->
                 val twoGeneration = two.generation
@@ -179,5 +182,112 @@ class TransportAndroidEngineTest {
         assertTrue(!state.claimRetry(watchdogTriggered = false, hasBudget = true))
         assertTrue(!state.claimRetry(watchdogTriggered = true, hasBudget = false))
         assertTrue(!state.attempted)
+    }
+
+    @Test
+    fun requestsRoundRobinAcrossFiveIndependentClientPools() {
+        val clientsCreated = AtomicInteger()
+        val manager = AndroidTransportClientGenerationManager(
+            clientFactory = {
+                clientsCreated.incrementAndGet()
+                buildTransportHttpClient(okHttpEnabled = true, recovery = it)
+            },
+        )
+        val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 5)
+        val leases = List(10) {
+            manager.acquire("https://api.example.test/v1/messages?request=$it", recovery)
+        }
+        try {
+            assertEquals(listOf(0, 1, 2, 3, 4, 0, 1, 2, 3, 4), leases.map { it.shard })
+            assertEquals(5, clientsCreated.get())
+            assertEquals(5, leases.map { it.generation }.distinct().size)
+        } finally {
+            leases.forEach(AndroidTransportClientLease::close)
+        }
+    }
+
+    @Test
+    fun oneStaleShardRollsOverWithoutChangingTheOtherFour() {
+        val manager = AndroidTransportClientGenerationManager()
+        val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 5)
+        val before = List(5) { manager.acquire("https://api.example.test/v1/$it", recovery) }
+        try {
+            val beforeByShard = before.associate { it.shard to it.generation }
+            val stale = before.first { it.shard == 2 }
+            val rollover = stale.drainGeneration()
+            assertTrue(rollover.initiated)
+
+            val after = List(5) { manager.acquire("https://api.example.test/v2/$it", recovery) }
+            try {
+                val afterByShard = after.associate { it.shard to it.generation }
+                assertTrue(afterByShard.getValue(2) != beforeByShard.getValue(2))
+                listOf(0, 1, 3, 4).forEach { shard ->
+                    assertEquals(beforeByShard.getValue(shard), afterByShard.getValue(shard))
+                }
+            } finally {
+                after.forEach(AndroidTransportClientLease::close)
+            }
+        } finally {
+            before.forEach(AndroidTransportClientLease::close)
+        }
+    }
+
+    @Test
+    fun freshRetryAvoidsTheShardThatTriggeredTheWatchdog() {
+        val manager = AndroidTransportClientGenerationManager()
+        val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 5)
+        manager.acquire("https://api.example.test/v1/old", recovery).use { old ->
+            old.drainGeneration()
+            manager.acquire(
+                "https://api.example.test/v1/fresh",
+                recovery,
+                avoidShard = old.shard,
+            ).use { fresh ->
+                assertTrue(fresh.shard != old.shard)
+            }
+        }
+    }
+
+    @Test
+    fun repeatedMultiShardFailuresCannotCreateClientsWithoutBound() {
+        var now = 1_000L
+        val clientsCreated = AtomicInteger()
+        val manager = AndroidTransportClientGenerationManager(
+            clientFactory = {
+                clientsCreated.incrementAndGet()
+                buildTransportHttpClient(okHttpEnabled = true, recovery = it)
+            },
+            nowMillis = { now },
+        )
+        val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 5)
+        val firstWave = List(5) { manager.acquire("https://api.example.test/first/$it", recovery) }
+        try {
+            firstWave.forEach { lease ->
+                val result = lease.drainGeneration()
+                assertTrue(result.initiated)
+                assertTrue(!result.rateLimited)
+            }
+            assertEquals(10, clientsCreated.get())
+
+            val secondWave = List(5) { manager.acquire("https://api.example.test/second/$it", recovery) }
+            try {
+                secondWave.forEach { lease ->
+                    val result = lease.drainGeneration()
+                    assertTrue(!result.initiated)
+                    assertTrue(result.rateLimited)
+                    assertTrue(!result.observedGenerationDraining)
+                }
+                assertEquals(10, clientsCreated.get())
+
+                now += 30_000L
+                val afterCooldown = secondWave.first().drainGeneration()
+                assertTrue(afterCooldown.initiated)
+                assertEquals(11, clientsCreated.get())
+            } finally {
+                secondWave.forEach(AndroidTransportClientLease::close)
+            }
+        } finally {
+            firstWave.forEach(AndroidTransportClientLease::close)
+        }
     }
 }
