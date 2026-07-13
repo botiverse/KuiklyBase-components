@@ -278,9 +278,21 @@ cmake -S "curl-${CURL_VERSION}" -B curl-build \
   -DCURL_DISABLE_LDAP=ON \
   -DCURL_DISABLE_WEBSOCKETS=OFF \
   -DENABLE_THREADED_RESOLVER=OFF \
+  -DHAVE_SENDMMSG=0 \
   -DCURL_CA_BUNDLE=/etc/ssl/certs/cacert.pem \
   -DCURL_CA_PATH=/etc/ssl/certs \
   -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+
+# The OHOS libc exports sendmmsg but its public sysroot does not define
+# struct mmsghdr or recvmmsg. curl's QUIC code uses HAVE_SENDMMSG to select a
+# combined send/receive batching path, so the function-only CMake probe is a
+# false positive here. Pin it off and use the portable sendmsg/recvmsg path.
+if grep -q '^#define HAVE_SENDMMSG 1' curl-build/lib/curl_config.h; then
+  echo "OHOS curl_config.h unexpectedly enabled HAVE_SENDMMSG" >&2
+  exit 1
+fi
+echo "curl_config.h HAVE_SENDMMSG: DISABLED (OHOS portable QUIC I/O)"
+
 cmake --build curl-build -j"$(nproc)"
 CURL_STATIC_LIB="$(find curl-build/lib -name 'libcurl.a' | head -n1)"
 if [[ -z "$CURL_STATIC_LIB" ]]; then
