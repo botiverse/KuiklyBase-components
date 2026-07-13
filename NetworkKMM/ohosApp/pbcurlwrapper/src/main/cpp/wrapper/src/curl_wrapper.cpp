@@ -45,6 +45,14 @@ static bool EnsureCurlGlobalInit() {
     return gCurlGlobalInitResult == CURLE_OK;
 }
 
+static bool CurlSupportsFeature(int feature) {
+    if (!EnsureCurlGlobalInit()) {
+        return false;
+    }
+    const curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
+    return info != nullptr && (info->features & feature) != 0;
+}
+
 static const char *CurlProtocolName(long httpVersion) {
     if (httpVersion == CURL_HTTP_VERSION_3 || httpVersion == CURL_HTTP_VERSION_3ONLY) {
         return "h3";
@@ -422,7 +430,9 @@ class CurlClient {
         // QUIC and fall back to h2/h1.1; 3ONLY is intentionally never used.
         const long requestedHttpVersion = http3_enabled_
             ? CURL_HTTP_VERSION_3
-            : CURL_HTTP_VERSION_2TLS;
+            : (CurlSupportsFeature(CURL_VERSION_HTTP2)
+                ? CURL_HTTP_VERSION_2TLS
+                : CURL_HTTP_VERSION_1_1);
         CURLcode httpVersionResult = curl_easy_setopt(curl_, CURLOPT_HTTP_VERSION, requestedHttpVersion);
         if (httpVersionResult != CURLE_OK) {
             logE(log_tag_, "CURLOPT_HTTP_VERSION failed: " + std::to_string(httpVersionResult));
@@ -898,11 +908,7 @@ int SetCurlResolve(CurClientHandle handle, const char *resolveEntry) {
 }
 
 int CurlSupportsHttp3(void) {
-    if (!EnsureCurlGlobalInit()) {
-        return 0;
-    }
-    const curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
-    return info != nullptr && (info->features & CURL_VERSION_HTTP3) != 0 ? 1 : 0;
+    return CurlSupportsFeature(CURL_VERSION_HTTP3) ? 1 : 0;
 }
 
 int SetCurlHttp3Enabled(CurClientHandle handle, int enabled) {
