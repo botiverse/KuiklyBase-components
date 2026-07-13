@@ -101,6 +101,13 @@ internal class AndroidStalledConnectionRegistry {
     }
 }
 
+internal inline fun cancelStalledCallIfReplaySafe(
+    canFreshRetry: Boolean,
+    cancel: () -> Unit,
+) {
+    if (canFreshRetry) cancel()
+}
+
 internal object AndroidTransportPhaseTracer {
     private val traces = ConcurrentHashMap<Int, Trace>()
     private val watchdogExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
@@ -123,6 +130,7 @@ internal object AndroidTransportPhaseTracer {
         watchdogMillis: Long,
         watchdogEnabled: Boolean,
         minimumConcurrentStalledRequests: Int,
+        canFreshRetry: Boolean,
     ): Int {
         val trace = traces.getOrPut(requestId) {
             Trace(requestId = requestId, scheduledNanos = nanoTime())
@@ -135,6 +143,7 @@ internal object AndroidTransportPhaseTracer {
                 watchdogMillis = watchdogMillis,
                 watchdogEnabled = watchdogEnabled,
                 minimumConcurrentStalledRequests = minimumConcurrentStalledRequests,
+                canFreshRetry = canFreshRetry,
                 onDrain = lease::drainGeneration,
             )
         }
@@ -142,7 +151,7 @@ internal object AndroidTransportPhaseTracer {
 
     fun watchdogTriggered(requestId: Int, attemptToken: Int): Boolean =
         traces[requestId]?.let { trace ->
-            synchronized(trace) { trace.watchdogAttemptToken == attemptToken }
+            synchronized(trace) { trace.triggeredAttemptToken == attemptToken }
         } ?: false
 
     fun markFreshRetry(requestId: Int) {
@@ -356,10 +365,12 @@ internal object AndroidTransportPhaseTracer {
         var freshRetry = false
         var freshRetryResult: String? = null
         var attemptToken = 0
-        var watchdogAttemptToken = 0
+        var maturedAttemptToken = 0
+        var triggeredAttemptToken = 0
         private var watchdogMillis = 0L
         private var watchdogEnabled = false
         private var minimumConcurrentStalledRequests = 2
+        private var canFreshRetry = false
         private var onDrain: (() -> AndroidTransportGenerationRollover)? = null
         private var watchdogFuture: ScheduledFuture<*>? = null
         var physicalConnectionKey: Any? = null
@@ -373,6 +384,7 @@ internal object AndroidTransportPhaseTracer {
             watchdogMillis: Long,
             watchdogEnabled: Boolean,
             minimumConcurrentStalledRequests: Int,
+            canFreshRetry: Boolean,
             onDrain: () -> AndroidTransportGenerationRollover,
         ): Int {
             cancelWatchdog()
@@ -388,6 +400,7 @@ internal object AndroidTransportPhaseTracer {
             this.watchdogMillis = watchdogMillis
             this.watchdogEnabled = watchdogEnabled
             this.minimumConcurrentStalledRequests = minimumConcurrentStalledRequests
+            this.canFreshRetry = canFreshRetry
             this.onDrain = onDrain
             connectAttempts = 0
             protocolName = null
@@ -427,7 +440,7 @@ internal object AndroidTransportPhaseTracer {
                         ) {
                             false
                         } else {
-                            watchdogAttemptToken = token
+                            maturedAttemptToken = token
                             true
                         }
                     }
@@ -453,7 +466,7 @@ internal object AndroidTransportPhaseTracer {
             synchronized(this) {
                 if (
                     token != attemptToken ||
-                    watchdogAttemptToken != token ||
+                    maturedAttemptToken != token ||
                     responseHeadersStartNanos > 0L ||
                     protocolName != "h2" ||
                     reusedConnection != true
@@ -462,14 +475,13 @@ internal object AndroidTransportPhaseTracer {
                 }
                 staleH2Detected = true
                 staleH2ConcurrentRequestCount = concurrentStalled
-                watchdogAttemptToken = token
+                triggeredAttemptToken = token
                 noResponseHeadersDurationNanos = elapsedSince(sentNanos)
                 onDrain?.invoke()?.let { rollover ->
                     connectionDraining = rollover.observedGenerationDraining
                     connectionRolloverRateLimited = rollover.rateLimited
                 }
-                val method = call.request().method
-                if (method == "GET" || method == "HEAD") call.cancel()
+                cancelStalledCallIfReplaySafe(canFreshRetry, call::cancel)
             }
         }
 

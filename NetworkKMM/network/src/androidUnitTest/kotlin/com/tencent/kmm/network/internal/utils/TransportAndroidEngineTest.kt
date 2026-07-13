@@ -184,9 +184,21 @@ class TransportAndroidEngineTest {
     fun getAndHeadBodiesAreNeverAutomaticallyReplayed() {
         listOf(VBTransportMethod.GET, VBTransportMethod.HEAD).forEach { method ->
             val bufferedBody = AndroidReusedH2RetryState(method, hasReplayUnsafeBody = true)
+            assertTrue(!bufferedBody.canFreshRetry)
             assertTrue(!bufferedBody.claimRetry(watchdogTriggered = true, hasBudget = true))
             assertTrue(!bufferedBody.attempted)
         }
+    }
+
+    @Test
+    fun watchdogCancelsOnlyCallsThatCanActuallyFreshRetry() {
+        var cancelCount = 0
+        cancelStalledCallIfReplaySafe(canFreshRetry = false) { cancelCount += 1 }
+        cancelStalledCallIfReplaySafe(canFreshRetry = false) { cancelCount += 1 }
+        assertEquals(0, cancelCount)
+
+        cancelStalledCallIfReplaySafe(canFreshRetry = true) { cancelCount += 1 }
+        assertEquals(1, cancelCount)
     }
 
     @Test

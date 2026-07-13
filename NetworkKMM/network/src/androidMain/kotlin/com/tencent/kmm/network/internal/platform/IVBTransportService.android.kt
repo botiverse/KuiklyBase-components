@@ -387,6 +387,7 @@ object AndroidTransportImpl : IVBTransportService {
                 watchdogMillis = recovery.responseHeadersWatchdogMillis,
                 watchdogEnabled = okHttpEnabled && recovery.enabled,
                 minimumConcurrentStalledRequests = recovery.minimumConcurrentStalledRequests,
+                canFreshRetry = retryState.canFreshRetry,
             )
             try {
                 val requestBudget = androidRequestTimeoutBudget(

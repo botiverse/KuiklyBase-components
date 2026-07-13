@@ -146,14 +146,14 @@ internal class AndroidReusedH2RetryState(
     method: VBTransportMethod,
     hasReplayUnsafeBody: Boolean = false,
 ) {
-    private val retryable =
+    val canFreshRetry: Boolean =
         (method == VBTransportMethod.GET || method == VBTransportMethod.HEAD) &&
             !hasReplayUnsafeBody
     var attempted: Boolean = false
         private set
 
     fun claimRetry(watchdogTriggered: Boolean, hasBudget: Boolean): Boolean {
-        if (!watchdogTriggered || !hasBudget || !retryable || attempted) return false
+        if (!watchdogTriggered || !hasBudget || !canFreshRetry || attempted) return false
         attempted = true
         return true
     }
