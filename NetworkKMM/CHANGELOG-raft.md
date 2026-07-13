@@ -1,5 +1,32 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.25 / 0.1.0-raft.25-ohos (Android reused-HTTP/2 recovery)
+
+- Android's Ktor/OkHttp transport gains a default-off recovery path for reused
+  HTTP/2 connections whose active streams stop receiving response headers. A
+  watchdog starts only after request headers/body transmission completes and
+  requires at least two independently matured calls on the same physical
+  OkHttp connection before declaring it stale.
+- Enabled origins are distributed round-robin across configurable, lazily
+  created independent client/pool slots (five in the initial Alpha plan).
+  Recovery rolls over only the affected slot to a fresh generation; retired
+  clients drain their in-flight leases before closing, while unaffected slots
+  continue serving traffic.
+- Automatic cancellation and one sequential fresh-pool retry are restricted
+  to replay-safe, bodyless GET/HEAD requests. Uploads, bodyful GET/HEAD calls,
+  and all mutation methods are neither cancelled nor replayed by the watchdog.
+- A rolling replacement budget caps pool churn, quarantines rate-limited stale
+  slots while alternatives exist, and makes them probe-eligible after cooldown
+  without creating slots beyond the configured count.
+- Total-timeout accounting remains explicit across acquisition, request I/O,
+  rollover, and retry; user/parent cancellation wins over watchdog-triggered
+  cancellation. Monotonic configuration epochs prevent old requests from
+  restoring superseded settings, and disabling recovery or switching engines
+  retires existing recovery state safely.
+- Transport diagnostics now report stale-h2 detection and quorum, connection
+  origin/shard/generation/identity, drain and rollover-rate-limit state, fresh
+  retry/result, and the observed no-response-headers duration.
+
 ## 0.1.0-raft.24 / 0.1.0-raft.24-ohos (explicit HTTP/3/QUIC curl gray lane)
 
 - Android, iOS, and OHOS curl artifacts now build pinned nghttp3 1.17.0
