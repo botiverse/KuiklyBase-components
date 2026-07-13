@@ -135,6 +135,12 @@ void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath);
 // disables environment/system proxy discovery for direct mode.
 void SetCurlProxy(CurClientHandle handle, const char *proxyUrl);
 
+// Add one libcurl CURLOPT_RESOLVE entry for this client. The entry is copied
+// and follows libcurl's "host:port:address[,address]" format. This preserves
+// the URL hostname for TLS SNI/verification while allowing a caller to supply
+// an already-resolved address. Empty clears the override.
+int SetCurlResolve(CurClientHandle handle, const char *resolveEntry);
+
 // Runtime artifact capability probe. Version numbers alone are insufficient:
 // this checks libcurl's compiled feature bits for an actual HTTP/3 backend.
 int CurlSupportsHttp3(void);
