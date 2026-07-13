@@ -92,25 +92,29 @@ class IosCurlRuntimeTest {
 
         configureRuntime(caPath, caSha, http3Enabled = true)
         val h3 = execute(engine, h3Url)
-        assertTrue(h3.isSuccess, h3.error?.message)
-        assertEquals(NetworkHttpProtocol.HTTP_3, h3.protocol)
+        val h3Diagnostic = h3.runtimeDiagnostic("h3", h3Url)
+        assertTrue(h3.isSuccess, h3Diagnostic)
+        assertEquals(NetworkHttpProtocol.HTTP_3, h3.protocol, h3Diagnostic)
 
         // The h3 connection above remains pooled. Default traffic must use
         // the separate h2/h1 pool instead of silently reusing that connection.
         configureRuntime(caPath, caSha)
         val defaultH2 = execute(engine, h3Url)
-        assertTrue(defaultH2.isSuccess, defaultH2.error?.message)
-        assertEquals(NetworkHttpProtocol.HTTP_2, defaultH2.protocol)
+        val defaultDiagnostic = defaultH2.runtimeDiagnostic("default", h3Url)
+        assertTrue(defaultH2.isSuccess, defaultDiagnostic)
+        assertEquals(NetworkHttpProtocol.HTTP_2, defaultH2.protocol, defaultDiagnostic)
 
         configureRuntime(caPath, caSha, http3Enabled = true)
         val fallback = execute(engine, fallbackUrl)
-        assertTrue(fallback.isSuccess, fallback.error?.message)
-        assertEquals(NetworkHttpProtocol.HTTP_2, fallback.protocol)
+        val fallbackDiagnostic = fallback.runtimeDiagnostic("fallback", fallbackUrl)
+        assertTrue(fallback.isSuccess, fallbackDiagnostic)
+        assertEquals(NetworkHttpProtocol.HTTP_2, fallback.protocol, fallbackDiagnostic)
 
         val totalFailure = execute(engine, totalFailureUrl)
-        assertFalse(totalFailure.isSuccess)
-        assertEquals(NetworkErrorKind.CONNECT, totalFailure.error?.kind)
-        assertEquals(NetworkHttpProtocol.UNKNOWN, totalFailure.protocol)
+        val failureDiagnostic = totalFailure.runtimeDiagnostic("total-failure", totalFailureUrl)
+        assertFalse(totalFailure.isSuccess, failureDiagnostic)
+        assertEquals(NetworkErrorKind.CONNECT, totalFailure.error?.kind, failureDiagnostic)
+        assertEquals(NetworkHttpProtocol.UNKNOWN, totalFailure.protocol, failureDiagnostic)
     }
 
     @Test
@@ -313,6 +317,10 @@ class IosCurlRuntimeTest {
         val request = NetworkRequest(url = url)
         return engine.execute(request, NetworkCall(request))
     }
+
+    private fun NetworkResponse.runtimeDiagnostic(label: String, url: String): String =
+        "$label url=$url status=$statusCode protocol=$protocol " +
+            "errorKind=${error?.kind} error=${error?.message}"
 
     private fun runtimeEnvironment(name: String): String? =
         getenv(name)?.toKString()?.takeIf(String::isNotBlank)

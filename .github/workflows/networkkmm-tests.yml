@@ -163,6 +163,15 @@ jobs:
         shell: bash
         run: NetworkKMM/scripts/run-ios-curl-runtime-tests.sh
 
+      - name: Upload iOS curl test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-ios-curl-test-reports
+          path: |
+            NetworkKMM/network/build/reports/tests/iosSimulatorArm64Test/
+            NetworkKMM/network/build/test-results/iosSimulatorArm64Test/
+
   ohos-tree:
     name: OHOS tree compile & publication metadata (:network)
     runs-on: ubuntu-latest
