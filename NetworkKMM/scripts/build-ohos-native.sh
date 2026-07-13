@@ -377,7 +377,7 @@ fi
 
 echo "==> Checking wrapper HTTP/3 control surface"
 WRAPPER_SYMBOLS="$("$LLVM_BIN/llvm-nm" -D "$WRAPPER_SO" 2>/dev/null || true)"
-for symbol in CurlSupportsHttp3 SetCurlHttp3Enabled GetCurlNegotiatedProtocol; do
+for symbol in CurlSupportsHttp3 SetCurlHttp3Enabled GetCurlNegotiatedProtocol SetCurlResolve; do
   if grep -Eq " [TW] ${symbol}$" <<<"$WRAPPER_SYMBOLS"; then
     echo "wrapper ${symbol}: EXPORTED"
   else

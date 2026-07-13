@@ -70,6 +70,25 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     return captured;
 }
 
+static Captured FetchWithResolve(const std::string &url, const std::string &resolveEntry) {
+    Captured captured;
+    StringDic headers{};
+    CurlRequest request{};
+    request.url = url.c_str();
+    request.method = "GET";
+    request.headers = &headers;
+    request.timeout = 5000;
+
+    CurlCallback callback{&captured, OnResponse};
+    CurClientHandle handle = CreateCurlClient("wrapper-resolve-test");
+    SetCurlProxy(handle, "");
+    CHECK(SetCurlResolve(handle, resolveEntry.c_str()) == 1,
+          "per-client resolve entry is accepted");
+    StartRequest(handle, request, &callback);
+    DeleteCurlClient(handle);
+    return captured;
+}
+
 static bool HasCurlFeature(long feature) {
     curl_version_info_data *info = curl_version_info(CURLVERSION_NOW);
     return info != nullptr && (info->features & feature) != 0;
@@ -112,6 +131,20 @@ int main(int argc, char **argv) {
         CHECK(std::strcmp(GetCurlNegotiatedProtocol(handle), "unknown") == 0,
               "protocol is unknown before a request completes");
         DeleteCurlClient(handle);
+    }
+
+    // CURLOPT_RESOLVE keeps the URL hostname while bypassing the process DNS
+    // resolver. Use the reserved .invalid TLD so success proves the override.
+    {
+        const size_t portSeparator = base.rfind(':');
+        CHECK(portSeparator != std::string::npos, "test server base URL has a port");
+        const std::string port = base.substr(portSeparator + 1);
+        const std::string alias = "networkkmm.invalid";
+        Captured resolved = FetchWithResolve(
+            "http://" + alias + ":" + port + "/ok",
+            alias + ":" + port + ":127.0.0.1");
+        CHECK(resolved.code == 0, "resolve override bypasses DNS");
+        CHECK(resolved.httpCode == 200, "resolve override reaches the intended server");
     }
 
     // 1. Plain success: transfer ok, HTTP 200, body delivered.

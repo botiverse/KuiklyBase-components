@@ -317,7 +317,7 @@ for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
   # diagnostics on 2026-07-10); -j is NOT portable across Xcode nm versions
   # and fails silently, so match the full-line format instead.
   syms="$(xcrun nm -g --defined-only -arch arm64 "$lib" 2>/dev/null || true)"
-  for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo _SetCurlProxy \
+  for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo _SetCurlProxy _SetCurlResolve \
              _CurlSupportsHttp3 _SetCurlHttp3Enabled _GetCurlNegotiatedProtocol \
              _StartRequest _StartStreamRequest _StartUploadRequest; do
     # herestring, not a pipe: grep -q exits on first match and pipefail

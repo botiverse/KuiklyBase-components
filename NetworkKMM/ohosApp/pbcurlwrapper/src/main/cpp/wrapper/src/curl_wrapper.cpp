@@ -404,6 +404,19 @@ class CurlClient {
         if (share != nullptr) {
             curl_easy_setopt(curl_, CURLOPT_SHARE, share);
         }
+        if (!resolve_entry_.empty()) {
+            struct curl_slist *updated_resolve_list = curl_slist_append(resolve_list_, resolve_entry_.c_str());
+            if (updated_resolve_list == nullptr) {
+                logE(log_tag_, "failed to allocate CURLOPT_RESOLVE entry");
+                return false;
+            }
+            resolve_list_ = updated_resolve_list;
+            CURLcode resolveResult = curl_easy_setopt(curl_, CURLOPT_RESOLVE, resolve_list_);
+            if (resolveResult != CURLE_OK) {
+                logE(log_tag_, "CURLOPT_RESOLVE failed: " + std::to_string(resolveResult));
+                return false;
+            }
+        }
         // Default requests are explicitly capped at h2/h1.1. Gray HTTP/3
         // requests use CURL_HTTP_VERSION_3, whose documented semantics race
         // QUIC and fall back to h2/h1.1; 3ONLY is intentionally never used.
@@ -684,6 +697,10 @@ class CurlClient {
             curl_slist_free_all(header_list_);
             header_list_ = nullptr;
         }
+        if (resolve_list_ != nullptr) {
+            curl_slist_free_all(resolve_list_);
+            resolve_list_ = nullptr;
+        }
 
         // No curl_global_cleanup() here: it used to fire on the FIRST client
         // destruction while the process-wide gCurlShare (pooled TLS/DNS
@@ -759,6 +776,11 @@ class CurlClient {
         proxy_url_ = proxyUrl == nullptr ? "" : proxyUrl;
     }
 
+    bool SetResolve(const char *resolveEntry) {
+        resolve_entry_ = resolveEntry == nullptr ? "" : resolveEntry;
+        return true;
+    }
+
     bool SetHttp3Enabled(bool enabled) {
         if (enabled && !CurlSupportsHttp3()) {
             return false;
@@ -782,6 +804,7 @@ class CurlClient {
     std::string log_tag_;
     CURL *curl_ = nullptr;
     struct curl_slist *header_list_ = nullptr;
+    struct curl_slist *resolve_list_ = nullptr;
     char curl_error_msg_[CURL_ERROR_SIZE];
     std::string headers_;
     std::string redirect_url_;
@@ -792,6 +815,7 @@ class CurlClient {
     std::string accept_encoding_;
     std::string ca_info_path_;
     std::string proxy_url_;
+    std::string resolve_entry_;
     // fork #8 streaming: set for the lifetime of a StartStreamRequest call.
     CurlStreamCallback *stream_callback_ = nullptr;
     // issue #8 slice 3: set for the lifetime of a StartUploadRequest call.
@@ -864,6 +888,13 @@ void SetCurlProxy(CurClientHandle handle, const char *proxyUrl) {
         return;
     }
     reinterpret_cast<CurlClient *>(handle)->SetProxy(proxyUrl);
+}
+
+int SetCurlResolve(CurClientHandle handle, const char *resolveEntry) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    return reinterpret_cast<CurlClient *>(handle)->SetResolve(resolveEntry) ? 1 : 0;
 }
 
 int CurlSupportsHttp3(void) {

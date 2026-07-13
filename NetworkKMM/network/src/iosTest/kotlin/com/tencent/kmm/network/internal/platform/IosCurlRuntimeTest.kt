@@ -88,7 +88,15 @@ class IosCurlRuntimeTest {
         val caPath = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_PUBLIC_CA_PATH") ?: return@runBlocking
         val caSha = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_PUBLIC_CA_SHA256") ?: return@runBlocking
         assertTrue(IosCurlCInteropBridge.supportsHttp3)
-        val engine = assertNotNull(resolvePlatformNetworkEngine(NetworkTransportEngine.CURL))
+        val resolveEntries = buildMap {
+            runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_HTTP3_RESOLVE")?.let { put(h3Url, it) }
+            runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_H2_FALLBACK_RESOLVE")?.let {
+                put(fallbackUrl, it)
+            }
+        }
+        val engine = IosCurlNetworkEngine(
+            IosCurlResolveOverrideBridge(IosCurlCInteropBridge, resolveEntries)
+        )
 
         configureRuntime(caPath, caSha, http3Enabled = true)
         val h3Attempt = executeExternal(engine, h3Url)
@@ -353,4 +361,35 @@ class IosCurlRuntimeTest {
         val response: NetworkResponse,
         val attempts: Int
     )
+
+    private class IosCurlResolveOverrideBridge(
+        private val delegate: IosCurlNativeBridge,
+        private val entriesByUrl: Map<String, String>
+    ) : IosCurlNativeBridge {
+        override val isAvailable: Boolean
+            get() = delegate.isAvailable
+        override val supportsHttp3: Boolean
+            get() = delegate.supportsHttp3
+
+        override suspend fun execute(request: IosCurlNativeRequest) =
+            delegate.execute(request.withResolveEntry())
+
+        override suspend fun downloadStream(
+            request: IosCurlNativeRequest,
+            onResponseStart: (Long, String) -> Unit,
+            onChunk: (ByteArray) -> Unit
+        ) = delegate.downloadStream(request.withResolveEntry(), onResponseStart, onChunk)
+
+        override suspend fun uploadStream(
+            request: IosCurlNativeRequest,
+            source: IosCurlUploadSource
+        ) = delegate.uploadStream(request.withResolveEntry(), source)
+
+        override fun cancel(requestId: Int) {
+            delegate.cancel(requestId)
+        }
+
+        private fun IosCurlNativeRequest.withResolveEntry(): IosCurlNativeRequest =
+            copy(resolveEntry = entriesByUrl[url])
+    }
 }

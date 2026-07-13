@@ -32,6 +32,7 @@ import com.tencent.kmm.network.curl.native.GetCurlNegotiatedProtocol
 import com.tencent.kmm.network.curl.native.SetCurlCaInfo
 import com.tencent.kmm.network.curl.native.SetCurlHttp3Enabled
 import com.tencent.kmm.network.curl.native.SetCurlProxy
+import com.tencent.kmm.network.curl.native.SetCurlResolve
 import com.tencent.kmm.network.curl.native.StartRequest
 import com.tencent.kmm.network.curl.native.StartStreamRequest
 import com.tencent.kmm.network.curl.native.StartUploadRequest
@@ -103,6 +104,7 @@ internal data class IosCurlNativeRequest(
     /** Empty string means explicit direct mode. */
     val proxyUrl: String,
     val http3Enabled: Boolean = false,
+    val resolveEntry: String? = null,
     val cancellationSignal: IosCurlCancellationSignal = IosCurlCancellationSignal()
 ) {
     fun cancel() {
@@ -222,6 +224,11 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             }
             SetCurlCaInfo(handle, request.caInfoPath)
             SetCurlProxy(handle, request.proxyUrl)
+            request.resolveEntry?.let { entry ->
+                if (SetCurlResolve(handle, entry) == 0) {
+                    return@withContext unavailable("iOS curl failed to apply resolve entry")
+                }
+            }
             IosCurlHandleRegistry.publish(request.requestId, handle)
             if (request.cancellationSignal.isCancelled()) {
                 cancelNative(handle)
