@@ -337,4 +337,40 @@ class TransportAndroidEngineTest {
             afterCooldown.forEach(AndroidTransportClientLease::close)
         }
     }
+
+    @Test
+    fun stalledConnectionRegistryRequiresTwoCallsOnTheSamePhysicalConnection() {
+        val registry = AndroidStalledConnectionRegistry()
+        val triggered = mutableListOf<String>()
+        registry.register("connection-a", "request-1") { triggered += "one:$it" }
+        registry.triggerIfAtLeast("connection-a", minimum = 2)
+        assertTrue(triggered.isEmpty())
+
+        registry.register("connection-b", "request-other") { triggered += "other:$it" }
+        registry.triggerIfAtLeast("connection-a", minimum = 2)
+        assertTrue(triggered.isEmpty())
+
+        // The key is the physical OkHttp Connection identity, not origin. Two
+        // coalesced-origin calls on the same connection therefore share count.
+        registry.register("connection-a", "request-2-other-origin") { triggered += "two:$it" }
+        registry.triggerIfAtLeast("connection-a", minimum = 2)
+        assertEquals(setOf("one:2", "two:2"), triggered.toSet())
+    }
+
+    @Test
+    fun stalledConnectionRegistryRemovalPreventsCountLeakAndFalseTrigger() {
+        val registry = AndroidStalledConnectionRegistry()
+        var triggerCount = 0
+        registry.register("connection-a", "request-1") { triggerCount += 1 }
+        registry.register("connection-a", "request-2") { triggerCount += 1 }
+        assertEquals(2, registry.count("connection-a"))
+
+        registry.unregister("connection-a", "request-1")
+        assertEquals(1, registry.count("connection-a"))
+        registry.triggerIfAtLeast("connection-a", minimum = 2)
+        assertEquals(0, triggerCount)
+
+        registry.unregister("connection-a", "request-2")
+        assertEquals(0, registry.count("connection-a"))
+    }
 }

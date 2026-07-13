@@ -70,6 +70,8 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 
 private val scope = CoroutineScope(Dispatchers.IO)
@@ -350,6 +352,7 @@ object AndroidTransportImpl : IVBTransportService {
                 lease = lease,
                 watchdogMillis = recovery.responseHeadersWatchdogMillis,
                 watchdogEnabled = okHttpEnabled && recovery.enabled,
+                minimumConcurrentStalledRequests = recovery.minimumConcurrentStalledRequests,
             )
             try {
                 val remainingTimeout = remainingRequestTimeout(request.totalTimeout, overallStart)
@@ -368,6 +371,10 @@ object AndroidTransportImpl : IVBTransportService {
                 }
                 return AndroidResponseLease(response, lease)
             } catch (throwable: Throwable) {
+                // User/scope cancellation must win over a simultaneous
+                // watchdog. OkHttp Call.cancel() leaves this coroutine active;
+                // parent cancellation does not.
+                currentCoroutineContext().ensureActive()
                 val watchdogTriggered =
                     AndroidTransportPhaseTracer.watchdogTriggered(request.requestId, attemptToken)
                 val hasBudget = request.totalTimeout <= 0L ||

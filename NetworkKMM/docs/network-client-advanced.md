@@ -292,14 +292,19 @@ VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
     enabled = remoteStaleH2RecoveryEnabled,
     clientShardCount = 5,
     responseHeadersWatchdogMillis = 7_000,
-    pingIntervalMillis = 15_000 // optional first-line liveness check
+    minimumConcurrentStalledRequests = 2,
+    pingIntervalMillis = 3_000 // Alpha first-line liveness check
 )
 ```
 
 The five slots are independent OkHttp clients and connection pools, selected round-robin for the same
 origin. This bounds a single bad reused connection's normal blast radius instead of putting the entire
 foreground burst on one pool. The watchdog starts only after request headers/body have been sent. It
-requires both `h2` and a reused connection, then atomically drains only the affected slot's generation.
+requires both `h2`, a reused connection, and at least two concurrently sent calls on the same physical
+OkHttp connection with no response headers. A single legitimately slow endpoint therefore does not
+retire a healthy pool. Once the connection-level condition is met, all waiting GET/HEAD calls registered
+on that connection are cancelled for their one sequential retry, and only the affected slot's generation
+is atomically drained.
 The replacement is a newly constructed OkHttp client and connection pool; the other slots do not change.
 The old generation closes only after its in-flight calls finish, so POST/PUT/PATCH/upload calls are never
 cancelled or replayed. GET/HEAD may make one sequential retry on a different slot within the original
@@ -312,7 +317,7 @@ until the window expires instead of creating clients without bound.
 the response-headers watchdog. Inspect `VBTransportElapseStatistics.staleH2Detected`,
 `connectionOrigin`, `connectionShard`, `connectionGeneration`, `connectionIdentity`, `connectionDraining`,
 `connectionRolloverRateLimited`, `freshRetry`,
-`freshRetryResult`, and `noResponseHeadersDurationMs` during rollout.
+`freshRetryResult`, `noResponseHeadersDurationMs`, and `staleH2ConcurrentRequestCount` during rollout.
 
 ## Handle stable error kinds
 

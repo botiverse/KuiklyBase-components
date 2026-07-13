@@ -40,9 +40,10 @@ object VBTransportAndroidEngine {
      * Keep this disabled until the host has selected a rollout cohort. When
      * enabled, NetworkKMM watches from request-send completion to
      * `responseHeadersStart`. A reused h2 call that exceeds
-     * [VBTransportReusedHttp2Recovery.responseHeadersWatchdogMillis] drains
-     * its origin's affected client slot generation. GET/HEAD may retry once
-     * on a different slot; methods with replay-unsafe bodies are never retried.
+     * [VBTransportReusedHttp2Recovery.responseHeadersWatchdogMillis], together
+     * with another stalled call on the same physical connection, drains its
+     * origin's affected client slot generation. GET/HEAD may retry once on a
+     * different slot; methods with replay-unsafe bodies are never retried.
      *
      * This value is sampled at the beginning of each request. Changing it does
      * not mutate an already-running request.
@@ -59,6 +60,8 @@ data class VBTransportReusedHttp2Recovery(
     val clientShardCount: Int = 5,
     /** No-response-headers interval after the request has been sent. */
     val responseHeadersWatchdogMillis: Long = 7_000L,
+    /** Concurrent stalled calls required on the same reused h2 connection. */
+    val minimumConcurrentStalledRequests: Int = 2,
     /**
      * Optional low-cost connection liveness layer. Zero keeps OkHttp's ping
      * interval disabled. PING does not replace the response-headers watchdog.
@@ -69,6 +72,9 @@ data class VBTransportReusedHttp2Recovery(
         require(clientShardCount in 1..8) { "clientShardCount must be between 1 and 8" }
         require(responseHeadersWatchdogMillis > 0L) {
             "responseHeadersWatchdogMillis must be positive"
+        }
+        require(minimumConcurrentStalledRequests > 0) {
+            "minimumConcurrentStalledRequests must be positive"
         }
         require(pingIntervalMillis >= 0L) { "pingIntervalMillis must be non-negative" }
     }

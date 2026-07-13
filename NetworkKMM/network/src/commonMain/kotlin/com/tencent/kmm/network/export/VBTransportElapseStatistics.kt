@@ -95,4 +95,6 @@ data class VBTransportElapseStatistics(
     var freshRetryResult: String? = null,
     /** Duration observed when the stale-h2 watchdog fired. */
     var noResponseHeadersDurationMs: Double = 0.0,
+    /** Concurrent no-headers calls observed on the same reused h2 connection. */
+    var staleH2ConcurrentRequestCount: Int = 0,
 )

@@ -274,14 +274,17 @@ VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
     enabled = remoteStaleH2RecoveryEnabled,
     clientShardCount = 5,
     responseHeadersWatchdogMillis = 7_000,
-    pingIntervalMillis = 15_000 // 可选的第一层存活探测
+    minimumConcurrentStalledRequests = 2,
+    pingIntervalMillis = 3_000 // Alpha 第一层存活探测
 )
 ```
 
 同一 origin 的 5 个槽位分别持有独立 OkHttp client 与 ConnectionPool，请求轮询分配；一条坏复用连接
 只会影响其中一份，而不是把整批前台请求压在同一个 pool。watchdog 只从 request headers/body 发送完毕
-后开始计时，并且只在 `h2 + reused connection` 同时成立时命中。命中者只把对应槽位的 generation 标记
-为 draining，并新建该槽位的 OkHttp client/ConnectionPool；其他 4 个槽位不变。旧 generation 等所有
+后开始计时，并且要求 `h2 + reused connection + 同一物理 OkHttp connection 至少 2 个并发请求都已发完且
+没有 response headers` 同时成立；单个合法慢 endpoint 不会误退休健康 pool。连接级条件命中后，该连接上
+所有等待中的 GET/HEAD 都会取消并进入各自唯一一次串行 retry。只把对应槽位的 generation 标记为
+draining，并新建该槽位的 OkHttp client/ConnectionPool；其他 4 个槽位不变。旧 generation 等所有
 在途调用自然结束后才关闭，因此 POST/PUT/PATCH/上传不会被取消或自动重放。GET/HEAD 在原 total timeout
 剩余预算内最多到另一个槽位串行 fresh retry 一次；它不是 hedge，所以旧 completion 不会与新结果竞争覆盖。
 同一 origin 的 30 秒滚动窗口内最多创建 `clientShardCount` 个 replacement client；如果新建的多个槽位也
@@ -290,7 +293,7 @@ VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
 `pingIntervalMillis` 能发现连 PING 都不再应答的连接，但不能替代 response-headers watchdog。灰度时检查
 `VBTransportElapseStatistics.staleH2Detected`、`connectionOrigin`、`connectionShard`、`connectionGeneration`、
 `connectionIdentity`、`connectionDraining`、`connectionRolloverRateLimited`、`freshRetry`、`freshRetryResult` 和
-`noResponseHeadersDurationMs`。
+`noResponseHeadersDurationMs` 和 `staleH2ConcurrentRequestCount`。
 
 ## 处理稳定错误分类
 
