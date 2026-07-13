@@ -281,6 +281,32 @@ I/O. Android and iOS still select OkHttp/Darwin by default, while OHOS remains t
 `NetworkEngineSelectionDiagnostics.capabilities` always describes the engine that was actually
 selected, not the requested engine.
 
+## Recover a stalled reused Android HTTP/2 connection
+
+Android's default Ktor-OkHttp transport can optionally detect a reused h2 connection that accepted a
+request but produced no response headers. The policy is default-off and should be enabled through a
+stable remote-config cohort:
+
+```kotlin
+VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
+    enabled = remoteStaleH2RecoveryEnabled,
+    responseHeadersWatchdogMillis = 7_000,
+    pingIntervalMillis = 15_000 // optional first-line liveness check
+)
+```
+
+The watchdog starts only after request headers/body have been sent. It requires both `h2` and a reused
+connection, then atomically drains that origin's current client generation. New requests use a newly
+constructed OkHttp client and connection pool. The old generation closes only after its in-flight calls
+finish, so POST/PUT/PATCH/upload calls are never cancelled or replayed. GET/HEAD may make one sequential
+fresh-generation retry within the original total timeout; this is not a hedge, so an old completion
+cannot race and overwrite the fresh result.
+
+`pingIntervalMillis` can detect a connection that also stopped answering PING, but it does not replace
+the response-headers watchdog. Inspect `VBTransportElapseStatistics.staleH2Detected`,
+`connectionOrigin`, `connectionGeneration`, `connectionIdentity`, `connectionDraining`, `freshRetry`,
+`freshRetryResult`, and `noResponseHeadersDurationMs` during rollout.
+
 ## Handle stable error kinds
 
 Use `NetworkError.kind` for business/UI branching and keep raw codes/messages for diagnostics:

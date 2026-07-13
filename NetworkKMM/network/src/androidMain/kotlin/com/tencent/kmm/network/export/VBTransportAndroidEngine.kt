@@ -32,4 +32,41 @@ package com.tencent.kmm.network.export
 object VBTransportAndroidEngine {
     @Volatile
     var okHttpEnabled: Boolean = true
+
+    /**
+     * Opt-in recovery for a reused HTTP/2 connection that accepts a request
+     * but makes no progress towards response headers.
+     *
+     * Keep this disabled until the host has selected a rollout cohort. When
+     * enabled, NetworkKMM watches from request-send completion to
+     * `responseHeadersStart`. A reused h2 call that exceeds
+     * [VBTransportReusedHttp2Recovery.responseHeadersWatchdogMillis] drains
+     * its origin's current client generation. GET/HEAD may retry once on the
+     * new generation; methods with replay-unsafe bodies are never retried.
+     *
+     * This value is sampled at the beginning of each request. Changing it does
+     * not mutate an already-running request.
+     */
+    @Volatile
+    var reusedHttp2Recovery: VBTransportReusedHttp2Recovery =
+        VBTransportReusedHttp2Recovery()
+}
+
+data class VBTransportReusedHttp2Recovery(
+    /** Default-off rollout gate. */
+    val enabled: Boolean = false,
+    /** No-response-headers interval after the request has been sent. */
+    val responseHeadersWatchdogMillis: Long = 7_000L,
+    /**
+     * Optional low-cost connection liveness layer. Zero keeps OkHttp's ping
+     * interval disabled. PING does not replace the response-headers watchdog.
+     */
+    val pingIntervalMillis: Long = 0L,
+) {
+    init {
+        require(responseHeadersWatchdogMillis > 0L) {
+            "responseHeadersWatchdogMillis must be positive"
+        }
+        require(pingIntervalMillis >= 0L) { "pingIntervalMillis must be non-negative" }
+    }
 }

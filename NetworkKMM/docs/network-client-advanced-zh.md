@@ -264,6 +264,30 @@ VBTransportCurl.configure(
 
 `NetworkEngineSelectionDiagnostics.capabilities` 描述的是**实际选中的 engine**，不是请求但未命中的 engine。
 
+## 恢复 Android 已复用但无响应头进展的 HTTP/2 连接
+
+Android 默认 Ktor-OkHttp transport 可选检测“请求已经发出，但复用 h2 连接一直没有响应头”的状态。
+策略默认关闭，应通过稳定 remote-config cohort 灰度：
+
+```kotlin
+VBTransportAndroidEngine.reusedHttp2Recovery = VBTransportReusedHttp2Recovery(
+    enabled = remoteStaleH2RecoveryEnabled,
+    responseHeadersWatchdogMillis = 7_000,
+    pingIntervalMillis = 15_000 // 可选的第一层存活探测
+)
+```
+
+watchdog 只从 request headers/body 发送完毕后开始计时，并且只在 `h2 + reused connection` 同时成立时
+命中。命中者会原子地把该 origin 当前 client generation 标记为 draining；后续请求使用新建的
+OkHttp client 与全新 ConnectionPool。旧 generation 等所有在途调用自然结束后才关闭，因此
+POST/PUT/PATCH/上传不会被取消或自动重放。GET/HEAD 在原 total timeout 剩余预算内最多串行 fresh retry
+一次；它不是 hedge，所以旧 completion 不会与新结果竞争覆盖。
+
+`pingIntervalMillis` 能发现连 PING 都不再应答的连接，但不能替代 response-headers watchdog。灰度时检查
+`VBTransportElapseStatistics.staleH2Detected`、`connectionOrigin`、`connectionGeneration`、
+`connectionIdentity`、`connectionDraining`、`freshRetry`、`freshRetryResult` 和
+`noResponseHeadersDurationMs`。
+
 ## 处理稳定错误分类
 
 业务/UI 层用 `NetworkError.kind` 分支，raw code/message 保留给 diagnostics：

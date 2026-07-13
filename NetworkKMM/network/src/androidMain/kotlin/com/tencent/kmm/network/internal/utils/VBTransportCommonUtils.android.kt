@@ -18,12 +18,17 @@ package com.tencent.kmm.network.internal.utils
 
 import com.tencent.kmm.network.export.VBTransportAndroidEngine
 import com.tencent.kmm.network.export.VBTransportBaseRequest
+import com.tencent.kmm.network.export.VBTransportReusedHttp2Recovery
+import com.tencent.kmm.network.export.VBTransportMethod
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.android.Android
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.HttpTimeout
 import okhttp3.Dispatcher
 import okhttp3.OkHttpClient
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 
 actual suspend fun readKnownSize(
     channel: ByteReadChannelWrapper,
@@ -56,12 +61,15 @@ private val sharedHttpClient: HttpClient by lazy {
     buildTransportHttpClient(VBTransportAndroidEngine.okHttpEnabled)
 }
 
-internal fun buildTransportHttpClient(okHttpEnabled: Boolean): HttpClient =
+internal fun buildTransportHttpClient(
+    okHttpEnabled: Boolean,
+    recovery: VBTransportReusedHttp2Recovery = VBTransportReusedHttp2Recovery(),
+): HttpClient =
     if (okHttpEnabled) {
         HttpClient(OkHttp) {
             install(HttpTimeout)
             engine {
-                config { applyTransportOkHttpDefaults() }
+                config { applyTransportOkHttpDefaults(recovery.pingIntervalMillis) }
             }
         }
     } else {
@@ -85,9 +93,12 @@ internal fun buildTransportHttpClient(okHttpEnabled: Boolean): HttpClient =
 // Only the per-host cap changes; the global Dispatcher.maxRequests stays at
 // OkHttp's default 64, so h1 degradation / multi-host traffic cannot expand the
 // overall concurrency ceiling.
-internal fun OkHttpClient.Builder.applyTransportOkHttpDefaults(): OkHttpClient.Builder =
+internal fun OkHttpClient.Builder.applyTransportOkHttpDefaults(
+    pingIntervalMillis: Long = 0L,
+): OkHttpClient.Builder =
     fastFallback(true)
         .dispatcher(Dispatcher().apply { maxRequestsPerHost = 16 })
+        .pingInterval(pingIntervalMillis, TimeUnit.MILLISECONDS)
         .eventListenerFactory(AndroidTransportPhaseTracer.eventListenerFactory())
         .addInterceptor { chain ->
             val request = chain.request()
@@ -98,3 +109,170 @@ internal fun OkHttpClient.Builder.applyTransportOkHttpDefaults(): OkHttpClient.B
         }
 
 actual fun getHttpClient(kmmRequest: VBTransportBaseRequest): Any? = sharedHttpClient
+
+/** A request-scoped hold on one origin/client-pool generation. */
+internal class AndroidTransportClientLease internal constructor(
+    val client: HttpClient,
+    val origin: String,
+    val generation: Long,
+    private val onRelease: () -> Unit,
+    private val onDrain: () -> AndroidTransportGenerationRollover,
+) : AutoCloseable {
+    private val released = AtomicBoolean(false)
+
+    fun drainGeneration(): AndroidTransportGenerationRollover = onDrain()
+
+    override fun close() {
+        if (released.compareAndSet(false, true)) onRelease()
+    }
+}
+
+internal data class AndroidTransportGenerationRollover(
+    val generation: Long,
+    /** True only for the first caller that retired the observed generation. */
+    val initiated: Boolean,
+)
+
+/** Per-logical-request replay safety gate; retries are sequential, never hedged. */
+internal class AndroidReusedH2RetryState(method: VBTransportMethod) {
+    private val retryable = method == VBTransportMethod.GET || method == VBTransportMethod.HEAD
+    var attempted: Boolean = false
+        private set
+
+    fun claimRetry(watchdogTriggered: Boolean, hasBudget: Boolean): Boolean {
+        if (!watchdogTriggered || !hasBudget || !retryable || attempted) return false
+        attempted = true
+        return true
+    }
+}
+
+/**
+ * Owns one OkHttp/Ktor pool generation per origin while recovery is enabled.
+ * A rollover swaps the current generation atomically; the old client closes
+ * only after every in-flight lease releases, so replay-unsafe writes can
+ * finish naturally.
+ */
+internal class AndroidTransportClientGenerationManager(
+    private val clientFactory: (VBTransportReusedHttp2Recovery) -> HttpClient = {
+        buildTransportHttpClient(okHttpEnabled = true, recovery = it)
+    },
+) {
+    private val lock = Any()
+    private val origins = mutableMapOf<String, OriginState>()
+    private var nextGeneration = 1L
+
+    fun acquire(
+        url: String,
+        recovery: VBTransportReusedHttp2Recovery,
+    ): AndroidTransportClientLease {
+        val origin = transportOrigin(url)
+        val generation = synchronized(lock) {
+            val state = origins.getOrPut(origin) {
+                OriginState(newGeneration(recovery))
+            }
+            if (state.current.recovery != recovery) {
+                retireCurrentLocked(state, recovery)
+            }
+            state.current.also { it.inFlight += 1 }
+        }
+        return AndroidTransportClientLease(
+            client = generation.client,
+            origin = origin,
+            generation = generation.id,
+            onRelease = { release(origin, generation) },
+            onDrain = { drain(origin, generation.id, recovery) },
+        )
+    }
+
+    private fun drain(
+        origin: String,
+        observedGeneration: Long,
+        recovery: VBTransportReusedHttp2Recovery,
+    ): AndroidTransportGenerationRollover = synchronized(lock) {
+        val state = origins.getValue(origin)
+        if (state.current.id != observedGeneration) {
+            return@synchronized AndroidTransportGenerationRollover(
+                generation = state.current.id,
+                initiated = false,
+            )
+        }
+        retireCurrentLocked(state, recovery)
+        AndroidTransportGenerationRollover(
+            generation = state.current.id,
+            initiated = true,
+        )
+    }
+
+    private fun retireCurrentLocked(
+        state: OriginState,
+        recovery: VBTransportReusedHttp2Recovery,
+    ) {
+        val retired = state.current
+        retired.draining = true
+        state.retired += retired
+        state.current = newGeneration(recovery)
+        closeIfDrainedLocked(state, retired)
+    }
+
+    private fun release(origin: String, generation: Generation) {
+        synchronized(lock) {
+            generation.inFlight -= 1
+            check(generation.inFlight >= 0) { "negative generation lease count" }
+            val state = origins[origin] ?: return
+            closeIfDrainedLocked(state, generation)
+        }
+    }
+
+    private fun closeIfDrainedLocked(state: OriginState, generation: Generation) {
+        if (generation.draining && generation.inFlight == 0) {
+            state.retired.remove(generation)
+            generation.client.close()
+        }
+    }
+
+    private fun newGeneration(recovery: VBTransportReusedHttp2Recovery): Generation =
+        Generation(
+            id = nextGeneration++,
+            client = clientFactory(recovery),
+            recovery = recovery,
+        )
+
+    private class OriginState(var current: Generation) {
+        val retired = mutableSetOf<Generation>()
+    }
+
+    private class Generation(
+        val id: Long,
+        val client: HttpClient,
+        val recovery: VBTransportReusedHttp2Recovery,
+        var inFlight: Int = 0,
+        var draining: Boolean = false,
+    )
+}
+
+internal object AndroidTransportClientProvider {
+    private val generationManager = AndroidTransportClientGenerationManager()
+
+    fun acquire(
+        request: VBTransportBaseRequest,
+        okHttpEnabled: Boolean = VBTransportAndroidEngine.okHttpEnabled,
+        recovery: VBTransportReusedHttp2Recovery = VBTransportAndroidEngine.reusedHttp2Recovery,
+    ): AndroidTransportClientLease {
+        if (!okHttpEnabled || !recovery.enabled) {
+            return AndroidTransportClientLease(
+                client = sharedHttpClient,
+                origin = transportOrigin(request.url),
+                generation = 0L,
+                onRelease = {},
+                onDrain = { AndroidTransportGenerationRollover(0L, initiated = false) },
+            )
+        }
+        return generationManager.acquire(request.url, recovery)
+    }
+}
+
+internal fun transportOrigin(url: String): String {
+    val parsed = url.toHttpUrlOrNull() ?: return "invalid-origin"
+    val diagnosticHost = if (':' in parsed.host) "[${parsed.host}]" else parsed.host
+    return "${parsed.scheme}://$diagnosticHost:${parsed.port}"
+}

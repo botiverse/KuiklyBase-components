@@ -17,6 +17,7 @@
 package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.export.VBTransportBaseRequest
+import com.tencent.kmm.network.export.VBTransportAndroidEngine
 import com.tencent.kmm.network.export.VBTransportBaseResponse
 import com.tencent.kmm.network.export.VBTransportBytesRequest
 import com.tencent.kmm.network.export.VBTransportBytesResponse
@@ -32,6 +33,9 @@ import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.VBPBLog
 import com.tencent.kmm.network.internal.utils.ByteReadChannelWrapper
 import com.tencent.kmm.network.internal.utils.AndroidTransportPhaseTracer
+import com.tencent.kmm.network.internal.utils.AndroidTransportClientLease
+import com.tencent.kmm.network.internal.utils.AndroidTransportClientProvider
+import com.tencent.kmm.network.internal.utils.AndroidReusedH2RetryState
 import com.tencent.kmm.network.internal.utils.NETWORK_KMM_TRACE_HEADER
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.buildResponseAndCallback
 import com.tencent.kmm.network.internal.utils.describeTransportFailure
@@ -41,7 +45,6 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapGetCall
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapPostCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapRequestCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringCallback
-import com.tencent.kmm.network.internal.utils.getHttpClient
 import com.tencent.kmm.network.internal.utils.readKnownSize
 import com.tencent.kmm.network.internal.utils.readUnknownSize
 import io.ktor.client.HttpClient
@@ -51,6 +54,7 @@ import io.ktor.client.request.header
 import io.ktor.client.request.request
 import io.ktor.client.request.setBody
 import io.ktor.client.statement.bodyAsChannel
+import io.ktor.client.statement.HttpResponse
 import io.ktor.http.content.OutgoingContent
 import io.ktor.utils.io.ByteWriteChannel
 import io.ktor.utils.io.writeFully
@@ -74,6 +78,13 @@ private val taskMap: MutableMap<Int, Job> = mutableMapOf()
 // Upper bound per streamed chunk read off the response channel (fork #8).
 private const val STREAM_CHUNK_BYTES = 16L * 1024L
 
+private class AndroidResponseLease(
+    val response: HttpResponse,
+    private val clientLease: AndroidTransportClientLease,
+) : AutoCloseable {
+    override fun close() = clientLease.close()
+}
+
 object AndroidTransportImpl : IVBTransportService {
     private fun triggerRequest(
         request: VBTransportBaseRequest,
@@ -84,86 +95,73 @@ object AndroidTransportImpl : IVBTransportService {
         val job = scope.launch {
             try {
                 AndroidTransportPhaseTracer.transportCoroutineStarted(request.requestId)
-                val client = getHttpClient(request) as HttpClient
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
-                val response = client.request(request.url) {
-                    method = HttpMethod(request.method.name)
-                    if (request.totalTimeout > 0) {
-                        timeout {
-                            requestTimeoutMillis = request.totalTimeout
-                            // raft.9: connect gets its own short budget so a dead
-                            // address family can't eat the whole request timeout
-                            // (see TransportTimeouts.kt for the 3s rationale).
-                            connectTimeoutMillis = transportConnectTimeoutMillis(request.totalTimeout)
-                            socketTimeoutMillis = request.totalTimeout
-                        }
+                val responseLease = executeWithReusedH2Recovery(request, startMark, uploadBody)
+                val response = responseLease.response
+                try {
+
+                    // raft.13 chain bracket 2/3: headers arrived — everything before
+                    // this line is connect/TLS/TTFB, everything after is body read.
+                    logI(
+                        "response received, id:${request.requestId}, status:${response.status.value}, " +
+                            "contentLength:${response.contentLength() ?: -1}, " +
+                            "elapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
+                        request.logTag
+                    )
+
+                    var errMsg = ""
+                    var errorCode = 0
+                    if (response.status != HttpStatusCode.OK) {
+                        errorCode = response.status.value
+                        errMsg = response.status.description
                     }
-                    constructRequest(request)
-                    header(NETWORK_KMM_TRACE_HEADER, request.requestId.toString())
-                    // issue #8: streaming upload — the body is written to the
-                    // engine channel as it is produced, never buffered whole.
-                    if (uploadBody != null) {
-                        setBody(uploadBody.toOutgoingContent())
+
+                    val channel = response.bodyAsChannel()
+                    val contentLength = response.contentLength()
+                    val data = if (contentLength == null) {
+                        // 动态扩容方案
+                        readUnknownSize(ByteReadChannelWrapper(channel))
+                    } else {
+                        // 预分配方案
+                        readKnownSize(ByteReadChannelWrapper(channel), contentLength)
                     }
-                }
-
-                // raft.13 chain bracket 2/3: headers arrived — everything before
-                // this line is connect/TLS/TTFB, everything after is body read.
-                logI(
-                    "response received, id:${request.requestId}, status:${response.status.value}, " +
-                        "contentLength:${response.contentLength() ?: -1}, " +
-                        "elapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
-                    request.logTag
-                )
-
-                var errMsg = ""
-                var errorCode = 0
-                if (response.status != HttpStatusCode.OK) {
-                    errorCode = response.status.value
-                    errMsg = response.status.description
-                }
-
-                val channel = response.bodyAsChannel()
-                val contentLength = response.contentLength()
-                val data = if (contentLength == null) {
-                    // 动态扩容方案
-                    readUnknownSize(ByteReadChannelWrapper(channel))
-                } else {
-                    // 预分配方案
-                    readKnownSize(ByteReadChannelWrapper(channel), contentLength)
-                }
                 // raft.9: a delivered size differing from the header length is
                 // legal (see ByteReadChannelWrapper.readAvailable) but almost
                 // always the thing you need to know when a payload looks wrong.
-                if (contentLength != null && data.size.toLong() != contentLength) {
-                    logE(
-                        "response body length mismatch, id:${request.requestId}, " +
-                            "content-length:$contentLength, read:${data.size}, " +
-                            "encoding:${response.headers["Content-Encoding"] ?: "-"}",
-                        request.logTag
-                    )
-                }
+                    if (contentLength != null && data.size.toLong() != contentLength) {
+                        logE(
+                            "response body length mismatch, id:${request.requestId}, " +
+                                "content-length:$contentLength, read:${data.size}, " +
+                                "encoding:${response.headers["Content-Encoding"] ?: "-"}",
+                            request.logTag
+                        )
+                    }
 
                 // raft.13 chain bracket 3/3: body fully read — a hang between
                 // bracket 2 and here is a body-read stall, not a network wait.
-                logI(
-                    "body read, id:${request.requestId}, bytes:${data.size}, " +
-                        "totalElapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
-                    request.logTag
-                )
-                AndroidTransportPhaseTracer.responseBodyRead(request.requestId)
-                request.transportElapseStatistics = AndroidTransportPhaseTracer.complete(request.requestId)
+                    logI(
+                        "body read, id:${request.requestId}, bytes:${data.size}, " +
+                            "totalElapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
+                        request.logTag
+                    )
+                    AndroidTransportPhaseTracer.responseBodyRead(request.requestId)
+                    AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = true)
+                    request.transportElapseStatistics = AndroidTransportPhaseTracer.complete(request.requestId)
 
-                buildResponseAndCallback(
-                    taskMap,
-                    errorCode,
-                    errMsg,
-                    response.headers.entries().associate { it.key to it.value },
-                    data,
-                    request,
-                    kmmCallback
-                )
+                    buildResponseAndCallback(
+                        taskMap,
+                        errorCode,
+                        errMsg,
+                        response.headers.entries().associate { it.key to it.value },
+                        data,
+                        request,
+                        kmmCallback
+                    )
+                } finally {
+                    responseLease.close()
+                }
             } catch (throwable: Throwable) {
+                AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
                 if (throwable is CancellationException) {
                     taskMap.remove(request.requestId)
                     AndroidTransportPhaseTracer.cancel(request.requestId)
@@ -243,74 +241,75 @@ object AndroidTransportImpl : IVBTransportService {
         logI("stream ${kmmRequest.method} request, id:${kmmRequest.requestId}, url:${kmmRequest.url}", kmmRequest.logTag)
         val job = scope.launch {
             try {
-                val client = getHttpClient(kmmRequest) as HttpClient
                 val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
-                val response = client.request(kmmRequest.url) {
-                    method = HttpMethod(kmmRequest.method.name)
-                    if (kmmRequest.totalTimeout > 0) {
-                        timeout {
-                            requestTimeoutMillis = kmmRequest.totalTimeout
-                            // raft.9: connect gets its own short budget so a dead
-                            // address family can't eat the whole request timeout
-                            // (see TransportTimeouts.kt for the 3s rationale).
-                            connectTimeoutMillis = transportConnectTimeoutMillis(kmmRequest.totalTimeout)
-                            socketTimeoutMillis = kmmRequest.totalTimeout
-                        }
-                    }
-                    constructRequest(kmmRequest)
-                }
+                AndroidTransportPhaseTracer.scheduled(kmmRequest.requestId)
+                AndroidTransportPhaseTracer.transportCoroutineStarted(kmmRequest.requestId)
+                val responseLease = executeWithReusedH2Recovery(kmmRequest, streamStart)
+                val response = responseLease.response
+                try {
 
-                var errorCode = 0
-                var errMsg = ""
-                if (response.status != HttpStatusCode.OK) {
-                    errorCode = response.status.value
-                    errMsg = response.status.description
-                }
+                    var errorCode = 0
+                    var errMsg = ""
+                    if (response.status != HttpStatusCode.OK) {
+                        errorCode = response.status.value
+                        errMsg = response.status.description
+                    }
 
                 // raft.13 stream bracket: headers arrived.
-                logI(
-                    "stream response received, id:${kmmRequest.requestId}, status:${response.status.value}, " +
-                        "contentLength:${response.contentLength() ?: -1}, elapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}",
-                    kmmRequest.logTag
-                )
-                val responseHeaders = response.headers.entries().associate { it.key to it.value }
-                onResponseStart(errorCode, responseHeaders)
+                    logI(
+                        "stream response received, id:${kmmRequest.requestId}, status:${response.status.value}, " +
+                            "contentLength:${response.contentLength() ?: -1}, elapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}",
+                        kmmRequest.logTag
+                    )
+                    val responseHeaders = response.headers.entries().associate { it.key to it.value }
+                    onResponseStart(errorCode, responseHeaders)
 
-                val channel = response.bodyAsChannel()
-                var streamedBytes = 0L
-                while (!channel.isClosedForRead) {
-                    val packet = channel.readRemaining(STREAM_CHUNK_BYTES)
-                    while (!packet.isEmpty) {
-                        val bytes = packet.readBytes()
-                        if (bytes.isNotEmpty()) {
-                            streamedBytes += bytes.size
-                            onChunk(bytes)
+                    val channel = response.bodyAsChannel()
+                    var streamedBytes = 0L
+                    while (!channel.isClosedForRead) {
+                        val packet = channel.readRemaining(STREAM_CHUNK_BYTES)
+                        while (!packet.isEmpty) {
+                            val bytes = packet.readBytes()
+                            if (bytes.isNotEmpty()) {
+                                streamedBytes += bytes.size
+                                onChunk(bytes)
+                            }
                         }
                     }
-                }
                 // raft.13 stream bracket: body fully streamed.
-                logI(
-                    "stream complete, id:${kmmRequest.requestId}, bytes:$streamedBytes, " +
-                        "totalElapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}",
-                    kmmRequest.logTag
-                )
+                    logI(
+                        "stream complete, id:${kmmRequest.requestId}, bytes:$streamedBytes, " +
+                            "totalElapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}",
+                        kmmRequest.logTag
+                    )
+                    AndroidTransportPhaseTracer.responseBodyRead(kmmRequest.requestId)
+                    AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = true)
+                    kmmRequest.transportElapseStatistics = AndroidTransportPhaseTracer.complete(kmmRequest.requestId)
 
-                taskMap.remove(kmmRequest.requestId)
-                onComplete(
-                    VBTransportResponse().apply {
-                        this.errorCode = errorCode
-                        this.errorMessage = errMsg
-                        this.header = response.headers.entries().associate { it.key to it.value }
-                        this.data = null
-                        this.request = kmmRequest
-                    }
-                )
+                    taskMap.remove(kmmRequest.requestId)
+                    onComplete(
+                        VBTransportResponse().apply {
+                            this.errorCode = errorCode
+                            this.errorMessage = errMsg
+                            this.header = response.headers.entries().associate { it.key to it.value }
+                            this.data = null
+                            this.request = kmmRequest
+                            this.elapseStatis = kmmRequest.transportElapseStatistics
+                        }
+                    )
+                } finally {
+                    responseLease.close()
+                }
             } catch (throwable: Throwable) {
+                AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = false)
                 if (throwable is CancellationException) {
                     taskMap.remove(kmmRequest.requestId)
+                    AndroidTransportPhaseTracer.cancel(kmmRequest.requestId)
                     throw throwable
                 }
                 taskMap.remove(kmmRequest.requestId)
+                kmmRequest.transportElapseStatistics =
+                    AndroidTransportPhaseTracer.complete(kmmRequest.requestId)
                 // raft.9: classified failure reason, same shape as callbackFailure.
                 val describedFailure = describeTransportFailure(throwable)
                 logE("stream request failed, id:${kmmRequest.requestId}, error:$describedFailure", kmmRequest.logTag)
@@ -320,11 +319,75 @@ object AndroidTransportImpl : IVBTransportService {
                         this.errorMessage = describedFailure
                         this.data = null
                         this.request = kmmRequest
+                        this.elapseStatis = kmmRequest.transportElapseStatistics
                     }
                 )
             }
         }
         taskMap[kmmRequest.requestId] = job
+    }
+
+    private suspend fun executeWithReusedH2Recovery(
+        request: VBTransportBaseRequest,
+        overallStart: kotlin.time.TimeMark,
+        uploadBody: StreamingUploadBody? = null,
+    ): AndroidResponseLease {
+        // Sample rollout settings once: a mid-request flag change must not send
+        // the recovery attempt back through the retired shared pool.
+        val okHttpEnabled = VBTransportAndroidEngine.okHttpEnabled
+        val recovery = VBTransportAndroidEngine.reusedHttp2Recovery
+        val retryState = AndroidReusedH2RetryState(request.method)
+        while (true) {
+            val lease = AndroidTransportClientProvider.acquire(request, okHttpEnabled, recovery)
+            val attemptToken = AndroidTransportPhaseTracer.beginAttempt(
+                requestId = request.requestId,
+                lease = lease,
+                watchdogMillis = recovery.responseHeadersWatchdogMillis,
+                watchdogEnabled = okHttpEnabled && recovery.enabled,
+            )
+            try {
+                val remainingTimeout = remainingRequestTimeout(request.totalTimeout, overallStart)
+                val response = lease.client.request(request.url) {
+                    method = HttpMethod(request.method.name)
+                    if (remainingTimeout > 0L) {
+                        timeout {
+                            requestTimeoutMillis = remainingTimeout
+                            connectTimeoutMillis = transportConnectTimeoutMillis(remainingTimeout)
+                            socketTimeoutMillis = remainingTimeout
+                        }
+                    }
+                    constructRequest(request)
+                    header(NETWORK_KMM_TRACE_HEADER, request.requestId.toString())
+                    if (uploadBody != null) setBody(uploadBody.toOutgoingContent())
+                }
+                return AndroidResponseLease(response, lease)
+            } catch (throwable: Throwable) {
+                val watchdogTriggered =
+                    AndroidTransportPhaseTracer.watchdogTriggered(request.requestId, attemptToken)
+                val hasBudget = request.totalTimeout <= 0L ||
+                    remainingRequestTimeout(request.totalTimeout, overallStart) > 0L
+                if (retryState.claimRetry(watchdogTriggered, hasBudget)) {
+                    AndroidTransportPhaseTracer.markFreshRetry(request.requestId)
+                    logI(
+                        "stale reused h2 detected, id:${request.requestId}, origin:${lease.origin}, " +
+                            "generation:${lease.generation}, freshRetry:true",
+                        request.logTag,
+                    )
+                    lease.close()
+                    continue
+                }
+                if (retryState.attempted) {
+                    AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
+                }
+                lease.close()
+                throw throwable
+            }
+        }
+    }
+
+    private fun remainingRequestTimeout(totalTimeout: Long, start: kotlin.time.TimeMark): Long {
+        if (totalTimeout <= 0L) return 0L
+        return (totalTimeout - start.elapsedNow().inWholeMilliseconds).coerceAtLeast(0L)
     }
 
     private fun HttpRequestBuilder.constructRequest(kmmRequest: VBTransportBaseRequest) {
