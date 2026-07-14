@@ -178,12 +178,14 @@ internal class AndroidTransportClientGenerationManager(
     private var activeEpoch = 1L
 
     fun activateConfiguration(epoch: Long) {
+        val pendingClose = mutableListOf<HttpClient>()
         synchronized(lock) {
             if (epoch <= activeEpoch) return
-            origins.values.forEach(::deactivateStateLocked)
+            origins.values.forEach { deactivateStateLocked(it, pendingClose) }
             origins.clear()
             activeEpoch = epoch
         }
+        pendingClose.forEach(HttpClient::close)
     }
 
     fun acquire(
@@ -223,83 +225,97 @@ internal class AndroidTransportClientGenerationManager(
         shardIndex: Int,
         observedGeneration: Long,
         recovery: VBTransportReusedHttp2Recovery,
-    ): AndroidTransportGenerationRollover = synchronized(lock) {
-        if (!state.active || epoch != activeEpoch) {
-            return@synchronized AndroidTransportGenerationRollover(
-                generation = observedGeneration,
-                initiated = false,
-                observedGenerationDraining = true,
-            )
-        }
-        val shard = state.shards.getOrNull(shardIndex)
-        if (shard == null || shard.current.id != observedGeneration) {
-            return@synchronized AndroidTransportGenerationRollover(
-                generation = shard?.current?.id ?: observedGeneration,
-                initiated = false,
-                observedGenerationDraining = true,
-            )
-        }
-        val now = nowMillis()
-        while (
-            state.rolloverTimes.isNotEmpty() &&
-            now - state.rolloverTimes.first() >= ORIGIN_ROLLOVER_WINDOW_MILLIS
-        ) {
-            state.rolloverTimes.removeFirst()
-        }
-        if (state.rolloverTimes.size >= recovery.clientShardCount) {
-            shard.quarantinedAtMillis = now
-            return@synchronized AndroidTransportGenerationRollover(
+    ): AndroidTransportGenerationRollover {
+        var pendingClose: HttpClient? = null
+        val rollover = synchronized(lock) {
+            if (!state.active || epoch != activeEpoch) {
+                return@synchronized AndroidTransportGenerationRollover(
+                    generation = observedGeneration,
+                    initiated = false,
+                    observedGenerationDraining = true,
+                )
+            }
+            val shard = state.shards.getOrNull(shardIndex)
+            if (shard == null || shard.current.id != observedGeneration) {
+                return@synchronized AndroidTransportGenerationRollover(
+                    generation = shard?.current?.id ?: observedGeneration,
+                    initiated = false,
+                    observedGenerationDraining = true,
+                )
+            }
+            val now = nowMillis()
+            while (
+                state.rolloverTimes.isNotEmpty() &&
+                now - state.rolloverTimes.first() >= ORIGIN_ROLLOVER_WINDOW_MILLIS
+            ) {
+                state.rolloverTimes.removeFirst()
+            }
+            if (state.rolloverTimes.size >= recovery.clientShardCount) {
+                shard.quarantinedAtMillis = now
+                return@synchronized AndroidTransportGenerationRollover(
+                    generation = shard.current.id,
+                    initiated = false,
+                    observedGenerationDraining = false,
+                    rateLimited = true,
+                )
+            }
+            state.rolloverTimes.addLast(now)
+            pendingClose = retireCurrentLocked(state, shard, recovery)
+            AndroidTransportGenerationRollover(
                 generation = shard.current.id,
-                initiated = false,
-                observedGenerationDraining = false,
-                rateLimited = true,
+                initiated = true,
             )
         }
-        state.rolloverTimes.addLast(now)
-        retireCurrentLocked(state, shard, recovery)
-        AndroidTransportGenerationRollover(
-            generation = shard.current.id,
-            initiated = true,
-        )
+        pendingClose?.close()
+        return rollover
     }
 
     private fun retireCurrentLocked(
         state: OriginState,
         shard: ShardState,
         recovery: VBTransportReusedHttp2Recovery,
-    ) {
+    ): HttpClient? {
         val retired = shard.current
         retired.draining = true
         state.retired += retired
         shard.current = newGeneration(recovery)
         shard.quarantinedAtMillis = null
-        closeIfDrainedLocked(state, retired)
+        return detachIfDrainedLocked(state, retired)
     }
 
-    private fun deactivateStateLocked(state: OriginState) {
+    private fun deactivateStateLocked(
+        state: OriginState,
+        pendingClose: MutableList<HttpClient>,
+    ) {
         state.active = false
         state.shards.filterNotNull().forEach { shard ->
             val retired = shard.current
             retired.draining = true
             state.retired += retired
-            closeIfDrainedLocked(state, retired)
+            detachIfDrainedLocked(state, retired)?.let(pendingClose::add)
         }
     }
 
     private fun release(state: OriginState, generation: Generation) {
-        synchronized(lock) {
+        val pendingClose = synchronized(lock) {
             generation.inFlight -= 1
             check(generation.inFlight >= 0) { "negative generation lease count" }
-            closeIfDrainedLocked(state, generation)
+            detachIfDrainedLocked(state, generation)
         }
+        pendingClose?.close()
     }
 
-    private fun closeIfDrainedLocked(state: OriginState, generation: Generation) {
+    // Detach only under the lock; callers close the returned client AFTER
+    // releasing it. HttpClient.close() shuts down the OkHttp dispatcher and
+    // evicts pooled sockets — doing that inside the manager lock would stall
+    // every concurrent acquire/release/drain behind socket teardown.
+    private fun detachIfDrainedLocked(state: OriginState, generation: Generation): HttpClient? {
         if (generation.draining && generation.inFlight == 0) {
             state.retired.remove(generation)
             openGenerations.remove(generation)
-            generation.client.close()
+            return generation.client
         }
+        return null
     }
 
     private fun newGeneration(recovery: VBTransportReusedHttp2Recovery): Generation =

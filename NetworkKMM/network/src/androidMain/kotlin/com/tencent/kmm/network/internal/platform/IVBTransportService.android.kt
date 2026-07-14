@@ -68,15 +68,34 @@ import io.ktor.utils.io.core.isEmpty
 import io.ktor.utils.io.core.readBytes
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import java.net.SocketTimeoutException
+import java.util.concurrent.ConcurrentHashMap
 
 private val scope = CoroutineScope(Dispatchers.IO)
-private val taskMap: MutableMap<Int, Job> = mutableMapOf()
+
+// Written by the caller thread, removed by the transport coroutine on
+// Dispatchers.IO, and read by cancel() from any thread — must be a concurrent
+// map, and the entry must be registered before the coroutine body can run so
+// a fast-completing request cannot remove its entry before it exists (which
+// would leave a completed Job resident and invisible to cancel()).
+private val taskMap: ConcurrentHashMap<Int, Job> = ConcurrentHashMap()
+
+internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, requestId: Int, job: Job) {
+    taskMap[requestId] = job
+    // Terminal-path safety net: fires on completion, failure, AND a cancel()
+    // that lands between the put above and start() below (a lazy job cancelled
+    // before start never runs its body, so the body's own remove never runs).
+    // Two-arg remove so a finished old job cannot evict a newer request that
+    // reuses the id.
+    job.invokeOnCompletion { taskMap.remove(requestId, job) }
+    job.start()
+}
 
 // Upper bound per streamed chunk read off the response channel (fork #8).
 private const val STREAM_CHUNK_BYTES = 16L * 1024L
@@ -120,7 +139,7 @@ object AndroidTransportImpl : IVBTransportService {
         uploadBody: StreamingUploadBody? = null
     ) {
         AndroidTransportPhaseTracer.scheduled(request.requestId)
-        val job = scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 AndroidTransportPhaseTracer.transportCoroutineStarted(request.requestId)
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
@@ -199,7 +218,7 @@ object AndroidTransportImpl : IVBTransportService {
                 callbackFailure(request, throwable, kmmCallback)
             }
         }
-        taskMap[request.requestId] = job
+        registerTransportTask(taskMap, request.requestId, job)
     }
 
     override fun sendBytesRequest(
@@ -267,7 +286,7 @@ object AndroidTransportImpl : IVBTransportService {
         onComplete: (response: VBTransportResponse) -> Unit
     ) {
         logI("stream ${kmmRequest.method} request, id:${kmmRequest.requestId}, url:${kmmRequest.url}", kmmRequest.logTag)
-        val job = scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
                 AndroidTransportPhaseTracer.scheduled(kmmRequest.requestId)
@@ -352,7 +371,7 @@ object AndroidTransportImpl : IVBTransportService {
                 )
             }
         }
-        taskMap[kmmRequest.requestId] = job
+        registerTransportTask(taskMap, kmmRequest.requestId, job)
     }
 
     private suspend fun executeWithReusedH2Recovery(
