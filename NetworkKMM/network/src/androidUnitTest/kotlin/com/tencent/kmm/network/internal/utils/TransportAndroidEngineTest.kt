@@ -5,9 +5,17 @@ import com.tencent.kmm.network.export.VBTransportReusedHttp2Recovery
 import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.internal.platform.AndroidRequestTimeoutBudget
 import com.tencent.kmm.network.internal.platform.androidRequestTimeoutBudget
+import com.tencent.kmm.network.internal.platform.registerTransportTask
 import com.tencent.kmm.network.internal.platform.requireAndroidRequestTimeoutBudget
 import io.ktor.client.engine.android.AndroidClientEngine
 import io.ktor.client.engine.okhttp.OkHttpEngine
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import kotlin.test.Test
 import kotlin.test.assertIs
@@ -15,9 +23,11 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 class TransportAndroidEngineTest {
@@ -504,6 +514,140 @@ class TransportAndroidEngineTest {
         } finally {
             VBTransportAndroidEngine.reusedHttp2Recovery = originalRecovery
             VBTransportAndroidEngine.okHttpEnabled = originalEngine
+        }
+    }
+
+    // task #36: the registry entry must exist before the transport coroutine
+    // body can run, so a fast-completing request can never remove its entry
+    // before the caller has written it (which used to leave a completed Job
+    // resident and invisible to cancel()).
+    @Test
+    fun transportTaskIsRegisteredBeforeItsBodyCanRun() {
+        val taskMap = ConcurrentHashMap<Int, Job>()
+        val scope = CoroutineScope(Dispatchers.IO)
+        repeat(200) { id ->
+            val entryVisibleToBody = AtomicBoolean(false)
+            val job = scope.launch(start = CoroutineStart.LAZY) {
+                entryVisibleToBody.set(taskMap.containsKey(id))
+                taskMap.remove(id)
+            }
+            registerTransportTask(taskMap, id, job)
+            runBlocking { job.join() }
+            assertTrue(entryVisibleToBody.get())
+            assertTrue(!taskMap.containsKey(id))
+        }
+    }
+
+    @Test
+    fun cancelBeforeStartLeavesNoResidualTaskEntry() {
+        val taskMap = ConcurrentHashMap<Int, Job>()
+        val scope = CoroutineScope(Dispatchers.IO)
+        val bodyRan = AtomicBoolean(false)
+        val job = scope.launch(start = CoroutineStart.LAZY) { bodyRan.set(true) }
+        // Models cancel() winning the race between the map put and start():
+        // the lazy body never runs, so the body's own remove never runs either.
+        job.cancel()
+        registerTransportTask(taskMap, 7, job)
+        runBlocking { job.join() }
+        assertTrue(!bodyRan.get())
+        assertTrue(taskMap.isEmpty())
+    }
+
+    @Test
+    fun completedOldJobCannotEvictNewerRequestReusingItsId() {
+        val taskMap = ConcurrentHashMap<Int, Job>()
+        val scope = CoroutineScope(Dispatchers.IO)
+        val release = CompletableDeferred<Unit>()
+        val oldRequest = com.tencent.kmm.network.export.VBTransportGetRequest().apply {
+            url = "https://api.example.test/id-reuse"
+            requestId = 9
+        }
+        val oldJob = scope.launch(start = CoroutineStart.LAZY) {
+            release.await()
+            // The production terminal path: the callback helper runs with the
+            // registry hands-off flag, so the body performs no keyed remove.
+            VBTransportCommonUtils.buildResponseAndCallback(
+                taskMap,
+                0,
+                "",
+                emptyMap(),
+                byteArrayOf(),
+                oldRequest,
+                {},
+                removeOnComplete = false,
+            )
+        }
+        registerTransportTask(taskMap, 9, oldJob)
+
+        val replacement = scope.launch(start = CoroutineStart.LAZY) { release.await() }
+        taskMap[9] = replacement
+
+        release.complete(Unit)
+        runBlocking { oldJob.join() }
+        // The completion hook's remove(key, value) must be a no-op against the
+        // newer job that reused the request id — which must stay reachable by
+        // the production cancel(id) lookup.
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (taskMap[9] !== replacement && System.nanoTime() < deadline) {
+            Thread.sleep(1)
+        }
+        assertTrue(taskMap[9] === replacement)
+        taskMap[9]?.cancel()
+        assertTrue(replacement.isCancelled)
+    }
+
+    // task #36 (review finding): the common callback helper's unconditional
+    // keyed remove was the ABA window — Android must be able to hand registry
+    // ownership to its completion hook, while iOS keeps the default cleanup.
+    @Test
+    fun callbackHelperLeavesRegistryAloneWhenAndroidOwnsCleanup() {
+        val taskMap = ConcurrentHashMap<Int, Job>()
+        val scope = CoroutineScope(Dispatchers.IO)
+        val resident = scope.launch(start = CoroutineStart.LAZY) { }
+        taskMap[11] = resident
+        val request = com.tencent.kmm.network.export.VBTransportGetRequest().apply {
+            url = "https://api.example.test/helper-seam"
+            requestId = 11
+        }
+
+        VBTransportCommonUtils.buildResponseAndCallback(
+            taskMap, 0, "", emptyMap(), byteArrayOf(), request, {},
+            removeOnComplete = false,
+        )
+        assertTrue(taskMap[11] === resident)
+
+        VBTransportCommonUtils.buildResponseAndCallback(
+            taskMap, 0, "", emptyMap(), byteArrayOf(), request, {},
+        )
+        assertTrue(taskMap.isEmpty())
+        resident.cancel()
+    }
+
+    // task #36: closing a drained generation's client (dispatcher shutdown +
+    // pool eviction) now happens after the manager lock is released; a burst
+    // of concurrent acquires against the same origin must not be serialized
+    // behind — or deadlocked by — the teardown.
+    @Test
+    fun drainedClientCloseDoesNotBlockConcurrentAcquires() {
+        val manager = AndroidTransportClientGenerationManager()
+        val recovery = VBTransportReusedHttp2Recovery(enabled = true, clientShardCount = 1)
+        val staleLease = manager.acquire("https://api.example.test/teardown", recovery)
+        assertTrue(staleLease.drainGeneration().initiated)
+
+        val executor = Executors.newFixedThreadPool(4)
+        try {
+            val done = CountDownLatch(20)
+            repeat(20) {
+                executor.execute {
+                    manager.acquire("https://api.example.test/teardown", recovery).close()
+                    done.countDown()
+                }
+            }
+            // Releasing the last lease closes the retired generation's client.
+            staleLease.close()
+            assertTrue(done.await(5, TimeUnit.SECONDS))
+        } finally {
+            executor.shutdownNow()
         }
     }
 }

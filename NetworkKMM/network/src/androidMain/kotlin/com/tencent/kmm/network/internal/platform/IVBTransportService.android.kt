@@ -68,15 +68,36 @@ import io.ktor.utils.io.core.isEmpty
 import io.ktor.utils.io.core.readBytes
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import java.net.SocketTimeoutException
+import java.util.concurrent.ConcurrentHashMap
 
 private val scope = CoroutineScope(Dispatchers.IO)
-private val taskMap: MutableMap<Int, Job> = mutableMapOf()
+
+// Written by the caller thread, removed by the transport coroutine on
+// Dispatchers.IO, and read by cancel() from any thread — must be a concurrent
+// map, and the entry must be registered before the coroutine body can run so
+// a fast-completing request cannot remove its entry before it exists (which
+// would leave a completed Job resident and invisible to cancel()).
+private val taskMap: ConcurrentHashMap<Int, Job> = ConcurrentHashMap()
+
+internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, requestId: Int, job: Job) {
+    taskMap[requestId] = job
+    // SOLE registry cleanup on Android — coroutine bodies and the common
+    // callback helper must not remove entries (Android passes
+    // removeOnComplete = false): a keyed remove racing an id reuse would
+    // evict the newer request. This hook fires on every terminal path
+    // (completion, failure, and a cancel() landing between the put above and
+    // start() below), and the two-arg remove is a no-op once a newer job has
+    // replaced this one under the same id.
+    job.invokeOnCompletion { taskMap.remove(requestId, job) }
+    job.start()
+}
 
 // Upper bound per streamed chunk read off the response channel (fork #8).
 private const val STREAM_CHUNK_BYTES = 16L * 1024L
@@ -120,7 +141,7 @@ object AndroidTransportImpl : IVBTransportService {
         uploadBody: StreamingUploadBody? = null
     ) {
         AndroidTransportPhaseTracer.scheduled(request.requestId)
-        val job = scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 AndroidTransportPhaseTracer.transportCoroutineStarted(request.requestId)
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
@@ -183,7 +204,11 @@ object AndroidTransportImpl : IVBTransportService {
                         response.headers.entries().associate { it.key to it.value },
                         data,
                         request,
-                        kmmCallback
+                        kmmCallback,
+                        // Registry cleanup happens solely in the completion
+                        // hook (registerTransportTask): a keyed remove here
+                        // could evict a newer request that reused the id.
+                        removeOnComplete = false
                     )
                 } finally {
                     responseLease.close()
@@ -191,7 +216,6 @@ object AndroidTransportImpl : IVBTransportService {
             } catch (throwable: Throwable) {
                 AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
                 if (throwable is CancellationException) {
-                    taskMap.remove(request.requestId)
                     AndroidTransportPhaseTracer.cancel(request.requestId)
                     throw throwable
                 }
@@ -199,7 +223,7 @@ object AndroidTransportImpl : IVBTransportService {
                 callbackFailure(request, throwable, kmmCallback)
             }
         }
-        taskMap[request.requestId] = job
+        registerTransportTask(taskMap, request.requestId, job)
     }
 
     override fun sendBytesRequest(
@@ -267,7 +291,7 @@ object AndroidTransportImpl : IVBTransportService {
         onComplete: (response: VBTransportResponse) -> Unit
     ) {
         logI("stream ${kmmRequest.method} request, id:${kmmRequest.requestId}, url:${kmmRequest.url}", kmmRequest.logTag)
-        val job = scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
                 AndroidTransportPhaseTracer.scheduled(kmmRequest.requestId)
@@ -314,7 +338,6 @@ object AndroidTransportImpl : IVBTransportService {
                     AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = true)
                     kmmRequest.transportElapseStatistics = AndroidTransportPhaseTracer.complete(kmmRequest.requestId)
 
-                    taskMap.remove(kmmRequest.requestId)
                     onComplete(
                         VBTransportResponse().apply {
                             this.errorCode = errorCode
@@ -331,11 +354,9 @@ object AndroidTransportImpl : IVBTransportService {
             } catch (throwable: Throwable) {
                 AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = false)
                 if (throwable is CancellationException) {
-                    taskMap.remove(kmmRequest.requestId)
                     AndroidTransportPhaseTracer.cancel(kmmRequest.requestId)
                     throw throwable
                 }
-                taskMap.remove(kmmRequest.requestId)
                 kmmRequest.transportElapseStatistics =
                     AndroidTransportPhaseTracer.complete(kmmRequest.requestId)
                 // raft.9: classified failure reason, same shape as callbackFailure.
@@ -352,7 +373,7 @@ object AndroidTransportImpl : IVBTransportService {
                 )
             }
         }
-        taskMap[kmmRequest.requestId] = job
+        registerTransportTask(taskMap, kmmRequest.requestId, job)
     }
 
     private suspend fun executeWithReusedH2Recovery(
@@ -516,7 +537,9 @@ object AndroidTransportImpl : IVBTransportService {
             emptyMap(),
             byteArrayOf(),
             request,
-            kmmCallback
+            kmmCallback,
+            // Registry cleanup happens solely in the completion hook.
+            removeOnComplete = false
         )
     }
 }

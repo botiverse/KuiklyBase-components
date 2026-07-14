@@ -98,7 +98,11 @@ object VBTransportCommonUtils {
         headers: Map<String, List<String>>,
         data: ByteArray,
         request: VBTransportBaseRequest,
-        kmmCallback: (response: VBTransportBaseResponse) -> Unit
+        kmmCallback: (response: VBTransportBaseResponse) -> Unit,
+        // Android owns registry cleanup solely through its Job completion hook
+        // (an unconditional keyed remove here would let a finished old job
+        // evict a newer request that reused the id); iOS keeps the default.
+        removeOnComplete: Boolean = true
     ) {
         VBPBLog.i(TAG, "${request.logTag} receive response, errCode:${errorCode}, " +
                 "errMsg:${errorMsg}, headers:${headers}, data size:${data.size}")
@@ -133,7 +137,7 @@ object VBTransportCommonUtils {
             }
             kmmCallback(kmmBytesResponse)
         }
-        taskMap.remove(request.requestId)
+        if (removeOnComplete) taskMap.remove(request.requestId)
     }
 
     private fun updateResponse(
