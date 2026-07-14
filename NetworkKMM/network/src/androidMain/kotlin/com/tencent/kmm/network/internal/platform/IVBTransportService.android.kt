@@ -88,11 +88,13 @@ private val taskMap: ConcurrentHashMap<Int, Job> = ConcurrentHashMap()
 
 internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, requestId: Int, job: Job) {
     taskMap[requestId] = job
-    // Terminal-path safety net: fires on completion, failure, AND a cancel()
-    // that lands between the put above and start() below (a lazy job cancelled
-    // before start never runs its body, so the body's own remove never runs).
-    // Two-arg remove so a finished old job cannot evict a newer request that
-    // reuses the id.
+    // SOLE registry cleanup on Android — coroutine bodies and the common
+    // callback helper must not remove entries (Android passes
+    // removeOnComplete = false): a keyed remove racing an id reuse would
+    // evict the newer request. This hook fires on every terminal path
+    // (completion, failure, and a cancel() landing between the put above and
+    // start() below), and the two-arg remove is a no-op once a newer job has
+    // replaced this one under the same id.
     job.invokeOnCompletion { taskMap.remove(requestId, job) }
     job.start()
 }
@@ -202,7 +204,11 @@ object AndroidTransportImpl : IVBTransportService {
                         response.headers.entries().associate { it.key to it.value },
                         data,
                         request,
-                        kmmCallback
+                        kmmCallback,
+                        // Registry cleanup happens solely in the completion
+                        // hook (registerTransportTask): a keyed remove here
+                        // could evict a newer request that reused the id.
+                        removeOnComplete = false
                     )
                 } finally {
                     responseLease.close()
@@ -210,7 +216,6 @@ object AndroidTransportImpl : IVBTransportService {
             } catch (throwable: Throwable) {
                 AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
                 if (throwable is CancellationException) {
-                    taskMap.remove(request.requestId)
                     AndroidTransportPhaseTracer.cancel(request.requestId)
                     throw throwable
                 }
@@ -333,7 +338,6 @@ object AndroidTransportImpl : IVBTransportService {
                     AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = true)
                     kmmRequest.transportElapseStatistics = AndroidTransportPhaseTracer.complete(kmmRequest.requestId)
 
-                    taskMap.remove(kmmRequest.requestId)
                     onComplete(
                         VBTransportResponse().apply {
                             this.errorCode = errorCode
@@ -350,11 +354,9 @@ object AndroidTransportImpl : IVBTransportService {
             } catch (throwable: Throwable) {
                 AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = false)
                 if (throwable is CancellationException) {
-                    taskMap.remove(kmmRequest.requestId)
                     AndroidTransportPhaseTracer.cancel(kmmRequest.requestId)
                     throw throwable
                 }
-                taskMap.remove(kmmRequest.requestId)
                 kmmRequest.transportElapseStatistics =
                     AndroidTransportPhaseTracer.complete(kmmRequest.requestId)
                 // raft.9: classified failure reason, same shape as callbackFailure.
@@ -535,7 +537,9 @@ object AndroidTransportImpl : IVBTransportService {
             emptyMap(),
             byteArrayOf(),
             request,
-            kmmCallback
+            kmmCallback,
+            // Registry cleanup happens solely in the completion hook.
+            removeOnComplete = false
         )
     }
 }

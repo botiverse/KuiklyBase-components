@@ -558,7 +558,25 @@ class TransportAndroidEngineTest {
         val taskMap = ConcurrentHashMap<Int, Job>()
         val scope = CoroutineScope(Dispatchers.IO)
         val release = CompletableDeferred<Unit>()
-        val oldJob = scope.launch(start = CoroutineStart.LAZY) { release.await() }
+        val oldRequest = com.tencent.kmm.network.export.VBTransportGetRequest().apply {
+            url = "https://api.example.test/id-reuse"
+            requestId = 9
+        }
+        val oldJob = scope.launch(start = CoroutineStart.LAZY) {
+            release.await()
+            // The production terminal path: the callback helper runs with the
+            // registry hands-off flag, so the body performs no keyed remove.
+            VBTransportCommonUtils.buildResponseAndCallback(
+                taskMap,
+                0,
+                "",
+                emptyMap(),
+                byteArrayOf(),
+                oldRequest,
+                {},
+                removeOnComplete = false,
+            )
+        }
         registerTransportTask(taskMap, 9, oldJob)
 
         val replacement = scope.launch(start = CoroutineStart.LAZY) { release.await() }
@@ -566,14 +584,43 @@ class TransportAndroidEngineTest {
 
         release.complete(Unit)
         runBlocking { oldJob.join() }
-        // The old job's completion cleanup uses remove(key, value): it must
-        // not evict the newer job that reused the request id.
+        // The completion hook's remove(key, value) must be a no-op against the
+        // newer job that reused the request id — which must stay reachable by
+        // the production cancel(id) lookup.
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
         while (taskMap[9] !== replacement && System.nanoTime() < deadline) {
             Thread.sleep(1)
         }
         assertTrue(taskMap[9] === replacement)
-        replacement.cancel()
+        taskMap[9]?.cancel()
+        assertTrue(replacement.isCancelled)
+    }
+
+    // task #36 (review finding): the common callback helper's unconditional
+    // keyed remove was the ABA window — Android must be able to hand registry
+    // ownership to its completion hook, while iOS keeps the default cleanup.
+    @Test
+    fun callbackHelperLeavesRegistryAloneWhenAndroidOwnsCleanup() {
+        val taskMap = ConcurrentHashMap<Int, Job>()
+        val scope = CoroutineScope(Dispatchers.IO)
+        val resident = scope.launch(start = CoroutineStart.LAZY) { }
+        taskMap[11] = resident
+        val request = com.tencent.kmm.network.export.VBTransportGetRequest().apply {
+            url = "https://api.example.test/helper-seam"
+            requestId = 11
+        }
+
+        VBTransportCommonUtils.buildResponseAndCallback(
+            taskMap, 0, "", emptyMap(), byteArrayOf(), request, {},
+            removeOnComplete = false,
+        )
+        assertTrue(taskMap[11] === resident)
+
+        VBTransportCommonUtils.buildResponseAndCallback(
+            taskMap, 0, "", emptyMap(), byteArrayOf(), request, {},
+        )
+        assertTrue(taskMap.isEmpty())
+        resident.cancel()
     }
 
     // task #36: closing a drained generation's client (dispatcher shutdown +
