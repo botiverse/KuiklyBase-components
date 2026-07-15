@@ -155,13 +155,30 @@ class AndroidTransportHardDeadlineIntegrationTest {
         assertEquals(0, nextResponse.errorCode)
         assertEquals("ok", (nextResponse.data as ByteArray).decodeToString())
         assertEquals(2, nextRecorded.sequenceNumber, "next request must reuse the same H2 connection")
-        assertEquals(
+        val stalledGeneration = assertNotNull(
             stalledRequest.transportElapseStatistics.connectionGeneration,
+            "stalled stream must report its managed client generation",
+        )
+        val nextGeneration = assertNotNull(
             nextRequest.transportElapseStatistics.connectionGeneration,
+            "next request must report its managed client generation",
+        )
+        assertTrue(stalledGeneration > 0L)
+        val stalledConnection = assertNotNull(
+            stalledRequest.transportElapseStatistics.connectionIdentity,
+            "stalled stream must report its physical H2 connection",
+        )
+        val nextConnection = assertNotNull(
+            nextRequest.transportElapseStatistics.connectionIdentity,
+            "next request must report its physical H2 connection",
         )
         assertEquals(
-            stalledRequest.transportElapseStatistics.connectionIdentity,
-            nextRequest.transportElapseStatistics.connectionIdentity,
+            stalledGeneration,
+            nextGeneration,
+        )
+        assertEquals(
+            stalledConnection,
+            nextConnection,
         )
         assertEventually("next request resources did not converge") {
             AndroidTransportPhaseTracer.activeCallCountForTests() == 0 &&
