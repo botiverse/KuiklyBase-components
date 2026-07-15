@@ -46,6 +46,7 @@ class VBTransportTask(
 
     private val state = atomic(VBTransportState.Create)
     private val streamGate = atomic<StreamCallbackGate<VBTransportResponse>?>(null)
+    private val platformEntryPhase = atomic(PLATFORM_PHASE_NONE)
     internal var platformPrepare: (Int) -> Boolean = { requestId ->
         getIVBTransportService().prepareRequest(requestId)
     }
@@ -64,6 +65,7 @@ class VBTransportTask(
         getIVBTransportService().cancel(requestId)
     }
     internal var afterRunningPreparedForTest: (() -> Unit)? = null
+    internal var afterStreamGateInstalledForTest: (() -> Unit)? = null
 
     private fun finishCanceledBeforeStart(
         response: VBTransportBaseResponse,
@@ -266,11 +268,15 @@ class VBTransportTask(
             }
         )
         streamGate.value = gate
+        afterStreamGateInstalledForTest?.invoke()
         if (state.value == VBTransportState.Canceled) {
             // cancel() recorded a pre-publish platform cancellation, but this
             // request will never enter platform code to consume it.
-            platformAbortPrepared(requestId)
+            abortUnusedPlatformReservation()
             gate.complete(cancelledStreamResponse(request))
+            return
+        }
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERED)) {
             return
         }
         platformRequestStream(request, gate::responseStart, gate::chunk, gate::complete)
@@ -305,8 +311,9 @@ class VBTransportTask(
             state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
             return false
         }
+        platformEntryPhase.value = PLATFORM_PHASE_RESERVED
         if (state.value != VBTransportState.Running) {
-            platformAbortPrepared(requestId)
+            abortUnusedPlatformReservation()
             return false
         }
         return true
@@ -344,10 +351,11 @@ class VBTransportTask(
             }
             val gate = streamGate.value
             if (current == VBTransportState.Running && gate != null) {
+                val abortedBeforeEntry = abortUnusedPlatformReservation()
                 val won = gate.complete(cancelledStreamResponse()) {
                     state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
                 }
-                if (won) {
+                if (won && !abortedBeforeEntry) {
                     platformCancel(requestId)
                 }
                 return
@@ -374,8 +382,21 @@ class VBTransportTask(
         platformCancel(requestId)
     }
 
+    private fun abortUnusedPlatformReservation(): Boolean {
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ABORTED)) {
+            return false
+        }
+        platformAbortPrepared(requestId)
+        return true
+    }
+
     private fun logI(content: String) {
         VBPBLog.i(VBPBLog.TASK, "$logTag $content")
     }
 
 }
+
+private const val PLATFORM_PHASE_NONE = 0
+private const val PLATFORM_PHASE_RESERVED = 1
+private const val PLATFORM_PHASE_ENTERED = 2
+private const val PLATFORM_PHASE_ABORTED = 3

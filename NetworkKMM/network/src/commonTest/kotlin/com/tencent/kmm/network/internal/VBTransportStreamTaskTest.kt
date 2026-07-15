@@ -68,6 +68,39 @@ class VBTransportStreamTaskTest {
     }
 
     @Test
+    fun cancelAfterGateInstallAbortsBeforeTerminalAllowsSameIdReplacement() {
+        val requestId = 991_005
+        val reservation = CancellationAwareRegistry<Int, String>()
+        val task = registeredTask(requestId)
+        val events = mutableListOf<String>()
+        task.platformPrepare = { reservation.begin(it) }
+        task.platformAbortPrepared = {
+            reservation.remove(it)
+            events += "abort"
+        }
+        task.platformCancel = { events += "platform-cancel" }
+        task.afterStreamGateInstalledForTest = { task.cancel() }
+        task.platformRequestStream = { _, _, _, _ -> events += "platform-entry" }
+
+        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
+            events += "terminal:${it.errorCode}"
+            check(reservation.begin(requestId))
+            events += "replacement-reserved"
+            reservation.remove(requestId)
+        }
+
+        assertEquals(
+            listOf(
+                "abort",
+                "terminal:${VBTransportResultCode.CODE_CANCELED}",
+                "replacement-reserved",
+            ),
+            events,
+        )
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+    }
+
+    @Test
     fun midstreamCancelWinsOnceAndSuppressesLateChunkAndSuccess() {
         val task = registeredTask(991_002)
         var start: ((Int, Map<String, List<String>>) -> Unit)? = null
