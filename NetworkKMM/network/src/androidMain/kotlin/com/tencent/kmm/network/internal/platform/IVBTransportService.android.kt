@@ -135,6 +135,15 @@ internal fun requireAndroidRequestTimeoutBudget(budget: AndroidRequestTimeoutBud
     }
 }
 
+internal object AndroidTransportTestHooks {
+    @Volatile
+    var beforeTransportCoroutineStart: (() -> Unit)? = null
+
+    fun reset() {
+        beforeTransportCoroutineStart = null
+    }
+}
+
 object AndroidTransportImpl : IVBTransportService {
     private fun triggerRequest(
         request: VBTransportBaseRequest,
@@ -142,7 +151,8 @@ object AndroidTransportImpl : IVBTransportService {
         uploadBody: StreamingUploadBody? = null
     ) {
         AndroidTransportPhaseTracer.scheduled(request.requestId)
-        val requestStart = kotlin.time.TimeSource.Monotonic.markNow()
+        val requestStart = request.serviceRequestStartMark
+            ?: kotlin.time.TimeSource.Monotonic.markNow()
         val transportJob = AtomicReference<Job?>(null)
         lateinit var hardDeadline: AndroidTransportHardDeadline
         val guardedCallback: (VBTransportBaseResponse) -> Unit = { response ->
@@ -152,6 +162,7 @@ object AndroidTransportImpl : IVBTransportService {
         }
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
+                AndroidTransportTestHooks.beforeTransportCoroutineStart?.invoke()
                 AndroidTransportPhaseTracer.transportCoroutineStarted(request.requestId)
                 val responseLease = executeWithReusedH2Recovery(request, requestStart, uploadBody)
                 val response = responseLease.response

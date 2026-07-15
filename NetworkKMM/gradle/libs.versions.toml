@@ -32,6 +32,7 @@ ktor-client-android = { module = "io.ktor:ktor-client-android", version.ref = "k
 ktor-client-darwin = { module = "io.ktor:ktor-client-darwin", version.ref = "ktor-client-core-version" }
 ktor-client-okhttp = { module = "io.ktor:ktor-client-okhttp", version.ref = "ktor-client-core-version" }
 okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
+mockwebserver = { module = "com.squareup.okhttp3:mockwebserver", version.ref = "okhttp" }
 ktor-ktor-client-core = { module = "io.ktor:ktor-client-core", version.ref = "ktor-client-core-version" }
 
 [plugins]

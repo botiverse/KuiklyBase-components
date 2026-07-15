@@ -110,6 +110,7 @@ internal inline fun cancelStalledCallIfReplaySafe(
 
 internal object AndroidTransportPhaseTracer {
     private val traces = ConcurrentHashMap<Int, Trace>()
+    private val activeCalls = ConcurrentHashMap<Call, Unit>()
     private val watchdogExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "networkkmm-h2-watchdog").apply { isDaemon = true }
     }
@@ -184,9 +185,12 @@ internal object AndroidTransportPhaseTracer {
 
     internal fun resetForTests() {
         traces.clear()
+        activeCalls.clear()
         stalledRegistry.clear()
         nanoTime = System::nanoTime
     }
+
+    internal fun activeCallCountForTests(): Int = activeCalls.size
 
     fun complete(requestId: Int): VBTransportElapseStatistics {
         val trace = traces.remove(requestId)
@@ -221,7 +225,10 @@ internal object AndroidTransportPhaseTracer {
             }
         }
 
-        override fun callStart(call: Call) = callStarted(requestId)
+        override fun callStart(call: Call) {
+            activeCalls[call] = Unit
+            callStarted(requestId)
+        }
 
         override fun dnsStart(call: Call, domainName: String) = update {
             dnsStartNanos = nanoTime()
@@ -314,14 +321,20 @@ internal object AndroidTransportPhaseTracer {
             responseBodyEndNanos = nanoTime()
         }
 
-        override fun callEnd(call: Call) = update {
-            cancelWatchdog()
-            callEndNanos = nanoTime()
+        override fun callEnd(call: Call) {
+            activeCalls.remove(call)
+            update {
+                cancelWatchdog()
+                callEndNanos = nanoTime()
+            }
         }
 
-        override fun callFailed(call: Call, ioe: IOException) = update {
-            cancelWatchdog()
-            callEndNanos = nanoTime()
+        override fun callFailed(call: Call, ioe: IOException) {
+            activeCalls.remove(call)
+            update {
+                cancelWatchdog()
+                callEndNanos = nanoTime()
+            }
         }
     }
 
