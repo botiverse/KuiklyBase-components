@@ -39,6 +39,7 @@ import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
 import com.tencent.kmm.network.internal.VBTransportManager
 import com.tencent.kmm.network.internal.VBTransportState
 import com.tencent.kmm.network.internal.VBTransportTask
+import com.tencent.kmm.network.internal.platform.platformOwnsRequestHardDeadline
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -72,8 +73,7 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendBytesRequest(request) { response ->
-                if (task.getState() != VBTransportState.Done) {
-                    task.setState(VBTransportState.Done)
+                if (task.trySetDone()) {
                     handler?.let { it(response) }
                 }
             }
@@ -98,8 +98,7 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendStringRequest(request) { response ->
-                if (task.getState() != VBTransportState.Done) {
-                    task.setState(VBTransportState.Done)
+                if (task.trySetDone()) {
                     handler?.let { it(response) }
                 }
             }
@@ -123,8 +122,7 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendPostRequest(request) { response ->
-                if (task.getState() != VBTransportState.Done) {
-                    task.setState(VBTransportState.Done)
+                if (task.trySetDone()) {
                     handler?.let { it(response) }
                 }
             }
@@ -148,8 +146,7 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendGetRequest(request) { response ->
-                if (task.getState() != VBTransportState.Done) {
-                    task.setState(VBTransportState.Done)
+                if (task.trySetDone()) {
                     handler?.let { it(response) }
                 }
             }
@@ -173,8 +170,7 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.sendRequest(request) { response ->
-                if (task.getState() != VBTransportState.Done) {
-                    task.setState(VBTransportState.Done)
+                if (task.trySetDone()) {
                     handler?.let { it(response) }
                 }
             }
@@ -203,8 +199,7 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.uploadStreamRequest(request, contentLength, writeBody) { response ->
-                if (task.getState() != VBTransportState.Done) {
-                    task.setState(VBTransportState.Done)
+                if (task.trySetDone()) {
                     handler?.let { it(response) }
                 }
             }
@@ -226,8 +221,7 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.streamRequest(request, onResponseStart, onChunk) { response ->
-                if (task.getState() != VBTransportState.Done) {
-                    task.setState(VBTransportState.Done)
+                if (task.trySetDone()) {
                     handler?.let { it(response) }
                 }
             }
@@ -240,6 +234,7 @@ object VBTransportService {
         request: VBTransportBaseRequest,
         handlerBlock: () -> Unit
     ) {
+        if (platformOwnsRequestHardDeadline) return
         networkScope.transportLaunch {
             VBPBLog.i(
                 VBPBLog.TASK_MANAGER, "${request.logTag} execute() coroutine " +
@@ -247,8 +242,9 @@ object VBTransportService {
             if (timeout <= 0) return@transportLaunch
             delay(timeout)
             taskManager.getTask(requestId)?.let { task ->
-                if (task.getState() != VBTransportState.Done) {
-                    task.setState(VBTransportState.Done)
+                if (task.trySetDone()) {
+                    task.cancelTransport()
+                    taskManager.onTaskFinish(requestId)
                     handlerBlock()
                 }
             }

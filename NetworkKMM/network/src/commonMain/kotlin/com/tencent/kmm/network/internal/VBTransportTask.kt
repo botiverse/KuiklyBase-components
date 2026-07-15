@@ -35,6 +35,7 @@ import com.tencent.kmm.network.export.VBTransportStringCompletionHandler
 import com.tencent.kmm.network.export.VBTransportStringRequest
 import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.platform.getIVBTransportService
+import kotlinx.atomicfu.atomic
 
 class VBTransportTask(
     val requestId: Int,
@@ -43,7 +44,7 @@ class VBTransportTask(
     private val taskManager: VBTransportManager
 ) {
 
-    private var state: VBTransportState = VBTransportState.Create
+    private val state = atomic(VBTransportState.Create)
 
     private fun wrapGetResponse(
         getCallback: ((getResponse: VBTransportGetResponse) -> Unit)?
@@ -133,14 +134,14 @@ class VBTransportTask(
             }
             return
         }
-        state = VBTransportState.Running
+        state.value = VBTransportState.Running
         getIVBTransportService().sendBytesRequest(request) { response ->
             handleResponse(request, response, wrapBytesResponse(handler))
         }
     }
 
     private fun isCanceledOrRemoved(): Boolean =
-        state == VBTransportState.Canceled || state == VBTransportState.Unknown
+        state.value == VBTransportState.Canceled || state.value == VBTransportState.Unknown
 
     // 发送字符类型Get类型网络请求
     fun sendStringRequest(
@@ -160,7 +161,7 @@ class VBTransportTask(
             }
             return
         }
-        state = VBTransportState.Running
+        state.value = VBTransportState.Running
         getIVBTransportService().sendStringRequest(request) { response ->
             handleResponse(request, response, wrapStringResponse(handler))
         }
@@ -183,7 +184,7 @@ class VBTransportTask(
             }
             return
         }
-        state = VBTransportState.Running
+        state.value = VBTransportState.Running
         getIVBTransportService().post(request) { response ->
             handleResponse(request, response, wrapPostResponse(handler))
         }
@@ -206,7 +207,7 @@ class VBTransportTask(
             }
             return
         }
-        state = VBTransportState.Running
+        state.value = VBTransportState.Running
         getIVBTransportService().get(request) { response ->
             handleResponse(request, response, wrapGetResponse(handler))
         }
@@ -229,7 +230,7 @@ class VBTransportTask(
             }
             return
         }
-        state = VBTransportState.Running
+        state.value = VBTransportState.Running
         getIVBTransportService().request(request) { response ->
             handleResponse(request, response, wrapResponse(handler))
         }
@@ -252,7 +253,7 @@ class VBTransportTask(
             handler?.invoke(response)
             return
         }
-        state = VBTransportState.Running
+        state.value = VBTransportState.Running
         getIVBTransportService().requestStream(request, onResponseStart, onChunk) { response ->
             handleResponse(request, response, wrapResponse(handler))
         }
@@ -274,20 +275,40 @@ class VBTransportTask(
             handler?.invoke(response)
             return
         }
-        state = VBTransportState.Running
+        state.value = VBTransportState.Running
         getIVBTransportService().requestUploadStream(request, contentLength, writeBody) { response ->
             handleResponse(request, response, wrapResponse(handler))
         }
     }
 
-    fun getState(): VBTransportState = this.state
+    fun getState(): VBTransportState = state.value
 
     fun setState(state: VBTransportState) {
-        this.state = state
+        this.state.value = state
+    }
+
+    fun trySetDone(): Boolean {
+        while (true) {
+            val current = state.value
+            if (
+                current == VBTransportState.Done ||
+                current == VBTransportState.Canceled ||
+                current == VBTransportState.Unknown
+            ) {
+                return false
+            }
+            if (state.compareAndSet(current, VBTransportState.Done)) {
+                return true
+            }
+        }
     }
 
     fun cancel() {
-        state = VBTransportState.Canceled
+        state.value = VBTransportState.Canceled
+        getIVBTransportService().cancel(requestId)
+    }
+
+    fun cancelTransport() {
         getIVBTransportService().cancel(requestId)
     }
 
