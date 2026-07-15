@@ -275,6 +275,12 @@ HTTP_FEATURE_SYMBOLS
     "$nghttp3_prefix/lib/libnghttp3.a" \
     "$openssl_prefix/lib/libssl.a" \
     "$openssl_prefix/lib/libcrypto.a"
+  local wrapper_symbols
+  wrapper_symbols="$(xcrun nm "$merged" 2>/dev/null || true)"
+  if ! grep -q 'CurlWrapperAbiVersion$' <<<"$wrapper_symbols"; then
+    echo "[${sdk}/${arch}] wrapper ABI probe missing from merged archive" >&2
+    exit 2
+  fi
   echo "    $(du -h "$merged" | cut -f1)  $merged"
 }
 

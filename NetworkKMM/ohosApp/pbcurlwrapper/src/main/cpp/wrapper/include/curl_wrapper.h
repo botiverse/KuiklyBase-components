@@ -24,6 +24,14 @@
 extern "C" {
 #endif
 
+// Increment whenever a public by-value struct or exported callback contract
+// changes incompatibly. Kotlin/JNI callers must verify this before passing a
+// CurlRequest so a stale native runtime fails closed instead of interpreting
+// a differently-sized struct.
+#define CURL_WRAPPER_ABI_VERSION 27
+
+int CurlWrapperAbiVersion(void);
+
 /**
  * 日志 回调
  * @param level
@@ -65,6 +73,10 @@ typedef struct {
     const char *method;
     StringDic *headers;
     int64_t timeout;  // 单位 ms
+    int64_t streamConnectTimeoutMs;
+    int64_t streamResponseHeadersTimeoutMs;
+    int64_t streamIdleTimeoutMs;
+    int64_t streamWholeTimeoutMs;  // 0 = disabled
     int postBodyLen;
     const char *postBody;
 } CurlRequest;

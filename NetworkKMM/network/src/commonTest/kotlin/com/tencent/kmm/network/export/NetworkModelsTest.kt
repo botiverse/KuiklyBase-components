@@ -26,6 +26,26 @@ import kotlin.test.assertTrue
 
 class NetworkModelsTest {
     @Test
+    fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
+        val defaults = NetworkRequestPolicy().streamTimeouts
+        assertEquals(3_000L, defaults.connectTimeoutMillis)
+        assertEquals(30_000L, defaults.responseHeadersTimeoutMillis)
+        assertEquals(60_000L, defaults.interChunkIdleTimeoutMillis)
+        assertEquals(0L, defaults.wholeTransferTimeoutMillis)
+
+        val custom = NetworkRequestPolicy(
+            timeoutMillis = 5_000,
+            streamTimeouts = NetworkStreamTimeoutPolicy(
+                connectTimeoutMillis = 1_000,
+                responseHeadersTimeoutMillis = 2_000,
+                interChunkIdleTimeoutMillis = 3_000,
+                wholeTransferTimeoutMillis = 120_000
+            )
+        )
+        assertEquals(custom, custom.copyMutable())
+    }
+
+    @Test
     fun resolvedUrlAppendsPathAndEscapedQuery() {
         val request = NetworkRequest(
             method = VBTransportMethod.GET,

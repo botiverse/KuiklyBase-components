@@ -384,17 +384,32 @@ data class NetworkRequestPolicy(
     val timeoutMillis: Long = 0,
     val retry: NetworkRetryPolicy = NetworkRetryPolicy(),
     val priority: NetworkPriority = NetworkPriority.NORMAL,
-    val dispatcher: NetworkDispatcher = NetworkDispatcher.IO
+    val dispatcher: NetworkDispatcher = NetworkDispatcher.IO,
+    /**
+     * Streaming responses are not bounded by [timeoutMillis] as a whole by
+     * default: a healthy large download may legitimately outlive it. These
+     * phase deadlines preserve fast failure without killing active progress.
+     */
+    val streamTimeouts: NetworkStreamTimeoutPolicy = NetworkStreamTimeoutPolicy()
 ) {
     fun copyMutable(): NetworkRequestPolicy {
         return NetworkRequestPolicy(
             timeoutMillis = timeoutMillis,
             retry = retry,
             priority = priority,
-            dispatcher = dispatcher
+            dispatcher = dispatcher,
+            streamTimeouts = streamTimeouts
         )
     }
 }
+
+data class NetworkStreamTimeoutPolicy(
+    val connectTimeoutMillis: Long = 3_000,
+    val responseHeadersTimeoutMillis: Long = 30_000,
+    val interChunkIdleTimeoutMillis: Long = 60_000,
+    /** Zero disables a whole-transfer deadline. */
+    val wholeTransferTimeoutMillis: Long = 0
+)
 
 internal class NetworkBodyBytes(
     val bytes: ByteArray?,

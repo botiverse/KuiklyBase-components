@@ -22,6 +22,8 @@ import com.tencent.kmm.network.curl.CurlResponseFields
 import com.tencent.kmm.network.curl.native.Cancel as cancelNative
 import com.tencent.kmm.network.curl.native.CreateCurlClient
 import com.tencent.kmm.network.curl.native.CurlSupportsHttp3
+import com.tencent.kmm.network.curl.native.CurlWrapperAbiVersion
+import com.tencent.kmm.network.curl.native.CURL_WRAPPER_ABI_VERSION
 import com.tencent.kmm.network.curl.native.CurlCallback
 import com.tencent.kmm.network.curl.native.CurlRequest
 import com.tencent.kmm.network.curl.native.CurlResponse
@@ -98,6 +100,10 @@ internal data class IosCurlNativeRequest(
     val method: String,
     val headers: Map<String, String>,
     val timeoutMillis: Long,
+    val streamConnectTimeoutMillis: Long = 0,
+    val streamResponseHeadersTimeoutMillis: Long = 0,
+    val streamIdleTimeoutMillis: Long = 0,
+    val streamWholeTimeoutMillis: Long = 0,
     val body: ByteArray? = null,
     val uploadContentLength: Long? = null,
     val caInfoPath: String,
@@ -139,7 +145,8 @@ internal interface IosCurlNativeBridge {
 
 @OptIn(ExperimentalForeignApi::class)
 internal object IosCurlCInteropBridge : IosCurlNativeBridge {
-    override val isAvailable: Boolean = true
+    override val isAvailable: Boolean
+        get() = CurlWrapperAbiVersion() == CURL_WRAPPER_ABI_VERSION
     override val supportsHttp3: Boolean
         get() = CurlSupportsHttp3() != 0
 
@@ -208,6 +215,9 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
         uploadSource: IosCurlUploadSource? = null,
         start: (COpaquePointer, IosCurlCallbackContext) -> Unit
     ): CurlNativeResponse = withContext(IosCurlExecutionDispatchers.perform) {
+        if (!isAvailable) {
+            return@withContext unavailable("iOS curl wrapper ABI mismatch")
+        }
         val handle = CreateCurlClient("NetworkKMM-iOS-${request.requestId}")
             ?: return@withContext unavailable("iOS curl failed to create native client")
         val callbackContext = IosCurlCallbackContext(
@@ -395,6 +405,10 @@ private fun <T> withCurlRequest(
         method = request.method.cstr.getPointer(this@memScoped)
         headers = dictionary.ptr
         timeout = request.timeoutMillis
+        streamConnectTimeoutMs = request.streamConnectTimeoutMillis
+        streamResponseHeadersTimeoutMs = request.streamResponseHeadersTimeoutMillis
+        streamIdleTimeoutMs = request.streamIdleTimeoutMillis
+        streamWholeTimeoutMs = request.streamWholeTimeoutMillis
         postBodyLen = request.body?.size ?: 0
         postBody = null
     }

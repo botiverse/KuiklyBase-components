@@ -121,7 +121,7 @@ class VBTransportTask(
         request: VBTransportBytesRequest,
         handler: VBTransportBytesCompletionHandler?,
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportBytesResponse()
             logI("execute() request task is canceled")
             handler?.let {
@@ -134,7 +134,6 @@ class VBTransportTask(
             }
             return
         }
-        state.value = VBTransportState.Running
         getIVBTransportService().sendBytesRequest(request) { response ->
             handleResponse(request, response, wrapBytesResponse(handler))
         }
@@ -148,7 +147,7 @@ class VBTransportTask(
         request: VBTransportStringRequest,
         handler: VBTransportStringCompletionHandler?,
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportStringResponse()
             logI("execute() request task is canceled")
             handler?.let {
@@ -161,7 +160,6 @@ class VBTransportTask(
             }
             return
         }
-        state.value = VBTransportState.Running
         getIVBTransportService().sendStringRequest(request) { response ->
             handleResponse(request, response, wrapStringResponse(handler))
         }
@@ -171,7 +169,7 @@ class VBTransportTask(
         request: VBTransportPostRequest,
         handler: VBTransportPostHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportPostResponse()
             logI("execute() request task is canceled before")
             handler?.let {
@@ -184,7 +182,6 @@ class VBTransportTask(
             }
             return
         }
-        state.value = VBTransportState.Running
         getIVBTransportService().post(request) { response ->
             handleResponse(request, response, wrapPostResponse(handler))
         }
@@ -194,7 +191,7 @@ class VBTransportTask(
         request: VBTransportGetRequest,
         handler: VBTransportGetHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportGetResponse()
             logI("execute() request task is canceled before")
             handler?.let {
@@ -207,7 +204,6 @@ class VBTransportTask(
             }
             return
         }
-        state.value = VBTransportState.Running
         getIVBTransportService().get(request) { response ->
             handleResponse(request, response, wrapGetResponse(handler))
         }
@@ -217,7 +213,7 @@ class VBTransportTask(
         request: VBTransportRequest,
         handler: VBTransportHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportResponse()
             logI("execute() request task is canceled before")
             handler?.let {
@@ -230,7 +226,6 @@ class VBTransportTask(
             }
             return
         }
-        state.value = VBTransportState.Running
         getIVBTransportService().request(request) { response ->
             handleResponse(request, response, wrapResponse(handler))
         }
@@ -245,7 +240,7 @@ class VBTransportTask(
         onChunk: (chunk: ByteArray) -> Unit,
         handler: VBTransportHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportResponse()
             response.errorCode = VBTransportResultCode.CODE_CANCELED
             response.errorMessage = "Request has been canceled"
@@ -253,7 +248,6 @@ class VBTransportTask(
             handler?.invoke(response)
             return
         }
-        state.value = VBTransportState.Running
         getIVBTransportService().requestStream(request, onResponseStart, onChunk) { response ->
             handleResponse(request, response, wrapResponse(handler))
         }
@@ -267,7 +261,7 @@ class VBTransportTask(
         writeBody: suspend (com.tencent.kmm.network.export.NetworkByteStreamSink) -> Unit,
         handler: VBTransportHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportResponse()
             response.errorCode = VBTransportResultCode.CODE_CANCELED
             response.errorMessage = "Request has been canceled"
@@ -275,13 +269,15 @@ class VBTransportTask(
             handler?.invoke(response)
             return
         }
-        state.value = VBTransportState.Running
         getIVBTransportService().requestUploadStream(request, contentLength, writeBody) { response ->
             handleResponse(request, response, wrapResponse(handler))
         }
     }
 
     fun getState(): VBTransportState = state.value
+
+    private fun trySetRunning(): Boolean =
+        state.compareAndSet(VBTransportState.Create, VBTransportState.Running)
 
     fun setState(state: VBTransportState) {
         this.state.value = state
@@ -304,8 +300,20 @@ class VBTransportTask(
     }
 
     fun cancel() {
-        state.value = VBTransportState.Canceled
-        getIVBTransportService().cancel(requestId)
+        while (true) {
+            val current = state.value
+            if (
+                current == VBTransportState.Done ||
+                current == VBTransportState.Canceled ||
+                current == VBTransportState.Unknown
+            ) {
+                return
+            }
+            if (state.compareAndSet(current, VBTransportState.Canceled)) {
+                getIVBTransportService().cancel(requestId)
+                return
+            }
+        }
     }
 
     fun cancelTransport() {

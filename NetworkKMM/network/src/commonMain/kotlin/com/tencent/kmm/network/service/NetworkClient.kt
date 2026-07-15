@@ -50,6 +50,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlin.coroutines.resume
 import kotlin.time.TimeSource
 import kotlin.time.TimeMark
@@ -154,6 +156,7 @@ class NetworkCall internal constructor(
     private var clientQueueTimeMs = 0.0
     private var requestPreparationTimeMs = 0.0
     private val completion = CompletableDeferred<NetworkResponse>()
+    private val stateLock = SynchronizedObject()
     private val cancelHandlers = mutableListOf<() -> Unit>()
     private var job: Job? = null
     private var cancelled = false
@@ -161,11 +164,14 @@ class NetworkCall internal constructor(
     private var engineSelectionReported = false
 
     val isCancelled: Boolean
-        get() = cancelled
+        get() = synchronized(stateLock) { cancelled }
 
     internal fun attachJob(job: Job) {
-        this.job = job
-        if (cancelled) {
+        val cancelNow = synchronized(stateLock) {
+            this.job = job
+            cancelled
+        }
+        if (cancelNow) {
             job.cancel()
         }
     }
@@ -185,10 +191,15 @@ class NetworkCall internal constructor(
     }
 
     internal fun addCancelHandler(handler: () -> Unit) {
-        if (cancelled) {
+        val invokeNow = synchronized(stateLock) {
+            if (cancelled) true
+            else {
+                cancelHandlers.add(handler)
+                false
+            }
+        }
+        if (invokeNow) {
             handler()
-        } else {
-            cancelHandlers.add(handler)
         }
     }
 
@@ -199,28 +210,41 @@ class NetworkCall internal constructor(
     }
 
     internal fun getOrResolveEngine(resolve: () -> ResolvedNetworkEngine): ResolvedNetworkEngine {
-        return resolvedEngine ?: resolve().also { resolvedEngine = it }
+        return synchronized(stateLock) {
+            resolvedEngine ?: resolve().also { resolvedEngine = it }
+        }
     }
 
-    internal fun markEngineSelectionReported(): Boolean {
-        if (engineSelectionReported) {
-            return false
+    internal fun markEngineSelectionReported(): Boolean = synchronized(stateLock) {
+        if (engineSelectionReported) false
+        else {
+            engineSelectionReported = true
+            true
         }
-        engineSelectionReported = true
-        return true
     }
 
     suspend fun await(): NetworkResponse = completion.await()
 
     fun cancel() {
-        if (cancelled) {
-            return
-        }
-        cancelled = true
+        val cancellation = synchronized(stateLock) {
+            if (cancelled) {
+                null
+            } else {
+                cancelled = true
+                val handlers = cancelHandlers.toList()
+                cancelHandlers.clear()
+                handlers to job
+            }
+        } ?: return
         originalRequest.body.cancel()
-        cancelHandlers.forEach { it() }
-        cancelHandlers.clear()
-        job?.cancel()
+        cancellation.first.forEach { handler ->
+            try {
+                handler()
+            } catch (_: Throwable) {
+                // Cancellation must continue to every registered owner.
+            }
+        }
+        cancellation.second?.cancel()
         if (!completion.isCompleted) {
             completion.complete(
                 NetworkResponse(
@@ -533,6 +557,10 @@ object VBTransportNetworkEngine : NetworkEngine {
             url = request.resolvedUrl()
             header.putAll(request.headers)
             totalTimeout = request.policy.timeoutMillis
+            streamConnectTimeoutMillis = request.policy.streamTimeouts.connectTimeoutMillis
+            streamResponseHeadersTimeoutMillis = request.policy.streamTimeouts.responseHeadersTimeoutMillis
+            streamIdleTimeoutMillis = request.policy.streamTimeouts.interChunkIdleTimeoutMillis
+            streamWholeTimeoutMillis = request.policy.streamTimeouts.wholeTransferTimeoutMillis
             curlCaInfoPath = preparedCurlCaInfoPath(request)
             curlProxyUrl = preparedCurlProxyUrl(request)
             curlHttp3Enabled = preparedCurlHttp3Enabled(request)

@@ -1,5 +1,32 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased (raft.27 stream lifecycle hardening)
+
+- Version the native curl wrapper ABI and verify it before any expanded
+  `CurlRequest` is passed by value, so stale native/runtime pairings fail
+  closed instead of interpreting the raft.27 timeout layout incorrectly.
+
+- Streaming cancellation now survives both common task publication and native
+  handle publication. Cancellation tombstones, CAS task transitions and a
+  lock-owned OHOS handle registry prevent lost pre-start cancellation and
+  prevent `Cancel` from dereferencing a handle concurrently with deletion.
+- Native response-start is emitted only after a complete final HTTP header
+  block. Informational and followed redirect blocks stay internal; HEAD, 204
+  and non-2xx responses start correctly, while DNS/TLS/connect failures no
+  longer fabricate an HTTP start. Cancellation after start or a body chunk
+  suppresses subsequent chunks and still terminates exactly once.
+- Consumer callback failures are latched and contained before crossing native
+  callback boundaries. The first response-start/chunk failure cancels the real
+  transfer, suppresses later business callbacks and becomes a controlled
+  terminal network failure.
+- Response streams use explicit connect, response-header/TTFB and inter-chunk
+  idle deadlines, with an optional whole-transfer deadline. Healthy progressing
+  large downloads are no longer implicitly bounded by the ordinary buffered
+  request timeout.
+- Executable contracts cover known-length and chunked bodies, informational
+  headers, redirects, HEAD/204/non-2xx responses, pre/start/mid cancellation,
+  callback failure, phase timeouts and cancel-vs-delete ownership stress.
+
 ## 0.1.0-raft.26 / 0.1.0-raft.26-ohos (caller-time hard deadlines)
 
 - Android whole-request timeouts now begin at the public synchronous

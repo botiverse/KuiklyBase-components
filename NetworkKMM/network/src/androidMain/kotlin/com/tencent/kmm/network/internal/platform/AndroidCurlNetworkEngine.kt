@@ -216,6 +216,10 @@ internal class AndroidCurlNetworkEngine(
             method = method.name,
             headers = nativeHeaders,
             timeoutMillis = policy.timeoutMillis,
+            streamConnectTimeoutMillis = policy.streamTimeouts.connectTimeoutMillis,
+            streamResponseHeadersTimeoutMillis = policy.streamTimeouts.responseHeadersTimeoutMillis,
+            streamIdleTimeoutMillis = policy.streamTimeouts.interChunkIdleTimeoutMillis,
+            streamWholeTimeoutMillis = policy.streamTimeouts.wholeTransferTimeoutMillis,
             body = body,
             uploadContentLength = uploadContentLength,
             caInfoPath = checkNotNull(preparedCurlCaInfoPath(this)) {

@@ -252,6 +252,10 @@ void NativePerform(
     jobjectArray header_names,
     jobjectArray header_values,
     jlong timeout_millis,
+    jlong stream_connect_timeout_millis,
+    jlong stream_response_headers_timeout_millis,
+    jlong stream_idle_timeout_millis,
+    jlong stream_whole_timeout_millis,
     jbyteArray body,
     jlong upload_content_length,
     jstring ca_info_path,
@@ -264,6 +268,10 @@ void NativePerform(
     context.env = env;
     context.callback = callback;
     if (!PopulateCallbackMethods(env, callback, &context)) {
+        return;
+    }
+    if (CurlWrapperAbiVersion() != CURL_WRAPPER_ABI_VERSION) {
+        InvokeEngineFailure(&context, "NetworkKMM curl wrapper ABI mismatch");
         return;
     }
 
@@ -318,6 +326,10 @@ void NativePerform(
     request.method = method_chars.get();
     request.headers = &headers;
     request.timeout = timeout_millis;
+    request.streamConnectTimeoutMs = stream_connect_timeout_millis;
+    request.streamResponseHeadersTimeoutMs = stream_response_headers_timeout_millis;
+    request.streamIdleTimeoutMs = stream_idle_timeout_millis;
+    request.streamWholeTimeoutMs = stream_whole_timeout_millis;
     request.postBodyLen = static_cast<int>(body_bytes.size());
     request.postBody = body_bytes.empty() ? nullptr : body_bytes.data();
 
@@ -400,7 +412,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         {
             const_cast<char *>("nativePerform"),
             const_cast<char *>(
-                "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;J[BJLjava/lang/String;"
+                "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;JJJJJ[BJLjava/lang/String;"
                 "Ljava/lang/String;ZILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)V"
             ),
             reinterpret_cast<void *>(NativePerform)

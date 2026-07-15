@@ -24,6 +24,8 @@ import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
+import com.tencent.kmm.network.export.NetworkRequestPolicy
+import com.tencent.kmm.network.export.NetworkStreamTimeoutPolicy
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
@@ -436,7 +438,15 @@ class AndroidCurlNetworkEngineTest {
         val progress = mutableListOf<NetworkTransferProgress>()
         val request = NetworkRequest(
             url = "https://example.test/file",
-            progress = NetworkProgressCallbacks(downloadProgress = progress::add)
+            progress = NetworkProgressCallbacks(downloadProgress = progress::add),
+            policy = NetworkRequestPolicy(
+                streamTimeouts = NetworkStreamTimeoutPolicy(
+                    connectTimeoutMillis = 101,
+                    responseHeadersTimeoutMillis = 202,
+                    interChunkIdleTimeoutMillis = 303,
+                    wholeTransferTimeoutMillis = 404
+                )
+            )
         )
         val starts = mutableListOf<Triple<Int, Long?, Map<String, List<String>>>>()
         val chunks = mutableListOf<ByteArray>()
@@ -458,6 +468,10 @@ class AndroidCurlNetworkEngineTest {
         )
         assertNull(response.body.bytes)
         assertEquals(7.0, response.timing.totalTimeMs)
+        assertEquals(101L, bridge.lastRequest?.streamConnectTimeoutMillis)
+        assertEquals(202L, bridge.lastRequest?.streamResponseHeadersTimeoutMillis)
+        assertEquals(303L, bridge.lastRequest?.streamIdleTimeoutMillis)
+        assertEquals(404L, bridge.lastRequest?.streamWholeTimeoutMillis)
     }
 
     @Test

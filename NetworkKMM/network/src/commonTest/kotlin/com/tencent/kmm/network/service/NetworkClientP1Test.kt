@@ -102,4 +102,33 @@ class NetworkClientP1Test {
             classifyNetworkErrorKind(503, "Service unavailable", 503)
         )
     }
+
+    @Test
+    fun cancelHandlerRegisteredAfterCancellationRunsImmediately() {
+        val request = NetworkRequest()
+        val call = NetworkCall(request)
+        var invocations = 0
+
+        call.cancel()
+        call.addCancelHandler { invocations++ }
+
+        assertEquals(1, invocations)
+    }
+
+    @Test
+    fun cancelContinuesAfterOneHandlerThrows() {
+        val request = NetworkRequest()
+        val call = NetworkCall(request)
+        val events = mutableListOf<String>()
+        call.addCancelHandler {
+            events += "first"
+            error("cancel callback failed")
+        }
+        call.addCancelHandler { events += "second" }
+
+        call.cancel()
+        call.cancel()
+
+        assertEquals(listOf("first", "second"), events)
+    }
 }

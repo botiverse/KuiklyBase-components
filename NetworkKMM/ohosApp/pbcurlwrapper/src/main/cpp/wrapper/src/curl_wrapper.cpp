@@ -19,8 +19,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <climits>
+#include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -147,37 +150,73 @@ class CurlClient {
         std::string line(contents, realsize);
         // 检测是否为HTTP状态行（如"HTTP/1.1 200 OK"）
         if (line.find("HTTP/") == 0) {
-            // CURLINFO_RESPONSE_CODE writes a long (8 bytes on LP64) — an
-            // int32_t here lets curl overwrite adjacent stack memory.
-            long httpCode = 0;
-            if (client->curl_ != nullptr) {
-                curl_easy_getinfo(client->curl_, CURLINFO_RESPONSE_CODE, &httpCode);
-            }
-            logI(client->log_tag_, "HeaderCallback httpCode:" + std::to_string(httpCode));
-            // 仅处理非重定向状态码（如200）
-            // 检测重定向状态码（3xx）
-            if (httpCode >= 300 && httpCode < 400) {
-                client->redirect_url_.clear();  // 开始新重定向时清空旧值
-            } else {
-                if (!client->headers_.empty()) {
-                    logI(client->log_tag_, "redirect header:" + client->headers_);
-                }
-                client->headers_.clear();  // 重置，准备记录最终头部.主要针对重定向场景,记录重定向之后的header信息
-            }
-            client->headers_ += line;
+            client->current_headers_.clear();
+            client->current_headers_ += line;
+            client->current_has_location_ = false;
+            client->current_status_code_ = ParseHttpStatusCode(line);
+            client->final_headers_ready_ = false;
+            logI(client->log_tag_, "HeaderCallback httpCode:" + std::to_string(client->current_status_code_));
         } else if (line.find("Location:") == 0 || line.find("location:") == 0) {
-            client->headers_ += line;
+            client->current_headers_ += line;
+            client->current_has_location_ = true;
             // 提取并存储重定向URL
             client->redirect_url_ = line.substr(line.find(":") + 1);
             // 去除末尾换行符（\r\n）
             if (client->redirect_url_.size() >= 2) {
                 client->redirect_url_.resize(client->redirect_url_.size() - 2);
             }
+        } else if (line == "\r\n" || line == "\n") {
+            client->current_headers_ += line;
+            if (!client->CompleteHeaderBlock()) {
+                return 0;
+            }
         } else {
             // 处理响应的头部信息是否包含 Content-Encoding = gzip
             HandleGzipContentEncoding(client, line);
         }
         return realsize;
+    }
+
+    static long ParseHttpStatusCode(const std::string &statusLine) {
+        const size_t firstSpace = statusLine.find(' ');
+        if (firstSpace == std::string::npos) {
+            return 0;
+        }
+        const char *begin = statusLine.c_str() + firstSpace + 1;
+        char *end = nullptr;
+        const long parsed = std::strtol(begin, &end, 10);
+        return end == begin ? 0 : parsed;
+    }
+
+    // Commits one complete header block. Informational blocks are never
+    // surfaced as the response start. Redirect blocks are retained as a
+    // fallback but delayed because CURLOPT_FOLLOWLOCATION may immediately
+    // replace them with the next response. Final 2xx/4xx/5xx (including
+    // body-less HEAD/204) start as soon as the terminating blank line arrives.
+    bool CompleteHeaderBlock() {
+        if (current_status_code_ <= 0) {
+            return true;
+        }
+        if (current_status_code_ >= 100 && current_status_code_ < 200) {
+            logI(log_tag_, "ignore informational header block:" + std::to_string(current_status_code_));
+            return true;
+        }
+        const bool redirectMayFollow =
+            current_status_code_ >= 300 && current_status_code_ < 400 && current_has_location_;
+        final_status_code_ = current_status_code_;
+        final_headers_ = current_headers_;
+        headers_ = final_headers_;
+        // A followed redirect is not the response visible to the caller. Keep
+        // waiting (and keep the response-header deadline armed) until curl
+        // completes a non-followed header block.
+        final_headers_ready_ = !redirectMayFollow;
+        if (final_headers_ready_) {
+            last_stream_activity_ = std::chrono::steady_clock::now();
+        }
+        if (stream_mode_ && final_headers_ready_) {
+            return DeliverStreamResponseStart();
+        }
+        return true;
     }
 
     static void HandleGzipContentEncoding(CurlClient *client, std::string line) {
@@ -204,7 +243,7 @@ class CurlClient {
             // CURLOPT_ACCEPT_ENCODING, so the write callback already receives the
             // decompressed bytes. Header lines are still recorded verbatim below.
         }
-        client->headers_ += line + "\n";  // 保留原始头部信息
+        client->current_headers_ += line;  // 保留原始头部信息
     }
 
     // 处理响应正文的回调函数
@@ -230,26 +269,36 @@ class CurlClient {
             logI(client->log_tag_, "StreamWriteCallback cancel by user.");
             return 0;  // abort the transfer
         }
-        client->DeliverStreamResponseStart();
+        client->last_stream_activity_ = std::chrono::steady_clock::now();
+        if (!client->DeliverStreamResponseStart()) {
+            return 0;
+        }
         if (realsize > 0 && client->stream_callback_->onChunk != nullptr) {
             client->stream_callback_->onChunk(
                 client->stream_callback_->callbackRef, reinterpret_cast<char *>(contents), static_cast<int>(realsize));
         }
-        return realsize;
+        // Kotlin callback failures request cancellation synchronously. Recheck
+        // before returning to libcurl so no later chunk can escape.
+        return client->cancel_flag_.load(std::memory_order_relaxed) ? 0 : realsize;
     }
 
     // Deliver onResponseStart exactly once, when the response headers are ready.
-    void DeliverStreamResponseStart() {
+    bool DeliverStreamResponseStart() {
         if (stream_started_ || stream_callback_ == nullptr) {
-            return;
+            return !cancel_flag_.load(std::memory_order_relaxed);
+        }
+        if (!final_headers_ready_ || cancel_flag_.load(std::memory_order_relaxed)) {
+            return false;
         }
         stream_started_ = true;
-        long httpCode = 0;
-        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &httpCode);
         if (stream_callback_->onResponseStart != nullptr) {
             stream_callback_->onResponseStart(
-                stream_callback_->callbackRef, httpCode, headers_.c_str(), static_cast<int>(headers_.length()));
+                stream_callback_->callbackRef,
+                final_status_code_,
+                final_headers_.c_str(),
+                static_cast<int>(final_headers_.length()));
         }
+        return !cancel_flag_.load(std::memory_order_relaxed);
     }
 
     // issue #8 slice 3: pull-based upload body. libcurl asks for up to
@@ -304,7 +353,35 @@ class CurlClient {
             logI(gDefaultTag, "ProgressCallback cancel by user.");
             return 1;
         }
+        if (client->stream_mode_ && client->StreamPhaseTimedOut()) {
+            return 1;
+        }
         return 0;
+    }
+
+    bool StreamPhaseTimedOut() {
+        const auto now = std::chrono::steady_clock::now();
+        if (!final_headers_ready_ && stream_response_headers_timeout_ms_ > 0) {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - stream_request_started_).count();
+            if (elapsed >= stream_response_headers_timeout_ms_) {
+                stream_timeout_reason_ = "response headers timeout after " + std::to_string(elapsed) + "ms";
+                std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", stream_timeout_reason_.c_str());
+                logE(log_tag_, stream_timeout_reason_);
+                return true;
+            }
+        }
+        if (stream_started_ && stream_idle_timeout_ms_ > 0) {
+            const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - last_stream_activity_).count();
+            if (idle >= stream_idle_timeout_ms_) {
+                stream_timeout_reason_ = "stream idle timeout after " + std::to_string(idle) + "ms";
+                std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", stream_timeout_reason_.c_str());
+                logE(log_tag_, stream_timeout_reason_);
+                return true;
+            }
+        }
+        return false;
     }
 
     // 调试回调函数
@@ -397,15 +474,22 @@ class CurlClient {
         logI(log_tag_, std::string("libcurl accept-encoding: ") +
             (accept_encoding[0] == '\0' ? "<all supported>" : accept_encoding));
         curl_easy_setopt(curl_, CURLOPT_ACCEPT_ENCODING, accept_encoding);
-        // 超时配置
-        if (timeout > 0) {
+        // Buffered requests keep the historical whole-request timeout.
+        // Streaming uses phase deadlines: connect, response headers/TTFB and
+        // inter-chunk idle; a whole-transfer deadline is opt-in only.
+        if (!stream_mode_ && timeout > 0) {
             curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout);
+        } else if (stream_mode_ && request.streamWholeTimeoutMs > 0) {
+            curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, request.streamWholeTimeoutMs);
         }
         // raft.11: connect gets its own short budget (aligned with the ktor
         // transports' 3s cap) so a black-holed address family fails fast
         // instead of inheriting the whole-request timeout, and Happy Eyeballs
         // racing is pinned explicitly instead of trusting the libcurl default.
-        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, 3000L);
+        const long connectTimeout = stream_mode_ && request.streamConnectTimeoutMs > 0
+            ? static_cast<long>(request.streamConnectTimeoutMs)
+            : 3000L;
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, connectTimeout);
         curl_easy_setopt(curl_, CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200L);
         // Pool connections/DNS/TLS sessions across per-request easy handles.
         CURLSH *share = GetCurlShare(http3_enabled_);
@@ -497,6 +581,13 @@ class CurlClient {
         // 响应头处理
         curl_easy_setopt(curl_, CURLOPT_HEADERFUNCTION, HeaderCallback);
         curl_easy_setopt(curl_, CURLOPT_HEADERDATA, this);
+        if (stream_mode_) {
+            stream_response_headers_timeout_ms_ = request.streamResponseHeadersTimeoutMs;
+            stream_idle_timeout_ms_ = request.streamIdleTimeoutMs;
+            stream_request_started_ = std::chrono::steady_clock::now();
+            last_stream_activity_ = stream_request_started_;
+            stream_timeout_reason_.clear();
+        }
         return true;
     }
 
@@ -644,17 +735,16 @@ class CurlClient {
     void StartStreamRequest(CurlRequest request, CurlStreamCallback *callback) {
         stream_callback_ = callback;
         stream_started_ = false;
+        stream_terminal_ = false;
         stream_mode_ = true;
         std::string method;
         if (!ConfigureRequest(request, method)) {
             // Always deliver exactly one terminal callback (upstream #31 contract).
-            DeliverStreamResponseStart();
             BuildStreamCompletion(CURLE_FAILED_INIT);
             return;
         }
         if (cancel_flag_.load(std::memory_order_relaxed)) {
             logI(log_tag_, "stream cancelled before perform started.");
-            DeliverStreamResponseStart();
             BuildStreamCompletion(CURLE_ABORTED_BY_CALLBACK);
             return;
         }
@@ -662,15 +752,30 @@ class CurlClient {
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, StreamWriteCallback);
         curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
         CURLcode res = curl_easy_perform(curl_);
-        // A body-less response (or a failure before any write) still owes the
-        // caller an onResponseStart before onComplete.
-        DeliverStreamResponseStart();
+        if (!stream_timeout_reason_.empty()) {
+            res = CURLE_OPERATION_TIMEDOUT;
+        } else if (cancel_flag_.load(std::memory_order_relaxed)) {
+            // Header/write callbacks abort with CURLE_WRITE_ERROR. Preserve the
+            // public cancellation contract regardless of which callback first
+            // observed the cancel flag.
+            res = CURLE_ABORTED_BY_CALLBACK;
+        }
+        // A body-less final response (HEAD/204/final redirect) still owes the
+        // caller a start. DNS/TLS/connect failures have no complete header
+        // block and must not fabricate an HTTP response start.
+        if (final_headers_ready_ && !cancel_flag_.load(std::memory_order_relaxed)) {
+            DeliverStreamResponseStart();
+        }
         BuildStreamCompletion(res);
     }
 
     // Builds a body-less CurlResponse (body already delivered via onChunk) and
     // invokes onComplete exactly once.
     void BuildStreamCompletion(int res) {
+        if (stream_terminal_) {
+            return;
+        }
+        stream_terminal_ = true;
         int errorCode = res;
         long httpCode = 0;
         curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &httpCode);
@@ -817,6 +922,8 @@ class CurlClient {
     struct curl_slist *resolve_list_ = nullptr;
     char curl_error_msg_[CURL_ERROR_SIZE];
     std::string headers_;
+    std::string current_headers_;
+    std::string final_headers_;
     std::string redirect_url_;
     std::string content_data_;
     CurlResponse *curl_response_ = nullptr;  // destructor deletes it — must not start wild
@@ -831,6 +938,16 @@ class CurlClient {
     // issue #8 slice 3: set for the lifetime of a StartUploadRequest call.
     CurlUploadSource *upload_source_ = nullptr;
     bool stream_started_ = false;
+    bool stream_terminal_ = false;
+    bool final_headers_ready_ = false;
+    bool current_has_location_ = false;
+    long current_status_code_ = 0;
+    long final_status_code_ = 0;
+    int64_t stream_response_headers_timeout_ms_ = 0;
+    int64_t stream_idle_timeout_ms_ = 0;
+    std::chrono::steady_clock::time_point stream_request_started_{};
+    std::chrono::steady_clock::time_point last_stream_activity_{};
+    std::string stream_timeout_reason_;
     // Streaming forces Accept-Encoding: identity so Content-Length matches the
     // bytes delivered to onChunk (determinate progress, no transparent decode).
     bool stream_mode_ = false;
@@ -923,4 +1040,7 @@ const char *GetCurlNegotiatedProtocol(CurClientHandle handle) {
         return "unknown";
     }
     return reinterpret_cast<CurlClient *>(handle)->GetNegotiatedProtocol();
+}
+int CurlWrapperAbiVersion(void) {
+    return CURL_WRAPPER_ABI_VERSION;
 }
