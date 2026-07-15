@@ -15,6 +15,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.delay
 import kotlin.test.Test
 import kotlin.test.assertEquals
 
@@ -97,6 +98,54 @@ class VBTransportStreamTaskTest {
             ),
             events,
         )
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+    }
+
+    @Test
+    fun doubleCancelCannotPublishTerminalWhilePlatformAbortIsBlocked() = runBlocking {
+        val requestId = 991_006
+        val reservation = CancellationAwareRegistry<Int, String>()
+        val task = registeredTask(requestId)
+        val abortEntered = CompletableDeferred<Unit>()
+        val releaseAbort = CompletableDeferred<Unit>()
+        val gateInstalled = CompletableDeferred<Unit>()
+        val terminals = atomic(0)
+        val platformCancels = atomic(0)
+        val platformEntries = atomic(0)
+        task.platformPrepare = { reservation.begin(it) }
+        task.platformAbortPrepared = {
+            abortEntered.complete(Unit)
+            runBlocking { releaseAbort.await() }
+            reservation.remove(it)
+        }
+        task.platformCancel = { platformCancels.incrementAndGet() }
+        task.afterStreamGateInstalledForTest = {
+            gateInstalled.complete(Unit)
+            task.cancel()
+        }
+        task.platformRequestStream = { _, _, _, _ -> platformEntries.incrementAndGet() }
+
+        val requestJob = launch(Dispatchers.Default) {
+            task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
+                terminals.incrementAndGet()
+                check(reservation.begin(requestId))
+                reservation.remove(requestId)
+            }
+        }
+        gateInstalled.await()
+        abortEntered.await()
+        val secondCancel = launch(Dispatchers.Default) { task.cancel() }
+        delay(25)
+
+        assertEquals(0, terminals.value)
+        assertEquals(0, platformCancels.value)
+        releaseAbort.complete(Unit)
+        requestJob.join()
+        secondCancel.join()
+
+        assertEquals(1, terminals.value)
+        assertEquals(0, platformCancels.value)
+        assertEquals(0, platformEntries.value)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
     }
 

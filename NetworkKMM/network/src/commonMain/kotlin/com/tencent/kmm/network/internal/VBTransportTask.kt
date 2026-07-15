@@ -352,10 +352,13 @@ class VBTransportTask(
             val gate = streamGate.value
             if (current == VBTransportState.Running && gate != null) {
                 val abortedBeforeEntry = abortUnusedPlatformReservation()
+                if (!abortedBeforeEntry && platformEntryPhase.value == PLATFORM_PHASE_ABORTING) {
+                    return
+                }
                 val won = gate.complete(cancelledStreamResponse()) {
                     state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
                 }
-                if (won && !abortedBeforeEntry) {
+                if (won && platformEntryPhase.value == PLATFORM_PHASE_ENTERED) {
                     platformCancel(requestId)
                 }
                 return
@@ -383,10 +386,16 @@ class VBTransportTask(
     }
 
     private fun abortUnusedPlatformReservation(): Boolean {
-        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ABORTED)) {
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ABORTING)) {
             return false
         }
-        platformAbortPrepared(requestId)
+        try {
+            platformAbortPrepared(requestId)
+            platformEntryPhase.value = PLATFORM_PHASE_ABORTED
+        } catch (throwable: Throwable) {
+            platformEntryPhase.value = PLATFORM_PHASE_RESERVED
+            throw throwable
+        }
         return true
     }
 
@@ -399,4 +408,5 @@ class VBTransportTask(
 private const val PLATFORM_PHASE_NONE = 0
 private const val PLATFORM_PHASE_RESERVED = 1
 private const val PLATFORM_PHASE_ENTERED = 2
-private const val PLATFORM_PHASE_ABORTED = 3
+private const val PLATFORM_PHASE_ABORTING = 3
+private const val PLATFORM_PHASE_ABORTED = 4
