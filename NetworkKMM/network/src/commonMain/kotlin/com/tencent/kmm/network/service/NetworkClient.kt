@@ -160,7 +160,7 @@ class NetworkCall internal constructor(
     private var requestPreparationTimeMs = 0.0
     private val completion = CompletableDeferred<NetworkResponse>()
     private val stateLock = SynchronizedObject()
-    private val callbackDeliveryLock = SynchronizedObject()
+    private val callbackDeliveryGate = CallbackDeliveryGate()
     private val cancelHandlers = mutableListOf<() -> Unit>()
     private val completionHandlers = mutableListOf<(NetworkResponse) -> Unit>()
     private var job: Job? = null
@@ -226,7 +226,7 @@ class NetworkCall internal constructor(
             terminal
         }
         if (completed != null) {
-            synchronized(callbackDeliveryLock) {
+            callbackDeliveryGate.enqueueAfterTerminal {
                 invokeCompletionHandler(handler, completed)
             }
         }
@@ -259,11 +259,9 @@ class NetworkCall internal constructor(
     }
 
     internal fun runWhileActive(action: () -> Unit) {
-        synchronized(callbackDeliveryLock) {
-            if (synchronized(stateLock) { terminalResponse == null }) {
-                beforeActiveCallbackActionForTest?.invoke()
-                action()
-            }
+        callbackDeliveryGate.runIfOpen {
+            beforeActiveCallbackActionForTest?.invoke()
+            action()
         }
     }
 
@@ -325,7 +323,7 @@ class NetworkCall internal constructor(
     private fun deliverTerminal(
         response: NetworkResponse,
         handlers: List<(NetworkResponse) -> Unit>
-    ) = synchronized(callbackDeliveryLock) {
+    ) = callbackDeliveryGate.closeAndRun {
         completion.complete(response)
         handlers.forEach { handler -> invokeCompletionHandler(handler, response) }
     }
@@ -347,6 +345,80 @@ class NetworkCall internal constructor(
         val completionHandlers: List<(NetworkResponse) -> Unit>,
         val response: NetworkResponse
     )
+}
+
+private class CallbackDeliveryGate {
+    private val lock = SynchronizedObject()
+    private var closed = false
+    private var inFlight = 0
+    private var terminalDeliveryStarted = false
+    private var terminalDelivered = false
+    private var terminalAction: (() -> Unit)? = null
+    private val afterTerminal = mutableListOf<() -> Unit>()
+
+    fun runIfOpen(action: () -> Unit) {
+        val admitted = synchronized(lock) {
+            if (closed) false
+            else {
+                inFlight++
+                true
+            }
+        }
+        if (!admitted) return
+        try {
+            action()
+        } finally {
+            val delivery = synchronized(lock) {
+                inFlight--
+                takeDeliveryIfReady()
+            }
+            delivery?.invoke()
+        }
+    }
+
+    fun closeAndRun(action: () -> Unit) {
+        val delivery = synchronized(lock) {
+            if (!closed) {
+                closed = true
+                terminalAction = action
+            }
+            takeDeliveryIfReady()
+        }
+        delivery?.invoke()
+    }
+
+    fun enqueueAfterTerminal(action: () -> Unit) {
+        val invokeNow = synchronized(lock) {
+            if (terminalDelivered) true
+            else {
+                afterTerminal += action
+                false
+            }
+        }
+        if (invokeNow) action()
+    }
+
+    private fun takeDeliveryIfReady(): (() -> Unit)? {
+        if (!closed || inFlight != 0 || terminalDeliveryStarted) return null
+        val terminal = terminalAction ?: return null
+        terminalDeliveryStarted = true
+        terminalAction = null
+        return {
+            terminal()
+            while (true) {
+                val observers = synchronized(lock) {
+                    if (afterTerminal.isEmpty()) {
+                        terminalDelivered = true
+                        emptyList()
+                    } else {
+                        afterTerminal.toList().also { afterTerminal.clear() }
+                    }
+                }
+                if (observers.isEmpty()) break
+                observers.forEach { observer -> observer() }
+            }
+        }
+    }
 }
 
 class NetworkClient(
