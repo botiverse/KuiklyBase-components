@@ -270,6 +270,7 @@ class NetworkClientP1Test {
     fun middlewareReplacementBodyIsOwnedBeforeEngineEntry() = runBlocking {
         var originalCancels = 0
         var replacementCancels = 0
+        val replacementCancelled = CompletableDeferred<Unit>()
         var engineCalls = 0
         val replacementInstalled = CompletableDeferred<Unit>()
         val blockAfterReplacement = CompletableDeferred<Unit>()
@@ -287,6 +288,7 @@ class NetworkClientP1Test {
                             body = NetworkBody.Stream(
                                 NetworkByteStream.fromChunks(cancelBlock = {
                                     replacementCancels++
+                                    replacementCancelled.complete(Unit)
                                     error("replacement cancel failed")
                                 }) {}
                             )
@@ -315,6 +317,7 @@ class NetworkClientP1Test {
         parent.cancel()
 
         assertEquals(NetworkErrorKind.CANCELLED, call.await().error?.kind)
+        replacementCancelled.await()
         assertEquals(1, originalCancels)
         assertEquals(1, replacementCancels)
         assertEquals(0, engineCalls)

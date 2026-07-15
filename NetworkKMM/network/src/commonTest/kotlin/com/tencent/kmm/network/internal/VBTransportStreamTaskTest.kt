@@ -95,7 +95,9 @@ class VBTransportStreamTaskTest {
         }) { response -> events += "terminal:${response.errorCode}" }
 
         assertEquals(
-            listOf("terminal:${VBTransportResultCode.CODE_NETWORK_ERROR}", "cancel"),
+            // The gate is logically closed before cancel; delivery waits for
+            // the currently admitted throwing callback to unwind.
+            listOf("cancel", "terminal:${VBTransportResultCode.CODE_NETWORK_ERROR}"),
             events,
         )
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(task.requestId))
