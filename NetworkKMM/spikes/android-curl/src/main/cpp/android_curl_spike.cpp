@@ -53,7 +53,14 @@ ProbeResult RunSingleProbe(const char *caInfoPath) {
 
     CurClientHandle client = CreateCurlClient("android-curl-spike");
     SetCurlCaInfo(client, caInfoPath);
-    StartRequest(client, request, &callback);
+    const bool started = StartRequestV27(
+        client,
+        &request,
+        sizeof(request),
+        CURL_WRAPPER_ABI_VERSION,
+        &callback
+    ) != 0;
+    result.passed = started && result.passed;
     DeleteCurlClient(client);
     return result;
 }

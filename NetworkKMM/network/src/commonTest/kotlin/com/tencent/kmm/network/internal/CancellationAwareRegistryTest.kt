@@ -12,6 +12,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
+import kotlin.test.assertFailsWith
 
 class CancellationAwareRegistryTest {
     @Test
@@ -79,5 +80,23 @@ class CancellationAwareRegistryTest {
         assertTrue(registry.publish(17, "second"))
 
         assertEquals("second", registry.get(17))
+    }
+
+    @Test
+    fun throwingPublishedCancellationStillRemovesOwnerInFinally() {
+        val registry = CancellationAwareRegistry<Int, String>()
+        registry.begin(19)
+        assertTrue(registry.publish(19, "first"))
+
+        assertFailsWith<IllegalStateException> {
+            registry.cancelOrRemember(19, removePublished = true) {
+                error("platform cancel failed")
+            }
+        }
+
+        assertNull(registry.get(19))
+        registry.begin(19)
+        assertTrue(registry.publish(19, "replacement"))
+        assertEquals("replacement", registry.get(19))
     }
 }

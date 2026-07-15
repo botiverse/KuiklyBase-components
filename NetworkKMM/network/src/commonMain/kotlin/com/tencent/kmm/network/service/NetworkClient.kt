@@ -163,6 +163,7 @@ class NetworkCall internal constructor(
     private val completionHandlers = mutableListOf<(NetworkResponse) -> Unit>()
     private var job: Job? = null
     private var cancelled = false
+    private val requestBodyCancelArmed = atomic(true)
     private var terminalResponse: NetworkResponse? = null
     private var resolvedEngine: ResolvedNetworkEngine? = null
     private var engineSelectionReported = false
@@ -254,6 +255,13 @@ class NetworkCall internal constructor(
         }
     }
 
+    internal fun runWhileActive(action: () -> Unit) {
+        val admitted = synchronized(stateLock) { terminalResponse == null }
+        if (admitted) {
+            action()
+        }
+    }
+
     suspend fun await(): NetworkResponse = completion.await()
 
     fun cancel() {
@@ -273,7 +281,7 @@ class NetworkCall internal constructor(
                 CancellationDelivery(handlers, attachedJob, callbacks, response)
             }
         } ?: return
-        originalRequest.body.cancel()
+        cancelRequestBodyOnce()
         cancellation.cancelHandlers.forEach { handler ->
             try {
                 handler()
@@ -285,6 +293,12 @@ class NetworkCall internal constructor(
         completion.complete(cancellation.response)
         cancellation.completionHandlers.forEach { handler ->
             invokeCompletionHandler(handler, cancellation.response)
+        }
+    }
+
+    internal fun cancelRequestBodyOnce() {
+        if (requestBodyCancelArmed.compareAndSet(expect = true, update = false)) {
+            originalRequest.body.cancel()
         }
     }
 
@@ -324,7 +338,12 @@ class NetworkClient(
     ): NetworkCall {
         val call = NetworkCall(request)
         call.addCompletionHandler(callback)
-        val policy = selectPolicy(request)
+        val policy = try {
+            selectPolicy(request)
+        } catch (throwable: Throwable) {
+            call.tryComplete(workerFailureResponse(request, throwable))
+            return call
+        }
         val job = scope.launch(dispatcherFor(policy.dispatcher)) {
             val response = try {
                 call.markClientStarted()
@@ -333,6 +352,11 @@ class NetworkClient(
                 workerFailureResponse(request, throwable)
             }
             call.tryComplete(response)
+        }
+        job.invokeOnCompletion { cause ->
+            if (cause != null) {
+                call.tryComplete(workerFailureResponse(request, cause))
+            }
         }
         call.attachJob(job)
         return call
@@ -365,7 +389,12 @@ class NetworkClient(
     ): NetworkCall {
         val call = NetworkCall(request)
         call.addCompletionHandler(onComplete)
-        val policy = selectPolicy(request)
+        val policy = try {
+            selectPolicy(request)
+        } catch (throwable: Throwable) {
+            call.tryComplete(workerFailureResponse(request, throwable))
+            return call
+        }
         val job = scope.launch(dispatcherFor(policy.dispatcher)) {
             val response = try {
                 var prepared = request.copyMutable()
@@ -377,12 +406,28 @@ class NetworkClient(
                 if (call.isCancelled) {
                     cancelledResponse(prepared)
                 } else {
-                    engine.downloadStream(prepared, call, onResponseStart, onChunk)
+                    engine.downloadStream(
+                        prepared,
+                        call,
+                        onResponseStart = { statusCode, contentLength, headers ->
+                            call.runWhileActive {
+                                onResponseStart(statusCode, contentLength, headers)
+                            }
+                        },
+                        onChunk = { chunk ->
+                            call.runWhileActive { onChunk(chunk) }
+                        }
+                    )
                 }
             } catch (throwable: Throwable) {
                 workerFailureResponse(request, throwable)
             }
             call.tryComplete(response)
+        }
+        job.invokeOnCompletion { cause ->
+            if (cause != null) {
+                call.tryComplete(workerFailureResponse(request, cause))
+            }
         }
         call.attachJob(job)
         return call
@@ -678,19 +723,20 @@ object VBTransportNetworkEngine : NetworkEngine {
                     }
                 })
             }
+            val cancellationOwners = StreamingUploadCancellationOwners(
+                cancelRequestBody = call::cancelRequestBodyOnce,
+                cancelDerivedSource = source.stream.takeIf { source.cancelSeparatelyFromRequestBody }
+                    ?.let { stream -> stream::cancel },
+                cancelTransport = { VBTransportService.cancel(vbRequest.requestId) }
+            )
             VBTransportService.uploadStream(vbRequest, source.contentLength, writeBody) { response ->
+                cancellationOwners.disarmTransport()
                 if (continuation.isActive) {
                     continuation.resume(response.toNetworkResponse(request))
                 }
             }
-            call.addCancelHandler {
-                source.stream.cancel()
-                VBTransportService.cancel(vbRequest.requestId)
-            }
-            continuation.invokeOnCancellation {
-                source.stream.cancel()
-                VBTransportService.cancel(vbRequest.requestId)
-            }
+            call.addCancelHandler(cancellationOwners::cancelAll)
+            continuation.invokeOnCancellation { cancellationOwners.cancelAll() }
         }
     }
 
@@ -702,7 +748,8 @@ object VBTransportNetworkEngine : NetworkEngine {
 internal class NetworkUploadStreamSource(
     val stream: NetworkByteStream,
     val contentType: String?,
-    val contentLength: Long?
+    val contentLength: Long?,
+    val cancelSeparatelyFromRequestBody: Boolean = false
 )
 
 internal suspend fun networkUploadStreamSourceOrNull(request: NetworkRequest): NetworkUploadStreamSource? =
@@ -711,7 +758,12 @@ internal suspend fun networkUploadStreamSourceOrNull(request: NetworkRequest): N
             NetworkUploadStreamSource(body.stream, body.contentType, body.contentLength)
         is NetworkBody.FileRef ->
             body.openStream()?.let { stream ->
-                NetworkUploadStreamSource(stream, body.contentType, stream.contentLength ?: body.contentLength)
+                NetworkUploadStreamSource(
+                    stream,
+                    body.contentType,
+                    stream.contentLength ?: body.contentLength,
+                    cancelSeparatelyFromRequestBody = true
+                )
             }
         // issue #8 slice 2: multiparts stream when they carry at least one
         // Stream/FileRef part; all-scalar multiparts keep the buffered path.
@@ -721,6 +773,32 @@ internal suspend fun networkUploadStreamSourceOrNull(request: NetworkRequest): N
             }
         else -> null
     }
+
+internal class StreamingUploadCancellationOwners(
+    private val cancelRequestBody: () -> Unit,
+    private val cancelDerivedSource: (() -> Unit)?,
+    private val cancelTransport: () -> Unit
+) {
+    private val requestBodyArmed = atomic(true)
+    private val derivedSourceArmed = atomic(cancelDerivedSource != null)
+    private val transportArmed = atomic(true)
+
+    fun cancelAll() {
+        cancelOnce(requestBodyArmed, cancelRequestBody)
+        cancelDerivedSource?.let { cancelOnce(derivedSourceArmed, it) }
+        cancelOnce(transportArmed, cancelTransport)
+    }
+
+    fun disarmTransport() {
+        transportArmed.value = false
+    }
+
+    private fun cancelOnce(armed: kotlinx.atomicfu.AtomicBoolean, cancel: () -> Unit) {
+        if (armed.compareAndSet(expect = true, update = false)) {
+            runCatching(cancel)
+        }
+    }
+}
 
 private class RealNetworkInterceptorChain(
     private val interceptors: List<NetworkInterceptor>,

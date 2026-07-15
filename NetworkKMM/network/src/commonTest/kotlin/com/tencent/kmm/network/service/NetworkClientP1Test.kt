@@ -29,6 +29,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
@@ -37,6 +38,79 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 
 class NetworkClientP1Test {
+    @Test
+    fun executeOnAlreadyCancelledScopeStillPublishesOneTerminal() = runBlocking {
+        val parent = Job().apply { cancel() }
+        val callbacks = mutableListOf<NetworkResponse>()
+        var engineCalls = 0
+        val client = NetworkClient(
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineCalls++
+                    error("cancelled scope must not dispatch")
+                }
+            },
+            scope = CoroutineScope(parent)
+        )
+
+        val call = client.execute(NetworkRequest(), callbacks::add)
+        val terminal = call.await()
+
+        assertEquals(0, engineCalls)
+        assertEquals(NetworkErrorKind.CANCELLED, terminal.error?.kind)
+        assertEquals(1, callbacks.size)
+        assertEquals(NetworkErrorKind.CANCELLED, callbacks.single().error?.kind)
+    }
+
+    @Test
+    fun downloadOnAlreadyCancelledScopeStillPublishesOneTerminal() = runBlocking {
+        val parent = Job().apply { cancel() }
+        val callbacks = mutableListOf<NetworkResponse>()
+        var engineCalls = 0
+        val client = NetworkClient(
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineCalls++
+                    error("cancelled scope must not dispatch")
+                }
+            },
+            scope = CoroutineScope(parent)
+        )
+
+        val call = client.downloadStream(NetworkRequest(), onChunk = {}, onComplete = callbacks::add)
+        val terminal = call.await()
+
+        assertEquals(0, engineCalls)
+        assertEquals(NetworkErrorKind.CANCELLED, terminal.error?.kind)
+        assertEquals(1, callbacks.size)
+        assertEquals(NetworkErrorKind.CANCELLED, callbacks.single().error?.kind)
+    }
+
+    @Test
+    fun throwingPolicySelectorStillPublishesOneTerminal() = runBlocking {
+        val callbacks = mutableListOf<NetworkResponse>()
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                policySelector = { error("policy selection failed") }
+            )
+        )
+
+        val executeCall = client.execute(NetworkRequest(), callbacks::add)
+        val executeTerminal = executeCall.await()
+        val streamCall = client.downloadStream(
+            NetworkRequest(),
+            onChunk = {},
+            onComplete = callbacks::add
+        )
+        val streamTerminal = streamCall.await()
+
+        assertEquals(NetworkErrorKind.UNKNOWN, executeTerminal.error?.kind)
+        assertEquals("policy selection failed", executeTerminal.error?.message)
+        assertEquals(NetworkErrorKind.UNKNOWN, streamTerminal.error?.kind)
+        assertEquals("policy selection failed", streamTerminal.error?.message)
+        assertEquals(2, callbacks.size)
+    }
+
     @Test
     fun interceptorsRunInDeclaredOrder() = runBlocking {
         val events = mutableListOf<String>()
@@ -222,6 +296,59 @@ class NetworkClientP1Test {
     }
 
     @Test
+    fun streamingCancelSuppressesLateStartAndChunksFromNonCooperativeEngine() = runBlocking {
+        val engineEntered = CompletableDeferred<Unit>()
+        val releaseEngine = CompletableDeferred<Unit>()
+        val engineFinished = CompletableDeferred<Unit>()
+        val callbacks = mutableListOf<NetworkResponse>()
+        var starts = 0
+        var chunks = 0
+        val client = NetworkClient(
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse =
+                    error("buffered execute is unused")
+
+                override suspend fun downloadStream(
+                    request: NetworkRequest,
+                    call: NetworkCall,
+                    onResponseStart: (Int, Long?, Map<String, List<String>>) -> Unit,
+                    onChunk: (ByteArray) -> Unit
+                ): NetworkResponse {
+                    engineEntered.complete(Unit)
+                    withContext(NonCancellable) { releaseEngine.await() }
+                    onResponseStart(200, 1, emptyMap())
+                    onChunk(byteArrayOf(1))
+                    engineFinished.complete(Unit)
+                    return NetworkResponse(
+                        request = request,
+                        statusCode = 200,
+                        headers = emptyMap(),
+                        body = NetworkResponseBody()
+                    )
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob())
+        )
+
+        val call = client.downloadStream(
+            NetworkRequest(),
+            onResponseStart = { _, _, _ -> starts++ },
+            onChunk = { chunks++ },
+            onComplete = callbacks::add
+        )
+        engineEntered.await()
+        call.cancel()
+        releaseEngine.complete(Unit)
+        engineFinished.await()
+        yield()
+
+        assertEquals(0, starts)
+        assertEquals(0, chunks)
+        assertEquals(NetworkErrorKind.CANCELLED, call.await().error?.kind)
+        assertEquals(1, callbacks.size)
+    }
+
+    @Test
     fun throwingMultipartCancellationStillReachesEveryOwnerAndTerminal() {
         val bodyCancels = mutableListOf<String>()
         val request = NetworkRequest().apply {
@@ -267,6 +394,46 @@ class NetworkClientP1Test {
         assertEquals(true, job.isCancelled)
         assertEquals(1, completions.size)
         assertEquals(NetworkErrorKind.CANCELLED, completions.single().error?.kind)
+    }
+
+    @Test
+    fun streamingUploadCancellationOwnersAreIndependentAndOneShot() = runBlocking {
+        var requestBodyCancels = 0
+        var derivedSourceCancels = 0
+        var transportCancels = 0
+        val request = NetworkRequest().apply {
+            body = NetworkBody.FileRef(
+                path = "/virtual/upload.bin",
+                cancelBlock = {
+                    requestBodyCancels++
+                    error("request body cancel failed")
+                },
+                openStreamBlock = {
+                    NetworkByteStream.fromChunks(cancelBlock = {
+                        derivedSourceCancels++
+                        error("derived source cancel failed")
+                    }) {}
+                }
+            )
+        }
+        val source = requireNotNull(networkUploadStreamSourceOrNull(request))
+        val call = NetworkCall(request)
+        val owners = StreamingUploadCancellationOwners(
+            cancelRequestBody = call::cancelRequestBodyOnce,
+            cancelDerivedSource = source.stream::cancel,
+            cancelTransport = { transportCancels++ }
+        )
+        call.addCancelHandler(owners::cancelAll)
+
+        call.cancel()
+        // Models the continuation cancellation callback racing the public
+        // NetworkCall cancellation handler.
+        owners.cancelAll()
+
+        assertEquals(1, requestBodyCancels)
+        assertEquals(1, derivedSourceCancels)
+        assertEquals(1, transportCancels)
+        assertEquals(NetworkErrorKind.CANCELLED, call.await().error?.kind)
     }
 
     @Test

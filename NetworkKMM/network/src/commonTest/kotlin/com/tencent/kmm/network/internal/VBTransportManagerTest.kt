@@ -10,6 +10,7 @@ package com.tencent.kmm.network.internal
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertSame
+import kotlin.test.assertFailsWith
 
 class VBTransportManagerTest {
     @Test
@@ -37,5 +38,37 @@ class VBTransportManagerTest {
         assertSame(replacement, VBTransportManager.getTask(requestId))
         VBTransportManager.onTaskFinish(replacement)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+    }
+
+    @Test
+    fun throwingPlatformCancelCannotLeaveCanceledTaskResident() {
+        val requestId = 987_654_322
+        val task = VBTransportTask(
+            requestId,
+            useCurl = true,
+            logTag = "throwing-platform-cancel",
+            taskManager = VBTransportManager
+        ).apply {
+            setState(VBTransportState.Running)
+            platformCancel = { error("platform cancel failed") }
+        }
+        VBTransportManager.onTaskPrepared(requestId)
+        VBTransportManager.onTaskBegin(task)
+
+        assertFailsWith<IllegalStateException> {
+            VBTransportManager.cancel(requestId)
+        }
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+
+        val replacement = VBTransportTask(
+            requestId,
+            useCurl = true,
+            logTag = "replacement-after-throw",
+            taskManager = VBTransportManager
+        )
+        VBTransportManager.onTaskPrepared(requestId)
+        VBTransportManager.onTaskBegin(replacement)
+        assertSame(replacement, VBTransportManager.getTask(requestId))
+        VBTransportManager.onTaskFinish(replacement)
     }
 }

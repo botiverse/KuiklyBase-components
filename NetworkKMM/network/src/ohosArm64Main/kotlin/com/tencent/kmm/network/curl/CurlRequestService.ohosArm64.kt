@@ -431,12 +431,13 @@ object CurlRequestServiceHM : ICurlRequestService {
                 } finally {
                     callbackWrapper.release()
                 }
+                // Publish the common terminal while the native handle is still
+                // owned. A concurrent common cancel can then only cancel this
+                // handle, never create a tombstone after native release.
+                buildResponseAndCallback(request, nativeResponse, responseCallback)
             } finally {
                 releaseNativeHandle(request.requestId, handle, logTag)
             }
-
-            // 构造回调信息
-            buildResponseAndCallback(request, nativeResponse, responseCallback)
             logI("[$logTag] invoke callback.")
         }
     }
@@ -673,17 +674,16 @@ object CurlRequestServiceHM : ICurlRequestService {
                         bridgeRef.dispose()
                         callbackWrapper.release()
                     }
+                    // Close common task ownership before native release so a
+                    // late common cancel cannot poison a reused request id.
+                    responseCallback(
+                        VBTransportResponse().apply {
+                            updateResponse(request.logTag, nativeResponse, request, this)
+                        }
+                    )
                 } finally {
                     releaseNativeHandle(request.requestId, handle, logTag)
                 }
-                // Built inline (like streamRequest's onComplete): responseCallback
-                // is typed (VBTransportResponse) -> Unit, narrower than
-                // buildResponseAndCallback's (VBTransportBaseResponse) -> Unit.
-                responseCallback(
-                    VBTransportResponse().apply {
-                        updateResponse(request.logTag, nativeResponse, request, this)
-                    }
-                )
             }
         } finally {
             // perform is over — a writer still blocked in send() (abort paths)

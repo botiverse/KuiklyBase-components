@@ -45,6 +45,9 @@ class VBTransportTask(
 ) {
 
     private val state = atomic(VBTransportState.Create)
+    internal var platformCancel: (Int) -> Unit = { requestId ->
+        getIVBTransportService().cancel(requestId)
+    }
 
     private fun wrapGetResponse(
         getCallback: ((getResponse: VBTransportGetResponse) -> Unit)?
@@ -312,7 +315,7 @@ class VBTransportTask(
             }
             if (state.compareAndSet(current, VBTransportState.Canceled)) {
                 if (current == VBTransportState.Running) {
-                    getIVBTransportService().cancel(requestId)
+                    platformCancel(requestId)
                 }
                 return
             }
@@ -320,7 +323,7 @@ class VBTransportTask(
     }
 
     fun cancelTransport() {
-        getIVBTransportService().cancel(requestId)
+        platformCancel(requestId)
     }
 
     private fun logI(content: String) {

@@ -70,11 +70,14 @@ internal class CancellationAwareRegistry<K, V>(
             // owner's cancellation. Only begin() opens a pre-publish window.
             false
         } else {
-            onPublished(value)
-            if (removePublished && values[key] == value) {
-                values.remove(key)
-                activeKeys.remove(key)
-                cancellationTombstones.remove(key)
+            try {
+                onPublished(value)
+            } finally {
+                if (removePublished && values[key] == value) {
+                    values.remove(key)
+                    activeKeys.remove(key)
+                    cancellationTombstones.remove(key)
+                }
             }
             true
         }

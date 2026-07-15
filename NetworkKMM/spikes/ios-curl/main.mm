@@ -79,7 +79,14 @@ void RunProbe() {
 
             CurClientHandle client = CreateCurlClient("ios-curl-spike");
             SetCurlCaInfo(client, caPath.UTF8String);
-            StartRequest(client, request, &callback);
+            const bool started = StartRequestV27(
+                client,
+                &request,
+                sizeof(request),
+                CURL_WRAPPER_ABI_VERSION,
+                &callback
+            ) != 0;
+            result.passed = started && result.passed;
             DeleteCurlClient(client);
             passed = passed && result.passed;
             if (attempt == 2) {
