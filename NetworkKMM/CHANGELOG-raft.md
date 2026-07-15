@@ -1,5 +1,31 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.26 / 0.1.0-raft.26-ohos (caller-time hard deadlines)
+
+- Android whole-request timeouts now begin at the public synchronous
+  `VBTransportService.send*` entry, before any common-to-platform dispatcher
+  handoff. The platform transport and its one allowed reused-H2 recovery retry
+  consume the same monotonic caller-time budget, so queue starvation cannot
+  silently extend a configured 30-second timeout into minutes.
+- An independent daemon wall-clock scheduler atomically races completion with
+  the deadline. A deadline winner cancels the real structured transport job
+  (reaching Ktor OkHttp `Call.cancel()` / the HTTP/2 stream), releases the
+  caller immediately without waiting for transport cleanup, suppresses late
+  callbacks, and reports configured timeout, deadline elapsed time, callback
+  delay, and cancellation result separately.
+- Every unsuccessful reused-H2 attempt now releases its client-generation
+  lease in a shared `finally`; caller cancellation is rethrown after cleanup
+  rather than converted into a normal network failure. Logical task terminal
+  state and the common task registry are concurrency-safe, and non-Android
+  common timeout paths now actively cancel their transport instead of only
+  returning a timeout response.
+- Executable coverage includes a public-service request whose transport
+  coroutine is blocked before OkHttp starts, deadline/completion and task-state
+  races, caller cancellation and late callbacks, plus a real HTTP/2 sequence:
+  warm connection, reused no-response-headers stream cancellation, active-call
+  and generation-lease convergence, then a successful request on the same
+  managed generation and physical connection.
+
 ## 0.1.0-raft.25 / 0.1.0-raft.25-ohos (Android reused-HTTP/2 recovery)
 
 - Android's Ktor/OkHttp transport gains a default-off recovery path for reused
