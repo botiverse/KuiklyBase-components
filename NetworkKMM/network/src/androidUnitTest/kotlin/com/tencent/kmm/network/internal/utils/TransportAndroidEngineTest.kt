@@ -554,7 +554,7 @@ class TransportAndroidEngineTest {
     }
 
     @Test
-    fun completedOldJobCannotEvictNewerRequestReusingItsId() {
+    fun activeRequestIdCollisionRejectsReplacementWithoutOrphaningOldJob() {
         val taskMap = ConcurrentHashMap<Int, Job>()
         val scope = CoroutineScope(Dispatchers.IO)
         val release = CompletableDeferred<Unit>()
@@ -580,20 +580,16 @@ class TransportAndroidEngineTest {
         registerTransportTask(taskMap, 9, oldJob)
 
         val replacement = scope.launch(start = CoroutineStart.LAZY) { release.await() }
-        taskMap[9] = replacement
+        assertTrue(!registerTransportTask(taskMap, 9, replacement))
 
         release.complete(Unit)
         runBlocking { oldJob.join() }
-        // The completion hook's remove(key, value) must be a no-op against the
-        // newer job that reused the request id — which must stay reachable by
-        // the production cancel(id) lookup.
         val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
-        while (taskMap[9] !== replacement && System.nanoTime() < deadline) {
+        while (taskMap.containsKey(9) && System.nanoTime() < deadline) {
             Thread.sleep(1)
         }
-        assertTrue(taskMap[9] === replacement)
-        taskMap[9]?.cancel()
-        assertTrue(replacement.isCancelled)
+        assertTrue(taskMap.isEmpty())
+        replacement.cancel()
     }
 
     // task #36 (review finding): the common callback helper's unconditional

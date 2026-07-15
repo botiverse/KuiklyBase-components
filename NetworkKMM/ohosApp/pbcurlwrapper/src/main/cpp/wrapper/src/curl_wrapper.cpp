@@ -241,6 +241,12 @@ class CurlClient {
             pending_redirect_ready_ = true;
             headers_ = pending_redirect_headers_;
             final_headers_ready_ = false;
+            if (stream_mode_) {
+                double pretransferSeconds = 0.0;
+                curl_easy_getinfo(curl_, CURLINFO_PRETRANSFER_TIME, &pretransferSeconds);
+                stream_pretransfer_baseline_seconds_ = pretransferSeconds;
+                stream_headers_phase_started_ = false;
+            }
             return true;
         }
         pending_redirect_ready_ = false;
@@ -422,7 +428,7 @@ class CurlClient {
             if (!stream_headers_phase_started_) {
                 double pretransferSeconds = 0.0;
                 if (curl_easy_getinfo(curl_, CURLINFO_PRETRANSFER_TIME, &pretransferSeconds) == CURLE_OK &&
-                    pretransferSeconds > 0.0) {
+                    pretransferSeconds > stream_pretransfer_baseline_seconds_) {
                     // PRETRANSFER is reached only after DNS/socket/proxy tunnel
                     // and TLS setup. The final-header budget is therefore a
                     // distinct phase following the connect budget.
@@ -667,6 +673,7 @@ class CurlClient {
             stream_request_started_ = std::chrono::steady_clock::now();
             last_stream_activity_ = stream_request_started_;
             stream_headers_phase_started_ = false;
+            stream_pretransfer_baseline_seconds_ = 0.0;
             stream_timeout_reason_.clear();
         }
         return true;
@@ -1033,6 +1040,7 @@ class CurlClient {
     std::chrono::steady_clock::time_point stream_request_started_{};
     bool stream_headers_phase_started_ = false;
     std::chrono::steady_clock::time_point stream_headers_phase_started_at_{};
+    double stream_pretransfer_baseline_seconds_ = 0.0;
     std::chrono::steady_clock::time_point last_stream_activity_{};
     std::string stream_timeout_reason_;
     // Streaming forces Accept-Encoding: identity so Content-Length matches the

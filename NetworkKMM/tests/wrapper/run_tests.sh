@@ -13,6 +13,7 @@ PORT="${WRAPPER_TEST_PORT:-18923}"
 PROXY_PORT="$((PORT + 1))"
 HTTPS_PORT="$((PORT + 2))"
 DELAYED_PROXY_PORT="$((PORT + 3))"
+CROSS_ORIGIN_PORT="$((PORT + 4))"
 PROXY_MARKER="${BUILD_DIR}/stalled-connect-proxy.marker"
 DELAYED_PROXY_MARKER="${BUILD_DIR}/delayed-connect-proxy.marker"
 TLS_CERT="${BUILD_DIR}/phase-test-cert.pem"
@@ -79,8 +80,10 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -subj "/CN=127.0.0.1" \
   -addext "subjectAltName=IP:127.0.0.1" \
   >/dev/null 2>&1
-python3 "$SCRIPT_DIR/test_server.py" "$PORT" &
+python3 "$SCRIPT_DIR/test_server.py" "$PORT" "$CROSS_ORIGIN_PORT" &
 SERVER_PID=$!
+python3 "$SCRIPT_DIR/test_server.py" "$CROSS_ORIGIN_PORT" "$PORT" &
+CROSS_ORIGIN_SERVER_PID=$!
 python3 "$SCRIPT_DIR/https_test_server.py" \
   --port "$HTTPS_PORT" \
   --cert "$TLS_CERT" \
@@ -96,7 +99,7 @@ python3 "$SCRIPT_DIR/connect_proxy.py" \
   --marker "$DELAYED_PROXY_MARKER" \
   --connect-delay-ms 400 &
 DELAYED_PROXY_PID=$!
-trap 'kill "$SERVER_PID" "$HTTPS_SERVER_PID" "$PROXY_PID" "$DELAYED_PROXY_PID" 2>/dev/null || true' EXIT
+trap 'kill "$SERVER_PID" "$CROSS_ORIGIN_SERVER_PID" "$HTTPS_SERVER_PID" "$PROXY_PID" "$DELAYED_PROXY_PID" 2>/dev/null || true' EXIT
 for _ in $(seq 1 50); do
   if curl -sf "http://127.0.0.1:$PORT/ok" >/dev/null 2>&1; then break; fi
   sleep 0.1

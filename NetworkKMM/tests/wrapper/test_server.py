@@ -65,6 +65,15 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "/delayed-headers")
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif self.path == "/slow-redirect-cross-origin":
+            time.sleep(0.35)
+            self.send_response(302)
+            self.send_header(
+                "Location",
+                f"http://127.0.0.1:{self.server.cross_origin_port}/delayed-short-headers",
+            )
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif self.path == "/redirect-loop":
             self.send_response(302)
             self.send_header("Location", "/redirect-loop")
@@ -84,6 +93,9 @@ class Handler(BaseHTTPRequestHandler):
             # no socket activity occurs; keep the stall beyond that cadence.
             time.sleep(1.5)
             self._send(200, b"late")
+        elif self.path == "/delayed-short-headers":
+            time.sleep(0.35)
+            self._send(200, b"cross-origin-ok")
         elif self.path == "/stream":
             chunks = [b"alpha", b"beta", b"gamma"]
             self.send_response(200)
@@ -165,6 +177,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 18923
+    cross_origin_port = int(sys.argv[2]) if len(sys.argv) > 2 else port
     server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    server.cross_origin_port = cross_origin_port
     print(f"listening on {port}", flush=True)
     server.serve_forever()

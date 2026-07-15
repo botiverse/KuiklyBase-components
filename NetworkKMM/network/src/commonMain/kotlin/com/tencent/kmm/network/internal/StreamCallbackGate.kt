@@ -25,8 +25,10 @@ internal class StreamCallbackGate<C>(
     private enum class Phase { Queued, Started, Terminal }
 
     private val lock = SynchronizedObject()
+    private val deliveryGate = InflightCallbackGate()
     private var phase = Phase.Queued
     private var callbackFailure: Throwable? = null
+    internal var beforeUserCallbackForTest: (() -> Unit)? = null
 
     fun responseStart(statusCode: Int, headers: Map<String, List<String>>) {
         val shouldInvoke = synchronized(lock) {
@@ -37,30 +39,42 @@ internal class StreamCallbackGate<C>(
             }
         }
         if (!shouldInvoke) return
-        invokeUserCallback { onStart(statusCode, headers) }
+        deliveryGate.runIfOpen {
+            beforeUserCallbackForTest?.invoke()
+            invokeUserCallback { onStart(statusCode, headers) }
+        }
     }
 
     fun chunk(bytes: ByteArray) {
         val shouldInvoke = synchronized(lock) { phase == Phase.Started && callbackFailure == null }
         if (!shouldInvoke || bytes.isEmpty()) return
-        invokeUserCallback { onChunk(bytes) }
+        deliveryGate.runIfOpen {
+            beforeUserCallbackForTest?.invoke()
+            invokeUserCallback { onChunk(bytes) }
+        }
     }
 
     fun complete(completion: C) {
-        val delivered = synchronized(lock) {
+        val shouldComplete = synchronized(lock) {
             if (phase == Phase.Terminal) {
-                null
+                false
             } else {
                 phase = Phase.Terminal
+                true
+            }
+        }
+        if (!shouldComplete) return
+        deliveryGate.closeAndRun {
+            val delivered = synchronized(lock) {
                 callbackFailure?.let(failureCompletion) ?: completion
             }
-        } ?: return
-        // Terminal callback failures are contained and diagnosed, but there is
-        // no later callback to convert them into. Exactly-once remains intact.
-        try {
-            onComplete(delivered)
-        } catch (throwable: Throwable) {
-            onCallbackFailure(throwable)
+            // Terminal callback failures are contained and diagnosed, but there is
+            // no later callback to convert them into. Exactly-once remains intact.
+            try {
+                onComplete(delivered)
+            } catch (throwable: Throwable) {
+                onCallbackFailure(throwable)
+            }
         }
     }
 
@@ -69,7 +83,7 @@ internal class StreamCallbackGate<C>(
             block()
         } catch (throwable: Throwable) {
             val firstFailure = synchronized(lock) {
-                if (callbackFailure == null && phase != Phase.Terminal) {
+                if (callbackFailure == null) {
                     callbackFailure = throwable
                     true
                 } else {

@@ -131,9 +131,11 @@ internal class AndroidCurlNetworkEngine(
             },
             onChunk = { chunk ->
                 transferred += chunk.size
-                request.progress.downloadProgress?.invoke(
-                    NetworkTransferProgress(transferred, responseLength)
-                )
+                call.runWhileActive {
+                    request.progress.downloadProgress?.invoke(
+                        NetworkTransferProgress(transferred, responseLength)
+                    )
+                }
                 onChunk(chunk)
             }
         )
@@ -192,9 +194,11 @@ internal class AndroidCurlNetworkEngine(
                 pullBridge.read(maxLength)?.also { bytes ->
                     if (bytes.isNotEmpty()) {
                         sent += bytes.size
-                        request.progress.uploadProgress?.invoke(
-                            NetworkTransferProgress(sent, source.contentLength)
-                        )
+                        call.runWhileActive {
+                            request.progress.uploadProgress?.invoke(
+                                NetworkTransferProgress(sent, source.contentLength)
+                            )
+                        }
                     }
                 }
             }

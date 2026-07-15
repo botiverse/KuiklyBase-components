@@ -36,9 +36,10 @@
 - Response streams use explicit sequential connect then final-origin-header
   budgets, an inter-chunk network-idle deadline, and an optional whole-transfer
   deadline. Curl starts the header clock only after pre-transfer connection,
-  proxy-tunnel and TLS setup; Android/iOS Ktor enforce the same public budgets
-  with a connect cap, a combined connect+header upper bound, socket-idle timeout
-  and opt-in request deadline. Healthy progressing large downloads are no
+  proxy-tunnel and TLS setup. Android/iOS Ktor apply the documented conservative
+  `connect + responseHeaders` upper bound (their public API has no portable
+  connection-ready event), plus a connect cap, socket-idle timeout and one
+  logical opt-in request deadline shared across Android fresh retry. Healthy progressing large downloads are no
   longer implicitly bounded by the ordinary buffered request timeout.
 - Executable contracts cover known-length and chunked bodies, informational
   headers, redirects, HEAD/204/non-2xx responses, pre/start/mid cancellation,

@@ -7,10 +7,53 @@
  */
 package com.tencent.kmm.network.internal
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 
 class StreamCallbackGateTest {
+    @Test
+    fun admittedFailureFinishesBeforeQueuedTerminalAndCancelsTransport() = runBlocking {
+        val admitted = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val terminal = CompletableDeferred<Unit>()
+        val events = mutableListOf<String>()
+        val gate = StreamCallbackGate(
+            onStart = { _, _ ->
+                events += "start"
+                error("late admitted failure")
+            },
+            onChunk = {},
+            onComplete = {
+                events += "complete:$it"
+                terminal.complete(Unit)
+            },
+            failureCompletion = { "failure:${it.message}" },
+            cancelTransport = { events += "cancel" }
+        )
+        gate.beforeUserCallbackForTest = {
+            admitted.complete(Unit)
+            runBlocking { release.await() }
+        }
+
+        launch(Dispatchers.Default) { gate.responseStart(200, emptyMap()) }
+        admitted.await()
+        gate.complete("success")
+        assertFalse(terminal.isCompleted)
+
+        release.complete(Unit)
+        terminal.await()
+
+        assertEquals(
+            listOf("start", "cancel", "complete:failure:late admitted failure"),
+            events
+        )
+    }
+
     @Test
     fun startFailureCancelsSuppressesChunksAndBecomesTerminalFailure() {
         val events = mutableListOf<String>()

@@ -264,7 +264,9 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                     return@withContext unavailable("iOS curl failed to apply resolve entry")
                 }
             }
-            IosCurlHandleRegistry.publish(request.requestId, handle)
+            if (!IosCurlHandleRegistry.publish(request.requestId, handle)) {
+                return@withContext unavailable("iOS curl request id already active")
+            }
             if (request.cancellationSignal.isCancelled()) {
                 cancelNative(handle)
             }
@@ -355,8 +357,12 @@ private class IosCurlCallbackContext(
 private object IosCurlHandleRegistry : SynchronizedObject() {
     private val handles = mutableMapOf<Int, COpaquePointer>()
 
-    fun publish(requestId: Int, handle: COpaquePointer) {
-        synchronized(this) { handles[requestId] = handle }
+    fun publish(requestId: Int, handle: COpaquePointer): Boolean = synchronized(this) {
+        if (handles.containsKey(requestId)) false
+        else {
+            handles[requestId] = handle
+            true
+        }
     }
 
     fun remove(requestId: Int, handle: COpaquePointer) {

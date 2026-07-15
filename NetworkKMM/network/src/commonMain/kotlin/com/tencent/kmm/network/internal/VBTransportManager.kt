@@ -25,9 +25,7 @@ object VBTransportManager {
 
     fun getTask(requestId: Int): VBTransportTask? = tasks.get(requestId)
 
-    fun onTaskPrepared(requestId: Int) {
-        tasks.begin(requestId)
-    }
+    fun onTaskPrepared(requestId: Int): Boolean = tasks.begin(requestId)
 
     fun onTaskBegin(task: VBTransportTask) {
         logI("${task.logTag} onTaskBegin() requestId :${task.requestId}")
@@ -47,7 +45,11 @@ object VBTransportManager {
     }
 
     fun cancel(requestId: Int) {
-        tasks.cancelOrRemember(requestId, removePublished = true) { task -> task.cancel() }
+        var taskToCancel: VBTransportTask? = null
+        tasks.cancelOrRemember(requestId, removePublished = true) { task ->
+            taskToCancel = task
+        }
+        taskToCancel?.cancel()
         logI("requestId:$requestId is cancelled!")
     }
 

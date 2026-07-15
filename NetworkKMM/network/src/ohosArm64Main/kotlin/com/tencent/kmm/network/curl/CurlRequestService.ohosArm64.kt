@@ -399,7 +399,7 @@ object CurlRequestServiceHM : ICurlRequestService {
             val headers = toStringDic(buildRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
             var nativeResponse = CurlNativeResponse()
-            nativeHandles.begin(request.requestId)
+            check(nativeHandles.begin(request.requestId)) { "native request id already active" }
             val handle = CreateCurlClient(logTag) ?: run {
                 nativeHandles.remove(request.requestId)
                 error("CreateCurlClient failed")
@@ -519,7 +519,7 @@ object CurlRequestServiceHM : ICurlRequestService {
             // gzip here (chunks would arrive compressed and undecodable).
             val headers = toStringDic(buildStreamRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
-            nativeHandles.begin(request.requestId)
+            check(nativeHandles.begin(request.requestId)) { "native stream request id already active" }
             val handle = CreateCurlClient(logTag) ?: run {
                 nativeHandles.remove(request.requestId)
                 error("CreateCurlClient failed")
@@ -634,7 +634,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                 val headers = toStringDic(buildRequestHeader(request), memScope)
                 val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
                 var nativeResponse = CurlNativeResponse()
-                nativeHandles.begin(request.requestId)
+                check(nativeHandles.begin(request.requestId)) { "native upload request id already active" }
                 val handle = CreateCurlClient(logTag) ?: run {
                     nativeHandles.remove(request.requestId)
                     error("CreateCurlClient failed")

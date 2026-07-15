@@ -16,6 +16,9 @@
  */
 package com.tencent.kmm.network.export
 
+import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlin.math.min
 import kotlin.random.Random
 
@@ -47,6 +50,7 @@ class NetworkByteStream(
     private val cancelBlock: (() -> Unit)? = null,
     private val readChunksBlock: (suspend (NetworkByteStreamSink) -> Unit)? = null
 ) {
+    private val cancelArmed = atomic(true)
     suspend fun readAll(): ByteArray = readAllBlock()
 
     suspend fun readChunks(sink: NetworkByteStreamSink) {
@@ -59,7 +63,9 @@ class NetworkByteStream(
     }
 
     fun cancel() {
-        cancelBlock?.invoke()
+        if (cancelArmed.compareAndSet(expect = true, update = false)) {
+            cancelBlock?.invoke()
+        }
     }
 
     companion object {
@@ -406,7 +412,12 @@ data class NetworkRequestPolicy(
 data class NetworkStreamTimeoutPolicy(
     /** DNS, socket, proxy tunnel and TLS establishment budget. */
     val connectTimeoutMillis: Long = 3_000,
-    /** Final origin response-header budget, starting after connection establishment. */
+    /**
+     * Final origin response-header budget. Curl starts this phase after each
+     * connection/proxy/TLS pre-transfer point. Ktor transports enforce the
+     * conservative combined upper bound `connect + responseHeaders` because
+     * their public engine API does not expose a portable connection-ready event.
+     */
     val responseHeadersTimeoutMillis: Long = 30_000,
     val interChunkIdleTimeoutMillis: Long = 60_000,
     /** Zero disables a whole-transfer deadline. */
@@ -605,6 +616,9 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
     }
     val epilogue = NetworkMultipartFraming.partEpilogue()
     val terminator = NetworkMultipartFraming.terminator(boundary)
+    val openedStreamLock = SynchronizedObject()
+    val openedStreams = mutableListOf<NetworkByteStream>()
+    var compositeCancelled = false
     val totalLength: Long? =
         if (plans.all { it.bodyLength != null }) {
             plans.sumOf { it.prologue.size.toLong() + it.bodyLength!! + epilogue.size } + terminator.size
@@ -614,7 +628,14 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
 
     return NetworkByteStream.fromChunks(
         contentLength = totalLength,
-        cancelBlock = { parts.forEach { it.body.cancel() } }
+        cancelBlock = {
+            val derived = synchronized(openedStreamLock) {
+                compositeCancelled = true
+                openedStreams.toList().also { openedStreams.clear() }
+            }
+            parts.forEach { it.body.cancel() }
+            derived.forEach { it.cancel() }
+        }
     ) { sink ->
         plans.forEach { plan ->
             sink.write(plan.prologue)
@@ -623,7 +644,18 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                 is NetworkBody.FileRef -> {
                     val stream = body.openStream()
                     if (stream != null) {
-                        stream.readChunks(sink)
+                        val cancelNow = synchronized(openedStreamLock) {
+                            if (compositeCancelled) true
+                            else {
+                                openedStreams += stream
+                                false
+                            }
+                        }
+                        if (cancelNow) {
+                            stream.cancel()
+                        } else {
+                            stream.readChunks(sink)
+                        }
                     } else {
                         val bytes = body.readAll()
                             ?: throw IllegalStateException(

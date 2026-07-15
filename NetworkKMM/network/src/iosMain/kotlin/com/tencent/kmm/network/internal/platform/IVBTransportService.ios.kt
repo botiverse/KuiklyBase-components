@@ -43,6 +43,7 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringC
 import com.tencent.kmm.network.internal.utils.getHttpClient
 import com.tencent.kmm.network.internal.utils.readKnownSize
 import com.tencent.kmm.network.internal.utils.readUnknownSize
+import com.tencent.kmm.network.internal.streamHeadersUpperBoundMillis
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.timeout
 import io.ktor.client.request.HttpRequestBuilder
@@ -63,16 +64,19 @@ import io.ktor.utils.io.core.isEmpty
 import io.ktor.utils.io.core.readBytes
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.withTimeout
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 
 private val iOSTransportImpl: IVBTransportService = IOSTransportImpl()
 private val scope = CoroutineScope(Dispatchers.IO)
-private val taskMap: MutableMap<Int, Job> = mutableMapOf()
+private val taskRegistry = IosTransportTaskRegistry()
 private const val TAG = "IOSTransportImpl"
 
 // Upper bound per streamed chunk read off the response channel (fork #8).
@@ -84,7 +88,7 @@ class IOSTransportImpl : IVBTransportService {
         kmmCallback: (response: VBTransportBaseResponse) -> Unit,
         uploadBody: IosStreamingUploadBody? = null
     ) {
-        val job = scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val client = getHttpClient(request) as HttpClient
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
@@ -153,7 +157,7 @@ class IOSTransportImpl : IVBTransportService {
                 )
 
                 buildResponseAndCallback(
-                    taskMap,
+                    null,
                     errorCode,
                     errMsg,
                     response.headers.entries().associate { it.key to it.value },
@@ -163,13 +167,19 @@ class IOSTransportImpl : IVBTransportService {
                 )
             } catch (throwable: Throwable) {
                 if (throwable is CancellationException) {
-                    taskMap.remove(request.requestId)
                     throw throwable
                 }
                 callbackFailure(request, throwable, kmmCallback)
             }
         }
-        taskMap[request.requestId] = job
+        if (!taskRegistry.register(request.requestId, job)) {
+            job.cancel()
+            callbackFailure(
+                request,
+                IllegalStateException("iOS transport request id already active"),
+                kmmCallback
+            )
+        }
     }
 
     override fun sendBytesRequest(
@@ -243,7 +253,7 @@ class IOSTransportImpl : IVBTransportService {
     ) {
         VBPBLog.i(VBPBLog.HMTRANSPORTIMPL, "${kmmRequest.logTag} stream ${kmmRequest.method} request, " +
                 "id:${kmmRequest.requestId}, url:${kmmRequest.url}")
-        val job = scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val client = getHttpClient(kmmRequest) as HttpClient
                 val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
@@ -259,9 +269,11 @@ class IOSTransportImpl : IVBTransportService {
                         }
                         constructRequest(kmmRequest)
                     }
-                val responseHeadersBudget = kmmRequest.streamConnectTimeoutMillis +
+                val responseHeadersBudget = streamHeadersUpperBoundMillis(
+                    kmmRequest.streamConnectTimeoutMillis,
                     kmmRequest.streamResponseHeadersTimeoutMillis
-                val response = if (responseHeadersBudget > 0) {
+                )
+                val response = if (responseHeadersBudget != null) {
                     withTimeout(responseHeadersBudget) { openResponse() }
                 } else {
                     openResponse()
@@ -305,7 +317,6 @@ class IOSTransportImpl : IVBTransportService {
                         "totalElapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}"
                 )
 
-                taskMap.remove(kmmRequest.requestId)
                 onComplete(
                     VBTransportResponse().apply {
                         this.errorCode = errorCode
@@ -317,10 +328,8 @@ class IOSTransportImpl : IVBTransportService {
                 )
             } catch (throwable: Throwable) {
                 if (throwable is CancellationException && throwable !is TimeoutCancellationException) {
-                    taskMap.remove(kmmRequest.requestId)
                     throw throwable
                 }
-                taskMap.remove(kmmRequest.requestId)
                 // raft.9: classified failure reason, same shape as callbackFailure.
                 val describedFailure = describeTransportFailure(throwable)
                 VBPBLog.e(TAG, "${kmmRequest.logTag} stream request failed, id:${kmmRequest.requestId}, error:$describedFailure")
@@ -339,7 +348,16 @@ class IOSTransportImpl : IVBTransportService {
                 )
             }
         }
-        taskMap[kmmRequest.requestId] = job
+        if (!taskRegistry.register(kmmRequest.requestId, job)) {
+            job.cancel()
+            onComplete(
+                VBTransportResponse().apply {
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = "iOS transport request id already active"
+                    this.request = kmmRequest
+                }
+            )
+        }
     }
 
     private fun HttpRequestBuilder.constructRequest(kmmRequest: VBTransportBaseRequest) {
@@ -386,7 +404,7 @@ class IOSTransportImpl : IVBTransportService {
 
     override fun cancel(requestId: Int) {
         VBPBLog.i(TAG, "requestID -> $requestId task cancel by user")
-        taskMap[requestId]?.cancel()
+        taskRegistry.cancel(requestId)
     }
 
     private fun callbackFailure(
@@ -399,7 +417,7 @@ class IOSTransportImpl : IVBTransportService {
         val errorMessage = describeTransportFailure(throwable)
         VBPBLog.e(TAG, "${request.logTag} request failed, id:${request.requestId}, error:${errorMessage}")
         buildResponseAndCallback(
-            taskMap,
+            null,
             VBTransportResultCode.CODE_NETWORK_ERROR,
             errorMessage,
             emptyMap(),
@@ -407,6 +425,32 @@ class IOSTransportImpl : IVBTransportService {
             request,
             kmmCallback
         )
+    }
+}
+
+private class IosTransportTaskRegistry : SynchronizedObject() {
+    private val jobs = mutableMapOf<Int, Job>()
+
+    fun register(requestId: Int, job: Job): Boolean {
+        val inserted = synchronized(this) {
+            if (jobs.containsKey(requestId)) false
+            else {
+                jobs[requestId] = job
+                true
+            }
+        }
+        if (!inserted) return false
+        job.invokeOnCompletion {
+            synchronized(this) {
+                if (jobs[requestId] === job) jobs.remove(requestId)
+            }
+        }
+        job.start()
+        return true
+    }
+
+    fun cancel(requestId: Int) {
+        synchronized(this) { jobs[requestId] }?.cancel()
     }
 }
 

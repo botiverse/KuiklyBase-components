@@ -45,6 +45,7 @@ class VBTransportTask(
 ) {
 
     private val state = atomic(VBTransportState.Create)
+    private val streamGate = atomic<StreamCallbackGate<VBTransportResponse>?>(null)
     internal var platformCancel: (Int) -> Unit = { requestId ->
         getIVBTransportService().cancel(requestId)
     }
@@ -252,9 +253,31 @@ class VBTransportTask(
             handler?.invoke(response)
             return
         }
-        getIVBTransportService().requestStream(request, onResponseStart, onChunk) { response ->
-            handleResponse(request, response, wrapResponse(handler))
+        val gate = StreamCallbackGate(
+            onStart = onResponseStart,
+            onChunk = onChunk,
+            onComplete = { response ->
+                response.request = request
+                handleResponse(request, response, wrapResponse(handler))
+            },
+            failureCompletion = { throwable ->
+                VBTransportResponse().apply {
+                    this.request = request
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = "stream callback failed: ${throwable.message ?: throwable::class.simpleName}"
+                }
+            },
+            cancelTransport = { cancelTransport() },
+            onCallbackFailure = { throwable ->
+                logI("stream callback failed: ${throwable.message ?: throwable::class.simpleName}")
+            }
+        )
+        streamGate.value = gate
+        if (state.value == VBTransportState.Canceled) {
+            gate.complete(cancelledStreamResponse(request))
+            return
         }
+        getIVBTransportService().requestStream(request, gate::responseStart, gate::chunk, gate::complete)
     }
 
     // issue #8: streaming upload — body pushed by [writeBody] into the
@@ -314,6 +337,12 @@ class VBTransportTask(
                 return
             }
             if (state.compareAndSet(current, VBTransportState.Canceled)) {
+                streamGate.value?.complete(
+                    VBTransportResponse().apply {
+                        this.errorCode = VBTransportResultCode.CODE_CANCELED
+                        this.errorMessage = "Request has been canceled"
+                    }
+                )
                 if (current == VBTransportState.Running) {
                     platformCancel(requestId)
                 }
@@ -321,6 +350,13 @@ class VBTransportTask(
             }
         }
     }
+
+    private fun cancelledStreamResponse(request: VBTransportRequest) =
+        VBTransportResponse().apply {
+            this.request = request
+            this.errorCode = VBTransportResultCode.CODE_CANCELED
+            this.errorMessage = "Request has been canceled"
+        }
 
     fun cancelTransport() {
         platformCancel(requestId)

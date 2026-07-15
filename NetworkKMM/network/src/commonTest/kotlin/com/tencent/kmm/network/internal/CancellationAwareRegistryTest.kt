@@ -28,6 +28,20 @@ class CancellationAwareRegistryTest {
     }
 
     @Test
+    fun secondPrePublicationOwnerIsRejectedWithoutClearingFirstCancellation() {
+        val registry = CancellationAwareRegistry<Int, String>()
+
+        assertTrue(registry.begin(8))
+        assertFalse(registry.begin(8))
+        assertFalse(registry.cancelOrRemember(8, removePublished = false) {})
+        assertFalse(registry.publish(8, "first"))
+        assertNull(registry.get(8))
+
+        assertTrue(registry.begin(8))
+        assertTrue(registry.publish(8, "next-generation"))
+    }
+
+    @Test
     fun cancelAndReleaseShareOneOwnershipBoundary() {
         val registry = CancellationAwareRegistry<Int, String>()
         val events = mutableListOf<String>()

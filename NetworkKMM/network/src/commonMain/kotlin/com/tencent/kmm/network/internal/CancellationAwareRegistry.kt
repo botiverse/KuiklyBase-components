@@ -28,11 +28,15 @@ internal class CancellationAwareRegistry<K, V>(
     private val activeKeys = mutableSetOf<K>()
 
     /** Marks a new logical owner before its value is published. */
-    fun begin(key: K) = synchronized(lock) {
+    fun begin(key: K): Boolean = synchronized(lock) {
+        if (key in activeKeys || values.containsKey(key)) {
+            return@synchronized false
+        }
         activeKeys += key
         if (!rememberCancellationWithoutBegin) {
             cancellationTombstones.remove(key)
         }
+        true
     }
 
     /** Returns false when a pre-publication cancellation tombstone was consumed. */

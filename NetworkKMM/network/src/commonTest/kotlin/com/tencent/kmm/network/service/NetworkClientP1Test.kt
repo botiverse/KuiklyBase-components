@@ -32,6 +32,7 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import kotlin.test.Test
@@ -263,6 +264,60 @@ class NetworkClientP1Test {
     }
 
     @Test
+    fun middlewareReplacementBodyIsOwnedBeforeEngineEntry() = runBlocking {
+        var originalCancels = 0
+        var replacementCancels = 0
+        var engineCalls = 0
+        val replacementInstalled = CompletableDeferred<Unit>()
+        val blockAfterReplacement = CompletableDeferred<Unit>()
+        val parent = SupervisorJob()
+        val request = NetworkRequest().apply {
+            body = NetworkBody.Stream(
+                NetworkByteStream.fromChunks(cancelBlock = { originalCancels++ }) {}
+            )
+        }
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                requestMiddlewares = listOf(
+                    object : NetworkRequestMiddleware {
+                        override suspend fun prepare(request: NetworkRequest): NetworkRequest = request.apply {
+                            body = NetworkBody.Stream(
+                                NetworkByteStream.fromChunks(cancelBlock = {
+                                    replacementCancels++
+                                    error("replacement cancel failed")
+                                }) {}
+                            )
+                            replacementInstalled.complete(Unit)
+                        }
+                    },
+                    object : NetworkRequestMiddleware {
+                        override suspend fun prepare(request: NetworkRequest): NetworkRequest {
+                            blockAfterReplacement.await()
+                            return request
+                        }
+                    }
+                )
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineCalls++
+                    error("engine must not start")
+                }
+            },
+            scope = CoroutineScope(Dispatchers.Default + parent)
+        )
+
+        val call = client.execute(request) {}
+        replacementInstalled.await()
+        parent.cancel()
+
+        assertEquals(NetworkErrorKind.CANCELLED, call.await().error?.kind)
+        assertEquals(1, originalCancels)
+        assertEquals(1, replacementCancels)
+        assertEquals(0, engineCalls)
+    }
+
+    @Test
     fun streamingCancelWinsAgainstLateEngineSuccess() = runBlocking {
         val engineEntered = CompletableDeferred<Unit>()
         val releaseEngine = CompletableDeferred<Unit>()
@@ -366,6 +421,7 @@ class NetworkClientP1Test {
         val callbackAdmitted = CompletableDeferred<Unit>()
         val releaseCallback = CompletableDeferred<Unit>()
         val cancelReturned = CompletableDeferred<Unit>()
+        val terminalDelivered = CompletableDeferred<Unit>()
         val events = mutableListOf<String>()
         val client = NetworkClient(
             engine = object : NetworkEngine {
@@ -397,7 +453,10 @@ class NetworkClientP1Test {
             NetworkRequest(),
             onResponseStart = { _, _, _ -> events += "start" },
             onChunk = { events += "chunk" },
-            onComplete = { events += "terminal" }
+            onComplete = {
+                events += "terminal"
+                terminalDelivered.complete(Unit)
+            }
         )
         call.beforeActiveCallbackActionForTest = {
             callbackAdmitted.complete(Unit)
@@ -410,11 +469,11 @@ class NetworkClientP1Test {
             call.cancel()
             cancelReturned.complete(Unit)
         }
-        yield()
-        assertFalse(cancelReturned.isCompleted)
+        cancelReturned.await()
+        assertFalse(terminalDelivered.isCompleted)
 
         releaseCallback.complete(Unit)
-        cancelReturned.await()
+        terminalDelivered.await()
         call.await()
 
         assertEquals(listOf("start", "terminal"), events)

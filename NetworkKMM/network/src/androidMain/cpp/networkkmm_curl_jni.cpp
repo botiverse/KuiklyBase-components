@@ -347,9 +347,16 @@ void NativePerform(
         DeleteCurlClient(client);
         return;
     }
+    bool published = false;
     {
         std::lock_guard<std::mutex> lock(g_clients_mutex);
-        g_clients[request_id] = client;
+        published = g_clients.emplace(request_id, client).second;
+    }
+    if (!published) {
+        InvokeEngineFailure(&context, "Android curl request id already active");
+        context.client = nullptr;
+        DeleteCurlClient(client);
+        return;
     }
     CancelIfSignalled(&context);
 

@@ -28,10 +28,10 @@ class VBTransportManagerTest {
             logTag = "replacement",
             taskManager = VBTransportManager
         )
-        VBTransportManager.onTaskPrepared(requestId)
+        assertEquals(true, VBTransportManager.onTaskPrepared(requestId))
         VBTransportManager.onTaskBegin(old)
-        VBTransportManager.onTaskPrepared(requestId)
-        VBTransportManager.onTaskBegin(replacement)
+        assertEquals(false, VBTransportManager.onTaskPrepared(requestId))
+        replacement.cancel()
 
         assertSame(old, VBTransportManager.getTask(requestId))
         assertEquals(VBTransportState.Canceled, replacement.getState())

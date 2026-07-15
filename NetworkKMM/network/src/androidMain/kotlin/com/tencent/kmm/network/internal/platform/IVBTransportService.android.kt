@@ -47,6 +47,8 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapRequest
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringCallback
 import com.tencent.kmm.network.internal.utils.readKnownSize
 import com.tencent.kmm.network.internal.utils.readUnknownSize
+import com.tencent.kmm.network.internal.remainingStreamWholeTimeoutMillis
+import com.tencent.kmm.network.internal.streamHeadersUpperBoundMillis
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.timeout
 import io.ktor.client.request.HttpRequestBuilder
@@ -89,8 +91,8 @@ private val scope = CoroutineScope(Dispatchers.IO)
 // would leave a completed Job resident and invisible to cancel()).
 private val taskMap: ConcurrentHashMap<Int, Job> = ConcurrentHashMap()
 
-internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, requestId: Int, job: Job) {
-    taskMap[requestId] = job
+internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, requestId: Int, job: Job): Boolean {
+    if (taskMap.putIfAbsent(requestId, job) != null) return false
     // SOLE registry cleanup on Android — coroutine bodies and the common
     // callback helper must not remove entries (Android passes
     // removeOnComplete = false): a keyed remove racing an id reuse would
@@ -100,6 +102,7 @@ internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, request
     // replaced this one under the same id.
     job.invokeOnCompletion { taskMap.remove(requestId, job) }
     job.start()
+    return true
 }
 
 // Upper bound per streamed chunk read off the response channel (fork #8).
@@ -295,7 +298,14 @@ object AndroidTransportImpl : IVBTransportService {
             )
         job.invokeOnCompletion(hardDeadline::transportJobCompleted)
         hardDeadline.start()
-        registerTransportTask(taskMap, request.requestId, job)
+        if (!registerTransportTask(taskMap, request.requestId, job)) {
+            job.cancel()
+            callbackFailure(
+                request,
+                IllegalStateException("Android transport request id already active"),
+                guardedCallback
+            )
+        }
     }
 
     override fun sendBytesRequest(
@@ -374,9 +384,11 @@ object AndroidTransportImpl : IVBTransportService {
                         streamStart,
                         streamTimeouts = true
                     )
-                val responseHeadersBudget = kmmRequest.streamConnectTimeoutMillis +
+                val responseHeadersBudget = streamHeadersUpperBoundMillis(
+                    kmmRequest.streamConnectTimeoutMillis,
                     kmmRequest.streamResponseHeadersTimeoutMillis
-                val responseLease = if (responseHeadersBudget > 0) {
+                )
+                val responseLease = if (responseHeadersBudget != null) {
                     withTimeout(responseHeadersBudget) { openResponse() }
                 } else {
                     openResponse()
@@ -462,7 +474,16 @@ object AndroidTransportImpl : IVBTransportService {
                 )
             }
         }
-        registerTransportTask(taskMap, kmmRequest.requestId, job)
+        if (!registerTransportTask(taskMap, kmmRequest.requestId, job)) {
+            job.cancel()
+            onComplete(
+                VBTransportResponse().apply {
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = "Android transport request id already active"
+                    this.request = kmmRequest
+                }
+            )
+        }
     }
 
     private suspend fun executeWithReusedH2Recovery(
@@ -509,9 +530,16 @@ object AndroidTransportImpl : IVBTransportService {
                 val response = lease.client.request(request.url) {
                     method = HttpMethod(request.method.name)
                     if (streamTimeouts) {
+                        val remainingWholeMillis = remainingStreamWholeTimeoutMillis(
+                            request.streamWholeTimeoutMillis,
+                            overallStart.elapsedNow().inWholeMilliseconds
+                        )
+                        if (remainingWholeMillis == 0L) {
+                            throw SocketTimeoutException("stream whole-transfer timeout exhausted")
+                        }
                         timeout {
-                            if (request.streamWholeTimeoutMillis > 0) {
-                                requestTimeoutMillis = request.streamWholeTimeoutMillis
+                            if (remainingWholeMillis != null) {
+                                requestTimeoutMillis = remainingWholeMillis
                             }
                             connectTimeoutMillis = request.streamConnectTimeoutMillis
                             socketTimeoutMillis = request.streamIdleTimeoutMillis

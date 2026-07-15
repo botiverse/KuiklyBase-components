@@ -17,6 +17,9 @@
 package com.tencent.kmm.network.export
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -25,6 +28,57 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class NetworkModelsTest {
+    @Test
+    fun sharedLogicalStreamCancellationIsOneShotAcrossBodyWrappers() {
+        var cancels = 0
+        val stream = NetworkByteStream.fromChunks(cancelBlock = { cancels++ }) {}
+
+        NetworkBody.Stream(stream).cancel()
+        NetworkBody.Stream(stream).cancel()
+
+        assertEquals(1, cancels)
+    }
+
+    @Test
+    fun multipartCancellationReachesOpenedFileRefDerivedStream() = runBlocking {
+        var fileRefCancels = 0
+        var derivedCancels = 0
+        val opened = CompletableDeferred<Unit>()
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/file",
+                        cancelBlock = { fileRefCancels++ },
+                        openStreamBlock = {
+                            NetworkByteStream.fromChunks(cancelBlock = {
+                                derivedCancels++
+                            }) {
+                                opened.complete(Unit)
+                                awaitCancellation()
+                            }
+                        }
+                    )
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+        val reader = launch {
+            composite.readChunks(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) = Unit
+            })
+        }
+        opened.await()
+
+        composite.cancel()
+        composite.cancel()
+        reader.cancel()
+
+        assertEquals(1, fileRefCancels)
+        assertEquals(1, derivedCancels)
+    }
+
     @Test
     fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
         val defaults = NetworkRequestPolicy().streamTimeouts
