@@ -404,7 +404,9 @@ data class NetworkRequestPolicy(
 }
 
 data class NetworkStreamTimeoutPolicy(
+    /** DNS, socket, proxy tunnel and TLS establishment budget. */
     val connectTimeoutMillis: Long = 3_000,
+    /** Final origin response-header budget, starting after connection establishment. */
     val responseHeadersTimeoutMillis: Long = 30_000,
     val interChunkIdleTimeoutMillis: Long = 60_000,
     /** Zero disables a whole-transfer deadline. */

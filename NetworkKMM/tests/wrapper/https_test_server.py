@@ -9,6 +9,10 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
     def do_GET(self):
+        if self.path == "/phase-headers":
+            time.sleep(0.25)
+            self._write(200, b"phase-ok")
+            return
         if self.path == "/slow":
             time.sleep(10)
             self._write(200, b"slow-ok")

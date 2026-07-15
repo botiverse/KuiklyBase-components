@@ -6,6 +6,9 @@
   entry points and remove the old by-value symbols. Both old-caller/new-runtime
   and new-caller/old-runtime skew now fail at symbol/ABI validation instead of
   interpreting the raft.27 80-byte request layout as raft.26's 48-byte layout.
+  Executable fixtures link frozen callers/runtimes in both skew directions and
+  place a real 48-byte raft.26 request against an unreadable guard page while
+  all three V27 entry points reject it before dereference.
 
 - Streaming cancellation now survives both common task publication and native
   handle publication. Cancellation tombstones, CAS task transitions and a
@@ -30,10 +33,13 @@
   atomic winner; callbacks remain exactly-once even before dispatch or while a
   custom middleware/engine is suspended. iOS C trampolines contain conversion
   and decode failures as well as user callback failures.
-- Response streams use explicit connect, response-header/TTFB and inter-chunk
-  idle deadlines, with an optional whole-transfer deadline. Healthy progressing
-  large downloads are no longer implicitly bounded by the ordinary buffered
-  request timeout.
+- Response streams use explicit sequential connect then final-origin-header
+  budgets, an inter-chunk network-idle deadline, and an optional whole-transfer
+  deadline. Curl starts the header clock only after pre-transfer connection,
+  proxy-tunnel and TLS setup; Android/iOS Ktor enforce the same public budgets
+  with a connect cap, a combined connect+header upper bound, socket-idle timeout
+  and opt-in request deadline. Healthy progressing large downloads are no
+  longer implicitly bounded by the ordinary buffered request timeout.
 - Executable contracts cover known-length and chunked bodies, informational
   headers, redirects, HEAD/204/non-2xx responses, pre/start/mid cancellation,
   callback failure, phase timeouts and cancel-vs-delete ownership stress.

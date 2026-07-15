@@ -67,6 +67,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 
 private val iOSTransportImpl: IVBTransportService = IOSTransportImpl()
 private val scope = CoroutineScope(Dispatchers.IO)
@@ -245,19 +247,24 @@ class IOSTransportImpl : IVBTransportService {
             try {
                 val client = getHttpClient(kmmRequest) as HttpClient
                 val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
-                val response = client.request(kmmRequest.url) {
-                    method = HttpMethod(kmmRequest.method.name)
-                    if (kmmRequest.totalTimeout > 0) {
+                suspend fun openResponse() =
+                    client.request(kmmRequest.url) {
+                        method = HttpMethod(kmmRequest.method.name)
                         timeout {
-                            requestTimeoutMillis = kmmRequest.totalTimeout
-                            // raft.9: connect gets its own short budget so a dead
-                            // address family can't eat the whole request timeout
-                            // (see TransportTimeouts.kt for the 3s rationale).
-                            connectTimeoutMillis = transportConnectTimeoutMillis(kmmRequest.totalTimeout)
-                            socketTimeoutMillis = kmmRequest.totalTimeout
+                            if (kmmRequest.streamWholeTimeoutMillis > 0) {
+                                requestTimeoutMillis = kmmRequest.streamWholeTimeoutMillis
+                            }
+                            connectTimeoutMillis = kmmRequest.streamConnectTimeoutMillis
+                            socketTimeoutMillis = kmmRequest.streamIdleTimeoutMillis
                         }
+                        constructRequest(kmmRequest)
                     }
-                    constructRequest(kmmRequest)
+                val responseHeadersBudget = kmmRequest.streamConnectTimeoutMillis +
+                    kmmRequest.streamResponseHeadersTimeoutMillis
+                val response = if (responseHeadersBudget > 0) {
+                    withTimeout(responseHeadersBudget) { openResponse() }
+                } else {
+                    openResponse()
                 }
 
                 var errMsg = ""
@@ -309,7 +316,7 @@ class IOSTransportImpl : IVBTransportService {
                     }
                 )
             } catch (throwable: Throwable) {
-                if (throwable is CancellationException) {
+                if (throwable is CancellationException && throwable !is TimeoutCancellationException) {
                     taskMap.remove(kmmRequest.requestId)
                     throw throwable
                 }
@@ -319,7 +326,12 @@ class IOSTransportImpl : IVBTransportService {
                 VBPBLog.e(TAG, "${kmmRequest.logTag} stream request failed, id:${kmmRequest.requestId}, error:$describedFailure")
                 onComplete(
                     VBTransportResponse().apply {
-                        this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                        this.errorCode = if (throwable is TimeoutCancellationException ||
+                            describedFailure.startsWith("[timeout]")) {
+                            VBTransportResultCode.CODE_FORCE_TIMEOUT
+                        } else {
+                            VBTransportResultCode.CODE_NETWORK_ERROR
+                        }
                         this.errorMessage = describedFailure
                         this.data = null
                         this.request = kmmRequest

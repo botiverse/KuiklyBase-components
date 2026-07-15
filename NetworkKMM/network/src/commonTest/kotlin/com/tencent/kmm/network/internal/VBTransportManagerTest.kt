@@ -14,7 +14,7 @@ import kotlin.test.assertFailsWith
 
 class VBTransportManagerTest {
     @Test
-    fun lateOldTerminalCannotRemoveReplacementWithSameId() {
+    fun activeIdCollisionRejectsReplacementWithoutOrphaningOwner() {
         val requestId = 987_654_321
         val old = VBTransportTask(
             requestId,
@@ -33,10 +33,11 @@ class VBTransportManagerTest {
         VBTransportManager.onTaskPrepared(requestId)
         VBTransportManager.onTaskBegin(replacement)
 
-        VBTransportManager.onTaskFinish(old)
-
-        assertSame(replacement, VBTransportManager.getTask(requestId))
+        assertSame(old, VBTransportManager.getTask(requestId))
+        assertEquals(VBTransportState.Canceled, replacement.getState())
         VBTransportManager.onTaskFinish(replacement)
+        assertSame(old, VBTransportManager.getTask(requestId))
+        VBTransportManager.onTaskFinish(old)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
     }
 

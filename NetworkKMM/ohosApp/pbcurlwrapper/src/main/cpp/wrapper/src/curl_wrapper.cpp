@@ -419,8 +419,22 @@ class CurlClient {
     bool StreamPhaseTimedOut() {
         const auto now = std::chrono::steady_clock::now();
         if (!final_headers_ready_ && stream_response_headers_timeout_ms_ > 0) {
+            if (!stream_headers_phase_started_) {
+                double pretransferSeconds = 0.0;
+                if (curl_easy_getinfo(curl_, CURLINFO_PRETRANSFER_TIME, &pretransferSeconds) == CURLE_OK &&
+                    pretransferSeconds > 0.0) {
+                    // PRETRANSFER is reached only after DNS/socket/proxy tunnel
+                    // and TLS setup. The final-header budget is therefore a
+                    // distinct phase following the connect budget.
+                    stream_headers_phase_started_ = true;
+                    stream_headers_phase_started_at_ = now;
+                }
+            }
+            if (!stream_headers_phase_started_) {
+                return false;
+            }
             const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                now - stream_request_started_).count();
+                now - stream_headers_phase_started_at_).count();
             if (elapsed >= stream_response_headers_timeout_ms_) {
                 stream_timeout_reason_ = "response headers timeout after " + std::to_string(elapsed) + "ms";
                 std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", stream_timeout_reason_.c_str());
@@ -652,6 +666,7 @@ class CurlClient {
             stream_idle_timeout_ms_ = request.streamIdleTimeoutMs;
             stream_request_started_ = std::chrono::steady_clock::now();
             last_stream_activity_ = stream_request_started_;
+            stream_headers_phase_started_ = false;
             stream_timeout_reason_.clear();
         }
         return true;
@@ -1016,6 +1031,8 @@ class CurlClient {
     int64_t stream_response_headers_timeout_ms_ = 0;
     int64_t stream_idle_timeout_ms_ = 0;
     std::chrono::steady_clock::time_point stream_request_started_{};
+    bool stream_headers_phase_started_ = false;
+    std::chrono::steady_clock::time_point stream_headers_phase_started_at_{};
     std::chrono::steady_clock::time_point last_stream_activity_{};
     std::string stream_timeout_reason_;
     // Streaming forces Accept-Encoding: identity so Content-Length matches the

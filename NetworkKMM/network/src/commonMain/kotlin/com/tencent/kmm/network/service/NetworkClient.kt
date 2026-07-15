@@ -44,6 +44,7 @@ import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.InternalCoroutinesApi
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.delay
@@ -159,11 +160,12 @@ class NetworkCall internal constructor(
     private var requestPreparationTimeMs = 0.0
     private val completion = CompletableDeferred<NetworkResponse>()
     private val stateLock = SynchronizedObject()
+    private val callbackDeliveryLock = SynchronizedObject()
     private val cancelHandlers = mutableListOf<() -> Unit>()
     private val completionHandlers = mutableListOf<(NetworkResponse) -> Unit>()
     private var job: Job? = null
     private var cancelled = false
-    private val requestBodyCancelArmed = atomic(true)
+    private val cancelledBodies = mutableListOf<NetworkBody>()
     private var terminalResponse: NetworkResponse? = null
     private var resolvedEngine: ResolvedNetworkEngine? = null
     private var engineSelectionReported = false
@@ -224,7 +226,9 @@ class NetworkCall internal constructor(
             terminal
         }
         if (completed != null) {
-            invokeCompletionHandler(handler, completed)
+            synchronized(callbackDeliveryLock) {
+                invokeCompletionHandler(handler, completed)
+            }
         }
     }
 
@@ -236,8 +240,7 @@ class NetworkCall internal constructor(
             cancelHandlers.clear()
             completionHandlers.toList().also { completionHandlers.clear() }
         }
-        completion.complete(response)
-        handlers.forEach { handler -> invokeCompletionHandler(handler, response) }
+        deliverTerminal(response, handlers)
         return true
     }
 
@@ -256,12 +259,21 @@ class NetworkCall internal constructor(
     }
 
     internal fun runWhileActive(action: () -> Unit) {
-        val admitted = synchronized(stateLock) { terminalResponse == null }
-        if (admitted) {
-            action()
+        synchronized(callbackDeliveryLock) {
+            if (synchronized(stateLock) { terminalResponse == null }) {
+                beforeActiveCallbackActionForTest?.invoke()
+                action()
+            }
         }
     }
 
+    internal var beforeActiveCallbackActionForTest: (() -> Unit)? = null
+
+    /**
+     * Returns the winning terminal response. Registered completion callbacks
+     * observe the same winner exactly once, but may finish just after this
+     * suspension resumes; callers that need both must synchronize explicitly.
+     */
     suspend fun await(): NetworkResponse = completion.await()
 
     fun cancel() {
@@ -290,16 +302,32 @@ class NetworkCall internal constructor(
             }
         }
         cancellation.job?.cancel()
-        completion.complete(cancellation.response)
-        cancellation.completionHandlers.forEach { handler ->
-            invokeCompletionHandler(handler, cancellation.response)
-        }
+        deliverTerminal(cancellation.response, cancellation.completionHandlers)
     }
 
     internal fun cancelRequestBodyOnce() {
-        if (requestBodyCancelArmed.compareAndSet(expect = true, update = false)) {
-            originalRequest.body.cancel()
+        cancelBodyOnce(originalRequest.body)
+    }
+
+    internal fun cancelBodyOnce(body: NetworkBody) {
+        val shouldCancel = synchronized(stateLock) {
+            if (cancelledBodies.any { it === body }) false
+            else {
+                cancelledBodies += body
+                true
+            }
         }
+        if (shouldCancel) {
+            body.cancel()
+        }
+    }
+
+    private fun deliverTerminal(
+        response: NetworkResponse,
+        handlers: List<(NetworkResponse) -> Unit>
+    ) = synchronized(callbackDeliveryLock) {
+        completion.complete(response)
+        handlers.forEach { handler -> invokeCompletionHandler(handler, response) }
     }
 
     private fun invokeCompletionHandler(
@@ -353,6 +381,7 @@ class NetworkClient(
             }
             call.tryComplete(response)
         }
+        attachCancellationOwner(job, call)
         job.invokeOnCompletion { cause ->
             if (cause != null) {
                 call.tryComplete(workerFailureResponse(request, cause))
@@ -424,6 +453,7 @@ class NetworkClient(
             }
             call.tryComplete(response)
         }
+        attachCancellationOwner(job, call)
         job.invokeOnCompletion { cause ->
             if (cause != null) {
                 call.tryComplete(workerFailureResponse(request, cause))
@@ -471,6 +501,15 @@ class NetworkClient(
         return config.policySelector?.invoke(request) ?: request.policy.takeIf {
             it != NetworkRequestPolicy()
         } ?: config.defaultPolicy
+    }
+
+    @OptIn(InternalCoroutinesApi::class)
+    private fun attachCancellationOwner(job: Job, call: NetworkCall) {
+        job.invokeOnCompletion(onCancelling = true, invokeImmediately = true) { cause ->
+            if (cause is CancellationException) {
+                call.cancel()
+            }
+        }
     }
 
     private suspend fun applyCurrentAuthToken(request: NetworkRequest) {
@@ -724,9 +763,12 @@ object VBTransportNetworkEngine : NetworkEngine {
                 })
             }
             val cancellationOwners = StreamingUploadCancellationOwners(
-                cancelRequestBody = call::cancelRequestBodyOnce,
+                cancelOriginalRequestBody = call::cancelRequestBodyOnce,
+                cancelPreparedRequestBody = { call.cancelBodyOnce(request.body) },
                 cancelDerivedSource = source.stream.takeIf { source.cancelSeparatelyFromRequestBody }
                     ?.let { stream -> stream::cancel },
+                cancelNativeRequest = null,
+                closePullBridge = null,
                 cancelTransport = { VBTransportService.cancel(vbRequest.requestId) }
             )
             VBTransportService.uploadStream(vbRequest, source.contentLength, writeBody) { response ->
@@ -775,21 +817,36 @@ internal suspend fun networkUploadStreamSourceOrNull(request: NetworkRequest): N
     }
 
 internal class StreamingUploadCancellationOwners(
-    private val cancelRequestBody: () -> Unit,
+    private val cancelOriginalRequestBody: () -> Unit,
+    private val cancelPreparedRequestBody: () -> Unit,
     private val cancelDerivedSource: (() -> Unit)?,
+    private val cancelNativeRequest: (() -> Unit)?,
+    private val closePullBridge: (() -> Unit)?,
     private val cancelTransport: () -> Unit
 ) {
-    private val requestBodyArmed = atomic(true)
+    private val originalRequestBodyArmed = atomic(true)
+    private val preparedRequestBodyArmed = atomic(true)
     private val derivedSourceArmed = atomic(cancelDerivedSource != null)
+    private val nativeRequestArmed = atomic(cancelNativeRequest != null)
+    private val pullBridgeArmed = atomic(closePullBridge != null)
     private val transportArmed = atomic(true)
 
     fun cancelAll() {
-        cancelOnce(requestBodyArmed, cancelRequestBody)
+        cancelOnce(originalRequestBodyArmed, cancelOriginalRequestBody)
+        cancelOnce(preparedRequestBodyArmed, cancelPreparedRequestBody)
         cancelDerivedSource?.let { cancelOnce(derivedSourceArmed, it) }
+        cancelNativeRequest?.let { cancelOnce(nativeRequestArmed, it) }
+        closePullBridge?.let { cancelOnce(pullBridgeArmed, it) }
         cancelOnce(transportArmed, cancelTransport)
     }
 
     fun disarmTransport() {
+        transportArmed.value = false
+    }
+
+    fun disarmNativeTransportOwners() {
+        nativeRequestArmed.value = false
+        pullBridgeArmed.value = false
         transportArmed.value = false
     }
 

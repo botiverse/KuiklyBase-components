@@ -74,6 +74,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
@@ -366,7 +368,19 @@ object AndroidTransportImpl : IVBTransportService {
                 val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
                 AndroidTransportPhaseTracer.scheduled(kmmRequest.requestId)
                 AndroidTransportPhaseTracer.transportCoroutineStarted(kmmRequest.requestId)
-                val responseLease = executeWithReusedH2Recovery(kmmRequest, streamStart)
+                suspend fun openResponse() =
+                    executeWithReusedH2Recovery(
+                        kmmRequest,
+                        streamStart,
+                        streamTimeouts = true
+                    )
+                val responseHeadersBudget = kmmRequest.streamConnectTimeoutMillis +
+                    kmmRequest.streamResponseHeadersTimeoutMillis
+                val responseLease = if (responseHeadersBudget > 0) {
+                    withTimeout(responseHeadersBudget) { openResponse() }
+                } else {
+                    openResponse()
+                }
                 val response = responseLease.response
                 try {
 
@@ -423,7 +437,7 @@ object AndroidTransportImpl : IVBTransportService {
                 }
             } catch (throwable: Throwable) {
                 AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = false)
-                if (throwable is CancellationException) {
+                if (throwable is CancellationException && throwable !is TimeoutCancellationException) {
                     AndroidTransportPhaseTracer.cancel(kmmRequest.requestId)
                     throw throwable
                 }
@@ -434,7 +448,12 @@ object AndroidTransportImpl : IVBTransportService {
                 logE("stream request failed, id:${kmmRequest.requestId}, error:$describedFailure", kmmRequest.logTag)
                 onComplete(
                     VBTransportResponse().apply {
-                        this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                        this.errorCode = if (throwable is TimeoutCancellationException ||
+                            describedFailure.startsWith("[timeout]")) {
+                            VBTransportResultCode.CODE_FORCE_TIMEOUT
+                        } else {
+                            VBTransportResultCode.CODE_NETWORK_ERROR
+                        }
                         this.errorMessage = describedFailure
                         this.data = null
                         this.request = kmmRequest
@@ -450,6 +469,7 @@ object AndroidTransportImpl : IVBTransportService {
         request: VBTransportBaseRequest,
         overallStart: kotlin.time.TimeMark,
         uploadBody: StreamingUploadBody? = null,
+        streamTimeouts: Boolean = false,
     ): AndroidResponseLease {
         // Sample rollout settings once: a mid-request flag change must not send
         // the recovery attempt back through the retired shared pool.
@@ -488,7 +508,15 @@ object AndroidTransportImpl : IVBTransportService {
                 requireAndroidRequestTimeoutBudget(requestBudget)
                 val response = lease.client.request(request.url) {
                     method = HttpMethod(request.method.name)
-                    if (requestBudget is AndroidRequestTimeoutBudget.Remaining) {
+                    if (streamTimeouts) {
+                        timeout {
+                            if (request.streamWholeTimeoutMillis > 0) {
+                                requestTimeoutMillis = request.streamWholeTimeoutMillis
+                            }
+                            connectTimeoutMillis = request.streamConnectTimeoutMillis
+                            socketTimeoutMillis = request.streamIdleTimeoutMillis
+                        }
+                    } else if (requestBudget is AndroidRequestTimeoutBudget.Remaining) {
                         timeout {
                             requestTimeoutMillis = requestBudget.millis
                             connectTimeoutMillis = transportConnectTimeoutMillis(requestBudget.millis)

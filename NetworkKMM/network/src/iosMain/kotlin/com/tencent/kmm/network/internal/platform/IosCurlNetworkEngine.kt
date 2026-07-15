@@ -32,6 +32,7 @@ import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngine
 import com.tencent.kmm.network.service.NetworkEngineAvailability
 import com.tencent.kmm.network.service.NetworkUploadStreamSource
+import com.tencent.kmm.network.service.StreamingUploadCancellationOwners
 import com.tencent.kmm.network.service.curlNetworkEngineCapabilities
 import com.tencent.kmm.network.service.curlRuntimeFailureResponse
 import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
@@ -167,12 +168,18 @@ internal class IosCurlNetworkEngine(
                 pullBridge.closeFailure(throwable)
             }
         }
-        call.addCancelHandler {
-            nativeRequest.cancel()
-            source.stream.cancel()
-            pullBridge.closeFailure(CancellationException("Upload cancelled"))
-            bridge.cancel(requestId)
-        }
+        val cancellationOwners = StreamingUploadCancellationOwners(
+            cancelOriginalRequestBody = call::cancelRequestBodyOnce,
+            cancelPreparedRequestBody = { call.cancelBodyOnce(request.body) },
+            cancelDerivedSource = source.stream.takeIf { source.cancelSeparatelyFromRequestBody }
+                ?.let { stream -> stream::cancel },
+            cancelNativeRequest = nativeRequest::cancel,
+            closePullBridge = {
+                pullBridge.closeFailure(CancellationException("Upload cancelled"))
+            },
+            cancelTransport = { bridge.cancel(requestId) }
+        )
+        call.addCancelHandler(cancellationOwners::cancelAll)
         if (call.isCancelled) {
             writer.cancel()
             return@coroutineScope cancelledResponse(request)
@@ -191,6 +198,7 @@ internal class IosCurlNetworkEngine(
             }
             bridge.uploadStream(nativeRequest, uploadSource).toNetworkResponse(request)
         } finally {
+            cancellationOwners.disarmNativeTransportOwners()
             writer.cancel()
         }
     }

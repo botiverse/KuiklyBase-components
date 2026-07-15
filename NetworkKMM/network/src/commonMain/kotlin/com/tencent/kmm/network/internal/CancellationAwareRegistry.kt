@@ -38,7 +38,12 @@ internal class CancellationAwareRegistry<K, V>(
     /** Returns false when a pre-publication cancellation tombstone was consumed. */
     fun publish(key: K, value: V): Boolean = synchronized(lock) {
         activeKeys += key
-        if (cancellationTombstones.remove(key)) {
+        if (values.containsKey(key)) {
+            // A logical owner remains active. Never silently orphan it by
+            // replacing the registry entry; the new publisher must fail
+            // closed and release/cancel its own value.
+            false
+        } else if (cancellationTombstones.remove(key)) {
             activeKeys.remove(key)
             false
         } else {

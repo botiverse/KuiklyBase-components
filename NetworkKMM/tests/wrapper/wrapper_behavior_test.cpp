@@ -6,8 +6,11 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <chrono>
 #include <string>
 #include <thread>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <curl/curl.h>
 #include "curl_wrapper.h"
 
@@ -80,7 +83,10 @@ static StreamCaptured FetchStream(const std::string &url,
                                   int64_t headerTimeoutMs = 1000,
                                   int64_t idleTimeoutMs = 1000,
                                   int64_t wholeTimeoutMs = 0,
-                                  int chunkDelayMs = 0) {
+                                  int chunkDelayMs = 0,
+                                  int64_t connectTimeoutMs = 1000,
+                                  const char *proxyUrl = "",
+                                  const char *caInfoPath = "") {
     StreamCaptured captured;
     captured.chunkDelayMs = chunkDelayMs;
     StringDic headers{};
@@ -88,7 +94,7 @@ static StreamCaptured FetchStream(const std::string &url,
     request.url = url.c_str();
     request.method = method;
     request.headers = &headers;
-    request.streamConnectTimeoutMs = 1000;
+    request.streamConnectTimeoutMs = connectTimeoutMs;
     request.streamResponseHeadersTimeoutMs = headerTimeoutMs;
     request.streamIdleTimeoutMs = idleTimeoutMs;
     request.streamWholeTimeoutMs = wholeTimeoutMs;
@@ -99,6 +105,8 @@ static StreamCaptured FetchStream(const std::string &url,
     callback.onChunk = OnStreamChunk;
     callback.onComplete = OnStreamComplete;
     CurClientHandle handle = CreateCurlClient("wrapper-stream-test");
+    SetCurlProxy(handle, proxyUrl);
+    SetCurlCaInfo(handle, caInfoPath);
     StartStreamRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
     DeleteCurlClient(handle);
     return captured;
@@ -172,6 +180,43 @@ static bool RequireAllContentCodecs() {
     return value != nullptr && std::strcmp(value, "0") != 0 && std::strcmp(value, "") != 0;
 }
 
+struct LegacyCurlRequestV26 {
+    const char *url;
+    const char *method;
+    StringDic *headers;
+    int64_t timeout;
+    int postBodyLen;
+    const char *postBody;
+};
+
+static void CheckGuardedLegacyRequestRejection() {
+    static_assert(sizeof(LegacyCurlRequestV26) == 48,
+                  "frozen LP64 raft.26 request must remain 48 bytes");
+    const long pageSize = sysconf(_SC_PAGESIZE);
+    void *mapping = mmap(nullptr, static_cast<size_t>(pageSize) * 2,
+                         PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    CHECK(mapping != MAP_FAILED, "guarded legacy ABI allocation succeeds");
+    if (mapping == MAP_FAILED) return;
+    auto *guard = static_cast<char *>(mapping) + pageSize;
+    CHECK(mprotect(guard, static_cast<size_t>(pageSize), PROT_NONE) == 0,
+          "legacy ABI allocation has an unreadable guard page");
+    auto *legacy = reinterpret_cast<LegacyCurlRequestV26 *>(guard - sizeof(LegacyCurlRequestV26));
+    std::memset(legacy, 0, sizeof(*legacy));
+    const auto *request = reinterpret_cast<const CurlRequest *>(legacy);
+    CurClientHandle handle = CreateCurlClient("wrapper-guarded-abi26");
+    CurlCallback buffered{};
+    CurlStreamCallback stream{};
+    CurlUploadSource upload{};
+    CHECK(StartRequestV27(handle, request, sizeof(*legacy), 26, &buffered) == 0,
+          "buffered V27 entry rejects a real guarded 48-byte v26 request pre-read");
+    CHECK(StartStreamRequestV27(handle, request, sizeof(*legacy), 26, &stream) == 0,
+          "stream V27 entry rejects a real guarded 48-byte v26 request pre-read");
+    CHECK(StartUploadRequestV27(handle, request, sizeof(*legacy), 26, &upload, &buffered) == 0,
+          "upload V27 entry rejects a real guarded 48-byte v26 request pre-read");
+    DeleteCurlClient(handle);
+    munmap(mapping, static_cast<size_t>(pageSize) * 2);
+}
+
 static void CheckDecodedContentEncoding(const std::string &base,
                                         const char *path,
                                         const char *label,
@@ -190,9 +235,14 @@ static void CheckDecodedContentEncoding(const std::string &base,
 
 int main(int argc, char **argv) {
     std::string base = argc > 1 ? argv[1] : "http://127.0.0.1:18923";
+    std::string stalledProxy = argc > 2 ? argv[2] : "";
+    std::string delayedProxy = argc > 3 ? argv[3] : "";
+    std::string phaseHttpsBase = argc > 4 ? argv[4] : "";
+    std::string phaseCaPath = argc > 5 ? argv[5] : "";
 
     CHECK(CurlWrapperAbiVersion() == CURL_WRAPPER_ABI_VERSION,
           "wrapper exports the exact CurlRequest ABI version");
+    CheckGuardedLegacyRequestRejection();
     {
         CurClientHandle handle = CreateCurlClient("wrapper-abi-skew");
         CurlRequest request{};
@@ -409,6 +459,30 @@ int main(int argc, char **argv) {
     // 8g. Header and inter-chunk deadlines fail independently; there is no
     //     implicit whole-transfer deadline for a healthy progressing stream.
     {
+        if (!stalledProxy.empty()) {
+            const auto connectStarted = std::chrono::steady_clock::now();
+            StreamCaptured connectTimeout = FetchStream(
+                "https://example.com/", "GET", 5000, 5000, 0, 0, 200,
+                stalledProxy.c_str());
+            const auto connectElapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - connectStarted).count();
+            CHECK(connectTimeout.starts == 0,
+                  "stalled CONNECT proxy times out before response-start");
+            CHECK(connectTimeout.completes == 1 && connectTimeout.code == 28,
+                  "stalled CONNECT proxy hits the positive connect-timeout path");
+            CHECK(connectElapsed < 2000,
+                  "positive connect timeout is bounded by its short phase budget");
+        }
+        if (!delayedProxy.empty() && !phaseHttpsBase.empty() && !phaseCaPath.empty()) {
+            StreamCaptured sequentialPhases = FetchStream(
+                phaseHttpsBase + "/phase-headers", "GET", 500, 1000, 0, 0,
+                1500, delayedProxy.c_str(), phaseCaPath.c_str());
+            CHECK(sequentialPhases.starts == 1 && sequentialPhases.startHttpCode == 200,
+                  "header budget starts after delayed CONNECT/TLS establishment");
+            CHECK(sequentialPhases.completes == 1 && sequentialPhases.code == 0 &&
+                      sequentialPhases.data == "phase-ok",
+                  "slow-connect plus in-budget delayed headers completes successfully");
+        }
         StreamCaptured headersTimeout = FetchStream(base + "/delayed-headers", "GET", 500, 2000);
         CHECK(headersTimeout.starts == 0, "headers timeout does not fabricate response-start");
         CHECK(headersTimeout.completes == 1 && headersTimeout.code == 28,

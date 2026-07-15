@@ -46,10 +46,11 @@ class CancellationAwareRegistryTest {
     fun staleOwnerCannotDeleteReplacement() {
         val registry = CancellationAwareRegistry<Int, String>()
         assertTrue(registry.publish(11, "old"))
-        assertTrue(registry.publish(11, "new"))
+        assertFalse(registry.publish(11, "new"))
 
-        assertFalse(registry.removeIfSame(11, "old"))
-        assertEquals("new", registry.get(11))
+        assertFalse(registry.removeIfSame(11, "new"))
+        assertEquals("old", registry.get(11))
+        assertTrue(registry.removeIfSame(11, "old"))
     }
 
     @Test
