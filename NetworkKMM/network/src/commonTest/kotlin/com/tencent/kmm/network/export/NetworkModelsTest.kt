@@ -80,6 +80,42 @@ class NetworkModelsTest {
     }
 
     @Test
+    fun multipartReadFailurePreservesCauseAndCancelsDerivedWhenFileOwnerThrows() = runBlocking {
+        var fileRefCancels = 0
+        var derivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/failing-file",
+                        cancelBlock = {
+                            fileRefCancels++
+                            error("file cancel failed")
+                        },
+                        openStreamBlock = {
+                            NetworkByteStream.fromChunks(cancelBlock = { derivedCancels++ }) {
+                                error("source read failed")
+                            }
+                        },
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+
+        val failure = runCatching {
+            composite.readChunks(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) = Unit
+            })
+        }.exceptionOrNull()
+
+        assertEquals("source read failed", failure?.message)
+        assertEquals(1, fileRefCancels)
+        assertEquals(1, derivedCancels)
+    }
+
+    @Test
     fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
         val defaults = NetworkRequestPolicy().streamTimeouts
         assertEquals(3_000L, defaults.connectTimeoutMillis)

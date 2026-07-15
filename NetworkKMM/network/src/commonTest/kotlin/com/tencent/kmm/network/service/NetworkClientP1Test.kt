@@ -775,7 +775,7 @@ class NetworkClientP1Test {
     }
 
     @Test
-    fun interceptorReplacementProgressAfterTerminalIsSuppressed() = runBlocking {
+    fun interceptorSameRequestProgressReplacementAfterTerminalIsSuppressed() = runBlocking {
         val engineEntered = CompletableDeferred<Unit>()
         val releaseEngine = CompletableDeferred<Unit>()
         var progressCalls = 0
@@ -784,7 +784,7 @@ class NetworkClientP1Test {
                 interceptors = listOf(
                     object : NetworkInterceptor {
                         override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
-                            val replacement = chain.request.copyMutable().apply {
+                            val replacement = chain.request.apply {
                                 progress = com.tencent.kmm.network.export.NetworkProgressCallbacks(
                                     downloadProgress = { progressCalls++ }
                                 )
@@ -839,7 +839,7 @@ class NetworkClientP1Test {
     }
 
     @Test
-    fun uploadFailureReleasesBodyAndDerivedOwnersOnlyOnce() {
+    fun uploadAttemptFailureReleasesOnlyDerivedOwnerOnce() {
         var original = 0
         var prepared = 0
         var derived = 0
@@ -853,13 +853,79 @@ class NetworkClientP1Test {
             cancelTransport = { transport++ },
         )
 
-        owners.releaseBodyOwnersOnFailure()
-        owners.releaseBodyOwnersOnFailure()
+        owners.releaseAttemptSourceOnFailure()
+        owners.releaseAttemptSourceOnFailure()
 
-        assertEquals(1, original)
-        assertEquals(1, prepared)
+        assertEquals(0, original)
+        assertEquals(0, prepared)
         assertEquals(1, derived)
         assertEquals(0, transport)
+    }
+
+    @Test
+    fun retryableUploadFailureKeepsLogicalBodyUntilFinalOutcome() = runBlocking {
+        fun request(cancel: () -> Unit) = NetworkRequest(method = VBTransportMethod.POST).apply {
+            body = NetworkBody.FileRef(
+                path = "/virtual/retryable.bin",
+                cancelBlock = cancel,
+                openStreamBlock = { NetworkByteStream.fromChunks {} },
+            )
+            policy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                    maxRetries = 1,
+                    backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(
+                        initialDelayMillis = 0,
+                        maxDelayMillis = 0,
+                    ),
+                )
+            )
+        }
+        fun failure(request: NetworkRequest) = NetworkResponse(
+            request = request,
+            statusCode = 503,
+            headers = emptyMap(),
+            body = NetworkResponseBody(),
+            error = com.tencent.kmm.network.export.NetworkError(
+                kind = NetworkErrorKind.UNKNOWN,
+                message = "retryable",
+                statusCode = 503,
+            ),
+        )
+
+        var successBodyCancels = 0
+        var successAttempts = 0
+        val successRequest = request { successBodyCancels++ }
+        val successClient = NetworkClient(
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    successAttempts++
+                    return if (successAttempts == 1) failure(request)
+                    else NetworkResponse(request, 200, emptyMap(), NetworkResponseBody())
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(200, successClient.execute(successRequest).statusCode)
+        assertEquals(2, successAttempts)
+        assertEquals(0, successBodyCancels)
+
+        var failedBodyCancels = 0
+        var failedAttempts = 0
+        val failedRequest = request { failedBodyCancels++ }
+        val failedClient = NetworkClient(
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    failedAttempts++
+                    return failure(request)
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(503, failedClient.execute(failedRequest).statusCode)
+        assertEquals(2, failedAttempts)
+        assertEquals(1, failedBodyCancels)
     }
 
     @Test

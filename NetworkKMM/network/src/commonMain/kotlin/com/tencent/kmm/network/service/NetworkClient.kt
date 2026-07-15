@@ -170,7 +170,7 @@ class NetworkCall internal constructor(
     private var cancelled = false
     private val cancelledBodies = mutableListOf<NetworkBody>()
     private val ownedBodies = mutableListOf<NetworkBody>()
-    private val progressGatedRequests = mutableListOf<NetworkRequest>()
+    private val progressGateRecords = mutableListOf<ProgressGateRecord>()
     private var terminalResponse: NetworkResponse? = null
     private var resolvedEngine: ResolvedNetworkEngine? = null
     private var engineSelectionReported = false
@@ -245,6 +245,14 @@ class NetworkCall internal constructor(
             cancelHandlers.clear()
             completionHandlers.toList().also { completionHandlers.clear() }
         }
+        if (response.error != null) {
+            try {
+                cancelRequestBodyOnce()
+            } catch (_: Throwable) {
+                // Final failure cleanup must continue through every owner.
+            }
+            cancelOwnedBodies()
+        }
         deliverTerminal(response, handlers)
         return true
     }
@@ -271,24 +279,22 @@ class NetworkCall internal constructor(
     }
 
     internal fun gateProgressCallbacks(request: NetworkRequest) {
-        val shouldGate = synchronized(stateLock) {
-            if (progressGatedRequests.any { it === request }) false
-            else {
-                progressGatedRequests += request
-                true
-            }
+        synchronized(stateLock) {
+            val current = request.progress
+            val record = progressGateRecords.firstOrNull { it.request === request }
+            if (record?.callbacks === current) return
+            val gated = com.tencent.kmm.network.export.NetworkProgressCallbacks(
+                uploadProgress = current.uploadProgress?.let { callback ->
+                    { progress -> runWhileActive { callback(progress) } }
+                },
+                downloadProgress = current.downloadProgress?.let { callback ->
+                    { progress -> runWhileActive { callback(progress) } }
+                },
+            )
+            request.progress = gated
+            if (record == null) progressGateRecords += ProgressGateRecord(request, gated)
+            else record.callbacks = gated
         }
-        if (!shouldGate) return
-        val upload = request.progress.uploadProgress
-        val download = request.progress.downloadProgress
-        request.progress = com.tencent.kmm.network.export.NetworkProgressCallbacks(
-            uploadProgress = upload?.let { callback ->
-                { progress -> runWhileActive { callback(progress) } }
-            },
-            downloadProgress = download?.let { callback ->
-                { progress -> runWhileActive { callback(progress) } }
-            },
-        )
     }
 
     internal var beforeActiveCallbackActionForTest: (() -> Unit)? = null
@@ -396,6 +402,11 @@ class NetworkCall internal constructor(
         val response: NetworkResponse
     )
 }
+
+private class ProgressGateRecord(
+    val request: NetworkRequest,
+    var callbacks: com.tencent.kmm.network.export.NetworkProgressCallbacks,
+)
 
 class NetworkClient(
     private val config: NetworkClientConfig = NetworkClientConfig(),
@@ -854,15 +865,20 @@ object VBTransportNetworkEngine : NetworkEngine {
                 closePullBridge = null,
                 cancelTransport = { VBTransportService.cancel(vbRequest.requestId) }
             )
-            VBTransportService.uploadStream(vbRequest, source.contentLength, writeBody) { response ->
-                cancellationOwners.disarmTransport()
-                if (continuation.isActive) {
-                    val mapped = response.toNetworkResponse(request)
-                    if (mapped.error != null) cancellationOwners.releaseBodyOwnersOnFailure()
-                    continuation.resume(mapped)
-                }
-            }
             call.addCancelHandler(cancellationOwners::cancelAll)
+            try {
+                VBTransportService.uploadStream(vbRequest, source.contentLength, writeBody) { response ->
+                    cancellationOwners.disarmTransport()
+                    if (continuation.isActive) {
+                        val mapped = response.toNetworkResponse(request)
+                        if (mapped.error != null) cancellationOwners.releaseAttemptSourceOnFailure()
+                        continuation.resume(mapped)
+                    }
+                }
+            } catch (throwable: Throwable) {
+                cancellationOwners.releaseAttemptSourceOnFailure()
+                throw throwable
+            }
             continuation.invokeOnCancellation { cancellationOwners.cancelAll() }
         }
     }
@@ -940,9 +956,7 @@ internal class StreamingUploadCancellationOwners(
         transportArmed.value = false
     }
 
-    fun releaseBodyOwnersOnFailure() {
-        cancelOnce(originalRequestBodyArmed, cancelOriginalRequestBody)
-        cancelOnce(preparedRequestBodyArmed, cancelPreparedRequestBody)
+    fun releaseAttemptSourceOnFailure() {
         cancelDerivedSource?.let { cancelOnce(derivedSourceArmed, it) }
     }
 

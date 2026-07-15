@@ -181,10 +181,13 @@ internal class AndroidCurlNetworkEngine(
         call: NetworkCall,
         source: NetworkUploadStreamSource
     ): NetworkResponse = coroutineScope {
-        val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
-        if (!availability.available) return@coroutineScope curlRuntimeFailureResponse(request, availability)
         val owner = Any()
-        val requestId = androidCurlRequestOwners.reserve(owner)
+        val requestId = try {
+            androidCurlRequestOwners.reserve(owner)
+        } catch (throwable: Throwable) {
+            runCatching { source.stream.cancel() }
+            throw throwable
+        }
         val pullBridge = AndroidCurlUploadPullBridge()
         val nativeRequest = try {
             request.toNativeRequest(
@@ -194,8 +197,6 @@ internal class AndroidCurlNetworkEngine(
             )
         } catch (throwable: Throwable) {
             androidCurlRequestOwners.release(requestId, owner)
-            runCatching { call.cancelRequestBodyOnce() }
-            runCatching { call.cancelBodyOnce(request.body) }
             runCatching { source.stream.cancel() }
             throw throwable
         }
@@ -247,10 +248,10 @@ internal class AndroidCurlNetworkEngine(
             }
             val response = bridge.uploadStream(nativeRequest, uploadSource)
                 .toNetworkResponse(request)
-            if (response.error != null) cancellationOwners.releaseBodyOwnersOnFailure()
+            if (response.error != null) cancellationOwners.releaseAttemptSourceOnFailure()
             response
         } catch (throwable: Throwable) {
-            cancellationOwners.releaseBodyOwnersOnFailure()
+            cancellationOwners.releaseAttemptSourceOnFailure()
             throw throwable
         } finally {
             cancellationOwners.disarmNativeTransportOwners()
