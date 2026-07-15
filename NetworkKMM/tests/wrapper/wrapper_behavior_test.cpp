@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <curl/curl.h>
 #include "curl_wrapper.h"
 
@@ -41,6 +42,7 @@ struct StreamCaptured {
     int code = -1;
     long httpCode = -1;
     std::string errorMsg;
+    int chunkDelayMs = 0;
 };
 
 static void OnStreamStart(void *ref, long httpCode, const char *headers, int headerLen) {
@@ -55,6 +57,9 @@ static void OnStreamStart(void *ref, long httpCode, const char *headers, int hea
 static void OnStreamChunk(void *ref, const char *data, int len) {
     auto *out = static_cast<StreamCaptured *>(ref);
     out->chunks++;
+    if (out->chunkDelayMs > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(out->chunkDelayMs));
+    }
     if (data != nullptr && len > 0) {
         out->data.append(data, len);
     }
@@ -74,8 +79,10 @@ static StreamCaptured FetchStream(const std::string &url,
                                   const char *method = "GET",
                                   int64_t headerTimeoutMs = 1000,
                                   int64_t idleTimeoutMs = 1000,
-                                  int64_t wholeTimeoutMs = 0) {
+                                  int64_t wholeTimeoutMs = 0,
+                                  int chunkDelayMs = 0) {
     StreamCaptured captured;
+    captured.chunkDelayMs = chunkDelayMs;
     StringDic headers{};
     CurlRequest request{};
     request.url = url.c_str();
@@ -92,7 +99,7 @@ static StreamCaptured FetchStream(const std::string &url,
     callback.onChunk = OnStreamChunk;
     callback.onComplete = OnStreamComplete;
     CurClientHandle handle = CreateCurlClient("wrapper-stream-test");
-    StartStreamRequest(handle, request, &callback);
+    StartStreamRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
     DeleteCurlClient(handle);
     return captured;
 }
@@ -131,7 +138,7 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     // semantics crashed exactly this pattern.
     CurlCallback callback{&captured, OnResponse};
     CurClientHandle handle = CreateCurlClient("wrapper-test");
-    StartRequest(handle, request, &callback);
+    StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
     DeleteCurlClient(handle);
     return captured;
 }
@@ -150,7 +157,7 @@ static Captured FetchWithResolve(const std::string &url, const std::string &reso
     SetCurlProxy(handle, "");
     CHECK(SetCurlResolve(handle, resolveEntry.c_str()) == 1,
           "per-client resolve entry is accepted");
-    StartRequest(handle, request, &callback);
+    StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
     DeleteCurlClient(handle);
     return captured;
 }
@@ -186,6 +193,14 @@ int main(int argc, char **argv) {
 
     CHECK(CurlWrapperAbiVersion() == CURL_WRAPPER_ABI_VERSION,
           "wrapper exports the exact CurlRequest ABI version");
+    {
+        CurClientHandle handle = CreateCurlClient("wrapper-abi-skew");
+        CurlRequest request{};
+        CurlCallback callback{};
+        CHECK(StartRequestV27(handle, &request, 48, 26, &callback) == 0,
+              "v27 entry rejects an old 48-byte/ABI-26 request before reading it");
+        DeleteCurlClient(handle);
+    }
 
     // HTTP/3 control surface is additive and must fail closed against a host
     // libcurl without the feature while leaving the default path available.
@@ -280,7 +295,7 @@ int main(int argc, char **argv) {
         CurlCallback callback{&cancelled, OnResponse};
         CurClientHandle handle = CreateCurlClient("wrapper-test");
         Cancel(handle);
-        StartRequest(handle, request, &callback);
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
         DeleteCurlClient(handle);
 
         CHECK(cancelled.invoked, "pre-start cancel still delivers a callback");
@@ -313,7 +328,7 @@ int main(int argc, char **argv) {
 
         CurClientHandle handle = CreateCurlClient("wrapper-test");
         Cancel(handle);
-        StartStreamRequest(handle, request, &callback);
+        StartStreamRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
         DeleteCurlClient(handle);
 
         CHECK(stream.starts == 0, "stream pre-start cancel suppresses response-start");
@@ -341,6 +356,19 @@ int main(int argc, char **argv) {
         CHECK(stream.starts == 1, "redirect stream emits one final response-start");
         CHECK(stream.startHttpCode == 200, "redirect stream starts with final HTTP 200, not 302");
         CHECK(stream.data == "{\"ok\":true}", "redirect stream delivers final body");
+        StreamCaptured mixedCase = FetchStream(base + "/redirect-mixed-case");
+        CHECK(mixedCase.starts == 1 && mixedCase.startHttpCode == 200,
+              "mixed-case Location header still exposes only the final 200 start");
+        StreamCaptured loop = FetchStream(base + "/redirect-loop");
+        CHECK(loop.starts == 1 && loop.startHttpCode == 302,
+              "redirect limit promotes exactly one terminal 302 start");
+        CHECK(loop.completes == 1 && loop.code == 47,
+              "redirect loop completes as CURLE_TOO_MANY_REDIRECTS");
+        StreamCaptured disallowed = FetchStream(base + "/redirect-disallowed");
+        CHECK(disallowed.starts == 1 && disallowed.startHttpCode == 302,
+              "disallowed redirect scheme promotes its terminal 302 start");
+        CHECK(disallowed.completes == 1 && disallowed.code != 0,
+              "disallowed redirect scheme completes with a transport error");
     }
 
     // Informational blocks are likewise internal; unknown-length chunked
@@ -399,6 +427,12 @@ int main(int argc, char **argv) {
         StreamCaptured healthy = FetchStream(base + "/stream", "GET", 1000, 100, 0);
         CHECK(healthy.code == 0 && healthy.data == "alphabetagamma",
               "progressing stream is not killed by a whole-transfer deadline");
+        StreamCaptured slowConsumer = FetchStream(base + "/stream", "GET", 1000, 100, 0, 200);
+        CHECK(slowConsumer.code == 0 && slowConsumer.data == "alphabetagamma",
+              "consumer callback backpressure is excluded from network-idle time");
+        StreamCaptured wholeTimeout = FetchStream(base + "/idle-stream", "GET", 2000, 3000, 200);
+        CHECK(wholeTimeout.completes == 1 && wholeTimeout.code == 28,
+              "opt-in whole-transfer deadline terminates an otherwise-live stream");
     }
 
     // Cancellation requested synchronously from response-start must win
@@ -432,7 +466,8 @@ int main(int argc, char **argv) {
         request.streamIdleTimeoutMs = 1000;
         CurlStreamCallback callback{&state, Hooks::Start, Hooks::Chunk, Hooks::Complete};
         state.handle = CreateCurlClient("wrapper-cancel-at-start");
-        StartStreamRequest(state.handle, request, &callback);
+        StartStreamRequestV27(
+            state.handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
         DeleteCurlClient(state.handle);
 
         CHECK(state.captured.starts == 1, "cancel-at-start observes the canonical start once");
@@ -472,7 +507,8 @@ int main(int argc, char **argv) {
         request.streamIdleTimeoutMs = 1000;
         CurlStreamCallback callback{&state, Hooks::Start, Hooks::Chunk, Hooks::Complete};
         state.handle = CreateCurlClient("wrapper-cancel-mid-stream");
-        StartStreamRequest(state.handle, request, &callback);
+        StartStreamRequestV27(
+            state.handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
         DeleteCurlClient(state.handle);
 
         CHECK(state.captured.starts == 1, "mid-stream cancel starts once");
@@ -502,7 +538,7 @@ int main(int argc, char **argv) {
 
         CurlCallback callback{&echo, OnResponse};
         CurClientHandle handle = CreateCurlClient("wrapper-test");
-        StartRequest(handle, request, &callback);
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
         DeleteCurlClient(handle);
 
         size_t count = 0, pos = 0;

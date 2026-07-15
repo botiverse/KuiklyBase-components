@@ -164,4 +164,14 @@ class NetworkModelsTest {
 
         assertEquals(listOf(7, 8, 9), assertNotNull(bodyBytes.bytes).map { it.toInt() })
     }
+
+    @Test
+    fun legacyDirectTransportStreamUsesSafePhaseDeadlineDefaults() {
+        val request = VBTransportRequest()
+
+        assertEquals(3_000L, request.streamConnectTimeoutMillis)
+        assertEquals(30_000L, request.streamResponseHeadersTimeoutMillis)
+        assertEquals(60_000L, request.streamIdleTimeoutMillis)
+        assertEquals(0L, request.streamWholeTimeoutMillis)
+    }
 }

@@ -18,6 +18,7 @@ class CancellationAwareRegistryTest {
     fun cancellationBeforePublishIsConsumedExactlyOnce() {
         val registry = CancellationAwareRegistry<Int, String>()
 
+        registry.begin(7)
         assertFalse(registry.cancelOrRemember(7, removePublished = false) {})
         assertFalse(registry.publish(7, "first"))
         assertNull(registry.get(7))
@@ -48,5 +49,35 @@ class CancellationAwareRegistryTest {
 
         assertFalse(registry.removeIfSame(11, "old"))
         assertEquals("new", registry.get(11))
+    }
+
+    @Test
+    fun duplicateCancelAfterRemovalDoesNotPoisonReusedKey() {
+        val registry = CancellationAwareRegistry<Int, String>()
+        var cancels = 0
+        registry.begin(13)
+        assertTrue(registry.publish(13, "first"))
+
+        assertTrue(registry.cancelOrRemember(13, removePublished = true) { cancels++ })
+        assertFalse(registry.cancelOrRemember(13, removePublished = true) { cancels++ })
+        registry.begin(13)
+        assertTrue(registry.publish(13, "second"))
+
+        assertEquals(1, cancels)
+        assertEquals("second", registry.get(13))
+    }
+
+    @Test
+    fun lateCancelAfterSuccessDoesNotPoisonReusedKey() {
+        val registry = CancellationAwareRegistry<Int, String>()
+        registry.begin(17)
+        assertTrue(registry.publish(17, "first"))
+        assertEquals("first", registry.remove(17))
+
+        assertFalse(registry.cancelOrRemember(17, removePublished = true) {})
+        registry.begin(17)
+        assertTrue(registry.publish(17, "second"))
+
+        assertEquals("second", registry.get(17))
     }
 }

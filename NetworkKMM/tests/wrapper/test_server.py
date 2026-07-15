@@ -55,9 +55,24 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Location", "/ok")
             self.send_header("Content-Length", "0")
             self.end_headers()
+        elif self.path == "/redirect-mixed-case":
+            self.send_response(302)
+            self.send_header("LoCaTiOn", "/ok")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
         elif self.path == "/redirect-delayed-headers":
             self.send_response(302)
             self.send_header("Location", "/delayed-headers")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/redirect-loop":
+            self.send_response(302)
+            self.send_header("Location", "/redirect-loop")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif self.path == "/redirect-disallowed":
+            self.send_response(302)
+            self.send_header("Location", "file:///tmp/networkkmm-disallowed")
             self.send_header("Content-Length", "0")
             self.end_headers()
         elif self.path == "/no-content":

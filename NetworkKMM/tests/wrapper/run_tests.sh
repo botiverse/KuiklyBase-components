@@ -24,6 +24,17 @@ g++ -std=c++17 -O1 -g \
   -lcurl -lz \
   -o "$BUILD_DIR/wrapper_behavior_test"
 
+WRAPPER_SYMBOLS="$(nm "$BUILD_DIR/wrapper_behavior_test")"
+for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27; do
+  grep -Eq " [Tt] ${symbol}$" <<<"$WRAPPER_SYMBOLS"
+done
+for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do
+  if grep -Eq " [Tt] ${legacy_symbol}$" <<<"$WRAPPER_SYMBOLS"; then
+    echo "legacy wrapper ABI symbol is still exported: ${legacy_symbol}" >&2
+    exit 1
+  fi
+done
+
 echo "==> Starting test server on :$PORT"
 python3 "$SCRIPT_DIR/test_server.py" "$PORT" &
 SERVER_PID=$!

@@ -86,6 +86,7 @@ object VBTransportService {
     private fun prepareRequest(request: VBTransportBaseRequest) {
         request.serviceRequestStartMark = TimeSource.Monotonic.markNow()
         request.requestId = VBPBRequestIdGenerator.getRequestId()
+        taskManager.onTaskPrepared(request.requestId)
     }
 
     // 发送字节数组Post类型网络请求
@@ -259,7 +260,7 @@ object VBTransportService {
             taskManager.getTask(requestId)?.let { task ->
                 if (task.trySetDone()) {
                     task.cancelTransport()
-                    taskManager.onTaskFinish(requestId)
+                    taskManager.onTaskFinish(task)
                     handlerBlock()
                 }
             }

@@ -455,9 +455,11 @@ internal suspend fun NetworkBody.toBytes(
 
 internal fun NetworkBody.cancel() {
     when (this) {
-        is NetworkBody.Stream -> stream.cancel()
-        is NetworkBody.FileRef -> this.cancel()
-        is NetworkBody.Multipart -> parts.forEach { it.body.cancel() }
+        is NetworkBody.Stream -> runCatching { stream.cancel() }
+        is NetworkBody.FileRef -> runCatching { this.cancel() }
+        is NetworkBody.Multipart -> parts.forEach { part ->
+            runCatching { part.body.cancel() }
+        }
         else -> Unit
     }
 }

@@ -2,23 +2,34 @@
 
 ## Unreleased (raft.27 stream lifecycle hardening)
 
-- Version the native curl wrapper ABI and verify it before any expanded
-  `CurlRequest` is passed by value, so stale native/runtime pairings fail
-  closed instead of interpreting the raft.27 timeout layout incorrectly.
+- Version the native curl wrapper ABI with pointer+size+version `Start*V27`
+  entry points and remove the old by-value symbols. Both old-caller/new-runtime
+  and new-caller/old-runtime skew now fail at symbol/ABI validation instead of
+  interpreting the raft.27 80-byte request layout as raft.26's 48-byte layout.
 
 - Streaming cancellation now survives both common task publication and native
   handle publication. Cancellation tombstones, CAS task transitions and a
   lock-owned OHOS handle registry prevent lost pre-start cancellation and
   prevent `Cancel` from dereferencing a handle concurrently with deletion.
+  Terminal cleanup is identity-safe, late/duplicate cancellation cannot poison
+  a reused request ID, and all cancellation owners still run when one throws.
 - Native response-start is emitted only after a complete final HTTP header
   block. Informational and followed redirect blocks stay internal; HEAD, 204
   and non-2xx responses start correctly, while DNS/TLS/connect failures no
   longer fabricate an HTTP start. Cancellation after start or a body chunk
   suppresses subsequent chunks and still terminates exactly once.
+  Proxy CONNECT headers are suppressed, Location field names are parsed
+  case-insensitively, and terminal redirect-limit/protocol failures expose the
+  actual final 3xx block without leaking followed intermediate redirects.
 - Consumer callback failures are latched and contained before crossing native
   callback boundaries. The first response-start/chunk failure cancels the real
   transfer, suppresses later business callbacks and becomes a controlled
   terminal network failure.
+- `NetworkCall` is the sole terminal arbiter for `await` and public completion
+  callbacks. Cancellation, worker exceptions and late engine success race one
+  atomic winner; callbacks remain exactly-once even before dispatch or while a
+  custom middleware/engine is suspended. iOS C trampolines contain conversion
+  and decode failures as well as user callback failures.
 - Response streams use explicit connect, response-header/TTFB and inter-chunk
   idle deadlines, with an optional whole-transfer deadline. Healthy progressing
   large downloads are no longer implicitly bounded by the ordinary buffered

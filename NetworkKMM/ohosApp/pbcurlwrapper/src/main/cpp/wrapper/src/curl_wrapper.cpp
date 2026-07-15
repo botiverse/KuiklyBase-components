@@ -21,6 +21,7 @@
 #include <cctype>
 #include <chrono>
 #include <climits>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
@@ -37,6 +38,22 @@
 #include "zlib.h"
 
 using namespace std;
+
+#if INTPTR_MAX == INT64_MAX
+static_assert(sizeof(CurlRequest) == 80, "CurlRequest ABI 27 must be 80 bytes on LP64");
+static_assert(alignof(CurlRequest) == 8, "CurlRequest ABI 27 must be 8-byte aligned on LP64");
+static_assert(offsetof(CurlRequest, timeout) == 24, "CurlRequest.timeout ABI offset drift");
+static_assert(offsetof(CurlRequest, streamConnectTimeoutMs) == 32,
+              "CurlRequest.streamConnectTimeoutMs ABI offset drift");
+static_assert(offsetof(CurlRequest, streamResponseHeadersTimeoutMs) == 40,
+              "CurlRequest.streamResponseHeadersTimeoutMs ABI offset drift");
+static_assert(offsetof(CurlRequest, streamIdleTimeoutMs) == 48,
+              "CurlRequest.streamIdleTimeoutMs ABI offset drift");
+static_assert(offsetof(CurlRequest, streamWholeTimeoutMs) == 56,
+              "CurlRequest.streamWholeTimeoutMs ABI offset drift");
+static_assert(offsetof(CurlRequest, postBodyLen) == 64, "CurlRequest.postBodyLen ABI offset drift");
+static_assert(offsetof(CurlRequest, postBody) == 72, "CurlRequest.postBody ABI offset drift");
+#endif
 
 static std::once_flag gCurlGlobalInitFlag;
 static CURLcode gCurlGlobalInitResult = CURLE_FAILED_INIT;
@@ -150,13 +167,16 @@ class CurlClient {
         std::string line(contents, realsize);
         // 检测是否为HTTP状态行（如"HTTP/1.1 200 OK"）
         if (line.find("HTTP/") == 0) {
+            // Seeing another status line proves a previously pending redirect
+            // was followed. It must never become the caller-visible start.
+            client->pending_redirect_ready_ = false;
             client->current_headers_.clear();
             client->current_headers_ += line;
             client->current_has_location_ = false;
             client->current_status_code_ = ParseHttpStatusCode(line);
             client->final_headers_ready_ = false;
             logI(client->log_tag_, "HeaderCallback httpCode:" + std::to_string(client->current_status_code_));
-        } else if (line.find("Location:") == 0 || line.find("location:") == 0) {
+        } else if (IsHeaderField(line, "location")) {
             client->current_headers_ += line;
             client->current_has_location_ = true;
             // 提取并存储重定向URL
@@ -188,6 +208,18 @@ class CurlClient {
         return end == begin ? 0 : parsed;
     }
 
+    static bool IsHeaderField(const std::string &line, const char *expectedLowercase) {
+        const size_t colon = line.find(':');
+        if (colon == std::string::npos) {
+            return false;
+        }
+        std::string field = line.substr(0, colon);
+        std::transform(field.begin(), field.end(), field.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        return field == expectedLowercase;
+    }
+
     // Commits one complete header block. Informational blocks are never
     // surfaced as the response start. Redirect blocks are retained as a
     // fallback but delayed because CURLOPT_FOLLOWLOCATION may immediately
@@ -203,19 +235,43 @@ class CurlClient {
         }
         const bool redirectMayFollow =
             current_status_code_ >= 300 && current_status_code_ < 400 && current_has_location_;
+        if (redirectMayFollow) {
+            pending_redirect_status_code_ = current_status_code_;
+            pending_redirect_headers_ = current_headers_;
+            pending_redirect_ready_ = true;
+            headers_ = pending_redirect_headers_;
+            final_headers_ready_ = false;
+            return true;
+        }
+        pending_redirect_ready_ = false;
         final_status_code_ = current_status_code_;
         final_headers_ = current_headers_;
         headers_ = final_headers_;
-        // A followed redirect is not the response visible to the caller. Keep
-        // waiting (and keep the response-header deadline armed) until curl
-        // completes a non-followed header block.
-        final_headers_ready_ = !redirectMayFollow;
-        if (final_headers_ready_) {
-            last_stream_activity_ = std::chrono::steady_clock::now();
-        }
+        final_headers_ready_ = true;
         if (stream_mode_ && final_headers_ready_) {
             return DeliverStreamResponseStart();
         }
+        return true;
+    }
+
+    bool PromoteTerminalRedirect(CURLcode result) {
+        if (!pending_redirect_ready_ || final_headers_ready_) {
+            return false;
+        }
+        // These results mean curl rejected/stopped at the redirect itself.
+        // A failure while connecting to the next hop (DNS/TLS/timeout) must
+        // not reclassify the intermediate response as the final origin.
+        if (result != CURLE_TOO_MANY_REDIRECTS &&
+            result != CURLE_UNSUPPORTED_PROTOCOL &&
+            result != CURLE_URL_MALFORMAT) {
+            return false;
+        }
+        final_status_code_ = pending_redirect_status_code_;
+        final_headers_ = pending_redirect_headers_;
+        headers_ = final_headers_;
+        final_headers_ready_ = true;
+        pending_redirect_ready_ = false;
+        last_stream_activity_ = std::chrono::steady_clock::now();
         return true;
     }
 
@@ -269,7 +325,6 @@ class CurlClient {
             logI(client->log_tag_, "StreamWriteCallback cancel by user.");
             return 0;  // abort the transfer
         }
-        client->last_stream_activity_ = std::chrono::steady_clock::now();
         if (!client->DeliverStreamResponseStart()) {
             return 0;
         }
@@ -277,6 +332,7 @@ class CurlClient {
             client->stream_callback_->onChunk(
                 client->stream_callback_->callbackRef, reinterpret_cast<char *>(contents), static_cast<int>(realsize));
         }
+        client->last_stream_activity_ = std::chrono::steady_clock::now();
         // Kotlin callback failures request cancellation synchronously. Recheck
         // before returning to libcurl so no later chunk can escape.
         return client->cancel_flag_.load(std::memory_order_relaxed) ? 0 : realsize;
@@ -298,6 +354,7 @@ class CurlClient {
                 final_headers_.c_str(),
                 static_cast<int>(final_headers_.length()));
         }
+        last_stream_activity_ = std::chrono::steady_clock::now();
         return !cancel_flag_.load(std::memory_order_relaxed);
     }
 
@@ -543,6 +600,15 @@ class CurlClient {
         }
         // 使用curl的内部重定向逻辑
         curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl_, CURLOPT_MAXREDIRS, 5L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+        curl_easy_setopt(curl_, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+        curl_easy_setopt(curl_, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+        // Do not surface a proxy's "HTTP/1.1 200 Connection established" as
+        // the origin response start or let it disarm the TTFB deadline.
+        curl_easy_setopt(curl_, CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
 
         // 进度回调
         curl_easy_setopt(curl_, CURLOPT_XFERINFOFUNCTION, ProgressCallback);
@@ -760,6 +826,7 @@ class CurlClient {
             // observed the cancel flag.
             res = CURLE_ABORTED_BY_CALLBACK;
         }
+        PromoteTerminalRedirect(res);
         // A body-less final response (HEAD/204/final redirect) still owes the
         // caller a start. DNS/TLS/connect failures have no complete header
         // block and must not fabricate an HTTP response start.
@@ -924,6 +991,7 @@ class CurlClient {
     std::string headers_;
     std::string current_headers_;
     std::string final_headers_;
+    std::string pending_redirect_headers_;
     std::string redirect_url_;
     std::string content_data_;
     CurlResponse *curl_response_ = nullptr;  // destructor deletes it — must not start wild
@@ -943,6 +1011,8 @@ class CurlClient {
     bool current_has_location_ = false;
     long current_status_code_ = 0;
     long final_status_code_ = 0;
+    long pending_redirect_status_code_ = 0;
+    bool pending_redirect_ready_ = false;
     int64_t stream_response_headers_timeout_ms_ = 0;
     int64_t stream_idle_timeout_ms_ = 0;
     std::chrono::steady_clock::time_point stream_request_started_{};
@@ -954,28 +1024,40 @@ class CurlClient {
     bool http3_enabled_ = false;
 };
 
-void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback) {
-    if (handle == nullptr) {
-        logE(gDefaultTag, "client is nullptr!!!");
-        return;
-    }
-    reinterpret_cast<CurlClient *>(handle)->StartRequest(request, callback);
+static bool ValidateV27Request(const CurlRequest *request, size_t requestSize, int abiVersion) {
+    return request != nullptr && requestSize == sizeof(CurlRequest) &&
+        abiVersion == CURL_WRAPPER_ABI_VERSION;
 }
 
-void StartStreamRequest(CurClientHandle handle, CurlRequest request, CurlStreamCallback *callback) {
-    if (handle == nullptr) {
-        logE(gDefaultTag, "client is nullptr!!!");
-        return;
+int StartRequestV27(CurClientHandle handle, const CurlRequest *request,
+                    size_t requestSize, int abiVersion, CurlCallback *callback) {
+    if (handle == nullptr || !ValidateV27Request(request, requestSize, abiVersion)) {
+        logE(gDefaultTag, "StartRequestV27 rejected incompatible request ABI");
+        return 0;
     }
-    reinterpret_cast<CurlClient *>(handle)->StartStreamRequest(request, callback);
+    reinterpret_cast<CurlClient *>(handle)->StartRequest(*request, callback);
+    return 1;
 }
 
-void StartUploadRequest(CurClientHandle handle, CurlRequest request, CurlUploadSource *source, CurlCallback *callback) {
-    if (handle == nullptr) {
-        logE(gDefaultTag, "client is nullptr!!!");
-        return;
+int StartStreamRequestV27(CurClientHandle handle, const CurlRequest *request,
+                          size_t requestSize, int abiVersion, CurlStreamCallback *callback) {
+    if (handle == nullptr || !ValidateV27Request(request, requestSize, abiVersion)) {
+        logE(gDefaultTag, "StartStreamRequestV27 rejected incompatible request ABI");
+        return 0;
     }
-    reinterpret_cast<CurlClient *>(handle)->StartUploadRequest(request, source, callback);
+    reinterpret_cast<CurlClient *>(handle)->StartStreamRequest(*request, callback);
+    return 1;
+}
+
+int StartUploadRequestV27(CurClientHandle handle, const CurlRequest *request,
+                          size_t requestSize, int abiVersion,
+                          CurlUploadSource *source, CurlCallback *callback) {
+    if (handle == nullptr || !ValidateV27Request(request, requestSize, abiVersion)) {
+        logE(gDefaultTag, "StartUploadRequestV27 rejected incompatible request ABI");
+        return 0;
+    }
+    reinterpret_cast<CurlClient *>(handle)->StartUploadRequest(*request, source, callback);
+    return 1;
 }
 
 CurClientHandle CreateCurlClient(const char *logTag) {

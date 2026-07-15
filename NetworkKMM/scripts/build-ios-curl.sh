@@ -277,10 +277,18 @@ HTTP_FEATURE_SYMBOLS
     "$openssl_prefix/lib/libcrypto.a"
   local wrapper_symbols
   wrapper_symbols="$(xcrun nm "$merged" 2>/dev/null || true)"
-  if ! grep -q 'CurlWrapperAbiVersion$' <<<"$wrapper_symbols"; then
-    echo "[${sdk}/${arch}] wrapper ABI probe missing from merged archive" >&2
-    exit 2
-  fi
+  for symbol in CurlWrapperAbiVersion StartRequestV27 StartStreamRequestV27 StartUploadRequestV27; do
+    if ! grep -q "${symbol}$" <<<"$wrapper_symbols"; then
+      echo "[${sdk}/${arch}] wrapper ABI symbol missing: ${symbol}" >&2
+      exit 2
+    fi
+  done
+  for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do
+    if grep -Eq " [Tt] _?${legacy_symbol}$" <<<"$wrapper_symbols"; then
+      echo "[${sdk}/${arch}] legacy ABI symbol must not be exported: ${legacy_symbol}" >&2
+      exit 2
+    fi
+  done
   echo "    $(du -h "$merged" | cut -f1)  $merged"
 }
 

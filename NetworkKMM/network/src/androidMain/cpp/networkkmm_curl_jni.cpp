@@ -359,17 +359,27 @@ void NativePerform(
         stream_callback.onResponseStart = OnResponseStart;
         stream_callback.onChunk = OnChunk;
         stream_callback.onComplete = OnComplete;
-        StartStreamRequest(client, request, &stream_callback);
+        if (StartStreamRequestV27(
+                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &stream_callback) == 0) {
+            InvokeEngineFailure(&context, "NetworkKMM stream request ABI rejected");
+        }
     } else if (mode == kModeStreamUpload) {
         CurlUploadSource upload_source{};
         upload_source.readRef = &context;
         upload_source.readChunk = ReadUploadChunk;
         upload_source.totalLength = upload_content_length;
         CurlCallback curl_callback{&context, OnComplete};
-        StartUploadRequest(client, request, &upload_source, &curl_callback);
+        if (StartUploadRequestV27(
+                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION,
+                &upload_source, &curl_callback) == 0) {
+            InvokeEngineFailure(&context, "NetworkKMM upload request ABI rejected");
+        }
     } else if (mode == kModeBuffered) {
         CurlCallback curl_callback{&context, OnComplete};
-        StartRequest(client, request, &curl_callback);
+        if (StartRequestV27(
+                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &curl_callback) == 0) {
+            InvokeEngineFailure(&context, "NetworkKMM request ABI rejected");
+        }
     } else {
         InvokeEngineFailure(&context, "unknown Android curl request mode");
     }

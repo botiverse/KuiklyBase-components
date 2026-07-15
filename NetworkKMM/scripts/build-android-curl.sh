@@ -280,5 +280,11 @@ echo "==> Linking libnetworkkmmcurl.so (${ANDROID_ABI})"
   -o "$OUT_ABI_DIR/libnetworkkmmcurl.so"
 "$STRIP" --strip-unneeded "$OUT_ABI_DIR/libnetworkkmmcurl.so"
 
+if ! strings "$OUT_ABI_DIR/libnetworkkmmcurl.so" \
+    | grep -F '[Ljava/lang/String;JJJJJ[BJLjava/lang/String;' >/dev/null; then
+  echo "JNI nativePerform descriptor is missing timeoutMillis + four stream timeout longs" >&2
+  exit 2
+fi
+
 echo "==> Artifact"
 du -h "$OUT_ABI_DIR/libnetworkkmmcurl.so"

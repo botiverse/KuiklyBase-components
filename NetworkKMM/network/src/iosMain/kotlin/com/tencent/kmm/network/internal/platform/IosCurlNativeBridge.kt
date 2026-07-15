@@ -35,9 +35,9 @@ import com.tencent.kmm.network.curl.native.SetCurlCaInfo
 import com.tencent.kmm.network.curl.native.SetCurlHttp3Enabled
 import com.tencent.kmm.network.curl.native.SetCurlProxy
 import com.tencent.kmm.network.curl.native.SetCurlResolve
-import com.tencent.kmm.network.curl.native.StartRequest
-import com.tencent.kmm.network.curl.native.StartStreamRequest
-import com.tencent.kmm.network.curl.native.StartUploadRequest
+import com.tencent.kmm.network.curl.native.StartRequestV27
+import com.tencent.kmm.network.curl.native.StartStreamRequestV27
+import com.tencent.kmm.network.curl.native.StartUploadRequestV27
 import com.tencent.kmm.network.curl.native.StringDic
 import com.tencent.kmm.network.curl.native.StringPair
 import com.tencent.kmm.network.export.VBTransportElapseStatistics
@@ -47,7 +47,6 @@ import kotlinx.atomicfu.locks.synchronized
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.CPointer
-import kotlinx.cinterop.CValue
 import kotlinx.cinterop.ExperimentalForeignApi
 import kotlinx.cinterop.MemScope
 import kotlinx.cinterop.StableRef
@@ -56,13 +55,14 @@ import kotlinx.cinterop.alloc
 import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.asStableRef
 import kotlinx.cinterop.cstr
+import kotlinx.cinterop.convert
 import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.pointed
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.readBytes
-import kotlinx.cinterop.readValue
 import kotlinx.cinterop.set
+import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.staticCFunction
 import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
@@ -158,7 +158,15 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                         callbackRef = callbackContext.stableRef.asCPointer()
                         callback = staticCFunction(::iosCurlComplete)
                     }
-                    StartRequest(handle, nativeRequest, callback.ptr)
+                    check(
+                        StartRequestV27(
+                            handle,
+                            nativeRequest,
+                            sizeOf<CurlRequest>().convert(),
+                            CURL_WRAPPER_ABI_VERSION,
+                            callback.ptr
+                        ) != 0
+                    ) { "iOS curl request ABI rejected" }
                 }
             }
         }
@@ -179,7 +187,15 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                 callback.onResponseStart = staticCFunction(::iosCurlResponseStart)
                 callback.onChunk = staticCFunction(::iosCurlChunk)
                 callback.onComplete = staticCFunction(::iosCurlComplete)
-                StartStreamRequest(handle, nativeRequest, callback.ptr)
+                check(
+                    StartStreamRequestV27(
+                        handle,
+                        nativeRequest,
+                        sizeOf<CurlRequest>().convert(),
+                        CURL_WRAPPER_ABI_VERSION,
+                        callback.ptr
+                    ) != 0
+                ) { "iOS curl stream request ABI rejected" }
             }
         }
     }
@@ -199,7 +215,16 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                     readChunk = staticCFunction(::iosCurlReadUploadChunk)
                     totalLength = request.uploadContentLength ?: -1L
                 }
-                StartUploadRequest(handle, nativeRequest, upload.ptr, callback.ptr)
+                check(
+                    StartUploadRequestV27(
+                        handle,
+                        nativeRequest,
+                        sizeOf<CurlRequest>().convert(),
+                        CURL_WRAPPER_ABI_VERSION,
+                        upload.ptr,
+                        callback.ptr
+                    ) != 0
+                ) { "iOS curl upload request ABI rejected" }
             }
         }
     }
@@ -307,6 +332,10 @@ private class IosCurlCallbackContext(
         "iOS curl callback failed: ${failure.message ?: failure::class.simpleName.orEmpty()}"
     }
 
+    fun onTrampolineFailure(throwable: Throwable) {
+        recordFailure(throwable)
+    }
+
     fun dispose() {
         stableRef.dispose()
     }
@@ -345,7 +374,11 @@ private object IosCurlHandleRegistry : SynchronizedObject() {
 
 @OptIn(ExperimentalForeignApi::class)
 private fun iosCurlComplete(callbackRef: COpaquePointer?, response: CPointer<CurlResponse>?) {
-    callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onComplete(response)
+    try {
+        callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onComplete(response)
+    } catch (throwable: Throwable) {
+        recordIosTrampolineFailure(callbackRef, throwable)
+    }
 }
 
 @OptIn(ExperimentalForeignApi::class)
@@ -355,16 +388,24 @@ private fun iosCurlResponseStart(
     headers: CPointer<ByteVar>?,
     headerLength: Int
 ) {
-    callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onResponseStart(
-        httpCode = httpCode,
-        headers = headers.readUtf8(headerLength)
-    )
+    try {
+        callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onResponseStart(
+            httpCode = httpCode,
+            headers = headers.readUtf8(headerLength)
+        )
+    } catch (throwable: Throwable) {
+        recordIosTrampolineFailure(callbackRef, throwable)
+    }
 }
 
 @OptIn(ExperimentalForeignApi::class)
 private fun iosCurlChunk(callbackRef: COpaquePointer?, data: CPointer<ByteVar>?, length: Int) {
-    if (length <= 0 || data == null) return
-    callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onChunk(data.readBytes(length))
+    try {
+        if (length <= 0 || data == null) return
+        callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onChunk(data.readBytes(length))
+    } catch (throwable: Throwable) {
+        recordIosTrampolineFailure(callbackRef, throwable)
+    }
 }
 
 @OptIn(ExperimentalForeignApi::class)
@@ -373,21 +414,36 @@ private fun iosCurlReadUploadChunk(
     buffer: CPointer<ByteVar>?,
     maxLength: Int
 ): Int {
-    if (buffer == null || maxLength <= 0) return 0
-    val context = callbackRef?.asStableRef<IosCurlCallbackContext>()?.get() ?: return -1
-    val bytes = context.readUploadChunk(maxLength) ?: return -1
-    if (bytes.isEmpty()) return 0
-    val count = minOf(bytes.size, maxLength)
-    for (index in 0 until count) {
-        buffer[index] = bytes[index]
+    return try {
+        if (buffer == null || maxLength <= 0) return 0
+        val context = callbackRef?.asStableRef<IosCurlCallbackContext>()?.get() ?: return -1
+        val bytes = context.readUploadChunk(maxLength) ?: return -1
+        if (bytes.isEmpty()) return 0
+        val count = minOf(bytes.size, maxLength)
+        for (index in 0 until count) {
+            buffer[index] = bytes[index]
+        }
+        count
+    } catch (throwable: Throwable) {
+        recordIosTrampolineFailure(callbackRef, throwable)
+        -1
     }
-    return count
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun recordIosTrampolineFailure(callbackRef: COpaquePointer?, throwable: Throwable) {
+    try {
+        callbackRef?.asStableRef<IosCurlCallbackContext>()?.get()?.onTrampolineFailure(throwable)
+    } catch (_: Throwable) {
+        // A corrupt/expired callback ref cannot be diagnosed safely, but no
+        // Kotlin exception may cross the C callback boundary.
+    }
 }
 
 @OptIn(ExperimentalForeignApi::class)
 private fun <T> withCurlRequest(
     request: IosCurlNativeRequest,
-    block: MemScope.(CValue<CurlRequest>) -> T
+    block: MemScope.(CPointer<CurlRequest>) -> T
 ): T = memScoped {
     val entries = request.headers.entries.toList()
     val pairs = entries.takeIf { it.isNotEmpty() }?.let { allocArray<StringPair>(it.size) }
@@ -414,11 +470,11 @@ private fun <T> withCurlRequest(
     }
     val body = request.body
     if (body == null || body.isEmpty()) {
-        block(nativeRequest.readValue())
+        block(nativeRequest.ptr)
     } else {
         body.usePinned { pinned ->
             nativeRequest.postBody = pinned.addressOf(0)
-            block(nativeRequest.readValue())
+            block(nativeRequest.ptr)
         }
     }
 }

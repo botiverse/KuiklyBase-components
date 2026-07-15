@@ -37,6 +37,7 @@ import com.tencent.kmm.network.export.cancel
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.export.toNetworkHttpProtocol
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Deferred
@@ -50,6 +51,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
 import kotlin.coroutines.resume
@@ -158,8 +160,10 @@ class NetworkCall internal constructor(
     private val completion = CompletableDeferred<NetworkResponse>()
     private val stateLock = SynchronizedObject()
     private val cancelHandlers = mutableListOf<() -> Unit>()
+    private val completionHandlers = mutableListOf<(NetworkResponse) -> Unit>()
     private var job: Job? = null
     private var cancelled = false
+    private var terminalResponse: NetworkResponse? = null
     private var resolvedEngine: ResolvedNetworkEngine? = null
     private var engineSelectionReported = false
 
@@ -168,7 +172,9 @@ class NetworkCall internal constructor(
 
     internal fun attachJob(job: Job) {
         val cancelNow = synchronized(stateLock) {
-            this.job = job
+            if (terminalResponse == null) {
+                this.job = job
+            }
             cancelled
         }
         if (cancelNow) {
@@ -193,20 +199,45 @@ class NetworkCall internal constructor(
     internal fun addCancelHandler(handler: () -> Unit) {
         val invokeNow = synchronized(stateLock) {
             if (cancelled) true
+            else if (terminalResponse != null) false
             else {
                 cancelHandlers.add(handler)
                 false
             }
         }
         if (invokeNow) {
-            handler()
+            try {
+                handler()
+            } catch (_: Throwable) {
+                // Late registration must not re-open or escape cancellation.
+            }
         }
     }
 
-    internal fun complete(response: NetworkResponse) {
-        if (!completion.isCompleted) {
-            completion.complete(response)
+    internal fun addCompletionHandler(handler: (NetworkResponse) -> Unit) {
+        val completed = synchronized(stateLock) {
+            val terminal = terminalResponse
+            if (terminal == null) {
+                completionHandlers += handler
+            }
+            terminal
         }
+        if (completed != null) {
+            invokeCompletionHandler(handler, completed)
+        }
+    }
+
+    internal fun tryComplete(response: NetworkResponse): Boolean {
+        val handlers = synchronized(stateLock) {
+            if (terminalResponse != null) return false
+            terminalResponse = response
+            job = null
+            cancelHandlers.clear()
+            completionHandlers.toList().also { completionHandlers.clear() }
+        }
+        completion.complete(response)
+        handlers.forEach { handler -> invokeCompletionHandler(handler, response) }
+        return true
     }
 
     internal fun getOrResolveEngine(resolve: () -> ResolvedNetworkEngine): ResolvedNetworkEngine {
@@ -227,36 +258,53 @@ class NetworkCall internal constructor(
 
     fun cancel() {
         val cancellation = synchronized(stateLock) {
-            if (cancelled) {
+            if (terminalResponse != null) {
                 null
             } else {
                 cancelled = true
                 val handlers = cancelHandlers.toList()
                 cancelHandlers.clear()
-                handlers to job
+                val callbacks = completionHandlers.toList()
+                completionHandlers.clear()
+                val response = cancelledResponse(originalRequest)
+                terminalResponse = response
+                val attachedJob = job
+                job = null
+                CancellationDelivery(handlers, attachedJob, callbacks, response)
             }
         } ?: return
         originalRequest.body.cancel()
-        cancellation.first.forEach { handler ->
+        cancellation.cancelHandlers.forEach { handler ->
             try {
                 handler()
             } catch (_: Throwable) {
                 // Cancellation must continue to every registered owner.
             }
         }
-        cancellation.second?.cancel()
-        if (!completion.isCompleted) {
-            completion.complete(
-                NetworkResponse(
-                    request = originalRequest,
-                    statusCode = null,
-                    headers = emptyMap(),
-                    body = NetworkResponseBody(),
-                    error = NetworkError(NetworkErrorKind.CANCELLED, "Request has been cancelled")
-                )
-            )
+        cancellation.job?.cancel()
+        completion.complete(cancellation.response)
+        cancellation.completionHandlers.forEach { handler ->
+            invokeCompletionHandler(handler, cancellation.response)
         }
     }
+
+    private fun invokeCompletionHandler(
+        handler: (NetworkResponse) -> Unit,
+        response: NetworkResponse
+    ) {
+        try {
+            handler(response)
+        } catch (_: Throwable) {
+            // One terminal observer must not suppress delivery to the others.
+        }
+    }
+
+    private data class CancellationDelivery(
+        val cancelHandlers: List<() -> Unit>,
+        val job: Job?,
+        val completionHandlers: List<(NetworkResponse) -> Unit>,
+        val response: NetworkResponse
+    )
 }
 
 class NetworkClient(
@@ -275,12 +323,16 @@ class NetworkClient(
         callback: (NetworkResponse) -> Unit
     ): NetworkCall {
         val call = NetworkCall(request)
+        call.addCompletionHandler(callback)
         val policy = selectPolicy(request)
         val job = scope.launch(dispatcherFor(policy.dispatcher)) {
-            call.markClientStarted()
-            val response = call.applyClientTiming(executeInternal(request.copyMutable(), call, policy))
-            call.complete(response)
-            callback(response)
+            val response = try {
+                call.markClientStarted()
+                call.applyClientTiming(executeInternal(request.copyMutable(), call, policy))
+            } catch (throwable: Throwable) {
+                workerFailureResponse(request, throwable)
+            }
+            call.tryComplete(response)
         }
         call.attachJob(job)
         return call
@@ -312,23 +364,25 @@ class NetworkClient(
         onComplete: (NetworkResponse) -> Unit
     ): NetworkCall {
         val call = NetworkCall(request)
+        call.addCompletionHandler(onComplete)
         val policy = selectPolicy(request)
         val job = scope.launch(dispatcherFor(policy.dispatcher)) {
-            var prepared = request.copyMutable()
-            config.requestMiddlewares.forEach { middleware ->
-                prepared = middleware.prepare(prepared)
+            val response = try {
+                var prepared = request.copyMutable()
+                config.requestMiddlewares.forEach { middleware ->
+                    prepared = middleware.prepare(prepared)
+                }
+                prepared.policy = policy
+                applyCurrentAuthToken(prepared)
+                if (call.isCancelled) {
+                    cancelledResponse(prepared)
+                } else {
+                    engine.downloadStream(prepared, call, onResponseStart, onChunk)
+                }
+            } catch (throwable: Throwable) {
+                workerFailureResponse(request, throwable)
             }
-            prepared.policy = policy
-            applyCurrentAuthToken(prepared)
-            if (call.isCancelled) {
-                val cancelled = cancelledResponse(prepared)
-                call.complete(cancelled)
-                onComplete(cancelled)
-                return@launch
-            }
-            val response = engine.downloadStream(prepared, call, onResponseStart, onChunk)
-            call.complete(response)
-            onComplete(response)
+            call.tryComplete(response)
         }
         call.attachJob(job)
         return call
@@ -565,6 +619,12 @@ object VBTransportNetworkEngine : NetworkEngine {
             curlProxyUrl = preparedCurlProxyUrl(request)
             curlHttp3Enabled = preparedCurlHttp3Enabled(request)
         }
+        val transportCancelArmed = atomic(true)
+        fun cancelTransportOnce() {
+            if (transportCancelArmed.compareAndSet(expect = true, update = false)) {
+                VBTransportService.cancel(vbRequest.requestId)
+            }
+        }
         VBTransportService.streamRequest(
             vbRequest,
             onResponseStart = { rawStatus, headers ->
@@ -575,18 +635,15 @@ object VBTransportNetworkEngine : NetworkEngine {
             },
             onChunk = onChunk
         ) { response ->
+            transportCancelArmed.value = false
             if (continuation.isActive) {
                 // Preserve the existing VBTransport streaming completion
                 // response exactly; callers already treat it as body-less.
                 continuation.resume(response.toNetworkResponse(request))
             }
         }
-        call.addCancelHandler {
-            VBTransportService.cancel(vbRequest.requestId)
-        }
-        continuation.invokeOnCancellation {
-            VBTransportService.cancel(vbRequest.requestId)
-        }
+        call.addCancelHandler(::cancelTransportOnce)
+        continuation.invokeOnCancellation { cancelTransportOnce() }
     }
 
     private suspend fun executeStreaming(
@@ -803,5 +860,21 @@ private fun cancelledResponse(request: NetworkRequest): NetworkResponse {
         headers = emptyMap(),
         body = NetworkResponseBody(),
         error = NetworkError(NetworkErrorKind.CANCELLED, "Request has been cancelled")
+    )
+}
+
+private fun workerFailureResponse(request: NetworkRequest, throwable: Throwable): NetworkResponse {
+    if (throwable is CancellationException) {
+        return cancelledResponse(request)
+    }
+    return NetworkResponse(
+        request = request,
+        statusCode = null,
+        headers = emptyMap(),
+        body = NetworkResponseBody(),
+        error = NetworkError(
+            NetworkErrorKind.UNKNOWN,
+            throwable.message ?: "Network worker failed"
+        )
     )
 }

@@ -40,9 +40,9 @@ import com.tencent.qqlive.kmm.native.libcurl.SetCurlHttp3Enabled
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlProxy
 import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlUploadSource
-import com.tencent.qqlive.kmm.native.libcurl.StartRequest
-import com.tencent.qqlive.kmm.native.libcurl.StartStreamRequest
-import com.tencent.qqlive.kmm.native.libcurl.StartUploadRequest
+import com.tencent.qqlive.kmm.native.libcurl.StartRequestV27
+import com.tencent.qqlive.kmm.native.libcurl.StartStreamRequestV27
+import com.tencent.qqlive.kmm.native.libcurl.StartUploadRequestV27
 import com.tencent.qqlive.kmm.native.libcurl.StringDic
 import com.tencent.qqlive.kmm.native.libcurl.StringPair
 import com.tencent.qqlive.kmm.native.libcurl.setCurlLogImpl
@@ -67,14 +67,12 @@ import kotlinx.cinterop.CFunction
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.CPointed
 import kotlinx.cinterop.CPointer
-import kotlinx.cinterop.CValue
 import kotlinx.cinterop.MemScope
 import kotlinx.cinterop.StableRef
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.asStableRef
-import kotlinx.cinterop.cValue
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.cstr
 import kotlinx.cinterop.get
@@ -84,6 +82,7 @@ import kotlinx.cinterop.pointed
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.readBytes
 import kotlinx.cinterop.staticCFunction
+import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
 import platform.posix.int8_tVar
@@ -128,7 +127,9 @@ private fun toSafeString(content: CPointer<ByteVar>?): String {
 // Curl 鸿蒙平台实现
 object CurlRequestServiceHM : ICurlRequestService {
 
-    private val nativeHandles = CancellationAwareRegistry<Int, CPointer<out CPointed>>()
+    private val nativeHandles = CancellationAwareRegistry<Int, CPointer<out CPointed>>(
+        rememberCancellationWithoutBegin = true
+    )
 
     private fun configureCurlRuntime(
         handle: CPointer<out CPointed>?,
@@ -227,8 +228,8 @@ object CurlRequestServiceHM : ICurlRequestService {
         headers: StringDic,
         memScope: MemScope,
         logTag: String
-    ): CValue<CurlRequest> {
-        return cValue<CurlRequest> {
+    ): CPointer<CurlRequest> {
+        return memScope.alloc<CurlRequest> {
             this.url = toCSTR(request.url, memScope)
             this.method = toCSTR(request.method.name, memScope)
             this.headers = headers.ptr
@@ -264,7 +265,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                             "size: ${postBodyLen}, data: $strData")
                 }
             }
-        }
+        }.ptr
     }
 
     override fun get(
@@ -398,8 +399,10 @@ object CurlRequestServiceHM : ICurlRequestService {
             val headers = toStringDic(buildRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
             var nativeResponse = CurlNativeResponse()
-            val handle = checkNotNull(CreateCurlClient(logTag)) {
-                "CreateCurlClient failed"
+            nativeHandles.begin(request.requestId)
+            val handle = CreateCurlClient(logTag) ?: run {
+                nativeHandles.remove(request.requestId)
+                error("CreateCurlClient failed")
             }
             try {
                 configureCurlRuntime(handle, request)
@@ -416,7 +419,15 @@ object CurlRequestServiceHM : ICurlRequestService {
                 val callbackWrapper = CurlCallbackWrapper(callback)
                 try {
                     publishNativeHandle(request.requestId, handle, logTag)
-                    StartRequest(handle, curlRequest, callbackWrapper.getCallbackNativePtr())
+                    check(
+                        StartRequestV27(
+                            handle,
+                            curlRequest,
+                            sizeOf<CurlRequest>().convert(),
+                            CURL_WRAPPER_ABI_VERSION,
+                            callbackWrapper.getCallbackNativePtr()
+                        ) != 0
+                    ) { "OHOS curl request ABI rejected" }
                 } finally {
                     callbackWrapper.release()
                 }
@@ -507,8 +518,10 @@ object CurlRequestServiceHM : ICurlRequestService {
             // gzip here (chunks would arrive compressed and undecodable).
             val headers = toStringDic(buildStreamRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
-            val handle = checkNotNull(CreateCurlClient(logTag)) {
-                "CreateCurlClient failed"
+            nativeHandles.begin(request.requestId)
+            val handle = CreateCurlClient(logTag) ?: run {
+                nativeHandles.remove(request.requestId)
+                error("CreateCurlClient failed")
             }
             try {
                 configureCurlRuntime(handle, request)
@@ -552,7 +565,15 @@ object CurlRequestServiceHM : ICurlRequestService {
                 val wrapper = CurlStreamCallbackWrapper(handler)
                 try {
                     publishNativeHandle(request.requestId, handle, logTag)
-                    StartStreamRequest(handle, curlRequest, wrapper.getCallbackNativePtr())
+                    check(
+                        StartStreamRequestV27(
+                            handle,
+                            curlRequest,
+                            sizeOf<CurlRequest>().convert(),
+                            CURL_WRAPPER_ABI_VERSION,
+                            wrapper.getCallbackNativePtr()
+                        ) != 0
+                    ) { "OHOS curl stream request ABI rejected" }
                 } finally {
                     wrapper.release()
                 }
@@ -612,8 +633,10 @@ object CurlRequestServiceHM : ICurlRequestService {
                 val headers = toStringDic(buildRequestHeader(request), memScope)
                 val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
                 var nativeResponse = CurlNativeResponse()
-                val handle = checkNotNull(CreateCurlClient(logTag)) {
-                    "CreateCurlClient failed"
+                nativeHandles.begin(request.requestId)
+                val handle = CreateCurlClient(logTag) ?: run {
+                    nativeHandles.remove(request.requestId)
+                    error("CreateCurlClient failed")
                 }
                 try {
                     configureCurlRuntime(handle, request)
@@ -636,7 +659,16 @@ object CurlRequestServiceHM : ICurlRequestService {
                         publishNativeHandle(request.requestId, handle, logTag)
                         logI("[$logTag] upload-stream id:${request.requestId}, " +
                                 "handle:${handle}, contentLength:${contentLength ?: -1}")
-                        StartUploadRequest(handle, curlRequest, source.ptr, callbackWrapper.getCallbackNativePtr())
+                        check(
+                            StartUploadRequestV27(
+                                handle,
+                                curlRequest,
+                                sizeOf<CurlRequest>().convert(),
+                                CURL_WRAPPER_ABI_VERSION,
+                                source.ptr,
+                                callbackWrapper.getCallbackNativePtr()
+                            ) != 0
+                        ) { "OHOS curl upload request ABI rejected" }
                     } finally {
                         bridgeRef.dispose()
                         callbackWrapper.release()

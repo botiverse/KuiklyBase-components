@@ -19,14 +19,27 @@ import kotlinx.atomicfu.locks.synchronized
  * native owner can pair [cancelOrRemember] with [removeIfSame] and guarantee that
  * cancellation never dereferences a value concurrently with its deletion.
  */
-internal class CancellationAwareRegistry<K, V> {
+internal class CancellationAwareRegistry<K, V>(
+    private val rememberCancellationWithoutBegin: Boolean = false
+) {
     private val lock = SynchronizedObject()
     private val values = mutableMapOf<K, V>()
     private val cancellationTombstones = mutableSetOf<K>()
+    private val activeKeys = mutableSetOf<K>()
+
+    /** Marks a new logical owner before its value is published. */
+    fun begin(key: K) = synchronized(lock) {
+        activeKeys += key
+        if (!rememberCancellationWithoutBegin) {
+            cancellationTombstones.remove(key)
+        }
+    }
 
     /** Returns false when a pre-publication cancellation tombstone was consumed. */
     fun publish(key: K, value: V): Boolean = synchronized(lock) {
+        activeKeys += key
         if (cancellationTombstones.remove(key)) {
+            activeKeys.remove(key)
             false
         } else {
             values[key] = value
@@ -49,13 +62,19 @@ internal class CancellationAwareRegistry<K, V> {
         onPublished: (V) -> Unit
     ): Boolean = synchronized(lock) {
         val value = values[key]
-        if (value == null) {
+        if (value == null && (key in activeKeys || rememberCancellationWithoutBegin)) {
             cancellationTombstones += key
+            false
+        } else if (value == null) {
+            // A late/duplicate cancel after terminal removal is not a future
+            // owner's cancellation. Only begin() opens a pre-publish window.
             false
         } else {
             onPublished(value)
             if (removePublished && values[key] == value) {
                 values.remove(key)
+                activeKeys.remove(key)
+                cancellationTombstones.remove(key)
             }
             true
         }
@@ -70,10 +89,16 @@ internal class CancellationAwareRegistry<K, V> {
             false
         } else {
             values.remove(key)
+            activeKeys.remove(key)
+            cancellationTombstones.remove(key)
             onRemoved(value)
             true
         }
     }
 
-    fun remove(key: K): V? = synchronized(lock) { values.remove(key) }
+    fun remove(key: K): V? = synchronized(lock) {
+        activeKeys.remove(key)
+        cancellationTombstones.remove(key)
+        values.remove(key)
+    }
 }

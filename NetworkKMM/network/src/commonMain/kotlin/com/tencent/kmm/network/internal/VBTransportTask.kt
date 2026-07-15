@@ -101,19 +101,20 @@ class VBTransportTask(
         response: VBTransportBaseResponse,
         handler: ((response: VBTransportBaseResponse) -> Unit)?
     ) {
-        handler?.let {
-            if (isCanceledOrRemoved()) {
-                logI("execute() request task is canceled")
-                response.errorCode = VBTransportResultCode.CODE_CANCELED
-                response.errorMessage = "Request has been canceled"
-                logI("execute() invoke failHandler，task has been canceled")
+        try {
+            handler?.let {
+                if (isCanceledOrRemoved()) {
+                    logI("execute() request task is canceled")
+                    response.errorCode = VBTransportResultCode.CODE_CANCELED
+                    response.errorMessage = "Request has been canceled"
+                    logI("execute() invoke failHandler，task has been canceled")
+                }
                 it(response)
-                return@let
+            } ?: run {
+                logI("handler is null!")
             }
-            it(response)
-            taskManager.onTaskFinish(requestId)
-        } ?: run {
-            logI("handler is null!")
+        } finally {
+            taskManager.onTaskFinish(this)
         }
     }
 
@@ -310,7 +311,9 @@ class VBTransportTask(
                 return
             }
             if (state.compareAndSet(current, VBTransportState.Canceled)) {
-                getIVBTransportService().cancel(requestId)
+                if (current == VBTransportState.Running) {
+                    getIVBTransportService().cancel(requestId)
+                }
                 return
             }
         }
