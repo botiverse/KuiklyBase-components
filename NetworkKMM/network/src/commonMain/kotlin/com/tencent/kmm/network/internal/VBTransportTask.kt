@@ -63,6 +63,7 @@ class VBTransportTask(
     internal var platformCancel: (Int) -> Unit = { requestId ->
         getIVBTransportService().cancel(requestId)
     }
+    internal var afterRunningPreparedForTest: (() -> Unit)? = null
 
     private fun finishCanceledBeforeStart(
         response: VBTransportBaseResponse,
@@ -243,6 +244,7 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapResponse(handler))
             return
         }
+        afterRunningPreparedForTest?.invoke()
         val gate = StreamCallbackGate(
             onStart = onResponseStart,
             onChunk = onChunk,
@@ -265,6 +267,9 @@ class VBTransportTask(
         )
         streamGate.value = gate
         if (state.value == VBTransportState.Canceled) {
+            // cancel() recorded a pre-publish platform cancellation, but this
+            // request will never enter platform code to consume it.
+            platformAbortPrepared(requestId)
             gate.complete(cancelledStreamResponse(request))
             return
         }

@@ -46,6 +46,28 @@ class VBTransportStreamTaskTest {
     }
 
     @Test
+    fun cancelAfterPrepareBeforeGateAbortsUnusedPlatformReservation() {
+        val task = registeredTask(991_004)
+        val terminals = mutableListOf<Int>()
+        var aborts = 0
+        var platformEntries = 0
+        task.platformPrepare = { true }
+        task.platformCancel = {}
+        task.platformAbortPrepared = { aborts++ }
+        task.afterRunningPreparedForTest = { task.cancel() }
+        task.platformRequestStream = { _, _, _, _ -> platformEntries++ }
+
+        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) { response ->
+            terminals += response.errorCode
+        }
+
+        assertEquals(listOf(VBTransportResultCode.CODE_CANCELED), terminals)
+        assertEquals(1, aborts)
+        assertEquals(0, platformEntries)
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(task.requestId))
+    }
+
+    @Test
     fun midstreamCancelWinsOnceAndSuppressesLateChunkAndSuccess() {
         val task = registeredTask(991_002)
         var start: ((Int, Map<String, List<String>>) -> Unit)? = null
@@ -84,10 +106,9 @@ class VBTransportStreamTaskTest {
         val events = mutableListOf<String>()
         task.platformPrepare = { true }
         task.platformCancel = { events += "cancel" }
-        task.platformRequestStream = { _, onStart, onChunk, onComplete ->
+        task.platformRequestStream = { _, onStart, onChunk, _ ->
             onStart(200, emptyMap())
             onChunk(byteArrayOf(1))
-            onComplete(VBTransportResponse())
         }
 
         task.streamRequest(VBTransportRequest(), { _, _ -> error("consumer start failed") }, {

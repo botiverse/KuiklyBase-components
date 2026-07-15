@@ -80,7 +80,13 @@ internal class IosCurlNetworkEngine(
         ) {
             return unsupportedStreamingRequestBodyResponse(request)
         }
-        networkUploadStreamSourceOrNull(request)?.let { source ->
+        val streamingSource = try {
+            networkUploadStreamSourceOrNull(request)
+        } catch (throwable: Throwable) {
+            runCatching { call.cancelBodyOnce(request.body) }
+            throw throwable
+        }
+        streamingSource?.let { source ->
             return executeUpload(request, call, source)
         }
         val body = request.body.toBytes(request.progress.uploadProgress)
@@ -95,14 +101,19 @@ internal class IosCurlNetworkEngine(
         }
         val owner = Any()
         val requestId = iosCurlRequestOwners.reserve(owner)
-        val nativeRequest = request.toNativeRequest(
-            requestId = requestId,
-            body = body.bytes,
-            contentType = body.contentType
-        )
+        val nativeRequest = try {
+            request.toNativeRequest(
+                requestId = requestId,
+                body = body.bytes,
+                contentType = body.contentType
+            )
+        } catch (throwable: Throwable) {
+            iosCurlRequestOwners.release(requestId, owner)
+            throw throwable
+        }
         call.addCancelHandler {
             nativeRequest.cancel()
-            if (iosCurlRequestOwners.isOwner(requestId, owner)) bridge.cancel(requestId)
+            iosCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
         }
         if (call.isCancelled) {
             iosCurlRequestOwners.release(requestId, owner)
@@ -125,12 +136,17 @@ internal class IosCurlNetworkEngine(
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         val owner = Any()
         val requestId = iosCurlRequestOwners.reserve(owner)
-        val nativeRequest = request.toNativeRequest(requestId = requestId)
+        val nativeRequest = try {
+            request.toNativeRequest(requestId = requestId)
+        } catch (throwable: Throwable) {
+            iosCurlRequestOwners.release(requestId, owner)
+            throw throwable
+        }
         var transferred = 0L
         var responseLength: Long? = null
         call.addCancelHandler {
             nativeRequest.cancel()
-            if (iosCurlRequestOwners.isOwner(requestId, owner)) bridge.cancel(requestId)
+            iosCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
         }
         if (call.isCancelled) {
             iosCurlRequestOwners.release(requestId, owner)
@@ -169,11 +185,19 @@ internal class IosCurlNetworkEngine(
         val owner = Any()
         val requestId = iosCurlRequestOwners.reserve(owner)
         val pullBridge = IosCurlUploadPullBridge()
-        val nativeRequest = request.toNativeRequest(
-            requestId = requestId,
-            contentType = source.contentType,
-            uploadContentLength = source.contentLength
-        )
+        val nativeRequest = try {
+            request.toNativeRequest(
+                requestId = requestId,
+                contentType = source.contentType,
+                uploadContentLength = source.contentLength
+            )
+        } catch (throwable: Throwable) {
+            iosCurlRequestOwners.release(requestId, owner)
+            runCatching { call.cancelRequestBodyOnce() }
+            runCatching { call.cancelBodyOnce(request.body) }
+            runCatching { source.stream.cancel() }
+            throw throwable
+        }
         val writer = launch(IosCurlExecutionDispatchers.uploadWriter) {
             try {
                 source.stream.readChunks(object : NetworkByteStreamSink {
@@ -196,7 +220,7 @@ internal class IosCurlNetworkEngine(
                 pullBridge.closeFailure(CancellationException("Upload cancelled"))
             },
             cancelTransport = {
-                if (iosCurlRequestOwners.isOwner(requestId, owner)) bridge.cancel(requestId)
+                iosCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
             }
         )
         call.addCancelHandler(cancellationOwners::cancelAll)
@@ -219,7 +243,12 @@ internal class IosCurlNetworkEngine(
                     }
                 }
             }
-            bridge.uploadStream(nativeRequest, uploadSource).toNetworkResponse(request)
+            val response = bridge.uploadStream(nativeRequest, uploadSource).toNetworkResponse(request)
+            if (response.error != null) cancellationOwners.releaseBodyOwnersOnFailure()
+            response
+        } catch (throwable: Throwable) {
+            cancellationOwners.releaseBodyOwnersOnFailure()
+            throw throwable
         } finally {
             cancellationOwners.disarmNativeTransportOwners()
             iosCurlRequestOwners.release(requestId, owner)

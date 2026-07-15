@@ -28,6 +28,15 @@ internal class RequestIdOwnerRegistry {
     fun isOwner(requestId: Int, owner: Any): Boolean =
         synchronized(lock) { owners[requestId] === owner }
 
+    fun cancelIfOwner(requestId: Int, owner: Any, cancel: () -> Unit): Boolean =
+        synchronized(lock) {
+            if (owners[requestId] !== owner) false
+            else {
+                cancel()
+                true
+            }
+        }
+
     fun release(requestId: Int, owner: Any) {
         synchronized(lock) {
             if (owners[requestId] === owner) owners.remove(requestId)

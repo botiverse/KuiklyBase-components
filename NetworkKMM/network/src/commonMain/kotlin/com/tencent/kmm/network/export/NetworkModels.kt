@@ -672,6 +672,7 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                             try {
                                 stream.readChunks(sink)
                             } catch (throwable: Throwable) {
+                                body.cancel()
                                 stream.cancel()
                                 throw throwable
                             } finally {

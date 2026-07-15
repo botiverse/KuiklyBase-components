@@ -170,6 +170,7 @@ class NetworkCall internal constructor(
     private var cancelled = false
     private val cancelledBodies = mutableListOf<NetworkBody>()
     private val ownedBodies = mutableListOf<NetworkBody>()
+    private val progressGatedRequests = mutableListOf<NetworkRequest>()
     private var terminalResponse: NetworkResponse? = null
     private var resolvedEngine: ResolvedNetworkEngine? = null
     private var engineSelectionReported = false
@@ -269,6 +270,27 @@ class NetworkCall internal constructor(
         }
     }
 
+    internal fun gateProgressCallbacks(request: NetworkRequest) {
+        val shouldGate = synchronized(stateLock) {
+            if (progressGatedRequests.any { it === request }) false
+            else {
+                progressGatedRequests += request
+                true
+            }
+        }
+        if (!shouldGate) return
+        val upload = request.progress.uploadProgress
+        val download = request.progress.downloadProgress
+        request.progress = com.tencent.kmm.network.export.NetworkProgressCallbacks(
+            uploadProgress = upload?.let { callback ->
+                { progress -> runWhileActive { callback(progress) } }
+            },
+            downloadProgress = download?.let { callback ->
+                { progress -> runWhileActive { callback(progress) } }
+            },
+        )
+    }
+
     internal var beforeActiveCallbackActionForTest: (() -> Unit)? = null
 
     /**
@@ -331,6 +353,10 @@ class NetworkCall internal constructor(
             }
         }
         addCancelHandler { cancelBodyOnce(body) }
+    }
+
+    internal fun ownCurrentBody(body: () -> NetworkBody) {
+        addCancelHandler { cancelBodyOnce(body()) }
     }
 
     internal fun cancelOwnedBodies() {
@@ -455,6 +481,7 @@ class NetworkClient(
                 var prepared = request.copyMutable()
                 try {
                     config.requestMiddlewares.forEach { middleware ->
+                        call.ownCurrentBody { prepared.body }
                         prepared = middleware.prepare(prepared)
                         call.ownBody(prepared.body)
                     }
@@ -463,7 +490,7 @@ class NetworkClient(
                     call.cancelOwnedBodies()
                     throw throwable
                 }
-                gateProgressCallbacks(prepared, call)
+                call.gateProgressCallbacks(prepared)
                 prepared.policy = policy
                 applyCurrentAuthToken(prepared)
                 if (call.isCancelled) {
@@ -506,6 +533,7 @@ class NetworkClient(
         var prepared = request
         try {
             config.requestMiddlewares.forEach { middleware ->
+                call.ownCurrentBody { prepared.body }
                 prepared = middleware.prepare(prepared)
                 call.ownBody(prepared.body)
             }
@@ -514,7 +542,7 @@ class NetworkClient(
             call.cancelOwnedBodies()
             throw throwable
         }
-        gateProgressCallbacks(prepared, call)
+        call.gateProgressCallbacks(prepared)
         prepared.policy = policy
         applyCurrentAuthToken(prepared)
         call.markRequestPrepared(preparationStartedAt)
@@ -677,8 +705,14 @@ object VBTransportNetworkEngine : NetworkEngine {
         // on platforms whose transport supports it; everything else (and every
         // body on non-streaming platforms) keeps the buffered path below.
         if (capabilities.requestBodyStreaming) {
-            networkUploadStreamSourceOrNull(request)?.let { source ->
-                return executeStreaming(request, call, source)
+            val source = try {
+                networkUploadStreamSourceOrNull(request)
+            } catch (throwable: Throwable) {
+                runCatching { call.cancelBodyOnce(request.body) }
+                throw throwable
+            }
+            source?.let {
+                return executeStreaming(request, call, it)
             }
         }
         val bodyBytes = request.body.toBytes(request.progress.uploadProgress)
@@ -823,7 +857,9 @@ object VBTransportNetworkEngine : NetworkEngine {
             VBTransportService.uploadStream(vbRequest, source.contentLength, writeBody) { response ->
                 cancellationOwners.disarmTransport()
                 if (continuation.isActive) {
-                    continuation.resume(response.toNetworkResponse(request))
+                    val mapped = response.toNetworkResponse(request)
+                    if (mapped.error != null) cancellationOwners.releaseBodyOwnersOnFailure()
+                    continuation.resume(mapped)
                 }
             }
             call.addCancelHandler(cancellationOwners::cancelAll)
@@ -876,19 +912,6 @@ internal fun NetworkBody.hasPotentialStreamingSource(): Boolean = when (this) {
     else -> false
 }
 
-private fun gateProgressCallbacks(request: NetworkRequest, call: NetworkCall) {
-    val upload = request.progress.uploadProgress
-    val download = request.progress.downloadProgress
-    request.progress = com.tencent.kmm.network.export.NetworkProgressCallbacks(
-        uploadProgress = upload?.let { callback ->
-            { progress -> call.runWhileActive { callback(progress) } }
-        },
-        downloadProgress = download?.let { callback ->
-            { progress -> call.runWhileActive { callback(progress) } }
-        },
-    )
-}
-
 internal class StreamingUploadCancellationOwners(
     private val cancelOriginalRequestBody: () -> Unit,
     private val cancelPreparedRequestBody: () -> Unit,
@@ -917,6 +940,12 @@ internal class StreamingUploadCancellationOwners(
         transportArmed.value = false
     }
 
+    fun releaseBodyOwnersOnFailure() {
+        cancelOnce(originalRequestBodyArmed, cancelOriginalRequestBody)
+        cancelOnce(preparedRequestBodyArmed, cancelPreparedRequestBody)
+        cancelDerivedSource?.let { cancelOnce(derivedSourceArmed, it) }
+    }
+
     fun disarmNativeTransportOwners() {
         nativeRequestArmed.value = false
         pullBridgeArmed.value = false
@@ -939,6 +968,7 @@ private class RealNetworkInterceptorChain(
 ) : NetworkInterceptorChain {
     override suspend fun proceed(request: NetworkRequest): NetworkResponse {
         if (index >= interceptors.size) {
+            call.gateProgressCallbacks(request)
             return engine.execute(request, call)
         }
         return interceptors[index].intercept(

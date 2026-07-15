@@ -270,7 +270,6 @@ class NetworkClientP1Test {
     fun middlewareReplacementBodyIsOwnedBeforeEngineEntry() = runBlocking {
         var originalCancels = 0
         var replacementCancels = 0
-        val replacementCancelled = CompletableDeferred<Unit>()
         var engineCalls = 0
         val replacementInstalled = CompletableDeferred<Unit>()
         val blockAfterReplacement = CompletableDeferred<Unit>()
@@ -288,7 +287,6 @@ class NetworkClientP1Test {
                             body = NetworkBody.Stream(
                                 NetworkByteStream.fromChunks(cancelBlock = {
                                     replacementCancels++
-                                    replacementCancelled.complete(Unit)
                                     error("replacement cancel failed")
                                 }) {}
                             )
@@ -317,7 +315,6 @@ class NetworkClientP1Test {
         parent.cancel()
 
         assertEquals(NetworkErrorKind.CANCELLED, call.await().error?.kind)
-        replacementCancelled.await()
         assertEquals(1, originalCancels)
         assertEquals(1, replacementCancels)
         assertEquals(0, engineCalls)
@@ -775,6 +772,94 @@ class NetworkClientP1Test {
 
         assertEquals(NetworkErrorKind.CANCELLED, response.error?.kind)
         assertEquals(0, progressCalls)
+    }
+
+    @Test
+    fun interceptorReplacementProgressAfterTerminalIsSuppressed() = runBlocking {
+        val engineEntered = CompletableDeferred<Unit>()
+        val releaseEngine = CompletableDeferred<Unit>()
+        var progressCalls = 0
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                interceptors = listOf(
+                    object : NetworkInterceptor {
+                        override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                            val replacement = chain.request.copyMutable().apply {
+                                progress = com.tencent.kmm.network.export.NetworkProgressCallbacks(
+                                    downloadProgress = { progressCalls++ }
+                                )
+                            }
+                            return chain.proceed(replacement)
+                        }
+                    }
+                )
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineEntered.complete(Unit)
+                    withContext(NonCancellable) {
+                        releaseEngine.await()
+                        request.progress.downloadProgress?.invoke(
+                            com.tencent.kmm.network.export.NetworkTransferProgress(1, 1)
+                        )
+                    }
+                    return NetworkResponse(request, 200, emptyMap(), NetworkResponseBody())
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        val call = client.execute(NetworkRequest()) {}
+        engineEntered.await()
+        call.cancel()
+        releaseEngine.complete(Unit)
+        assertEquals(NetworkErrorKind.CANCELLED, call.await().error?.kind)
+        yield()
+
+        assertEquals(0, progressCalls)
+    }
+
+    @Test
+    fun streamingSourceOpenFailureCancelsPreparedFileOwner() = runBlocking {
+        var fileCancels = 0
+        val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+            body = NetworkBody.FileRef(
+                path = "/virtual/open-fails.bin",
+                cancelBlock = { fileCancels++ },
+                openStreamBlock = { error("open failed") },
+            )
+        }
+
+        val failure = runCatching {
+            VBTransportNetworkEngine.execute(request, NetworkCall(request))
+        }.exceptionOrNull()
+
+        assertEquals("open failed", failure?.message)
+        assertEquals(1, fileCancels)
+    }
+
+    @Test
+    fun uploadFailureReleasesBodyAndDerivedOwnersOnlyOnce() {
+        var original = 0
+        var prepared = 0
+        var derived = 0
+        var transport = 0
+        val owners = StreamingUploadCancellationOwners(
+            cancelOriginalRequestBody = { original++ },
+            cancelPreparedRequestBody = { prepared++ },
+            cancelDerivedSource = { derived++ },
+            cancelNativeRequest = null,
+            closePullBridge = null,
+            cancelTransport = { transport++ },
+        )
+
+        owners.releaseBodyOwnersOnFailure()
+        owners.releaseBodyOwnersOnFailure()
+
+        assertEquals(1, original)
+        assertEquals(1, prepared)
+        assertEquals(1, derived)
+        assertEquals(0, transport)
     }
 
     @Test
