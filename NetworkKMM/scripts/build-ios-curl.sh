@@ -332,8 +332,8 @@ for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
   # and fails silently, so match the full-line format instead.
   syms="$(xcrun nm -g --defined-only -arch arm64 "$lib" 2>/dev/null || true)"
   for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo _SetCurlProxy _SetCurlResolve \
-             _CurlSupportsHttp3 _SetCurlHttp3Enabled _GetCurlNegotiatedProtocol \
-             _StartRequest _StartStreamRequest _StartUploadRequest; do
+             _CurlWrapperAbiVersion _CurlSupportsHttp3 _SetCurlHttp3Enabled _GetCurlNegotiatedProtocol \
+             _StartRequestV27 _StartStreamRequestV27 _StartUploadRequestV27; do
     # herestring, not a pipe: grep -q exits on first match and pipefail
     # would turn printf's SIGPIPE into a pipeline failure.
     grep -q " T ${sym}\$" <<<"$syms" || {
@@ -342,6 +342,12 @@ for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
       grep -E "Start|Cancel|CurlClient|SetCurl" <<<"$syms" | head -30 >&2 || true
       exit 2
     }
+  done
+  for legacy_sym in _StartRequest _StartStreamRequest _StartUploadRequest; do
+    if grep -q " T ${legacy_sym}\$" <<<"$syms"; then
+      echo "Legacy ABI symbol ${legacy_sym} must not be exported by ${lib}" >&2
+      exit 2
+    fi
   done
 done
 
