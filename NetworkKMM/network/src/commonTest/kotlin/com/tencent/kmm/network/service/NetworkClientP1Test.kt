@@ -287,6 +287,7 @@ class NetworkClientP1Test {
 
         val call = client.downloadStream(NetworkRequest(), onChunk = {}, onComplete = callbacks::add)
         val awaited = call.await()
+        yield()
 
         assertEquals(NetworkErrorKind.UNKNOWN, awaited.error?.kind)
         assertEquals("middleware failed", awaited.error?.message)
