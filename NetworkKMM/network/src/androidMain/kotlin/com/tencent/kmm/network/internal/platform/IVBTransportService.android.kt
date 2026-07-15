@@ -76,6 +76,7 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicReference
 
 private val scope = CoroutineScope(Dispatchers.IO)
 
@@ -134,6 +135,15 @@ internal fun requireAndroidRequestTimeoutBudget(budget: AndroidRequestTimeoutBud
     }
 }
 
+internal object AndroidTransportTestHooks {
+    @Volatile
+    var beforeTransportCoroutineStart: (() -> Unit)? = null
+
+    fun reset() {
+        beforeTransportCoroutineStart = null
+    }
+}
+
 object AndroidTransportImpl : IVBTransportService {
     private fun triggerRequest(
         request: VBTransportBaseRequest,
@@ -141,11 +151,20 @@ object AndroidTransportImpl : IVBTransportService {
         uploadBody: StreamingUploadBody? = null
     ) {
         AndroidTransportPhaseTracer.scheduled(request.requestId)
+        val requestStart = request.serviceRequestStartMark
+            ?: kotlin.time.TimeSource.Monotonic.markNow()
+        val transportJob = AtomicReference<Job?>(null)
+        lateinit var hardDeadline: AndroidTransportHardDeadline
+        val guardedCallback: (VBTransportBaseResponse) -> Unit = { response ->
+            if (hardDeadline.tryDeliverTransportCallback()) {
+                kmmCallback(response)
+            }
+        }
         val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
+                AndroidTransportTestHooks.beforeTransportCoroutineStart?.invoke()
                 AndroidTransportPhaseTracer.transportCoroutineStarted(request.requestId)
-                val startMark = kotlin.time.TimeSource.Monotonic.markNow()
-                val responseLease = executeWithReusedH2Recovery(request, startMark, uploadBody)
+                val responseLease = executeWithReusedH2Recovery(request, requestStart, uploadBody)
                 val response = responseLease.response
                 try {
 
@@ -154,7 +173,7 @@ object AndroidTransportImpl : IVBTransportService {
                     logI(
                         "response received, id:${request.requestId}, status:${response.status.value}, " +
                             "contentLength:${response.contentLength() ?: -1}, " +
-                            "elapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
+                            "elapsedMs:${requestStart.elapsedNow().inWholeMilliseconds}",
                         request.logTag
                     )
 
@@ -190,7 +209,7 @@ object AndroidTransportImpl : IVBTransportService {
                 // bracket 2 and here is a body-read stall, not a network wait.
                     logI(
                         "body read, id:${request.requestId}, bytes:${data.size}, " +
-                            "totalElapsedMs:${startMark.elapsedNow().inWholeMilliseconds}",
+                            "totalElapsedMs:${requestStart.elapsedNow().inWholeMilliseconds}",
                         request.logTag
                     )
                     AndroidTransportPhaseTracer.responseBodyRead(request.requestId)
@@ -204,7 +223,7 @@ object AndroidTransportImpl : IVBTransportService {
                         response.headers.entries().associate { it.key to it.value },
                         data,
                         request,
-                        kmmCallback,
+                        guardedCallback,
                         // Registry cleanup happens solely in the completion
                         // hook (registerTransportTask): a keyed remove here
                         // could evict a newer request that reused the id.
@@ -216,13 +235,64 @@ object AndroidTransportImpl : IVBTransportService {
             } catch (throwable: Throwable) {
                 AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
                 if (throwable is CancellationException) {
-                    AndroidTransportPhaseTracer.cancel(request.requestId)
+                    if (!hardDeadline.deadlineWon()) {
+                        AndroidTransportPhaseTracer.cancel(request.requestId)
+                    }
                     throw throwable
                 }
                 request.transportElapseStatistics = AndroidTransportPhaseTracer.complete(request.requestId)
-                callbackFailure(request, throwable, kmmCallback)
+                callbackFailure(request, throwable, guardedCallback)
             }
         }
+        transportJob.set(job)
+        hardDeadline =
+            AndroidTransportHardDeadline(
+                configuredTimeoutMillis = request.totalTimeout,
+                elapsedMillis = { requestStart.elapsedNow().inWholeMilliseconds },
+                cancelTransport = cancelTransport@{
+                    val activeJob = transportJob.get()
+                        ?: return@cancelTransport AndroidTransportCancellationResult.Missing
+                    if (activeJob.isCompleted) {
+                        AndroidTransportCancellationResult.AlreadyComplete
+                    } else {
+                        activeJob.cancel(CancellationException("Android transport wall-clock deadline"))
+                        AndroidTransportCancellationResult.Requested
+                    }
+                },
+                onDeadline = { diagnostics ->
+                    AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
+                    request.transportElapseStatistics = AndroidTransportPhaseTracer.complete(request.requestId)
+                    logE(
+                        "request hard deadline, id:${request.requestId}, " +
+                            "configuredTimeoutMs:${diagnostics.configuredTimeoutMillis}, " +
+                            "deadlineElapsedMs:${diagnostics.deadlineElapsedMillis}, " +
+                            "transportCallbackDelayMs:${diagnostics.transportCallbackDelayMillis}, " +
+                            "cancellationResult:${diagnostics.cancellationResult.name}",
+                        request.logTag
+                    )
+                    callbackFailure(
+                        request,
+                        SocketTimeoutException(
+                            "Request wall-clock deadline exceeded " +
+                                "[configuredTimeoutMs=${diagnostics.configuredTimeoutMillis}, " +
+                                "deadlineElapsedMs=${diagnostics.deadlineElapsedMillis}]"
+                        ),
+                        kmmCallback
+                    )
+                },
+                onLateTransportCallback = { callbackDelayMillis ->
+                    logE(
+                        "request late callback suppressed, id:${request.requestId}, " +
+                            "configuredTimeoutMs:${request.totalTimeout}, " +
+                            "deadlineElapsedMs:${hardDeadline.deadlineElapsedMillis()}, " +
+                            "transportCallbackDelayMs:$callbackDelayMillis, " +
+                            "cancellationResult:${hardDeadline.cancellationResult().name}",
+                        request.logTag
+                    )
+                }
+            )
+        job.invokeOnCompletion(hardDeadline::transportJobCompleted)
+        hardDeadline.start()
         registerTransportTask(taskMap, request.requestId, job)
     }
 
@@ -431,41 +501,45 @@ object AndroidTransportImpl : IVBTransportService {
                 }
                 return AndroidResponseLease(response, lease)
             } catch (throwable: Throwable) {
-                // User/scope cancellation must win over a simultaneous
-                // watchdog. OkHttp Call.cancel() leaves this coroutine active;
-                // parent cancellation does not.
-                currentCoroutineContext().ensureActive()
-                val watchdogTriggered =
-                    AndroidTransportPhaseTracer.watchdogTriggered(request.requestId, attemptToken)
-                if (watchdogTriggered && !AndroidTransportClientProvider.isCurrent(transportConfiguration)) {
-                    lease.close()
-                    throw throwable
-                }
-                val retryBudget = androidRequestTimeoutBudget(
-                    request.totalTimeout,
-                    overallStart.elapsedNow().inWholeMilliseconds,
-                )
-                if (watchdogTriggered && retryBudget == AndroidRequestTimeoutBudget.Expired) {
-                    lease.close()
-                    throw SocketTimeoutException("Request total timeout budget exhausted")
-                }
-                val hasBudget = retryBudget != AndroidRequestTimeoutBudget.Expired
-                if (retryState.claimRetry(watchdogTriggered, hasBudget)) {
-                    avoidShard = lease.shard
-                    AndroidTransportPhaseTracer.markFreshRetry(request.requestId)
-                    logI(
-                        "stale reused h2 detected, id:${request.requestId}, origin:${lease.origin}, " +
-                            "shard:${lease.shard}, generation:${lease.generation}, freshRetry:true",
-                        request.logTag,
+                try {
+                    // User/scope cancellation must win over a simultaneous
+                    // watchdog. Ktor propagates this cancellation to the
+                    // engine call, which cancels the OkHttp Call/H2 stream.
+                    currentCoroutineContext().ensureActive()
+                    val watchdogTriggered =
+                        AndroidTransportPhaseTracer.watchdogTriggered(request.requestId, attemptToken)
+                    if (watchdogTriggered && !AndroidTransportClientProvider.isCurrent(transportConfiguration)) {
+                        throw throwable
+                    }
+                    val retryBudget = androidRequestTimeoutBudget(
+                        request.totalTimeout,
+                        overallStart.elapsedNow().inWholeMilliseconds,
                     )
+                    if (watchdogTriggered && retryBudget == AndroidRequestTimeoutBudget.Expired) {
+                        throw SocketTimeoutException("Request total timeout budget exhausted")
+                    }
+                    val hasBudget = retryBudget != AndroidRequestTimeoutBudget.Expired
+                    if (retryState.claimRetry(watchdogTriggered, hasBudget)) {
+                        avoidShard = lease.shard
+                        AndroidTransportPhaseTracer.markFreshRetry(request.requestId)
+                        logI(
+                            "stale reused h2 detected, id:${request.requestId}, origin:${lease.origin}, " +
+                                "shard:${lease.shard}, generation:${lease.generation}, freshRetry:true",
+                            request.logTag,
+                        )
+                        continue
+                    }
+                    if (retryState.attempted) {
+                        AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
+                    }
+                    throw throwable
+                } finally {
+                    // Every non-success attempt relinquishes its generation
+                    // lease exactly once. AndroidTransportClientLease.close()
+                    // is atomic/idempotent, so deadline/caller cancellation
+                    // cannot retain a pool generation behind a stuck stream.
                     lease.close()
-                    continue
                 }
-                if (retryState.attempted) {
-                    AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
-                }
-                lease.close()
-                throw throwable
             }
         }
     }
@@ -550,6 +624,8 @@ internal fun hasExplicitContentType(headers: Map<String, String>): Boolean =
     }
 
 actual fun getIVBTransportService(): IVBTransportService = AndroidTransportImpl
+
+actual val platformOwnsRequestHardDeadline: Boolean = true
 
 
 // issue #8: adapter from the transport's push-sink contract to ktor's

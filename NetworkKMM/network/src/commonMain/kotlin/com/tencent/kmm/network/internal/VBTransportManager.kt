@@ -16,34 +16,39 @@
  */
 package com.tencent.kmm.network.internal
 
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
+
 object VBTransportManager {
 
     // 任务状态管理Map
+    private val lock = SynchronizedObject()
     private val taskMap = mutableMapOf<Int, VBTransportTask>()
 
-    fun getTask(requestId: Int): VBTransportTask? = taskMap[requestId]
+    fun getTask(requestId: Int): VBTransportTask? = synchronized(lock) { taskMap[requestId] }
 
     fun onTaskBegin(task: VBTransportTask) {
         logI("${task.logTag} onTaskBegin() requestId :${task.requestId}")
-        taskMap[task.requestId] = task
+        synchronized(lock) { taskMap[task.requestId] = task }
     }
 
     fun getState(requestId: Int): VBTransportState {
-        if (!taskMap.containsKey(requestId)) {
+        val task = synchronized(lock) { taskMap[requestId] }
+        if (task == null) {
             logI("requestId:$requestId don't exist！")
             return VBTransportState.Unknown
         }
-        return taskMap[requestId]?.getState() ?: VBTransportState.Unknown
+        return task.getState()
     }
 
     fun cancel(requestId: Int) {
-        taskMap[requestId]?.cancel()
+        val task = synchronized(lock) { taskMap.remove(requestId) }
+        task?.cancel()
         logI("requestId:$requestId is cancelled!")
-        onTaskFinish(requestId)
     }
 
     fun onTaskFinish(requestId: Int) {
-        taskMap.remove(requestId)
+        synchronized(lock) { taskMap.remove(requestId) }
         logI("requestId:$requestId is removed!")
     }
 

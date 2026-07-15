@@ -33,6 +33,10 @@ import java.util.ArrayDeque
 
 private const val ORIGIN_ROLLOVER_WINDOW_MILLIS = 30_000L
 
+@Volatile
+private var transportHttpClientFactoryForTests:
+    ((VBTransportReusedHttp2Recovery) -> HttpClient)? = null
+
 actual suspend fun readKnownSize(
     channel: ByteReadChannelWrapper,
     contentLength: Long
@@ -167,7 +171,8 @@ internal class AndroidReusedH2RetryState(
  */
 internal class AndroidTransportClientGenerationManager(
     private val clientFactory: (VBTransportReusedHttp2Recovery) -> HttpClient = {
-        buildTransportHttpClient(okHttpEnabled = true, recovery = it)
+        transportHttpClientFactoryForTests?.invoke(it)
+            ?: buildTransportHttpClient(okHttpEnabled = true, recovery = it)
     },
     private val nowMillis: () -> Long = System::currentTimeMillis,
 ) {
@@ -329,6 +334,10 @@ internal class AndroidTransportClientGenerationManager(
         openGenerations.size
     }
 
+    internal fun activeLeaseCountForTests(): Int = synchronized(lock) {
+        openGenerations.sumOf { it.inFlight }
+    }
+
     private class OriginState(
         initialRecovery: VBTransportReusedHttp2Recovery,
         val epoch: Long,
@@ -408,6 +417,17 @@ internal object AndroidTransportClientProvider {
 
     internal fun openGenerationCountForTests(): Int =
         generationManager.openGenerationCountForTests()
+
+    internal fun activeLeaseCountForTests(): Int =
+        generationManager.activeLeaseCountForTests()
+
+    internal fun setClientFactoryForTests(
+        factory: ((VBTransportReusedHttp2Recovery) -> HttpClient)?,
+    ) = synchronized(configurationLock) {
+        transportHttpClientFactoryForTests = factory
+        configurationEpoch += 1
+        generationManager.activateConfiguration(configurationEpoch)
+    }
 
     fun acquire(
         request: VBTransportBaseRequest,

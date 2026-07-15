@@ -400,6 +400,8 @@ class IOSTransportImpl : IVBTransportService {
 
 actual fun getIVBTransportService(): IVBTransportService = iOSTransportImpl
 
+actual val platformOwnsRequestHardDeadline: Boolean = false
+
 
 // issue #8: adapter from the transport's push-sink contract to ktor's
 // streaming request body (see the Android twin for semantics).

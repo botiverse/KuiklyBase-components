@@ -17,6 +17,7 @@
 package com.tencent.kmm.network.export
 
 import kotlin.random.Random
+import kotlin.time.TimeMark
 
 enum class VBTransportMethod {
     GET, POST, PUT, PATCH, DELETE, HEAD, OPTIONS
@@ -126,6 +127,14 @@ open class VBTransportBaseRequest {
     // 底层是否使用 libcurl 进行请求
     var useCurl: Boolean = true
     internal var transportElapseStatistics: VBTransportElapseStatistics = VBTransportElapseStatistics()
+    /**
+     * The public service-entry timestamp for the whole-request timeout.
+     *
+     * Android owns a hard deadline in the platform transport, but the budget
+     * begins before any common-to-platform handoff. Keeping the exact mark on
+     * the request prevents dispatcher delay from silently extending it.
+     */
+    internal var serviceRequestStartMark: TimeMark? = null
 
     /** Internal curl inputs prepared and latched by the selected engine. */
     internal var curlCaInfoPath: String? = null

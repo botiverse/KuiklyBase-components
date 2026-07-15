@@ -167,3 +167,6 @@ private val uploadStreamFallbackScope =
 
 // 需要各平台实现获取传输能力的实力
 expect fun getIVBTransportService(): IVBTransportService
+
+/** True when the platform transport owns an independent wall-clock deadline. */
+expect val platformOwnsRequestHardDeadline: Boolean

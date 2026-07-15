@@ -134,3 +134,5 @@ object HmTransportImpl : IVBTransportService {
 }
 
 actual fun getIVBTransportService(): IVBTransportService = HmTransportImpl
+
+actual val platformOwnsRequestHardDeadline: Boolean = false
