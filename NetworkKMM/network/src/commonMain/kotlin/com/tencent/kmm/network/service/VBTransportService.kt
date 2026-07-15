@@ -85,9 +85,7 @@ object VBTransportService {
 
     private fun prepareRequest(request: VBTransportBaseRequest) {
         request.serviceRequestStartMark = TimeSource.Monotonic.markNow()
-        do {
-            request.requestId = VBPBRequestIdGenerator.getRequestId()
-        } while (!taskManager.onTaskPrepared(request.requestId))
+        request.requestId = VBPBRequestIdGenerator.reserveRequestId(taskManager::onTaskPrepared)
     }
 
     // 发送字节数组Post类型网络请求
@@ -227,6 +225,8 @@ object VBTransportService {
     // arrive; [handler] receives the body-less completion. No force-timeout
     // task is scheduled — a long stream is expected to outlive totalTimeout,
     // whose semantics ("whole request done") do not fit an open download.
+    // The terminal is exactly once and runs only after an admitted start/chunk
+    // returns; no later business callback is admitted.
     fun streamRequest(
         request: VBTransportRequest,
         onResponseStart: (statusCode: Int, headers: Map<String, List<String>>) -> Unit,
@@ -238,9 +238,10 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.streamRequest(request, onResponseStart, onChunk) { response ->
-                if (task.trySetDone()) {
-                    handler?.let { it(response) }
-                }
+                // StreamCallbackGate is the sole terminal arbiter, including
+                // cancellation and callback failure. A second task-state CAS
+                // would suppress the CANCELLED winner after state=Canceled.
+                handler?.let { it(response) }
             }
         }
     }

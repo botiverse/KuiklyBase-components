@@ -54,7 +54,7 @@ internal class StreamCallbackGate<C>(
         }
     }
 
-    fun complete(completion: C) {
+    fun complete(completion: C, onWinner: () -> Unit = {}): Boolean {
         val shouldComplete = synchronized(lock) {
             if (phase == Phase.Terminal) {
                 false
@@ -63,7 +63,8 @@ internal class StreamCallbackGate<C>(
                 true
             }
         }
-        if (!shouldComplete) return
+        if (!shouldComplete) return false
+        onWinner()
         deliveryGate.closeAndRun {
             val delivered = synchronized(lock) {
                 callbackFailure?.let(failureCompletion) ?: completion
@@ -76,6 +77,7 @@ internal class StreamCallbackGate<C>(
                 onCallbackFailure(throwable)
             }
         }
+        return true
     }
 
     private fun invokeUserCallback(block: () -> Unit) {
@@ -92,6 +94,10 @@ internal class StreamCallbackGate<C>(
             }
             if (firstFailure) {
                 onCallbackFailure(throwable)
+                // Close the business callback surface first. Transport cancel
+                // is a cleanup side effect and must not be the only route to a
+                // terminal response (some platform jobs rethrow cancellation).
+                complete(failureCompletion(throwable))
                 try {
                     cancelTransport()
                 } catch (cancelFailure: Throwable) {

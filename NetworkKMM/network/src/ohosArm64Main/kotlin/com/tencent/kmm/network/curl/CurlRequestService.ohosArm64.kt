@@ -127,9 +127,13 @@ private fun toSafeString(content: CPointer<ByteVar>?): String {
 // Curl 鸿蒙平台实现
 object CurlRequestServiceHM : ICurlRequestService {
 
-    private val nativeHandles = CancellationAwareRegistry<Int, CPointer<out CPointed>>(
-        rememberCancellationWithoutBegin = true
-    )
+    private val nativeHandles = CancellationAwareRegistry<Int, CPointer<out CPointed>>()
+
+    fun prepareRequest(requestId: Int): Boolean = nativeHandles.begin(requestId)
+
+    fun abortPreparedRequest(requestId: Int) {
+        nativeHandles.remove(requestId)
+    }
 
     private fun configureCurlRuntime(
         handle: CPointer<out CPointed>?,
@@ -399,12 +403,12 @@ object CurlRequestServiceHM : ICurlRequestService {
             val headers = toStringDic(buildRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
             var nativeResponse = CurlNativeResponse()
-            check(nativeHandles.begin(request.requestId)) { "native request id already active" }
             val handle = CreateCurlClient(logTag) ?: run {
                 nativeHandles.remove(request.requestId)
                 error("CreateCurlClient failed")
             }
             try {
+                publishNativeHandle(request.requestId, handle, logTag)
                 configureCurlRuntime(handle, request)
                 val callback = object : ICurlCallback {
                     override fun onResponse(result: CurlResponse) {
@@ -418,7 +422,6 @@ object CurlRequestServiceHM : ICurlRequestService {
                 // 使用 libcurl 发起请求
                 val callbackWrapper = CurlCallbackWrapper(callback)
                 try {
-                    publishNativeHandle(request.requestId, handle, logTag)
                     check(
                         StartRequestV27(
                             handle,
@@ -519,12 +522,12 @@ object CurlRequestServiceHM : ICurlRequestService {
             // gzip here (chunks would arrive compressed and undecodable).
             val headers = toStringDic(buildStreamRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
-            check(nativeHandles.begin(request.requestId)) { "native stream request id already active" }
             val handle = CreateCurlClient(logTag) ?: run {
                 nativeHandles.remove(request.requestId)
                 error("CreateCurlClient failed")
             }
             try {
+                publishNativeHandle(request.requestId, handle, logTag)
                 configureCurlRuntime(handle, request)
                 fun callbackFailureResponse(throwable: Throwable) =
                     VBTransportResponse().apply {
@@ -565,7 +568,6 @@ object CurlRequestServiceHM : ICurlRequestService {
                 }
                 val wrapper = CurlStreamCallbackWrapper(handler)
                 try {
-                    publishNativeHandle(request.requestId, handle, logTag)
                     check(
                         StartStreamRequestV27(
                             handle,
@@ -634,12 +636,12 @@ object CurlRequestServiceHM : ICurlRequestService {
                 val headers = toStringDic(buildRequestHeader(request), memScope)
                 val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
                 var nativeResponse = CurlNativeResponse()
-                check(nativeHandles.begin(request.requestId)) { "native upload request id already active" }
                 val handle = CreateCurlClient(logTag) ?: run {
                     nativeHandles.remove(request.requestId)
                     error("CreateCurlClient failed")
                 }
                 try {
+                    publishNativeHandle(request.requestId, handle, logTag)
                     configureCurlRuntime(handle, request)
                     val callback = object : ICurlCallback {
                         override fun onResponse(result: CurlResponse) {
@@ -657,7 +659,6 @@ object CurlRequestServiceHM : ICurlRequestService {
                             this.readChunk = staticCFunction(::uploadReadChunk)
                             this.totalLength = contentLength ?: -1L
                         }
-                        publishNativeHandle(request.requestId, handle, logTag)
                         logI("[$logTag] upload-stream id:${request.requestId}, " +
                                 "handle:${handle}, contentLength:${contentLength ?: -1}")
                         check(

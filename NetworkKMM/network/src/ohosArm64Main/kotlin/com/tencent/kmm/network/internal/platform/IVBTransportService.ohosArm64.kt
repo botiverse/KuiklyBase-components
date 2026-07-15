@@ -32,6 +32,13 @@ import com.tencent.kmm.network.export.VBTransportStringResponse
 import com.tencent.kmm.network.internal.VBPBLog
 
 object HmTransportImpl : IVBTransportService {
+    override fun prepareRequest(requestId: Int): Boolean =
+        CurlRequestServiceHM.prepareRequest(requestId)
+
+    override fun abortPreparedRequest(requestId: Int) {
+        CurlRequestServiceHM.abortPreparedRequest(requestId)
+    }
+
     override fun sendBytesRequest(
         kmmBytesRequest: VBTransportBytesRequest,
         kmmBytesResponseCallback: (response: VBTransportBytesResponse) -> Unit
@@ -95,6 +102,7 @@ object HmTransportImpl : IVBTransportService {
     ) {
         val method = kmmRequest.method.name.uppercase()
         if (method == "GET" || method == "HEAD") {
+            abortPreparedRequest(kmmRequest.requestId)
             kmmResponseCallback(
                 VBTransportResponse().apply {
                     this.request = kmmRequest

@@ -30,6 +30,7 @@ import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.VBTransportBaseResponse
+import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.VBTransportRequest
 import com.tencent.kmm.network.export.VBTransportResponse
 import com.tencent.kmm.network.export.VBTransportResultCode
@@ -37,6 +38,7 @@ import com.tencent.kmm.network.export.cancel
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.export.toNetworkHttpProtocol
 import com.tencent.kmm.network.internal.InflightCallbackGate
+import com.tencent.kmm.network.internal.platform.unsupportedStreamingRequestBodyResponse
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineDispatcher
@@ -167,6 +169,7 @@ class NetworkCall internal constructor(
     private var job: Job? = null
     private var cancelled = false
     private val cancelledBodies = mutableListOf<NetworkBody>()
+    private val ownedBodies = mutableListOf<NetworkBody>()
     private var terminalResponse: NetworkResponse? = null
     private var resolvedEngine: ResolvedNetworkEngine? = null
     private var engineSelectionReported = false
@@ -322,7 +325,23 @@ class NetworkCall internal constructor(
     }
 
     internal fun ownBody(body: NetworkBody) {
+        synchronized(stateLock) {
+            if (ownedBodies.none { it === body }) {
+                ownedBodies += body
+            }
+        }
         addCancelHandler { cancelBodyOnce(body) }
+    }
+
+    internal fun cancelOwnedBodies() {
+        val bodies = synchronized(stateLock) { ownedBodies.toList() }
+        bodies.forEach { body ->
+            try {
+                cancelBodyOnce(body)
+            } catch (_: Throwable) {
+                // Preparation failure must release every registered owner.
+            }
+        }
     }
 
     private fun deliverTerminal(
@@ -412,6 +431,10 @@ class NetworkClient(
      * platforms whose engine cannot stream, the transport falls back to
      * buffering the full body and delivering it as a single chunk — same
      * result, no memory saving — until native streaming lands there.
+     * The terminal closes admission and drains an already admitted start,
+     * chunk, or progress callback before [onComplete]. [NetworkCall.await]
+     * observes the same terminal winner but does not promise that an external
+     * completion observer has returned before the suspension resumes.
      */
     fun downloadStream(
         request: NetworkRequest,
@@ -430,10 +453,17 @@ class NetworkClient(
         val job = scope.launch(dispatcherFor(policy.dispatcher)) {
             val response = try {
                 var prepared = request.copyMutable()
-                config.requestMiddlewares.forEach { middleware ->
-                    prepared = middleware.prepare(prepared)
+                try {
+                    config.requestMiddlewares.forEach { middleware ->
+                        prepared = middleware.prepare(prepared)
+                        call.ownBody(prepared.body)
+                    }
+                } catch (throwable: Throwable) {
                     call.ownBody(prepared.body)
+                    call.cancelOwnedBodies()
+                    throw throwable
                 }
+                gateProgressCallbacks(prepared, call)
                 prepared.policy = policy
                 applyCurrentAuthToken(prepared)
                 if (call.isCancelled) {
@@ -474,10 +504,17 @@ class NetworkClient(
     ): NetworkResponse {
         val preparationStartedAt = TimeSource.Monotonic.markNow()
         var prepared = request
-        config.requestMiddlewares.forEach { middleware ->
-            prepared = middleware.prepare(prepared)
+        try {
+            config.requestMiddlewares.forEach { middleware ->
+                prepared = middleware.prepare(prepared)
+                call.ownBody(prepared.body)
+            }
+        } catch (throwable: Throwable) {
             call.ownBody(prepared.body)
+            call.cancelOwnedBodies()
+            throw throwable
         }
+        gateProgressCallbacks(prepared, call)
         prepared.policy = policy
         applyCurrentAuthToken(prepared)
         call.markRequestPrepared(preparationStartedAt)
@@ -630,6 +667,11 @@ object VBTransportNetworkEngine : NetworkEngine {
         if (usesCurlPlatformDefault) {
             val availability = prepareCurlRuntime(request)
             if (!availability.available) return curlRuntimeFailureResponse(request, availability)
+        }
+        if ((request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) &&
+            request.body.hasPotentialStreamingSource()
+        ) {
+            return unsupportedStreamingRequestBodyResponse(request)
         }
         // issue #8 slice 1: Stream/FileRef bodies go out as a true byte stream
         // on platforms whose transport supports it; everything else (and every
@@ -818,10 +860,34 @@ internal suspend fun networkUploadStreamSourceOrNull(request: NetworkRequest): N
         // Stream/FileRef part; all-scalar multiparts keep the buffered path.
         is NetworkBody.Multipart ->
             body.streamingUploadStreamOrNull()?.let { stream ->
-                NetworkUploadStreamSource(stream, body.contentType, stream.contentLength)
+                NetworkUploadStreamSource(
+                    stream,
+                    body.contentType,
+                    stream.contentLength,
+                    cancelSeparatelyFromRequestBody = true,
+                )
             }
         else -> null
     }
+
+internal fun NetworkBody.hasPotentialStreamingSource(): Boolean = when (this) {
+    is NetworkBody.Stream, is NetworkBody.FileRef -> true
+    is NetworkBody.Multipart -> parts.any { it.body.hasPotentialStreamingSource() }
+    else -> false
+}
+
+private fun gateProgressCallbacks(request: NetworkRequest, call: NetworkCall) {
+    val upload = request.progress.uploadProgress
+    val download = request.progress.downloadProgress
+    request.progress = com.tencent.kmm.network.export.NetworkProgressCallbacks(
+        uploadProgress = upload?.let { callback ->
+            { progress -> call.runWhileActive { callback(progress) } }
+        },
+        downloadProgress = download?.let { callback ->
+            { progress -> call.runWhileActive { callback(progress) } }
+        },
+    )
+}
 
 internal class StreamingUploadCancellationOwners(
     private val cancelOriginalRequestBody: () -> Unit,

@@ -30,6 +30,12 @@ import com.tencent.kmm.network.export.VBTransportStringRequest
 import com.tencent.kmm.network.export.VBTransportStringResponse
 
 interface IVBTransportService {
+    /** Reserve platform cancellation ownership before a Running task enters transport code. */
+    fun prepareRequest(requestId: Int): Boolean = true
+
+    /** Abort an unused reservation when cancellation wins before platform entry. */
+    fun abortPreparedRequest(requestId: Int) = Unit
+
     /**
      * 发送字节数组类型请求
      */

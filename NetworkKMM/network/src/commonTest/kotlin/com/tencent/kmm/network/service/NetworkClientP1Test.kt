@@ -19,11 +19,13 @@ package com.tencent.kmm.network.service
 import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkByteStream
+import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkMultipartPart
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.VBTransportResultCode
+import com.tencent.kmm.network.export.VBTransportMethod
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -554,6 +556,7 @@ class NetworkClientP1Test {
             )
         }
         val source = requireNotNull(networkUploadStreamSourceOrNull(prepared))
+        assertTrue(source.cancelSeparatelyFromRequestBody)
         val call = NetworkCall(request)
         val owners = StreamingUploadCancellationOwners(
             cancelOriginalRequestBody = call::cancelRequestBodyOnce,
@@ -578,9 +581,10 @@ class NetworkClientP1Test {
     }
 
     @Test
-    fun middlewareReplacementMultipartCancelsEveryLogicalOwnerOnce() {
+    fun middlewareReplacementMultipartCancelsEveryLogicalOwnerOnce() = runBlocking {
         var originalCancels = 0
         val partCancels = mutableListOf<String>()
+        var derivedCancels = 0
         var transportCancels = 0
         val request = NetworkRequest().apply {
             body = NetworkBody.Stream(
@@ -601,41 +605,79 @@ class NetworkClientP1Test {
                     ),
                     NetworkMultipartPart(
                         "second",
-                        NetworkBody.Stream(
-                            NetworkByteStream.fromChunks(cancelBlock = { partCancels += "second" }) {}
+                        NetworkBody.FileRef(
+                            path = "/virtual/second.bin",
+                            cancelBlock = { partCancels += "second" },
+                            openStreamBlock = {
+                                NetworkByteStream.fromChunks(cancelBlock = { derivedCancels++ }) {
+                                    it.write(byteArrayOf(1))
+                                }
+                            }
                         )
                     )
                 )
             )
         }
+        val source = requireNotNull(networkUploadStreamSourceOrNull(prepared))
+        assertTrue(source.cancelSeparatelyFromRequestBody)
         val call = NetworkCall(request)
         val owners = StreamingUploadCancellationOwners(
             cancelOriginalRequestBody = call::cancelRequestBodyOnce,
             cancelPreparedRequestBody = { call.cancelBodyOnce(prepared.body) },
-            cancelDerivedSource = null,
+            cancelDerivedSource = source.stream::cancel,
             cancelNativeRequest = null,
             closePullBridge = null,
             cancelTransport = { transportCancels++ }
         )
         call.addCancelHandler(owners::cancelAll)
 
+        source.stream.readChunks(object : NetworkByteStreamSink {
+            override suspend fun write(bytes: ByteArray) {
+                if (bytes.contentEquals(byteArrayOf(1))) call.cancel()
+            }
+        })
+
         call.cancel()
         owners.cancelAll()
 
         assertEquals(1, originalCancels)
         assertEquals(listOf("first", "second"), partCancels)
+        assertEquals(1, derivedCancels)
         assertEquals(1, transportCancels)
+    }
+
+    @Test
+    fun unsupportedStreamingMethodDoesNotOpenTopLevelFileRef() = runBlocking {
+        var opens = 0
+        val request = NetworkRequest(method = VBTransportMethod.GET).apply {
+            body = NetworkBody.FileRef(
+                path = "/virtual/never-open.bin",
+                openStreamBlock = {
+                    opens++
+                    NetworkByteStream.fromChunks {}
+                },
+            )
+        }
+
+        val response = VBTransportNetworkEngine.execute(request, NetworkCall(request))
+
+        assertEquals(0, opens)
+        assertEquals(NetworkErrorKind.UNKNOWN, response.error?.kind)
     }
 
     @Test
     fun streamingMiddlewareFailurePublishesOneTerminal() = runBlocking {
         val callbacks = mutableListOf<NetworkResponse>()
         val callbackDelivered = CompletableDeferred<Unit>()
+        var mutatedBodyCancels = 0
         val client = NetworkClient(
             config = NetworkClientConfig(
                 requestMiddlewares = listOf(
                     object : NetworkRequestMiddleware {
                         override suspend fun prepare(request: NetworkRequest): NetworkRequest {
+                            request.body = NetworkBody.Stream(
+                                NetworkByteStream.fromChunks(cancelBlock = { mutatedBodyCancels++ }) {}
+                            )
                             error("middleware failed")
                         }
                     }
@@ -654,6 +696,81 @@ class NetworkClientP1Test {
         assertEquals(NetworkErrorKind.UNKNOWN, awaited.error?.kind)
         assertEquals("middleware failed", awaited.error?.message)
         assertEquals(1, callbacks.size)
+        assertEquals(1, mutatedBodyCancels)
+    }
+
+    @Test
+    fun laterMiddlewareFailureCancelsEarlierReplacementBodyExactlyOnce() = runBlocking {
+        var replacementCancels = 0
+        var engineCalls = 0
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                requestMiddlewares = listOf(
+                    object : NetworkRequestMiddleware {
+                        override suspend fun prepare(request: NetworkRequest): NetworkRequest = request.apply {
+                            body = NetworkBody.Stream(
+                                NetworkByteStream.fromChunks(cancelBlock = { replacementCancels++ }) {}
+                            )
+                        }
+                    },
+                    object : NetworkRequestMiddleware {
+                        override suspend fun prepare(request: NetworkRequest): NetworkRequest =
+                            error("later middleware failed")
+                    },
+                )
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineCalls++
+                    error("engine must not start")
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        val response = client.execute(NetworkRequest())
+
+        assertEquals(NetworkErrorKind.UNKNOWN, response.error?.kind)
+        assertEquals("later middleware failed", response.error?.message)
+        assertEquals(1, replacementCancels)
+        assertEquals(0, engineCalls)
+    }
+
+    @Test
+    fun bufferedProgressAfterCancellationTerminalIsSuppressed() = runBlocking {
+        val engineEntered = CompletableDeferred<NetworkRequest>()
+        val releaseEngine = CompletableDeferred<Unit>()
+        var progressCalls = 0
+        val request = NetworkRequest().apply {
+            progress = com.tencent.kmm.network.export.NetworkProgressCallbacks(
+                downloadProgress = { progressCalls++ }
+            )
+        }
+        val client = NetworkClient(
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineEntered.complete(request)
+                    withContext(NonCancellable) {
+                        releaseEngine.await()
+                        request.progress.downloadProgress?.invoke(
+                            com.tencent.kmm.network.export.NetworkTransferProgress(1, 1)
+                        )
+                    }
+                    return NetworkResponse(request, 200, emptyMap(), NetworkResponseBody())
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        val call = client.execute(request) {}
+        engineEntered.await()
+        call.cancel()
+        releaseEngine.complete(Unit)
+        val response = call.await()
+        yield()
+
+        assertEquals(NetworkErrorKind.CANCELLED, response.error?.kind)
+        assertEquals(0, progressCalls)
     }
 
     @Test

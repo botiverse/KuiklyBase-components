@@ -150,6 +150,7 @@ sealed class NetworkBody {
         private val cancelBlock: (() -> Unit)? = null,
         private val openStreamBlock: (suspend (path: String) -> NetworkByteStream)? = null
     ) : NetworkBody() {
+        private val cancelArmed = atomic(true)
         override val repeatable: Boolean = readAllBlock != null || openStreamBlock != null
 
         suspend fun readAll(): ByteArray? = readAllBlock?.invoke(path)
@@ -157,7 +158,9 @@ sealed class NetworkBody {
         suspend fun openStream(): NetworkByteStream? = openStreamBlock?.invoke(path)
 
         fun cancel() {
-            cancelBlock?.invoke()
+            if (cancelArmed.compareAndSet(expect = true, update = false)) {
+                cancelBlock?.invoke()
+            }
         }
     }
 }
@@ -633,8 +636,20 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                 compositeCancelled = true
                 openedStreams.toList().also { openedStreams.clear() }
             }
-            parts.forEach { it.body.cancel() }
-            derived.forEach { it.cancel() }
+            parts.forEach {
+                try {
+                    it.body.cancel()
+                } catch (_: Throwable) {
+                    // One broken owner must not strand the remaining parts.
+                }
+            }
+            derived.forEach {
+                try {
+                    it.cancel()
+                } catch (_: Throwable) {
+                    // Continue cancelling every lazily opened derived stream.
+                }
+            }
         }
     ) { sink ->
         plans.forEach { plan ->
@@ -654,7 +669,16 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                         if (cancelNow) {
                             stream.cancel()
                         } else {
-                            stream.readChunks(sink)
+                            try {
+                                stream.readChunks(sink)
+                            } catch (throwable: Throwable) {
+                                stream.cancel()
+                                throw throwable
+                            } finally {
+                                synchronized(openedStreamLock) {
+                                    openedStreams.removeAll { it === stream }
+                                }
+                            }
                         }
                     } else {
                         val bytes = body.readAll()

@@ -84,6 +84,19 @@ class CancellationAwareRegistryTest {
     }
 
     @Test
+    fun abortedPrePlatformCancellationDoesNotPoisonSameIdReuse() {
+        val registry = CancellationAwareRegistry<Int, String>()
+
+        assertTrue(registry.begin(14))
+        assertFalse(registry.cancelOrRemember(14, removePublished = false) {})
+        assertNull(registry.remove(14))
+
+        assertTrue(registry.begin(14))
+        assertTrue(registry.publish(14, "next-generation"))
+        assertEquals("next-generation", registry.get(14))
+    }
+
+    @Test
     fun lateCancelAfterSuccessDoesNotPoisonReusedKey() {
         val registry = CancellationAwareRegistry<Int, String>()
         registry.begin(17)

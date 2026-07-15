@@ -27,6 +27,7 @@ import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
+import com.tencent.kmm.network.internal.RequestIdOwnerRegistry
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngine
 import com.tencent.kmm.network.service.NetworkEngineAvailability
@@ -34,6 +35,7 @@ import com.tencent.kmm.network.service.NetworkUploadStreamSource
 import com.tencent.kmm.network.service.StreamingUploadCancellationOwners
 import com.tencent.kmm.network.service.curlNetworkEngineCapabilities
 import com.tencent.kmm.network.service.curlRuntimeFailureResponse
+import com.tencent.kmm.network.service.hasPotentialStreamingSource
 import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
 import com.tencent.kmm.network.service.prepareCurlRuntime
 import com.tencent.kmm.network.service.preparedCurlCaInfoPath
@@ -74,6 +76,11 @@ internal class AndroidCurlNetworkEngine(
     override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
         val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
+        if ((request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) &&
+            request.body.hasPotentialStreamingSource()
+        ) {
+            return unsupportedStreamingRequestBodyResponse(request)
+        }
         networkUploadStreamSourceOrNull(request)?.let { source ->
             return executeUpload(request, call, source)
         }
@@ -87,7 +94,8 @@ internal class AndroidCurlNetworkEngine(
                 error = error
             )
         }
-        val requestId = VBPBRequestIdGenerator.getRequestId()
+        val owner = Any()
+        val requestId = androidCurlRequestOwners.reserve(owner)
         val nativeRequest = request.toNativeRequest(
             requestId = requestId,
             body = body.bytes,
@@ -95,12 +103,17 @@ internal class AndroidCurlNetworkEngine(
         )
         call.addCancelHandler {
             nativeRequest.cancel()
-            bridge.cancel(requestId)
+            if (androidCurlRequestOwners.isOwner(requestId, owner)) bridge.cancel(requestId)
         }
         if (call.isCancelled) {
+            androidCurlRequestOwners.release(requestId, owner)
             return cancelledResponse(request)
         }
-        return bridge.execute(nativeRequest).toNetworkResponse(request)
+        return try {
+            bridge.execute(nativeRequest).toNetworkResponse(request)
+        } finally {
+            androidCurlRequestOwners.release(requestId, owner)
+        }
     }
 
     override suspend fun downloadStream(
@@ -111,35 +124,40 @@ internal class AndroidCurlNetworkEngine(
     ): NetworkResponse {
         val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
-        val requestId = VBPBRequestIdGenerator.getRequestId()
+        val owner = Any()
+        val requestId = androidCurlRequestOwners.reserve(owner)
         val nativeRequest = request.toNativeRequest(requestId = requestId)
         var transferred = 0L
         var responseLength: Long? = null
         call.addCancelHandler {
             nativeRequest.cancel()
-            bridge.cancel(requestId)
+            if (androidCurlRequestOwners.isOwner(requestId, owner)) bridge.cancel(requestId)
         }
         if (call.isCancelled) {
+            androidCurlRequestOwners.release(requestId, owner)
             return cancelledResponse(request)
         }
-        val response = bridge.downloadStream(
-            request = nativeRequest,
-            onResponseStart = { httpCode, headerText ->
-                val headers = parseCurlHeaders(headerText)
-                responseLength = contentLength(headers)
-                onResponseStart(httpCode.toInt(), responseLength, headers)
-            },
-            onChunk = { chunk ->
-                transferred += chunk.size
-                call.runWhileActive {
-                    request.progress.downloadProgress?.invoke(
-                        NetworkTransferProgress(transferred, responseLength)
-                    )
+        return try {
+            bridge.downloadStream(
+                request = nativeRequest,
+                onResponseStart = { httpCode, headerText ->
+                    val headers = parseCurlHeaders(headerText)
+                    responseLength = contentLength(headers)
+                    onResponseStart(httpCode.toInt(), responseLength, headers)
+                },
+                onChunk = { chunk ->
+                    transferred += chunk.size
+                    call.runWhileActive {
+                        request.progress.downloadProgress?.invoke(
+                            NetworkTransferProgress(transferred, responseLength)
+                        )
+                    }
+                    onChunk(chunk)
                 }
-                onChunk(chunk)
-            }
-        )
-        return response.toNetworkResponse(request)
+            ).toNetworkResponse(request)
+        } finally {
+            androidCurlRequestOwners.release(requestId, owner)
+        }
     }
 
     private suspend fun executeUpload(
@@ -149,10 +167,8 @@ internal class AndroidCurlNetworkEngine(
     ): NetworkResponse = coroutineScope {
         val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
         if (!availability.available) return@coroutineScope curlRuntimeFailureResponse(request, availability)
-        if (request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) {
-            return@coroutineScope unsupportedStreamingRequestBodyResponse(request)
-        }
-        val requestId = VBPBRequestIdGenerator.getRequestId()
+        val owner = Any()
+        val requestId = androidCurlRequestOwners.reserve(owner)
         val pullBridge = AndroidCurlUploadPullBridge()
         val nativeRequest = request.toNativeRequest(
             requestId = requestId,
@@ -181,11 +197,14 @@ internal class AndroidCurlNetworkEngine(
             closePullBridge = {
                 pullBridge.closeFailure(CancellationException("Upload cancelled"))
             },
-            cancelTransport = { bridge.cancel(requestId) }
+            cancelTransport = {
+                if (androidCurlRequestOwners.isOwner(requestId, owner)) bridge.cancel(requestId)
+            }
         )
         call.addCancelHandler(cancellationOwners::cancelAll)
         if (call.isCancelled) {
             writer.cancel()
+            androidCurlRequestOwners.release(requestId, owner)
             return@coroutineScope cancelledResponse(request)
         }
         try {
@@ -206,6 +225,7 @@ internal class AndroidCurlNetworkEngine(
                 .toNetworkResponse(request)
         } finally {
             cancellationOwners.disarmNativeTransportOwners()
+            androidCurlRequestOwners.release(requestId, owner)
             writer.cancel()
         }
     }
@@ -251,6 +271,8 @@ internal class AndroidCurlNetworkEngine(
         ).toNetworkResponse(request)
 
 }
+
+private val androidCurlRequestOwners = RequestIdOwnerRegistry()
 
 internal class AndroidCurlUploadPullBridge {
     private val channel = Channel<ByteArray>(capacity = 4)

@@ -140,6 +140,22 @@ internal fun requireAndroidRequestTimeoutBudget(budget: AndroidRequestTimeoutBud
     }
 }
 
+internal fun androidAttemptTimeoutBudget(
+    totalTimeoutMillis: Long,
+    streamWholeTimeoutMillis: Long,
+    elapsedMillis: Long,
+    streamTimeouts: Boolean,
+): AndroidRequestTimeoutBudget {
+    if (!streamTimeouts) {
+        return androidRequestTimeoutBudget(totalTimeoutMillis, elapsedMillis)
+    }
+    return when (val remaining = remainingStreamWholeTimeoutMillis(streamWholeTimeoutMillis, elapsedMillis)) {
+        null -> AndroidRequestTimeoutBudget.Unlimited
+        0L -> AndroidRequestTimeoutBudget.Expired
+        else -> AndroidRequestTimeoutBudget.Remaining(remaining)
+    }
+}
+
 internal object AndroidTransportTestHooks {
     @Volatile
     var beforeTransportCoroutineStart: (() -> Unit)? = null
@@ -503,9 +519,11 @@ object AndroidTransportImpl : IVBTransportService {
         )
         var avoidShard: Int? = null
         while (true) {
-            val budget = androidRequestTimeoutBudget(
-                request.totalTimeout,
-                overallStart.elapsedNow().inWholeMilliseconds,
+            val budget = androidAttemptTimeoutBudget(
+                totalTimeoutMillis = request.totalTimeout,
+                streamWholeTimeoutMillis = request.streamWholeTimeoutMillis,
+                elapsedMillis = overallStart.elapsedNow().inWholeMilliseconds,
+                streamTimeouts = streamTimeouts,
             )
             requireAndroidRequestTimeoutBudget(budget)
             val lease = AndroidTransportClientProvider.acquire(
@@ -522,9 +540,11 @@ object AndroidTransportImpl : IVBTransportService {
                 canFreshRetry = retryState.canFreshRetry,
             )
             try {
-                val requestBudget = androidRequestTimeoutBudget(
-                    request.totalTimeout,
-                    overallStart.elapsedNow().inWholeMilliseconds,
+                val requestBudget = androidAttemptTimeoutBudget(
+                    totalTimeoutMillis = request.totalTimeout,
+                    streamWholeTimeoutMillis = request.streamWholeTimeoutMillis,
+                    elapsedMillis = overallStart.elapsedNow().inWholeMilliseconds,
+                    streamTimeouts = streamTimeouts,
                 )
                 requireAndroidRequestTimeoutBudget(requestBudget)
                 val response = lease.client.request(request.url) {
@@ -567,12 +587,17 @@ object AndroidTransportImpl : IVBTransportService {
                     if (watchdogTriggered && !AndroidTransportClientProvider.isCurrent(transportConfiguration)) {
                         throw throwable
                     }
-                    val retryBudget = androidRequestTimeoutBudget(
-                        request.totalTimeout,
-                        overallStart.elapsedNow().inWholeMilliseconds,
+                    val retryBudget = androidAttemptTimeoutBudget(
+                        totalTimeoutMillis = request.totalTimeout,
+                        streamWholeTimeoutMillis = request.streamWholeTimeoutMillis,
+                        elapsedMillis = overallStart.elapsedNow().inWholeMilliseconds,
+                        streamTimeouts = streamTimeouts,
                     )
                     if (watchdogTriggered && retryBudget == AndroidRequestTimeoutBudget.Expired) {
-                        throw SocketTimeoutException("Request total timeout budget exhausted")
+                        throw SocketTimeoutException(
+                            if (streamTimeouts) "stream whole-transfer timeout exhausted"
+                            else "Request total timeout budget exhausted"
+                        )
                     }
                     val hasBudget = retryBudget != AndroidRequestTimeoutBudget.Expired
                     if (retryState.claimRetry(watchdogTriggered, hasBudget)) {

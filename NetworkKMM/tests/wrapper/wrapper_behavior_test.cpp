@@ -494,7 +494,7 @@ int main(int argc, char **argv) {
         CHECK(redirectHeadersTimeout.completes == 1 && redirectHeadersTimeout.code == 28,
               "redirect final-header stall completes as CURLE_OPERATION_TIMEDOUT");
         StreamCaptured crossOrigin =
-            FetchStream(base + "/slow-redirect-cross-origin", "GET", 500, 2000);
+            FetchStream(base + "/slow-redirect-cross-origin", "GET", 900, 3000);
         CHECK(crossOrigin.starts == 1 && crossOrigin.startHttpCode == 200,
               "cross-origin redirect resets the final-header phase after reconnect");
         CHECK(crossOrigin.code == 0 && crossOrigin.data == "cross-origin-ok",

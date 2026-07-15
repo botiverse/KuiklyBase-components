@@ -66,7 +66,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
         elif self.path == "/slow-redirect-cross-origin":
-            time.sleep(0.35)
+            time.sleep(0.75)
             self.send_response(302)
             self.send_header(
                 "Location",
@@ -94,7 +94,7 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(1.5)
             self._send(200, b"late")
         elif self.path == "/delayed-short-headers":
-            time.sleep(0.35)
+            time.sleep(0.75)
             self._send(200, b"cross-origin-ok")
         elif self.path == "/stream":
             chunks = [b"alpha", b"beta", b"gamma"]
