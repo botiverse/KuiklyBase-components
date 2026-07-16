@@ -45,6 +45,53 @@ class VBTransportTask(
 ) {
 
     private val state = atomic(VBTransportState.Create)
+    private val streamGate = atomic<StreamCallbackGate<VBTransportResponse>?>(null)
+    private val platformCallbackHandoff = atomic<PlatformTerminalHandoff<VBTransportResponse>?>(null)
+    private val platformEntryPhase = atomic(PLATFORM_PHASE_NONE)
+    private val platformPrepareInProgress = atomic(false)
+    private val bufferedTerminalLock = kotlinx.atomicfu.locks.SynchronizedObject()
+    private var bufferedCompletionClaimed = false
+    internal var platformPrepare: (Int) -> Boolean = { requestId ->
+        getIVBTransportService().prepareRequest(requestId)
+    }
+    internal var platformAbortPrepared: (Int) -> Unit = { requestId ->
+        getIVBTransportService().abortPreparedRequest(requestId)
+    }
+    internal var platformRequestStream: (
+        VBTransportRequest,
+        (Int, Map<String, List<String>>) -> Unit,
+        (ByteArray) -> Unit,
+        (VBTransportResponse) -> Unit,
+    ) -> Unit = { request, onStart, onChunk, onComplete ->
+        getIVBTransportService().requestStream(request, onStart, onChunk, onComplete)
+    }
+    internal var platformRequestUpload: (
+        VBTransportRequest,
+        Long?,
+        suspend (com.tencent.kmm.network.export.NetworkByteStreamSink) -> Unit,
+        (VBTransportResponse) -> Unit,
+    ) -> Unit = { request, contentLength, writeBody, onComplete ->
+        getIVBTransportService().requestUploadStream(request, contentLength, writeBody, onComplete)
+    }
+    internal var platformRequest: (VBTransportRequest, (VBTransportResponse) -> Unit) -> Unit =
+        { request, onComplete -> getIVBTransportService().request(request, onComplete) }
+    internal var platformCancel: (Int) -> Unit = { requestId ->
+        getIVBTransportService().cancel(requestId)
+    }
+    internal var afterRunningPreparedForTest: (() -> Unit)? = null
+    internal var beforePlatformPrepareForTest: (() -> Unit)? = null
+    internal var afterPlatformPreparedForTest: (() -> Unit)? = null
+    internal var afterStreamGateInstalledForTest: (() -> Unit)? = null
+
+    private fun finishCanceledBeforeStart(
+        response: VBTransportBaseResponse,
+        handler: ((VBTransportBaseResponse) -> Unit)?,
+    ) {
+        response.errorCode = VBTransportResultCode.CODE_CANCELED
+        response.errorMessage = "Request has been canceled"
+        taskManager.onTaskFinish(this)
+        handler?.invoke(response)
+    }
 
     private fun wrapGetResponse(
         getCallback: ((getResponse: VBTransportGetResponse) -> Unit)?
@@ -101,43 +148,40 @@ class VBTransportTask(
         response: VBTransportBaseResponse,
         handler: ((response: VBTransportBaseResponse) -> Unit)?
     ) {
-        handler?.let {
-            if (isCanceledOrRemoved()) {
-                logI("execute() request task is canceled")
-                response.errorCode = VBTransportResultCode.CODE_CANCELED
-                response.errorMessage = "Request has been canceled"
-                logI("execute() invoke failHandler，task has been canceled")
-                it(response)
-                return@let
+        if (streamGate.value == null) {
+            kotlinx.atomicfu.locks.synchronized(bufferedTerminalLock) {
+                bufferedCompletionClaimed = true
             }
-            it(response)
-            taskManager.onTaskFinish(requestId)
-        } ?: run {
-            logI("handler is null!")
         }
+        if (isCanceledOrRemoved()) {
+            logI("execute() request task is canceled")
+            response.errorCode = VBTransportResultCode.CODE_CANCELED
+            response.errorMessage = "Request has been canceled"
+            logI("execute() invoke failHandler，task has been canceled")
+        }
+        // Platform handoff/cancel owns native cleanup. Release the common
+        // identity before making terminal visible so same-id replacement in a
+        // terminal handler cannot collide with the old common task.
+        taskManager.onTaskFinish(this)
+        handler?.invoke(response) ?: logI("handler is null!")
     }
 
     fun sendBytesRequest(
         request: VBTransportBytesRequest,
         handler: VBTransportBytesCompletionHandler?,
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportBytesResponse()
             logI("execute() request task is canceled")
-            handler?.let {
-                response.errorCode = VBTransportResultCode.CODE_CANCELED
-                response.errorMessage = "Request has been canceled"
-                logI("execute() invoke failHandler，task has been canceled")
-                it(response)
-            } ?: run {
-                logI("task has been canceled and handler is null!")
-            }
+            finishCanceledBeforeStart(response, wrapBytesResponse(handler))
             return
         }
-        state.value = VBTransportState.Running
-        getIVBTransportService().sendBytesRequest(request) { response ->
-            handleResponse(request, response, wrapBytesResponse(handler))
-        }
+        enterBufferedPlatform(
+            start = { completion -> getIVBTransportService().sendBytesRequest(request, completion) },
+            onComplete = { response ->
+                handleResponse(request, response, wrapBytesResponse(handler))
+            },
+        )
     }
 
     private fun isCanceledOrRemoved(): Boolean =
@@ -148,92 +192,72 @@ class VBTransportTask(
         request: VBTransportStringRequest,
         handler: VBTransportStringCompletionHandler?,
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportStringResponse()
             logI("execute() request task is canceled")
-            handler?.let {
-                response.errorCode = VBTransportResultCode.CODE_CANCELED
-                response.errorMessage = "Request has been canceled"
-                logI("execute() invoke failHandler，task has been canceled")
-                it(response)
-            } ?: run {
-                logI("task has been canceled and handler is null!")
-            }
+            finishCanceledBeforeStart(response, wrapStringResponse(handler))
             return
         }
-        state.value = VBTransportState.Running
-        getIVBTransportService().sendStringRequest(request) { response ->
-            handleResponse(request, response, wrapStringResponse(handler))
-        }
+        enterBufferedPlatform(
+            start = { completion -> getIVBTransportService().sendStringRequest(request, completion) },
+            onComplete = { response ->
+                handleResponse(request, response, wrapStringResponse(handler))
+            },
+        )
     }
 
     fun sendPostRequest(
         request: VBTransportPostRequest,
         handler: VBTransportPostHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportPostResponse()
             logI("execute() request task is canceled before")
-            handler?.let {
-                response.errorCode = VBTransportResultCode.CODE_CANCELED
-                response.errorMessage = "Request has been canceled"
-                logI("execute() invoke failHandler，task has been canceled")
-                it(response)
-            } ?: run {
-                logI("task has been canceled and handler is null!")
-            }
+            finishCanceledBeforeStart(response, wrapPostResponse(handler))
             return
         }
-        state.value = VBTransportState.Running
-        getIVBTransportService().post(request) { response ->
-            handleResponse(request, response, wrapPostResponse(handler))
-        }
+        enterBufferedPlatform(
+            start = { completion -> getIVBTransportService().post(request, completion) },
+            onComplete = { response ->
+                handleResponse(request, response, wrapPostResponse(handler))
+            },
+        )
     }
 
     fun sendGetRequest(
         request: VBTransportGetRequest,
         handler: VBTransportGetHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportGetResponse()
             logI("execute() request task is canceled before")
-            handler?.let {
-                response.errorCode = VBTransportResultCode.CODE_CANCELED
-                response.errorMessage = "Request has been canceled"
-                logI("execute() invoke failHandler，task has been canceled")
-                it(response)
-            } ?: run {
-                logI("task has been canceled and handler is null!")
-            }
+            finishCanceledBeforeStart(response, wrapGetResponse(handler))
             return
         }
-        state.value = VBTransportState.Running
-        getIVBTransportService().get(request) { response ->
-            handleResponse(request, response, wrapGetResponse(handler))
-        }
+        enterBufferedPlatform(
+            start = { completion -> getIVBTransportService().get(request, completion) },
+            onComplete = { response ->
+                handleResponse(request, response, wrapGetResponse(handler))
+            },
+        )
     }
 
     fun sendRequest(
         request: VBTransportRequest,
         handler: VBTransportHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportResponse()
             logI("execute() request task is canceled before")
-            handler?.let {
-                response.errorCode = VBTransportResultCode.CODE_CANCELED
-                response.errorMessage = "Request has been canceled"
-                logI("execute() invoke failHandler，task has been canceled")
-                it(response)
-            } ?: run {
-                logI("task has been canceled and handler is null!")
-            }
+            finishCanceledBeforeStart(response, wrapResponse(handler))
             return
         }
-        state.value = VBTransportState.Running
-        getIVBTransportService().request(request) { response ->
-            handleResponse(request, response, wrapResponse(handler))
-        }
+        enterBufferedPlatform(
+            start = { completion -> platformRequest(request, completion) },
+            onComplete = { response ->
+                handleResponse(request, response, wrapResponse(handler))
+            },
+        )
     }
 
     // fork #8: streaming download — response headers via [onResponseStart] as
@@ -245,18 +269,60 @@ class VBTransportTask(
         onChunk: (chunk: ByteArray) -> Unit,
         handler: VBTransportHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportResponse()
-            response.errorCode = VBTransportResultCode.CODE_CANCELED
-            response.errorMessage = "Request has been canceled"
             logI("streamRequest() task is canceled before")
-            handler?.invoke(response)
+            finishCanceledBeforeStart(response, wrapResponse(handler))
             return
         }
-        state.value = VBTransportState.Running
-        getIVBTransportService().requestStream(request, onResponseStart, onChunk) { response ->
-            handleResponse(request, response, wrapResponse(handler))
+        afterRunningPreparedForTest?.invoke()
+        val terminalHandoff = PlatformTerminalHandoff<VBTransportResponse>()
+        lateinit var gate: StreamCallbackGate<VBTransportResponse>
+        gate = StreamCallbackGate(
+            onStart = onResponseStart,
+            onChunk = onChunk,
+            onComplete = { response ->
+                response.request = request
+                state.compareAndSet(VBTransportState.Running, VBTransportState.Done)
+                handleResponse(request, response, wrapResponse(handler))
+            },
+            failureCompletion = { throwable ->
+                VBTransportResponse().apply {
+                    this.request = request
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = "stream callback failed: ${throwable.message ?: throwable::class.simpleName}"
+                }
+            },
+            cancelTransport = { cancelTransport() },
+            callbackFailureCompletion = { response ->
+                terminalHandoff.platformComplete(response, gate::complete)
+            },
+            onCallbackFailure = { throwable ->
+                logI("stream callback failed: ${throwable.message ?: throwable::class.simpleName}")
+            }
+        )
+        platformCallbackHandoff.value = terminalHandoff
+        streamGate.value = gate
+        afterStreamGateInstalledForTest?.invoke()
+        if (state.value == VBTransportState.Canceled) {
+            // cancel() recorded a pre-publish platform cancellation, but this
+            // request will never enter platform code to consume it.
+            abortUnusedPlatformReservation()
+            taskManager.onTaskFinish(this)
+            gate.complete(cancelledStreamResponse(request))
+            return
         }
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) {
+            return
+        }
+        platformRequestStream(
+            request,
+            { status, headers -> terminalHandoff.businessCallback { gate.responseStart(status, headers) } },
+            { chunk -> terminalHandoff.businessCallback { gate.chunk(chunk) } },
+        ) { response ->
+            terminalHandoff.platformComplete(response, gate::complete)
+        }
+        completePlatformEntryHandoff(gate, request, terminalHandoff)
     }
 
     // issue #8: streaming upload — body pushed by [writeBody] into the
@@ -267,21 +333,83 @@ class VBTransportTask(
         writeBody: suspend (com.tencent.kmm.network.export.NetworkByteStreamSink) -> Unit,
         handler: VBTransportHandler?
     ) {
-        if (isCanceledOrRemoved()) {
+        if (!trySetRunning()) {
             val response = VBTransportResponse()
-            response.errorCode = VBTransportResultCode.CODE_CANCELED
-            response.errorMessage = "Request has been canceled"
             logI("uploadStreamRequest() task is canceled before")
-            handler?.invoke(response)
+            finishCanceledBeforeStart(response, wrapResponse(handler))
             return
         }
-        state.value = VBTransportState.Running
-        getIVBTransportService().requestUploadStream(request, contentLength, writeBody) { response ->
-            handleResponse(request, response, wrapResponse(handler))
+        afterRunningPreparedForTest?.invoke()
+        val gate = StreamCallbackGate(
+            onStart = { _, _ -> },
+            onChunk = {},
+            onComplete = { response ->
+                response.request = request
+                state.compareAndSet(VBTransportState.Running, VBTransportState.Done)
+                handleResponse(request, response, wrapResponse(handler))
+            },
+            failureCompletion = { throwable ->
+                VBTransportResponse().apply {
+                    this.request = request
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = "upload callback failed: ${throwable.message ?: throwable::class.simpleName}"
+                }
+            },
+            cancelTransport = { cancelTransport() },
+        )
+        val terminalHandoff = PlatformTerminalHandoff<VBTransportResponse>()
+        platformCallbackHandoff.value = terminalHandoff
+        streamGate.value = gate
+        afterStreamGateInstalledForTest?.invoke()
+        if (state.value == VBTransportState.Canceled) {
+            abortUnusedPlatformReservation()
+            taskManager.onTaskFinish(this)
+            gate.complete(cancelledStreamResponse(request))
+            return
         }
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) {
+            return
+        }
+        platformRequestUpload(request, contentLength, writeBody) { response ->
+            terminalHandoff.platformComplete(response, gate::complete)
+        }
+        completePlatformEntryHandoff(gate, request, terminalHandoff)
     }
 
     fun getState(): VBTransportState = state.value
+
+    private fun trySetRunning(): Boolean {
+        // Publish prepare ownership before Running becomes externally visible;
+        // cancel can then never release the common id while an old thread is
+        // still able to create a platform reservation.
+        platformPrepareInProgress.value = true
+        if (!state.compareAndSet(VBTransportState.Create, VBTransportState.Running)) {
+            platformPrepareInProgress.value = false
+            return false
+        }
+        beforePlatformPrepareForTest?.invoke()
+        if (state.value != VBTransportState.Running) {
+            platformPrepareInProgress.value = false
+            return false
+        }
+        val prepared = runCatching { platformPrepare(requestId) }.getOrElse { throwable ->
+            logI("platform prepare failed: ${throwable.message ?: throwable::class.simpleName}")
+            false
+        }
+        if (!prepared) {
+            platformPrepareInProgress.value = false
+            state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+            return false
+        }
+        afterPlatformPreparedForTest?.invoke()
+        platformEntryPhase.value = PLATFORM_PHASE_RESERVED
+        platformPrepareInProgress.value = false
+        if (state.value != VBTransportState.Running) {
+            abortUnusedPlatformReservation()
+            return false
+        }
+        return true
+    }
 
     fun setState(state: VBTransportState) {
         this.state.value = state
@@ -304,12 +432,151 @@ class VBTransportTask(
     }
 
     fun cancel() {
-        state.value = VBTransportState.Canceled
-        getIVBTransportService().cancel(requestId)
+        while (true) {
+            val current = state.value
+            if (
+                current == VBTransportState.Done ||
+                current == VBTransportState.Canceled ||
+                current == VBTransportState.Unknown
+            ) {
+                return
+            }
+            val gate = streamGate.value
+            if (current == VBTransportState.Running && gate != null) {
+                val abortedBeforeEntry = abortUnusedPlatformReservation()
+                if (!abortedBeforeEntry && platformEntryPhase.value == PLATFORM_PHASE_ABORTING) {
+                    return
+                }
+                if (platformEntryPhase.value == PLATFORM_PHASE_CANCEL_PENDING) return
+                if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_CANCEL_PENDING)) {
+                    // Publish cancellation to the platform reservation now so
+                    // register/handoff cannot start work. Terminal delivery
+                    // waits until the synchronous handoff returns, preventing
+                    // same-id reuse from being consumed by the old request.
+                    platformCallbackHandoff.value?.cancelBusinessCallbacks()
+                    cancelPlatformContained()
+                    return
+                }
+                gate.complete(cancelledStreamResponse()) {
+                    state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+                    if (platformEntryPhase.value == PLATFORM_PHASE_ENTERED) {
+                        cancelPlatformContained()
+                    }
+                    taskManager.onTaskFinish(this)
+                }
+                return
+            }
+            if (gate == null) {
+                kotlinx.atomicfu.locks.synchronized(bufferedTerminalLock) {
+                    if (bufferedCompletionClaimed) return
+                    cancelWithoutStreamGate()
+                }
+                return
+            }
+        }
     }
 
+    private fun cancelWithoutStreamGate() {
+        val current = state.value
+        if (
+            current == VBTransportState.Done ||
+            current == VBTransportState.Canceled ||
+            current == VBTransportState.Unknown
+        ) return
+        if (current == VBTransportState.Running && abortUnusedPlatformReservation()) {
+            state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+            taskManager.onTaskFinish(this)
+            return
+        }
+        if (current == VBTransportState.Running && platformEntryPhase.value == PLATFORM_PHASE_CANCEL_PENDING) return
+        if (
+            current == VBTransportState.Running &&
+            platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_CANCEL_PENDING)
+        ) {
+            state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+            cancelPlatformContained()
+            return
+        }
+        if (state.compareAndSet(current, VBTransportState.Canceled) && current == VBTransportState.Running) {
+            cancelPlatformContained()
+            if (!platformPrepareInProgress.value) taskManager.onTaskFinish(this)
+        }
+    }
+
+    private fun cancelledStreamResponse(request: VBTransportRequest? = null) =
+        VBTransportResponse().apply {
+            if (request != null) {
+                this.request = request
+            }
+            this.errorCode = VBTransportResultCode.CODE_CANCELED
+            this.errorMessage = "Request has been canceled"
+        }
+
     fun cancelTransport() {
-        getIVBTransportService().cancel(requestId)
+        cancelPlatformContained()
+    }
+
+    private fun cancelPlatformContained() {
+        runCatching { platformCancel(requestId) }.onFailure { throwable ->
+            logI("platform cancel failed: ${throwable.message ?: throwable::class.simpleName}")
+        }
+    }
+
+    private fun abortUnusedPlatformReservation(): Boolean {
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ABORTING)) {
+            return false
+        }
+        try {
+            platformAbortPrepared(requestId)
+            platformEntryPhase.value = PLATFORM_PHASE_ABORTED
+        } catch (throwable: Throwable) {
+            val retryFailure = runCatching { platformAbortPrepared(requestId) }.exceptionOrNull()
+            platformEntryPhase.value = if (retryFailure == null) {
+                PLATFORM_PHASE_ABORTED
+            } else {
+                PLATFORM_PHASE_ABORT_FAILED
+            }
+            logI(
+                "abort prepared request failed: ${throwable.message ?: throwable::class.simpleName}" +
+                    (retryFailure?.let { "; retry failed: ${it.message ?: it::class.simpleName}" } ?: "; retry succeeded")
+            )
+        }
+        return true
+    }
+
+    private fun completePlatformEntryHandoff(
+        gate: StreamCallbackGate<VBTransportResponse>,
+        request: VBTransportRequest,
+        terminalHandoff: PlatformTerminalHandoff<VBTransportResponse>,
+    ) {
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_ENTERED)) {
+            terminalHandoff.finish(cancelled = false, gate::complete)
+            return
+        }
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_CANCEL_PENDING, PLATFORM_PHASE_ENTERED)) {
+            terminalHandoff.finish(cancelled = true, gate::complete)
+            gate.complete(cancelledStreamResponse(request)) {
+                state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+                taskManager.onTaskFinish(this)
+            }
+        }
+    }
+
+    private fun <C : VBTransportBaseResponse> enterBufferedPlatform(
+        start: ((C) -> Unit) -> Unit,
+        onComplete: (C) -> Unit,
+    ) {
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) return
+        val terminalHandoff = PlatformTerminalHandoff<C>()
+        start { response -> terminalHandoff.platformComplete(response, onComplete) }
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_ENTERED)) {
+            terminalHandoff.finish(cancelled = false, onComplete)
+            return
+        }
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_CANCEL_PENDING, PLATFORM_PHASE_ENTERED)) {
+            terminalHandoff.finish(cancelled = true, onComplete)
+            taskManager.onTaskFinish(this)
+        }
     }
 
     private fun logI(content: String) {
@@ -317,3 +584,49 @@ class VBTransportTask(
     }
 
 }
+
+private class PlatformTerminalHandoff<C> : kotlinx.atomicfu.locks.SynchronizedObject() {
+    private val businessGate = InflightCallbackGate()
+    private var finished = false
+    private var cancelled = false
+    private var pending: C? = null
+
+    fun businessCallback(action: () -> Unit) {
+        businessGate.runIfOpen(action)
+    }
+
+    fun cancelBusinessCallbacks() {
+        businessGate.closeAndRun {}
+    }
+
+    fun platformComplete(completion: C, deliver: (C) -> Unit) {
+        val deliverNow = kotlinx.atomicfu.locks.synchronized(this) {
+            if (!finished) {
+                if (pending == null) pending = completion
+                false
+            } else {
+                !cancelled
+            }
+        }
+        if (deliverNow) deliver(completion)
+    }
+
+    fun finish(cancelled: Boolean, deliver: (C) -> Unit) {
+        if (cancelled) cancelBusinessCallbacks()
+        val pendingCompletion = kotlinx.atomicfu.locks.synchronized(this) {
+            this.finished = true
+            this.cancelled = cancelled
+            pending.also { pending = null }.takeUnless { cancelled }
+        }
+        pendingCompletion?.let(deliver)
+    }
+}
+
+private const val PLATFORM_PHASE_NONE = 0
+private const val PLATFORM_PHASE_RESERVED = 1
+private const val PLATFORM_PHASE_ENTERED = 2
+private const val PLATFORM_PHASE_ABORTING = 3
+private const val PLATFORM_PHASE_ABORTED = 4
+private const val PLATFORM_PHASE_ABORT_FAILED = 5
+private const val PLATFORM_PHASE_ENTERING = 6
+private const val PLATFORM_PHASE_CANCEL_PENDING = 7

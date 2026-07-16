@@ -92,7 +92,7 @@ object VBTransportCommonUtils {
     }
 
     fun buildResponseAndCallback(
-        taskMap: MutableMap<Int, Job>,
+        taskMap: MutableMap<Int, Job>?,
         errorCode: Int,
         errorMsg: String,
         headers: Map<String, List<String>>,
@@ -137,7 +137,7 @@ object VBTransportCommonUtils {
             }
             kmmCallback(kmmBytesResponse)
         }
-        if (removeOnComplete) taskMap.remove(request.requestId)
+        if (removeOnComplete) taskMap?.remove(request.requestId)
     }
 
     private fun updateResponse(

@@ -140,6 +140,10 @@ open class VBTransportBaseRequest {
     internal var curlCaInfoPath: String? = null
     internal var curlProxyUrl: String? = null
     internal var curlHttp3Enabled: Boolean = false
+    internal var streamConnectTimeoutMillis: Long = 3_000L
+    internal var streamResponseHeadersTimeoutMillis: Long = 30_000L
+    internal var streamIdleTimeoutMillis: Long = 60_000L
+    internal var streamWholeTimeoutMillis: Long = 0L
 
     internal open fun bodyData(): Any? = null
 }

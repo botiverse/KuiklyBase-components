@@ -16,24 +16,27 @@
  */
 package com.tencent.kmm.network.internal
 
-import kotlinx.atomicfu.locks.SynchronizedObject
-import kotlinx.atomicfu.locks.synchronized
-
 object VBTransportManager {
 
-    // 任务状态管理Map
-    private val lock = SynchronizedObject()
-    private val taskMap = mutableMapOf<Int, VBTransportTask>()
+    // Cancellation-aware task ownership. A cancel may beat the coroutine that
+    // publishes the task; the tombstone makes that race deterministic instead
+    // of silently losing the cancellation.
+    private val tasks = CancellationAwareRegistry<Int, VBTransportTask>()
 
-    fun getTask(requestId: Int): VBTransportTask? = synchronized(lock) { taskMap[requestId] }
+    fun getTask(requestId: Int): VBTransportTask? = tasks.get(requestId)
+
+    fun onTaskPrepared(requestId: Int): Boolean = tasks.begin(requestId)
 
     fun onTaskBegin(task: VBTransportTask) {
         logI("${task.logTag} onTaskBegin() requestId :${task.requestId}")
-        synchronized(lock) { taskMap[task.requestId] = task }
+        if (!tasks.publish(task.requestId, task)) {
+            logI("${task.logTag} onTaskBegin() consumed pre-cancel requestId:${task.requestId}")
+            task.cancel()
+        }
     }
 
     fun getState(requestId: Int): VBTransportState {
-        val task = synchronized(lock) { taskMap[requestId] }
+        val task = tasks.get(requestId)
         if (task == null) {
             logI("requestId:$requestId don't exist！")
             return VBTransportState.Unknown
@@ -42,14 +45,20 @@ object VBTransportManager {
     }
 
     fun cancel(requestId: Int) {
-        val task = synchronized(lock) { taskMap.remove(requestId) }
-        task?.cancel()
+        var taskToCancel: VBTransportTask? = null
+        // Keep the common owner published until its platform reservation/job
+        // is synchronously cleaned. This closes same-id ABA between manager
+        // lookup and task.cancel(); onTaskFinish removes by identity.
+        tasks.cancelOrRemember(requestId, removePublished = false) { task ->
+            taskToCancel = task
+        }
+        taskToCancel?.cancel()
         logI("requestId:$requestId is cancelled!")
     }
 
-    fun onTaskFinish(requestId: Int) {
-        synchronized(lock) { taskMap.remove(requestId) }
-        logI("requestId:$requestId is removed!")
+    fun onTaskFinish(task: VBTransportTask) {
+        tasks.removeIfSame(task.requestId, task)
+        logI("requestId:${task.requestId} is removed!")
     }
 
     private fun logI(content: String) {

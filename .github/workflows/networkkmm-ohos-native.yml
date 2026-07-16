@@ -21,22 +21,32 @@ on:
     paths:
       - "NetworkKMM/scripts/build-ohos-native.sh"
       - "NetworkKMM/settings.gradle.kts"
+      - "NetworkKMM/settings.ohos.gradle.kts"
+      - "NetworkKMM/build.ohos.gradle.kts"
+      - "NetworkKMM/network/build.ohos.gradle.kts"
+      - "NetworkKMM/gradle/libs.versions.toml"
+      - "NetworkKMM/gradle.properties"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
-      - "NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/curl/**"
-      - "NetworkKMM/network/src/ohosArm64Main/kotlin/com/tencent/kmm/network/curl/**"
-      - "NetworkKMM/network/src/nativeInterop/cinterop/**"
+      - "NetworkKMM/network/src/**"
       - "NetworkKMM/network-host-native-tests/**"
       - ".github/workflows/networkkmm-ohos-native.yml"
   pull_request:
     paths:
       - "NetworkKMM/scripts/build-ohos-native.sh"
       - "NetworkKMM/settings.gradle.kts"
+      - "NetworkKMM/settings.ohos.gradle.kts"
+      - "NetworkKMM/build.ohos.gradle.kts"
+      - "NetworkKMM/network/build.ohos.gradle.kts"
+      - "NetworkKMM/gradle/libs.versions.toml"
+      - "NetworkKMM/gradle.properties"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
-      - "NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/curl/**"
-      - "NetworkKMM/network/src/ohosArm64Main/kotlin/com/tencent/kmm/network/curl/**"
-      - "NetworkKMM/network/src/nativeInterop/cinterop/**"
+      - "NetworkKMM/network/src/**"
       - "NetworkKMM/network-host-native-tests/**"
       - ".github/workflows/networkkmm-ohos-native.yml"
+
+concurrency:
+  group: networkkmm-ohos-native-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # Behavior-contract tests: the wrapper built for the HOST (same sources,
@@ -81,9 +91,6 @@ jobs:
   build-native:
     name: Cross-compile OHOS native (OpenSSL + curl + wrapper)
     runs-on: ubuntu-latest
-    # contents:write lets the commit_binaries dispatch push refreshed .so back.
-    permissions:
-      contents: write
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     steps:
@@ -152,6 +159,31 @@ jobs:
           grep -q -- "--openssldir=/etc/ssl" "$script"
           echo "TLS verification + system CA path: OK"
 
+      - name: Build paired OHOS Kotlin/Native consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd NetworkKMM
+          ./gradlew -c settings.ohos.gradle.kts :network:linkDebugSharedOhosArm64 \
+            --no-daemon --console=plain --stacktrace
+          source_lib="network/build/bin/ohosArm64/debugShared/libkn.so"
+          target_lib="ohosApp/entry/libs/arm64-v8a/libkn.so"
+          test -s "$source_lib"
+          cp "$source_lib" "$target_lib"
+          symbols="$(readelf --dyn-syms --wide "$target_lib")"
+          printf '%s\n' "$symbols" | grep ' UND CurlWrapperAbiVersion$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartStreamRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartUploadRequestV27$' >/dev/null
+          legacy_matches="$(printf '%s\n' "$symbols" | grep -E ' UND Start(Request|StreamRequest|UploadRequest)$' || true)"
+          if [[ -n "$legacy_matches" ]]; then
+            echo "OHOS Kotlin/Native consumer still imports legacy Start* symbols" >&2
+            printf '%s\n' "$legacy_matches" >&2
+            exit 1
+          fi
+          echo "OHOS Kotlin/Native consumer ABI/V27 dynamic imports:"
+          printf '%s\n' "$symbols" | grep -E ' UND (CurlWrapperAbiVersion|Start(Request|StreamRequest|UploadRequest)V27)$'
+
       - name: Upload native artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -164,12 +196,75 @@ jobs:
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libpbcurlwrapper.so
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libopenssl.so
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libc++_shared.so
+            NetworkKMM/ohosApp/entry/libs/arm64-v8a/libkn.so
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libcurl.a
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libnghttp3.a
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
 
+  commit:
+    name: Commit paired OHOS native binaries
+    if: github.event_name == 'workflow_dispatch' && inputs.commit_binaries
+    needs: [wrapper-behavior-tests, build-native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify frozen dispatch exact
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ github.sha }}"
+          actual="$(git rev-parse HEAD)"
+          echo "writeback expected_sha=$expected actual_sha=$actual target_ref=${{ github.ref_name }}"
+          test "$actual" = "$expected"
+
+      - name: Download paired artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: networkkmm-ohos-native
+          path: /tmp/networkkmm-ohos-native
+
+      - name: Place paired artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact=/tmp/networkkmm-ohos-native
+          files=(
+            network/libs/libpbcurlwrapper.so
+            network/libs/libopenssl.so
+            network/libs/libc++_shared.so
+            ohosApp/entry/libs/arm64-v8a/libpbcurlwrapper.so
+            ohosApp/entry/libs/arm64-v8a/libopenssl.so
+            ohosApp/entry/libs/arm64-v8a/libc++_shared.so
+            ohosApp/entry/libs/arm64-v8a/libkn.so
+            ohosApp/pbcurlwrapper/libs/arm64-v8a/libcurl.a
+            ohosApp/pbcurlwrapper/libs/arm64-v8a/libnghttp3.a
+            ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
+          )
+          for file in "${files[@]}"; do
+            test -s "$artifact/$file" || { echo "missing paired artifact member: $file" >&2; exit 1; }
+          done
+
+          symbols="$(readelf --dyn-syms --wide "$artifact/ohosApp/entry/libs/arm64-v8a/libkn.so")"
+          printf '%s\n' "$symbols" | grep ' UND CurlWrapperAbiVersion$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartStreamRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartUploadRequestV27$' >/dev/null
+          legacy_matches="$(printf '%s\n' "$symbols" | grep -E ' UND Start(Request|StreamRequest|UploadRequest)$' || true)"
+          test -z "$legacy_matches" || { printf '%s\n' "$legacy_matches" >&2; exit 1; }
+
+          for file in "${files[@]}"; do
+            mkdir -p "NetworkKMM/$(dirname "$file")"
+            cp -f "$artifact/$file" "NetworkKMM/$file"
+          done
+
       - name: Commit refreshed binaries back
-        if: github.event_name == 'workflow_dispatch' && inputs.commit_binaries
         shell: bash
         run: |
           set -euo pipefail
@@ -183,5 +278,8 @@ jobs:
             echo "No binary changes to commit."
           else
             git commit -m "ci: refresh NetworkKMM OHOS native binaries [skip ci]"
-            git push
+            # The detached commit is based on the exact dispatch SHA. If the
+            # branch moved while this run was building, the non-force push is
+            # rejected rather than mixing old artifacts into newer source.
+            git push origin "HEAD:${{ github.ref_name }}"
           fi

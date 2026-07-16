@@ -19,10 +19,19 @@
 #define NETWORKKMM_OHOSAPP_PBCURLWRAPPER_MAIN_CPP_WRAPPER_INCLUDE_CURL_WRAPPER_H_
 
 #include <stdint.h>
+#include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+// Increment whenever a public by-value struct or exported callback contract
+// changes incompatibly. Kotlin/JNI callers must verify this before passing a
+// CurlRequest so a stale native runtime fails closed instead of interpreting
+// a differently-sized struct.
+#define CURL_WRAPPER_ABI_VERSION 27
+
+int CurlWrapperAbiVersion(void);
 
 /**
  * 日志 回调
@@ -65,6 +74,10 @@ typedef struct {
     const char *method;
     StringDic *headers;
     int64_t timeout;  // 单位 ms
+    int64_t streamConnectTimeoutMs;
+    int64_t streamResponseHeadersTimeoutMs;
+    int64_t streamIdleTimeoutMs;
+    int64_t streamWholeTimeoutMs;  // 0 = disabled
     int postBodyLen;
     const char *postBody;
 } CurlRequest;
@@ -157,17 +170,21 @@ int SetCurlHttp3Enabled(CurClientHandle handle, int enabled);
 const char *GetCurlNegotiatedProtocol(CurClientHandle handle);
 
 // Curl 发送请求
-void StartRequest(CurClientHandle handle, CurlRequest request, CurlCallback *callback);
+int StartRequestV27(CurClientHandle handle, const CurlRequest *request,
+                    size_t requestSize, int abiVersion, CurlCallback *callback);
 
 // Curl 流式发送请求 (fork #8): 响应体逐块通过 callback->onChunk 交付, 不缓冲整包。
-void StartStreamRequest(CurClientHandle handle, CurlRequest request, CurlStreamCallback *callback);
+int StartStreamRequestV27(CurClientHandle handle, const CurlRequest *request,
+                          size_t requestSize, int abiVersion, CurlStreamCallback *callback);
 
 // Curl 流式上传请求 (issue #8 slice 3): 请求体从 source->readChunk 逐块拉取,
 // 不整包进内存 (request 的 postBody/postBodyLen 被忽略); 响应仍整包缓冲后经
 // callback 交付, 与 StartRequest 一致。source 为非可寻址流: 需要重发 body 的
 // 场景 (重定向 re-POST / 认证重试) 会以 CURLE_SEND_FAIL_REWIND 失败而不是
 // 静默发送残缺 body。
-void StartUploadRequest(CurClientHandle handle, CurlRequest request, CurlUploadSource *source, CurlCallback *callback);
+int StartUploadRequestV27(CurClientHandle handle, const CurlRequest *request,
+                          size_t requestSize, int abiVersion,
+                          CurlUploadSource *source, CurlCallback *callback);
 
 #ifdef __cplusplus
 }

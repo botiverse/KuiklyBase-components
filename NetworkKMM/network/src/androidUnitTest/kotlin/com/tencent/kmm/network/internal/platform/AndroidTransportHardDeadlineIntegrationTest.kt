@@ -21,6 +21,7 @@ import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.VBTransportRequest
 import com.tencent.kmm.network.export.VBTransportResponse
 import com.tencent.kmm.network.export.VBTransportReusedHttp2Recovery
+import com.tencent.kmm.network.export.VBTransportResultCode
 import com.tencent.kmm.network.internal.utils.AndroidTransportClientProvider
 import com.tencent.kmm.network.internal.utils.AndroidTransportPhaseTracer
 import com.tencent.kmm.network.internal.utils.applyTransportOkHttpDefaults
@@ -118,6 +119,43 @@ class AndroidTransportHardDeadlineIntegrationTest {
             AndroidTransportPhaseTracer.activeCallCountForTests() == 0,
             "transport must still be blocked before an OkHttp call starts",
         )
+    }
+
+    @Test
+    fun publicStreamWholeDeadlineStartsBeforeBlockedTransportCoroutine() {
+        AndroidTransportTestHooks.beforeTransportCoroutineStart = {
+            releaseTransportStart.await(5, TimeUnit.SECONDS)
+        }
+        val request = request("/never-started", timeoutMillis = 0L).apply {
+            useCurl = false
+            streamWholeTimeoutMillis = 100L
+            streamResponseHeadersTimeoutMillis = 0L
+        }
+        val response = AtomicReference<VBTransportResponse?>()
+        val terminal = CountDownLatch(1)
+        var starts = 0
+        var chunks = 0
+
+        VBTransportService.streamRequest(
+            request,
+            onResponseStart = { _, _ -> starts++ },
+            onChunk = { chunks++ },
+        ) {
+            response.set(it)
+            terminal.countDown()
+        }
+        Thread.sleep(150L)
+        releaseTransportStart.countDown()
+
+        assertTrue(terminal.await(2, TimeUnit.SECONDS), "stream terminal did not arrive")
+        assertEquals(VBTransportResultCode.CODE_FORCE_TIMEOUT, assertNotNull(response.get()).errorCode)
+        assertEquals(0, starts)
+        assertEquals(0, chunks)
+        assertEquals(null, server.takeRequest(200, TimeUnit.MILLISECONDS))
+        assertEventually("expired stream resources did not converge") {
+            AndroidTransportPhaseTracer.activeCallCountForTests() == 0 &&
+                AndroidTransportClientProvider.activeLeaseCountForTests() == 0
+        }
     }
 
     @Test

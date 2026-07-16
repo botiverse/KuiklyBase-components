@@ -18,6 +18,8 @@ package com.tencent.kmm.network.curl
 
 import com.tencent.kmm.network.export.IVBPBLog
 import com.tencent.kmm.network.internal.VBPBLog
+import com.tencent.kmm.network.internal.CancellationAwareRegistry
+import com.tencent.kmm.network.internal.StreamCallbackGate
 import com.tencent.kmm.network.internal.transportLaunch
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapBytesCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapGetCallback
@@ -25,6 +27,8 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapPostCal
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapRequestCallback
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringCallback
 import com.tencent.qqlive.kmm.native.libcurl.Cancel
+import com.tencent.qqlive.kmm.native.libcurl.CurlWrapperAbiVersion
+import com.tencent.qqlive.kmm.native.libcurl.CURL_WRAPPER_ABI_VERSION
 import com.tencent.qqlive.kmm.native.libcurl.CreateCurlClient
 import com.tencent.qqlive.kmm.native.libcurl.GetCurlNegotiatedProtocol
 import com.tencent.qqlive.kmm.native.libcurl.CurlCallback
@@ -36,9 +40,9 @@ import com.tencent.qqlive.kmm.native.libcurl.SetCurlHttp3Enabled
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlProxy
 import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlUploadSource
-import com.tencent.qqlive.kmm.native.libcurl.StartRequest
-import com.tencent.qqlive.kmm.native.libcurl.StartStreamRequest
-import com.tencent.qqlive.kmm.native.libcurl.StartUploadRequest
+import com.tencent.qqlive.kmm.native.libcurl.StartRequestV27
+import com.tencent.qqlive.kmm.native.libcurl.StartStreamRequestV27
+import com.tencent.qqlive.kmm.native.libcurl.StartUploadRequestV27
 import com.tencent.qqlive.kmm.native.libcurl.StringDic
 import com.tencent.qqlive.kmm.native.libcurl.StringPair
 import com.tencent.qqlive.kmm.native.libcurl.setCurlLogImpl
@@ -63,14 +67,12 @@ import kotlinx.cinterop.CFunction
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.CPointed
 import kotlinx.cinterop.CPointer
-import kotlinx.cinterop.CValue
 import kotlinx.cinterop.MemScope
 import kotlinx.cinterop.StableRef
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.asStableRef
-import kotlinx.cinterop.cValue
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.cstr
 import kotlinx.cinterop.get
@@ -80,6 +82,7 @@ import kotlinx.cinterop.pointed
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.readBytes
 import kotlinx.cinterop.staticCFunction
+import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
 import platform.posix.int8_tVar
@@ -124,12 +127,21 @@ private fun toSafeString(content: CPointer<ByteVar>?): String {
 // Curl 鸿蒙平台实现
 object CurlRequestServiceHM : ICurlRequestService {
 
-    private val taskMap: MutableMap<Int, CPointer<out CPointed>?> = mutableMapOf()
+    private val nativeHandles = CancellationAwareRegistry<Int, CPointer<out CPointed>>()
+
+    fun prepareRequest(requestId: Int): Boolean = nativeHandles.begin(requestId)
+
+    fun abortPreparedRequest(requestId: Int) {
+        nativeHandles.remove(requestId)
+    }
 
     private fun configureCurlRuntime(
         handle: CPointer<out CPointed>?,
         request: VBTransportBaseRequest
     ) {
+        check(CurlWrapperAbiVersion() == CURL_WRAPPER_ABI_VERSION) {
+            "OHOS curl wrapper ABI mismatch"
+        }
         // App-owned trust: preparation staged a verified CA path. Absent path
         // = platform-default trust — skip SetCurlCaInfo so the compiled
         // CURL_CA_BUNDLE (/etc/ssl/certs/cacert.pem) applies. The proxy URL
@@ -187,9 +199,33 @@ object CurlRequestServiceHM : ICurlRequestService {
 
     override fun cancel(requestId: Int) {
         logI("TaskManager remove task, id:${requestId}")
-        taskMap[requestId]?.let {
-            logI("TaskManager remove task, id:${requestId} handler:${it}")
-            Cancel(it)
+        nativeHandles.cancelOrRemember(requestId, removePublished = false) { handle ->
+            logI("TaskManager cancel task, id:${requestId} handler:${handle}")
+            Cancel(handle)
+        }
+    }
+
+    private fun publishNativeHandle(requestId: Int, handle: CPointer<out CPointed>, logTag: String): Boolean {
+        return if (nativeHandles.publish(requestId, handle)) {
+            logI("[$logTag] native handle published, id:$requestId, handle:$handle")
+            true
+        } else {
+            logI("[$logTag] native handle consumed pre-cancel, id:$requestId, handle:$handle")
+            Cancel(handle)
+            false
+        }
+    }
+
+    private fun releaseNativeHandle(requestId: Int, handle: CPointer<out CPointed>, logTag: String) {
+        val released = nativeHandles.removeIfSame(requestId, handle) { owned ->
+            logI("[$logTag] native handle release, id:$requestId, handle:$owned")
+            DeleteCurlClient(owned)
+        }
+        if (!released) {
+            // The handle may have consumed a pre-publication tombstone and was
+            // therefore never inserted. It is still exclusively owned here.
+            logI("[$logTag] unpublished native handle release, id:$requestId, handle:$handle")
+            DeleteCurlClient(handle)
         }
     }
 
@@ -198,12 +234,16 @@ object CurlRequestServiceHM : ICurlRequestService {
         headers: StringDic,
         memScope: MemScope,
         logTag: String
-    ): CValue<CurlRequest> {
-        return cValue<CurlRequest> {
+    ): CPointer<CurlRequest> {
+        return memScope.alloc<CurlRequest> {
             this.url = toCSTR(request.url, memScope)
             this.method = toCSTR(request.method.name, memScope)
             this.headers = headers.ptr
             this.timeout = request.totalTimeout
+            this.streamConnectTimeoutMs = request.streamConnectTimeoutMillis
+            this.streamResponseHeadersTimeoutMs = request.streamResponseHeadersTimeoutMillis
+            this.streamIdleTimeoutMs = request.streamIdleTimeoutMillis
+            this.streamWholeTimeoutMs = request.streamWholeTimeoutMillis
             this.postBodyLen = 0
             when (val data = request.bodyData()) {
                 is ByteArray -> {
@@ -231,7 +271,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                             "size: ${postBodyLen}, data: $strData")
                 }
             }
-        }
+        }.ptr
     }
 
     override fun get(
@@ -365,10 +405,12 @@ object CurlRequestServiceHM : ICurlRequestService {
             val headers = toStringDic(buildRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
             var nativeResponse = CurlNativeResponse()
-            val handle = checkNotNull(CreateCurlClient(logTag)) {
-                "CreateCurlClient failed"
+            val handle = CreateCurlClient(logTag) ?: run {
+                nativeHandles.remove(request.requestId)
+                error("CreateCurlClient failed")
             }
             try {
+                if (!publishNativeHandle(request.requestId, handle, logTag)) return@memScoped
                 configureCurlRuntime(handle, request)
                 val callback = object : ICurlCallback {
                     override fun onResponse(result: CurlResponse) {
@@ -382,21 +424,25 @@ object CurlRequestServiceHM : ICurlRequestService {
                 // 使用 libcurl 发起请求
                 val callbackWrapper = CurlCallbackWrapper(callback)
                 try {
-                    taskMap[request.requestId] = handle
-                    logI("[$logTag] TaskManager add transport task, id:${request.requestId}, handle:${handle}")
-                    StartRequest(handle, curlRequest, callbackWrapper.getCallbackNativePtr())
+                    check(
+                        StartRequestV27(
+                            handle,
+                            curlRequest,
+                            sizeOf<CurlRequest>().convert(),
+                            CURL_WRAPPER_ABI_VERSION,
+                            callbackWrapper.getCallbackNativePtr()
+                        ) != 0
+                    ) { "OHOS curl request ABI rejected" }
                 } finally {
-                    if (taskMap[request.requestId] == handle) {
-                        taskMap.remove(request.requestId)
-                    }
                     callbackWrapper.release()
                 }
+                // Publish the common terminal while the native handle is still
+                // owned. A concurrent common cancel can then only cancel this
+                // handle, never create a tombstone after native release.
+                buildResponseAndCallback(request, nativeResponse, responseCallback)
             } finally {
-                DeleteCurlClient(handle)
+                releaseNativeHandle(request.requestId, handle, logTag)
             }
-
-            // 构造回调信息
-            buildResponseAndCallback(request, nativeResponse, responseCallback)
             logI("[$logTag] invoke callback.")
         }
     }
@@ -452,13 +498,17 @@ object CurlRequestServiceHM : ICurlRequestService {
             streamRequestUnsafe(request, onResponseStart, onChunk, onComplete, logTag)
         } catch (throwable: Throwable) {
             logI("[$logTag] streamRequest failed: ${throwable.message ?: throwable::class.simpleName}")
-            onComplete(
-                VBTransportResponse().apply {
-                    this.request = request
-                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
-                    this.errorMessage = throwable.message ?: "native stream request failed"
-                }
-            )
+            try {
+                onComplete(
+                    VBTransportResponse().apply {
+                        this.request = request
+                        this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                        this.errorMessage = throwable.message ?: "native stream request failed"
+                    }
+                )
+            } catch (callbackFailure: Throwable) {
+                logE("[$logTag] stream terminal callback failed: ${callbackFailure.message}")
+            }
         }
     }
 
@@ -474,18 +524,36 @@ object CurlRequestServiceHM : ICurlRequestService {
             // gzip here (chunks would arrive compressed and undecodable).
             val headers = toStringDic(buildStreamRequestHeader(request), memScope)
             val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
-            val handle = checkNotNull(CreateCurlClient(logTag)) {
-                "CreateCurlClient failed"
+            val handle = CreateCurlClient(logTag) ?: run {
+                nativeHandles.remove(request.requestId)
+                error("CreateCurlClient failed")
             }
             try {
+                if (!publishNativeHandle(request.requestId, handle, logTag)) return@memScoped
                 configureCurlRuntime(handle, request)
+                fun callbackFailureResponse(throwable: Throwable) =
+                    VBTransportResponse().apply {
+                        this.request = request
+                        this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                        this.errorMessage = "stream callback failed: ${throwable.message ?: throwable::class.simpleName}"
+                    }
+                val gate = StreamCallbackGate(
+                    onStart = onResponseStart,
+                    onChunk = onChunk,
+                    onComplete = onComplete,
+                    failureCompletion = ::callbackFailureResponse,
+                    cancelTransport = { cancel(request.requestId) },
+                    onCallbackFailure = { throwable ->
+                        logE("[$logTag] stream callback failure: ${throwable.message ?: throwable::class.simpleName}")
+                    }
+                )
                 val handler = object : IStreamHandler {
                     override fun onResponseStart(httpCode: Long, headers: String) {
-                        onResponseStart(httpCode.toInt(), parseCurlHeaders(headers))
+                        gate.responseStart(httpCode.toInt(), parseCurlHeaders(headers))
                     }
 
                     override fun onChunk(chunk: ByteArray) {
-                        onChunk(chunk)
+                        gate.chunk(chunk)
                     }
 
                     override fun onComplete(result: CurlResponse) {
@@ -493,7 +561,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                             handleCurlNativeResponse(result, logTag),
                             handle
                         )
-                        onComplete(
+                        gate.complete(
                             VBTransportResponse().apply {
                                 updateResponse(request.logTag, nativeResponse, request, this)
                             }
@@ -502,17 +570,20 @@ object CurlRequestServiceHM : ICurlRequestService {
                 }
                 val wrapper = CurlStreamCallbackWrapper(handler)
                 try {
-                    taskMap[request.requestId] = handle
-                    logI("[$logTag] stream transport task add, id:${request.requestId}, handle:${handle}")
-                    StartStreamRequest(handle, curlRequest, wrapper.getCallbackNativePtr())
+                    check(
+                        StartStreamRequestV27(
+                            handle,
+                            curlRequest,
+                            sizeOf<CurlRequest>().convert(),
+                            CURL_WRAPPER_ABI_VERSION,
+                            wrapper.getCallbackNativePtr()
+                        ) != 0
+                    ) { "OHOS curl stream request ABI rejected" }
                 } finally {
-                    if (taskMap[request.requestId] == handle) {
-                        taskMap.remove(request.requestId)
-                    }
                     wrapper.release()
                 }
             } finally {
-                DeleteCurlClient(handle)
+                releaseNativeHandle(request.requestId, handle, logTag)
             }
         }
     }
@@ -549,29 +620,31 @@ object CurlRequestServiceHM : ICurlRequestService {
         logTag: String
     ) {
         val bridge = UploadPullBridge()
-        // The writer pushes writeBody's chunks into the bridge from its own
-        // worker; the curl perform thread blocks in the READFUNCTION pulling
-        // them out. Dispatchers.IO keeps the (blocking) producer off the
-        // Default pool the perform coroutine already occupies.
-        val writerJob = uploadWriterScope.transportLaunch {
-            try {
-                writeBody(bridge.sink)
-                bridge.closeSuccess()
-            } catch (throwable: Throwable) {
-                logI("[$logTag] upload writeBody failed: ${throwable.message ?: throwable::class.simpleName}")
-                bridge.closeFailure(throwable)
-            }
-        }
+        var writerJob: kotlinx.coroutines.Job? = null
         try {
             memScoped {
                 val headers = toStringDic(buildRequestHeader(request), memScope)
                 val curlRequest = getCurlRequestParams(request, headers.pointed, memScope, logTag)
                 var nativeResponse = CurlNativeResponse()
-                val handle = checkNotNull(CreateCurlClient(logTag)) {
-                    "CreateCurlClient failed"
+                val handle = CreateCurlClient(logTag) ?: run {
+                    nativeHandles.remove(request.requestId)
+                    error("CreateCurlClient failed")
                 }
                 try {
+                    if (!publishNativeHandle(request.requestId, handle, logTag)) return@memScoped
                     configureCurlRuntime(handle, request)
+                    // Start the producer only after cancellation ownership was
+                    // published. A consumed pre-cancel must not read the body
+                    // or enter StartUploadRequestV27 at all.
+                    writerJob = uploadWriterScope.transportLaunch {
+                        try {
+                            writeBody(bridge.sink)
+                            bridge.closeSuccess()
+                        } catch (throwable: Throwable) {
+                            logI("[$logTag] upload writeBody failed: ${throwable.message ?: throwable::class.simpleName}")
+                            bridge.closeFailure(throwable)
+                        }
+                    }
                     val callback = object : ICurlCallback {
                         override fun onResponse(result: CurlResponse) {
                             nativeResponse = applyNegotiatedProtocol(
@@ -588,33 +661,37 @@ object CurlRequestServiceHM : ICurlRequestService {
                             this.readChunk = staticCFunction(::uploadReadChunk)
                             this.totalLength = contentLength ?: -1L
                         }
-                        taskMap[request.requestId] = handle
-                        logI("[$logTag] upload-stream transport task add, id:${request.requestId}, " +
+                        logI("[$logTag] upload-stream id:${request.requestId}, " +
                                 "handle:${handle}, contentLength:${contentLength ?: -1}")
-                        StartUploadRequest(handle, curlRequest, source.ptr, callbackWrapper.getCallbackNativePtr())
+                        check(
+                            StartUploadRequestV27(
+                                handle,
+                                curlRequest,
+                                sizeOf<CurlRequest>().convert(),
+                                CURL_WRAPPER_ABI_VERSION,
+                                source.ptr,
+                                callbackWrapper.getCallbackNativePtr()
+                            ) != 0
+                        ) { "OHOS curl upload request ABI rejected" }
                     } finally {
-                        if (taskMap[request.requestId] == handle) {
-                            taskMap.remove(request.requestId)
-                        }
                         bridgeRef.dispose()
                         callbackWrapper.release()
                     }
+                    // Close common task ownership before native release so a
+                    // late common cancel cannot poison a reused request id.
+                    responseCallback(
+                        VBTransportResponse().apply {
+                            updateResponse(request.logTag, nativeResponse, request, this)
+                        }
+                    )
                 } finally {
-                    DeleteCurlClient(handle)
+                    releaseNativeHandle(request.requestId, handle, logTag)
                 }
-                // Built inline (like streamRequest's onComplete): responseCallback
-                // is typed (VBTransportResponse) -> Unit, narrower than
-                // buildResponseAndCallback's (VBTransportBaseResponse) -> Unit.
-                responseCallback(
-                    VBTransportResponse().apply {
-                        updateResponse(request.logTag, nativeResponse, request, this)
-                    }
-                )
             }
         } finally {
             // perform is over — a writer still blocked in send() (abort paths)
             // must not leak.
-            writerJob.cancel()
+            writerJob?.cancel()
         }
     }
 
@@ -832,17 +909,32 @@ class CurlStreamCallbackWrapper(handler: IStreamHandler) {
 internal fun streamOnResponseStart(
     callbackRef: COpaquePointer?, httpCode: Long, headers: CPointer<ByteVar>?, headerLen: Int
 ) {
-    callbackRef?.asStableRef<IStreamHandler>()?.get()?.onResponseStart(httpCode, headers?.toKString() ?: "")
+    try {
+        callbackRef?.asStableRef<IStreamHandler>()?.get()?.onResponseStart(
+            httpCode,
+            headers?.toKString() ?: ""
+        )
+    } catch (throwable: Throwable) {
+        VBPBLog.e(VBPBLog.HMCURLIMPL, "stream response-start trampoline failed: ${throwable.message}")
+    }
 }
 
 internal fun streamOnChunk(callbackRef: COpaquePointer?, data: CPointer<ByteVar>?, len: Int) {
     if (data == null || len <= 0) return
-    callbackRef?.asStableRef<IStreamHandler>()?.get()?.onChunk(data.readBytes(len))
+    try {
+        callbackRef?.asStableRef<IStreamHandler>()?.get()?.onChunk(data.readBytes(len))
+    } catch (throwable: Throwable) {
+        VBPBLog.e(VBPBLog.HMCURLIMPL, "stream chunk trampoline failed: ${throwable.message}")
+    }
 }
 
 internal fun streamOnComplete(callbackRef: COpaquePointer?, result: CPointer<CurlResponse>?) {
     val res = result ?: return
-    callbackRef?.asStableRef<IStreamHandler>()?.get()?.onComplete(res.pointed)
+    try {
+        callbackRef?.asStableRef<IStreamHandler>()?.get()?.onComplete(res.pointed)
+    } catch (throwable: Throwable) {
+        VBPBLog.e(VBPBLog.HMCURLIMPL, "stream completion trampoline failed: ${throwable.message}")
+    }
 }
 
 // issue #8 slice 3: push→pull adapter between the transport's writeBody sink

@@ -141,6 +141,41 @@ jobs:
           DARWIN_TEST_BASE_URL: http://127.0.0.1:18923
         run: ./gradlew :network:macosArm64Test -PdarwinBehaviorTests --console=plain --no-daemon --stacktrace
 
+      - name: Verify caller-time deadline test executed
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import glob
+          import sys
+          import xml.etree.ElementTree as ET
+
+          expected = "com.tencent.kmm.network.internal.platform.IosStreamWholeDeadlineBehaviorTest"
+          files = glob.glob("NetworkKMM/network/build/test-results/macosArm64Test/*.xml")
+          if not files:
+              sys.exit("macosArm64Test produced no JUnit XML")
+          matches = []
+          for path in files:
+              root = ET.parse(path).getroot()
+              for case in root.iter("testcase"):
+                  if case.attrib.get("classname") == expected:
+                      matches.append((path, case))
+          if len(matches) != 1:
+              sys.exit(f"expected exactly one {expected} testcase, found {len(matches)}")
+          path, case = matches[0]
+          if case.find("failure") is not None or case.find("error") is not None:
+              sys.exit(f"{expected} did not pass in {path}")
+          print(f"verified {expected}.{case.attrib.get('name')} failures=0 errors=0 xml={path}")
+          PY
+
+      - name: Upload Darwin test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: networkkmm-macos-arm64-test-results
+          path: NetworkKMM/network/build/test-results/macosArm64Test
+          if-no-files-found: warn
+          retention-days: 14
+
       - name: Stop test server
         if: always()
         shell: bash

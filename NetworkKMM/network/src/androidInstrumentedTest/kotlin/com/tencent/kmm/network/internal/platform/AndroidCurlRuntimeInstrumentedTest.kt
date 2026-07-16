@@ -31,6 +31,7 @@ import com.tencent.kmm.network.export.NetworkCurlTrustStore
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkRequestPolicy
+import com.tencent.kmm.network.export.NetworkStreamTimeoutPolicy
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.VBTransportAndroidCurl
 import com.tencent.kmm.network.export.VBTransportCurl
@@ -333,6 +334,10 @@ class AndroidCurlRuntimeInstrumentedTest {
         val unknown = RuntimeHttpsServer(AndroidCurlTlsTestMaterial.UNKNOWN_PKCS12_BASE64)
         val expired = RuntimeHttpsServer(AndroidCurlTlsTestMaterial.EXPIRED_PKCS12_BASE64)
         val mismatch = RuntimeHttpsServer(AndroidCurlTlsTestMaterial.MISMATCH_PKCS12_BASE64)
+        val delayed = RuntimeHttpsServer(
+            AndroidCurlTlsTestMaterial.VALID_PKCS12_BASE64,
+            responseDelayMillis = 1_500
+        )
         try {
             configureCurl(trustStoreFile, NetworkCurlProxyConfiguration.direct())
             assertTrue(curlClient().execute(NetworkRequest(url = valid.url())).isSuccess)
@@ -355,8 +360,45 @@ class AndroidCurlRuntimeInstrumentedTest {
                     trustStoreFile,
                     NetworkCurlProxyConfiguration.manual("http://127.0.0.1:${proxy.port}")
                 )
-                assertTrue(curlClient().execute(NetworkRequest(url = valid.url())).isSuccess)
+                val starts = Collections.synchronizedList(mutableListOf<Int>())
+                val streamCall = curlClient().downloadStream(
+                    request = NetworkRequest(url = valid.url()),
+                    onResponseStart = { status, _, _ -> starts += status },
+                    onChunk = {},
+                    onComplete = {}
+                )
+                assertTrue(withTimeout(TIMEOUT_MS) { streamCall.await() }.isSuccess)
+                assertEquals(
+                    "proxy CONNECT headers must not become the origin start",
+                    listOf(200),
+                    starts
+                )
                 assertTrue("manual proxy must observe CONNECT", proxy.awaitConnect())
+            }
+
+            RuntimeConnectProxy().use { proxy ->
+                configureCurl(
+                    trustStoreFile,
+                    NetworkCurlProxyConfiguration.manual("http://127.0.0.1:${proxy.port}")
+                )
+                val starts = Collections.synchronizedList(mutableListOf<Int>())
+                val streamCall = curlClient().downloadStream(
+                    request = NetworkRequest(url = delayed.url()).apply {
+                        policy = NetworkRequestPolicy(
+                            streamTimeouts = NetworkStreamTimeoutPolicy(
+                                responseHeadersTimeoutMillis = 500,
+                                interChunkIdleTimeoutMillis = 2_000
+                            )
+                        )
+                    },
+                    onResponseStart = { status, _, _ -> starts += status },
+                    onChunk = {},
+                    onComplete = {}
+                )
+                val response = withTimeout(TIMEOUT_MS) { streamCall.await() }
+                assertEquals(NetworkErrorKind.TIMEOUT, response.error?.kind)
+                assertTrue("CONNECT 200 must not disarm final-header timeout", starts.isEmpty())
+                assertTrue("delayed proxy request must observe CONNECT", proxy.awaitConnect())
             }
 
             RuntimeConnectProxy().use { proxy ->
@@ -376,6 +418,7 @@ class AndroidCurlRuntimeInstrumentedTest {
             unknown.close()
             expired.close()
             mismatch.close()
+            delayed.close()
             configureCurl(trustStoreFile, NetworkCurlProxyConfiguration.direct())
         }
     }
@@ -492,7 +535,10 @@ class AndroidCurlRuntimeInstrumentedTest {
         return output.toByteArray()
     }
 
-    private class RuntimeHttpsServer(pkcs12Base64: String) : AutoCloseable {
+    private class RuntimeHttpsServer(
+        pkcs12Base64: String,
+        private val responseDelayMillis: Long = 0
+    ) : AutoCloseable {
         private val executor = Executors.newCachedThreadPool()
         private val running = java.util.concurrent.atomic.AtomicBoolean(true)
         private val server: SSLServerSocket
@@ -546,6 +592,9 @@ class AndroidCurlRuntimeInstrumentedTest {
                 val output = BufferedOutputStream(connection.getOutputStream())
                 readLine(input) ?: return
                 while (!readLine(input).isNullOrEmpty()) Unit
+                if (responseDelayMillis > 0) {
+                    Thread.sleep(responseDelayMillis)
+                }
                 val body = "tls-ok".encodeToByteArray()
                 output.write(
                     (

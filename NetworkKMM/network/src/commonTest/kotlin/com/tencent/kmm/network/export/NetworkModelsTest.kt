@@ -17,6 +17,9 @@
 package com.tencent.kmm.network.export
 
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.launch
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -25,6 +28,445 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 class NetworkModelsTest {
+    @Test
+    fun sharedLogicalStreamCancellationIsOneShotAcrossBodyWrappers() {
+        var cancels = 0
+        val stream = NetworkByteStream.fromChunks(cancelBlock = { cancels++ }) {}
+
+        NetworkBody.Stream(stream).cancel()
+        NetworkBody.Stream(stream).cancel()
+
+        assertEquals(1, cancels)
+    }
+
+    @Test
+    fun multipartCancellationReachesOpenedFileRefDerivedStream() = runBlocking {
+        var fileRefCancels = 0
+        var derivedCancels = 0
+        val opened = CompletableDeferred<Unit>()
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/file",
+                        cancelBlock = { fileRefCancels++ },
+                        openStreamBlock = {
+                            NetworkByteStream.fromChunks(cancelBlock = {
+                                derivedCancels++
+                            }) {
+                                opened.complete(Unit)
+                                awaitCancellation()
+                            }
+                        }
+                    )
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+        val reader = launch {
+            composite.readChunks(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) = Unit
+            })
+        }
+        opened.await()
+
+        composite.cancel()
+        composite.cancel()
+        reader.cancel()
+
+        assertEquals(1, fileRefCancels)
+        assertEquals(1, derivedCancels)
+    }
+
+    @Test
+    fun multipartAttemptReadFailurePreservesLogicalFileAndCancelsDerived() = runBlocking {
+        var fileRefCancels = 0
+        var derivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/failing-file",
+                        cancelBlock = {
+                            fileRefCancels++
+                            error("file cancel failed")
+                        },
+                        openStreamBlock = {
+                            NetworkByteStream.fromChunks(cancelBlock = { derivedCancels++ }) {
+                                error("source read failed")
+                            }
+                        },
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+
+        val failure = runCatching {
+            composite.readChunks(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) = Unit
+            })
+        }.exceptionOrNull()
+
+        assertEquals("source read failed", failure?.message)
+        assertEquals(0, fileRefCancels)
+        assertEquals(1, derivedCancels)
+        runCatching { body.cancel() }
+        assertEquals(1, fileRefCancels)
+    }
+
+    @Test
+    fun multipartAttemptFailureKeepsLogicalFileRepeatableForNextAttempt() = runBlocking {
+        var opens = 0
+        var fileCancels = 0
+        var firstDerivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/retry-file",
+                        cancelBlock = { fileCancels++ },
+                        openStreamBlock = {
+                            opens++
+                            if (opens == 1) {
+                                NetworkByteStream.fromChunks(cancelBlock = { firstDerivedCancels++ }) {
+                                    error("first attempt failed")
+                                }
+                            } else {
+                                NetworkByteStream.fromChunks { sink -> sink.write(byteArrayOf(7)) }
+                            }
+                        },
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+        val sink = object : NetworkByteStreamSink {
+            override suspend fun write(bytes: ByteArray) = Unit
+        }
+
+        assertEquals("first attempt failed", runCatching { composite.readChunks(sink) }.exceptionOrNull()?.message)
+        composite.readChunks(sink)
+
+        assertEquals(2, opens)
+        assertEquals(1, firstDerivedCancels)
+        assertEquals(0, fileCancels)
+        body.cancel()
+        assertEquals(1, fileCancels)
+    }
+
+    @Test
+    fun multipartAttemptCancelOwnsDerivedStreamOpenedAfterCancellation() = runBlocking {
+        val openStarted = CompletableDeferred<Unit>()
+        val releaseOpen = CompletableDeferred<Unit>()
+        var fileCancels = 0
+        var derivedCancels = 0
+        var laterOpens = 0
+        var laterReads = 0
+        var writtenBytes = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/late-open",
+                        cancelBlock = { fileCancels++ },
+                        openStreamBlock = {
+                            openStarted.complete(Unit)
+                            releaseOpen.await()
+                            NetworkByteStream.fromChunks(cancelBlock = { derivedCancels++ }) { sink ->
+                                sink.write(byteArrayOf(1, 2, 3))
+                            }
+                        },
+                    ),
+                ),
+                NetworkMultipartPart(
+                    "later",
+                    NetworkBody.FileRef(
+                        path = "/virtual/must-not-open",
+                        openStreamBlock = {
+                            laterOpens++
+                            NetworkByteStream.fromChunks { sink ->
+                                laterReads++
+                                sink.write(byteArrayOf(4, 5, 6))
+                            }
+                        },
+                    ),
+                ),
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+        val reader = launch {
+            composite.readChunks(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) {
+                    writtenBytes += bytes.size
+                }
+            })
+        }
+        openStarted.await()
+        val bytesBeforeCancel = writtenBytes
+
+        composite.cancelAttempt()
+        releaseOpen.complete(Unit)
+        reader.join()
+
+        assertEquals(0, fileCancels)
+        assertEquals(1, derivedCancels)
+        assertEquals(0, writtenBytes - bytesBeforeCancel)
+        assertEquals(0, laterOpens)
+        assertEquals(0, laterReads)
+    }
+
+    @Test
+    fun multipartAttemptCancelBeforeReaderStartsRejectsThePendingAttempt() = runBlocking {
+        var opens = 0
+        var bytes = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/must-not-open",
+                        openStreamBlock = {
+                            opens++
+                            NetworkByteStream.fromChunks { sink -> sink.write(byteArrayOf(1)) }
+                        },
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+
+        composite.cancelAttempt()
+        composite.readChunks(object : NetworkByteStreamSink {
+            override suspend fun write(value: ByteArray) {
+                bytes += value.size
+            }
+        })
+
+        assertEquals(0, opens)
+        assertEquals(0, bytes)
+    }
+
+    @Test
+    fun multipartAttemptCancelReleasesBlockingLogicalStreamAndStopsFurtherWrites() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var streamCancels = 0
+        var bytes = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "stream",
+                    NetworkBody.Stream(
+                        NetworkByteStream.fromChunks(
+                            cancelBlock = {
+                                streamCancels++
+                                release.complete(Unit)
+                            }
+                        ) { sink ->
+                            entered.complete(Unit)
+                            release.await()
+                            sink.write(byteArrayOf(1, 2, 3))
+                        }
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+        val reader = launch {
+            composite.readChunks(object : NetworkByteStreamSink {
+                override suspend fun write(value: ByteArray) {
+                    bytes += value.size
+                }
+            })
+        }
+        entered.await()
+        val bytesBeforeCancel = bytes
+
+        composite.cancelAttempt()
+        reader.join()
+
+        assertEquals(1, streamCancels)
+        assertEquals(0, bytes - bytesBeforeCancel)
+    }
+
+    @Test
+    fun readAllOnlyFileRefKeepsMultipartOffTheDirectStreamingAttemptPath() = runBlocking {
+        var reads = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/read-all-only",
+                        readAllBlock = {
+                            reads++
+                            byteArrayOf(1, 2, 3)
+                        },
+                    ),
+                )
+            )
+        )
+
+        assertNull(body.streamingUploadStreamOrNull())
+        assertEquals(0, reads)
+    }
+
+    @Test
+    fun bufferedMixedMultipartPublishesOpenedFileStreamToCancellationOwner() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val owned = mutableListOf<NetworkByteStream>()
+        var derivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "metadata",
+                    NetworkBody.FileRef(
+                        path = "/virtual/read-all",
+                        readAllBlock = { byteArrayOf(1) },
+                    ),
+                ),
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/open-stream",
+                        openStreamBlock = {
+                            NetworkByteStream.fromChunks(
+                                cancelBlock = {
+                                    derivedCancels++
+                                    release.complete(Unit)
+                                }
+                            ) { sink ->
+                                entered.complete(Unit)
+                                release.await()
+                                sink.write(byteArrayOf(2))
+                            }
+                        },
+                    ),
+                ),
+            )
+        )
+        val reader = launch {
+            body.toBytes(ownDerivedStream = {
+                owned += it
+                true
+            })
+        }
+        entered.await()
+
+        owned.forEach { it.cancel() }
+        reader.join()
+
+        assertEquals(1, owned.size)
+        assertEquals(1, derivedCancels)
+    }
+
+    @Test
+    fun nestedStreamingMultipartFallsBackAndPublishesDerivedOwnerRecursively() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val owned = mutableListOf<NetworkByteStream>()
+        var derivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "direct",
+                    NetworkBody.Stream(
+                        NetworkByteStream.fromChunks { sink -> sink.write(byteArrayOf(1)) }
+                    ),
+                ),
+                NetworkMultipartPart(
+                    "nested",
+                    NetworkBody.Multipart(
+                        parts = listOf(
+                            NetworkMultipartPart(
+                                "file",
+                                NetworkBody.FileRef(
+                                    path = "/virtual/nested-open-stream",
+                                    openStreamBlock = {
+                                        NetworkByteStream.fromChunks(
+                                            cancelBlock = {
+                                                derivedCancels++
+                                                release.complete(Unit)
+                                            }
+                                        ) { sink ->
+                                            entered.complete(Unit)
+                                            release.await()
+                                            sink.write(byteArrayOf(2))
+                                        }
+                                    },
+                                ),
+                            )
+                        )
+                    ),
+                ),
+            )
+        )
+
+        assertNull(body.streamingUploadStreamOrNull())
+        val reader = launch {
+            body.toBytes(ownDerivedStream = {
+                owned += it
+                true
+            })
+        }
+        entered.await()
+
+        owned.forEach { it.cancel() }
+        reader.join()
+
+        assertEquals(1, owned.size)
+        assertEquals(1, derivedCancels)
+    }
+
+    @Test
+    fun lateBufferedFileStreamOwnerRejectionPreventsReadAfterCancellation() = runBlocking {
+        var reads = 0
+        var cancels = 0
+        val body = NetworkBody.FileRef(
+            path = "/virtual/late-derived",
+            openStreamBlock = {
+                NetworkByteStream.fromChunks(cancelBlock = { cancels++ }) {
+                    reads++
+                }
+            },
+        )
+
+        val result = body.toBytes(ownDerivedStream = { stream ->
+            stream.cancel()
+            false
+        })
+
+        assertEquals(NetworkErrorKind.CANCELLED, result.error?.kind)
+        assertEquals(1, cancels)
+        assertEquals(0, reads)
+    }
+
+    @Test
+    fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
+        val defaults = NetworkRequestPolicy().streamTimeouts
+        assertEquals(3_000L, defaults.connectTimeoutMillis)
+        assertEquals(30_000L, defaults.responseHeadersTimeoutMillis)
+        assertEquals(60_000L, defaults.interChunkIdleTimeoutMillis)
+        assertEquals(0L, defaults.wholeTransferTimeoutMillis)
+
+        val custom = NetworkRequestPolicy(
+            timeoutMillis = 5_000,
+            streamTimeouts = NetworkStreamTimeoutPolicy(
+                connectTimeoutMillis = 1_000,
+                responseHeadersTimeoutMillis = 2_000,
+                interChunkIdleTimeoutMillis = 3_000,
+                wholeTransferTimeoutMillis = 120_000
+            )
+        )
+        assertEquals(custom, custom.copyMutable())
+    }
+
     @Test
     fun resolvedUrlAppendsPathAndEscapedQuery() {
         val request = NetworkRequest(
@@ -121,7 +563,7 @@ class NetworkModelsTest {
             sink.write(byteArrayOf(3, 4, 5))
         }
 
-        val bodyBytes = NetworkBody.Stream(stream).toBytes { progress.add(it) }
+        val bodyBytes = NetworkBody.Stream(stream).toBytes(progress = { progress.add(it) })
 
         assertEquals(listOf(1, 2, 3, 4, 5), assertNotNull(bodyBytes.bytes).map { it.toInt() })
         assertEquals(listOf(2L, 5L), progress.map { it.bytesTransferred })
@@ -143,5 +585,15 @@ class NetworkModelsTest {
         val bodyBytes = body.toBytes()
 
         assertEquals(listOf(7, 8, 9), assertNotNull(bodyBytes.bytes).map { it.toInt() })
+    }
+
+    @Test
+    fun legacyDirectTransportStreamUsesSafePhaseDeadlineDefaults() {
+        val request = VBTransportRequest()
+
+        assertEquals(3_000L, request.streamConnectTimeoutMillis)
+        assertEquals(30_000L, request.streamResponseHeadersTimeoutMillis)
+        assertEquals(60_000L, request.streamIdleTimeoutMillis)
+        assertEquals(0L, request.streamWholeTimeoutMillis)
     }
 }

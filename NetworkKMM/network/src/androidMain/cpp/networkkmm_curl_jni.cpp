@@ -252,6 +252,10 @@ void NativePerform(
     jobjectArray header_names,
     jobjectArray header_values,
     jlong timeout_millis,
+    jlong stream_connect_timeout_millis,
+    jlong stream_response_headers_timeout_millis,
+    jlong stream_idle_timeout_millis,
+    jlong stream_whole_timeout_millis,
     jbyteArray body,
     jlong upload_content_length,
     jstring ca_info_path,
@@ -264,6 +268,10 @@ void NativePerform(
     context.env = env;
     context.callback = callback;
     if (!PopulateCallbackMethods(env, callback, &context)) {
+        return;
+    }
+    if (CurlWrapperAbiVersion() != CURL_WRAPPER_ABI_VERSION) {
+        InvokeEngineFailure(&context, "NetworkKMM curl wrapper ABI mismatch");
         return;
     }
 
@@ -318,6 +326,10 @@ void NativePerform(
     request.method = method_chars.get();
     request.headers = &headers;
     request.timeout = timeout_millis;
+    request.streamConnectTimeoutMs = stream_connect_timeout_millis;
+    request.streamResponseHeadersTimeoutMs = stream_response_headers_timeout_millis;
+    request.streamIdleTimeoutMs = stream_idle_timeout_millis;
+    request.streamWholeTimeoutMs = stream_whole_timeout_millis;
     request.postBodyLen = static_cast<int>(body_bytes.size());
     request.postBody = body_bytes.empty() ? nullptr : body_bytes.data();
 
@@ -335,9 +347,16 @@ void NativePerform(
         DeleteCurlClient(client);
         return;
     }
+    bool published = false;
     {
         std::lock_guard<std::mutex> lock(g_clients_mutex);
-        g_clients[request_id] = client;
+        published = g_clients.emplace(request_id, client).second;
+    }
+    if (!published) {
+        InvokeEngineFailure(&context, "Android curl request id already active");
+        context.client = nullptr;
+        DeleteCurlClient(client);
+        return;
     }
     CancelIfSignalled(&context);
 
@@ -347,17 +366,27 @@ void NativePerform(
         stream_callback.onResponseStart = OnResponseStart;
         stream_callback.onChunk = OnChunk;
         stream_callback.onComplete = OnComplete;
-        StartStreamRequest(client, request, &stream_callback);
+        if (StartStreamRequestV27(
+                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &stream_callback) == 0) {
+            InvokeEngineFailure(&context, "NetworkKMM stream request ABI rejected");
+        }
     } else if (mode == kModeStreamUpload) {
         CurlUploadSource upload_source{};
         upload_source.readRef = &context;
         upload_source.readChunk = ReadUploadChunk;
         upload_source.totalLength = upload_content_length;
         CurlCallback curl_callback{&context, OnComplete};
-        StartUploadRequest(client, request, &upload_source, &curl_callback);
+        if (StartUploadRequestV27(
+                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION,
+                &upload_source, &curl_callback) == 0) {
+            InvokeEngineFailure(&context, "NetworkKMM upload request ABI rejected");
+        }
     } else if (mode == kModeBuffered) {
         CurlCallback curl_callback{&context, OnComplete};
-        StartRequest(client, request, &curl_callback);
+        if (StartRequestV27(
+                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &curl_callback) == 0) {
+            InvokeEngineFailure(&context, "NetworkKMM request ABI rejected");
+        }
     } else {
         InvokeEngineFailure(&context, "unknown Android curl request mode");
     }
@@ -400,7 +429,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         {
             const_cast<char *>("nativePerform"),
             const_cast<char *>(
-                "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;J[BJLjava/lang/String;"
+                "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;JJJJJ[BJLjava/lang/String;"
                 "Ljava/lang/String;ZILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)V"
             ),
             reinterpret_cast<void *>(NativePerform)

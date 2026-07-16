@@ -40,6 +40,11 @@ kotlin {
             freeCompilerArgs += "-Xadd-light-debug=enable"
             freeCompilerArgs += "-Xbinary=sourceInfoType=libbacktrace"
         }
+        binaries {
+            sharedLib {
+                baseName = "kn"
+            }
+        }
     }
 
     sourceSets {

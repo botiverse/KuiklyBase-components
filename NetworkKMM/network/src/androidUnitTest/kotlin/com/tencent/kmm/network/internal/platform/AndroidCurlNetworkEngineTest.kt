@@ -24,6 +24,8 @@ import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
+import com.tencent.kmm.network.export.NetworkRequestPolicy
+import com.tencent.kmm.network.export.NetworkStreamTimeoutPolicy
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
@@ -35,6 +37,9 @@ import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.VBTransportResultCode
 import com.tencent.kmm.network.export.networkCurlSha256Hex
 import com.tencent.kmm.network.service.NetworkCall
+import com.tencent.kmm.network.service.NetworkClient
+import com.tencent.kmm.network.service.NetworkClientConfig
+import com.tencent.kmm.network.service.NetworkRequestMiddleware
 import com.tencent.kmm.network.service.NetworkEngineSelection
 import com.tencent.kmm.network.service.NetworkTransportEngine
 import com.tencent.kmm.network.service.AndroidCurlSystemProxyResolver
@@ -43,8 +48,13 @@ import com.tencent.kmm.network.service.NetworkEngineUnavailableReason
 import com.tencent.kmm.network.service.resolveAndroidCurlSystemProxy
 import com.tencent.kmm.network.service.resolveNetworkEngine
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import java.io.File
 import java.io.IOException
 import java.net.InetSocketAddress
@@ -436,7 +446,15 @@ class AndroidCurlNetworkEngineTest {
         val progress = mutableListOf<NetworkTransferProgress>()
         val request = NetworkRequest(
             url = "https://example.test/file",
-            progress = NetworkProgressCallbacks(downloadProgress = progress::add)
+            progress = NetworkProgressCallbacks(downloadProgress = progress::add),
+            policy = NetworkRequestPolicy(
+                streamTimeouts = NetworkStreamTimeoutPolicy(
+                    connectTimeoutMillis = 101,
+                    responseHeadersTimeoutMillis = 202,
+                    interChunkIdleTimeoutMillis = 303,
+                    wholeTransferTimeoutMillis = 404
+                )
+            )
         )
         val starts = mutableListOf<Triple<Int, Long?, Map<String, List<String>>>>()
         val chunks = mutableListOf<ByteArray>()
@@ -458,6 +476,10 @@ class AndroidCurlNetworkEngineTest {
         )
         assertNull(response.body.bytes)
         assertEquals(7.0, response.timing.totalTimeMs)
+        assertEquals(101L, bridge.lastRequest?.streamConnectTimeoutMillis)
+        assertEquals(202L, bridge.lastRequest?.streamResponseHeadersTimeoutMillis)
+        assertEquals(303L, bridge.lastRequest?.streamIdleTimeoutMillis)
+        assertEquals(404L, bridge.lastRequest?.streamWholeTimeoutMillis)
     }
 
     @Test
@@ -496,6 +518,57 @@ class AndroidCurlNetworkEngineTest {
             ),
             progress
         )
+    }
+
+    @Test
+    fun throwingUploadBodyCancelStillClosesPullAndCancelsNativeExactlyOnce() = runBlocking {
+        val bridge = BlockingUploadBridge()
+        var originalBodyCancels = 0
+        var replacementBodyCancels = 0
+        val callbacks = mutableListOf<com.tencent.kmm.network.export.NetworkResponse>()
+        val parent = SupervisorJob()
+        val request = NetworkRequest(
+            method = VBTransportMethod.PUT,
+            url = "https://example.test/upload-cancel",
+            body = NetworkBody.Stream(
+                NetworkByteStream.fromChunks(cancelBlock = { originalBodyCancels++ }) {}
+            )
+        )
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                requestMiddlewares = listOf(
+                    object : NetworkRequestMiddleware {
+                        override suspend fun prepare(request: NetworkRequest): NetworkRequest = request.apply {
+                            body = NetworkBody.Stream(
+                                NetworkByteStream.fromChunks(cancelBlock = {
+                                    replacementBodyCancels++
+                                    error("replacement cancel failed")
+                                }) {
+                                    bridge.writerStarted.complete(Unit)
+                                    awaitCancellation()
+                                }
+                            )
+                        }
+                    }
+                )
+            ),
+            engine = AndroidCurlNetworkEngine(bridge),
+            scope = CoroutineScope(Dispatchers.Default + parent)
+        )
+
+        val call = client.execute(request, callbacks::add)
+        bridge.started.await()
+        bridge.writerStarted.await()
+        parent.cancel()
+
+        val terminal = withTimeout(2_000) { call.await() }
+        withTimeout(2_000) { bridge.pullClosed.await() }
+        assertEquals(NetworkErrorKind.CANCELLED, terminal.error?.kind)
+        assertEquals(1, callbacks.size)
+        assertEquals(1, originalBodyCancels)
+        assertEquals(1, replacementBodyCancels)
+        assertEquals(1, bridge.cancelledIds.size)
+        assertTrue(assertNotNull(bridge.lastRequest).cancellationSignal.isCancelled())
     }
 
     @Test
@@ -675,6 +748,24 @@ class AndroidCurlNetworkEngineTest {
         override fun cancel(requestId: Int) {
             cancelledRequestId.complete(requestId)
             response.complete(CurlNativeResponse(code = 42, errorMsg = "cancelled by caller"))
+        }
+    }
+
+    private class BlockingUploadBridge : FakeBridge() {
+        val started = CompletableDeferred<Unit>()
+        val writerStarted = CompletableDeferred<Unit>()
+        val pullClosed = CompletableDeferred<Unit>()
+
+        override suspend fun uploadStream(
+            request: AndroidCurlNativeRequest,
+            source: AndroidCurlUploadSource
+        ): CurlNativeResponse {
+            lastRequest = request
+            started.complete(Unit)
+            if (source.read(4) == null) {
+                pullClosed.complete(Unit)
+            }
+            return CurlNativeResponse(code = 42, errorMsg = "cancelled by caller")
         }
     }
 }

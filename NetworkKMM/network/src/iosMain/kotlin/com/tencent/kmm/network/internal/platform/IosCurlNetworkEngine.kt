@@ -21,6 +21,7 @@ import com.tencent.kmm.network.curl.contentLength
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
+import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
@@ -28,12 +29,15 @@ import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.VBTransportMethod
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
+import com.tencent.kmm.network.internal.RequestIdOwnerRegistry
 import com.tencent.kmm.network.service.NetworkCall
 import com.tencent.kmm.network.service.NetworkEngine
 import com.tencent.kmm.network.service.NetworkEngineAvailability
 import com.tencent.kmm.network.service.NetworkUploadStreamSource
+import com.tencent.kmm.network.service.StreamingUploadCancellationOwners
 import com.tencent.kmm.network.service.curlNetworkEngineCapabilities
 import com.tencent.kmm.network.service.curlRuntimeFailureResponse
+import com.tencent.kmm.network.service.hasPotentialStreamingSource
 import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
 import com.tencent.kmm.network.service.prepareCurlRuntime
 import com.tencent.kmm.network.service.preparedCurlCaInfoPath
@@ -72,10 +76,23 @@ internal class IosCurlNetworkEngine(
     override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
         val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
-        networkUploadStreamSourceOrNull(request)?.let { source ->
+        if ((request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) &&
+            request.body.hasPotentialStreamingSource()
+        ) {
+            return unsupportedStreamingRequestBodyResponse(request)
+        }
+        val streamingSource = try {
+            networkUploadStreamSourceOrNull(request)
+        } catch (throwable: Throwable) {
+            runCatching { call.cancelBodyOnce(request.body) }
+            throw throwable
+        }
+        streamingSource?.let { source ->
             return executeUpload(request, call, source)
         }
-        val body = request.body.toBytes(request.progress.uploadProgress)
+        val body = request.body.toBytes(request.progress.uploadProgress) { stream ->
+            call.ownBodyIfActive(NetworkBody.Stream(stream))
+        }
         body.error?.let { error ->
             return NetworkResponse(
                 request = request,
@@ -85,20 +102,31 @@ internal class IosCurlNetworkEngine(
                 error = error
             )
         }
-        val requestId = VBPBRequestIdGenerator.getRequestId()
-        val nativeRequest = request.toNativeRequest(
-            requestId = requestId,
-            body = body.bytes,
-            contentType = body.contentType
-        )
+        val owner = Any()
+        val requestId = iosCurlRequestOwners.reserve(owner)
+        val nativeRequest = try {
+            request.toNativeRequest(
+                requestId = requestId,
+                body = body.bytes,
+                contentType = body.contentType
+            )
+        } catch (throwable: Throwable) {
+            iosCurlRequestOwners.release(requestId, owner)
+            throw throwable
+        }
         call.addCancelHandler {
             nativeRequest.cancel()
-            bridge.cancel(requestId)
+            iosCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
         }
         if (call.isCancelled) {
+            iosCurlRequestOwners.release(requestId, owner)
             return cancelledResponse(request)
         }
-        return bridge.execute(nativeRequest).toNetworkResponse(request)
+        return try {
+            bridge.execute(nativeRequest).toNetworkResponse(request)
+        } finally {
+            iosCurlRequestOwners.release(requestId, owner)
+        }
     }
 
     override suspend fun downloadStream(
@@ -109,18 +137,26 @@ internal class IosCurlNetworkEngine(
     ): NetworkResponse {
         val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
-        val requestId = VBPBRequestIdGenerator.getRequestId()
-        val nativeRequest = request.toNativeRequest(requestId = requestId)
+        val owner = Any()
+        val requestId = iosCurlRequestOwners.reserve(owner)
+        val nativeRequest = try {
+            request.toNativeRequest(requestId = requestId)
+        } catch (throwable: Throwable) {
+            iosCurlRequestOwners.release(requestId, owner)
+            throw throwable
+        }
         var transferred = 0L
         var responseLength: Long? = null
         call.addCancelHandler {
             nativeRequest.cancel()
-            bridge.cancel(requestId)
+            iosCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
         }
         if (call.isCancelled) {
+            iosCurlRequestOwners.release(requestId, owner)
             return cancelledResponse(request)
         }
-        val response = bridge.downloadStream(
+        return try {
+            bridge.downloadStream(
             request = nativeRequest,
             onResponseStart = { httpCode, headerText ->
                 val headers = parseCurlHeaders(headerText)
@@ -129,13 +165,17 @@ internal class IosCurlNetworkEngine(
             },
             onChunk = { chunk ->
                 transferred += chunk.size
-                request.progress.downloadProgress?.invoke(
-                    NetworkTransferProgress(transferred, responseLength)
-                )
+                call.runWhileActive {
+                    request.progress.downloadProgress?.invoke(
+                        NetworkTransferProgress(transferred, responseLength)
+                    )
+                }
                 onChunk(chunk)
             }
-        )
-        return response.toNetworkResponse(request)
+            ).toNetworkResponse(request)
+        } finally {
+            iosCurlRequestOwners.release(requestId, owner)
+        }
     }
 
     private suspend fun executeUpload(
@@ -143,18 +183,25 @@ internal class IosCurlNetworkEngine(
         call: NetworkCall,
         source: NetworkUploadStreamSource
     ): NetworkResponse = coroutineScope {
-        val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
-        if (!availability.available) return@coroutineScope curlRuntimeFailureResponse(request, availability)
-        if (request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) {
-            return@coroutineScope unsupportedStreamingRequestBodyResponse(request)
+        val owner = Any()
+        val requestId = try {
+            iosCurlRequestOwners.reserve(owner)
+        } catch (throwable: Throwable) {
+            runCatching { source.stream.cancel() }
+            throw throwable
         }
-        val requestId = VBPBRequestIdGenerator.getRequestId()
         val pullBridge = IosCurlUploadPullBridge()
-        val nativeRequest = request.toNativeRequest(
-            requestId = requestId,
-            contentType = source.contentType,
-            uploadContentLength = source.contentLength
-        )
+        val nativeRequest = try {
+            request.toNativeRequest(
+                requestId = requestId,
+                contentType = source.contentType,
+                uploadContentLength = source.contentLength
+            )
+        } catch (throwable: Throwable) {
+            iosCurlRequestOwners.release(requestId, owner)
+            runCatching { source.stream.cancel() }
+            throw throwable
+        }
         val writer = launch(IosCurlExecutionDispatchers.uploadWriter) {
             try {
                 source.stream.readChunks(object : NetworkByteStreamSink {
@@ -167,14 +214,24 @@ internal class IosCurlNetworkEngine(
                 pullBridge.closeFailure(throwable)
             }
         }
-        call.addCancelHandler {
-            nativeRequest.cancel()
-            source.stream.cancel()
-            pullBridge.closeFailure(CancellationException("Upload cancelled"))
-            bridge.cancel(requestId)
-        }
+        val cancellationOwners = StreamingUploadCancellationOwners(
+            cancelOriginalRequestBody = call::cancelRequestBodyOnce,
+            cancelPreparedRequestBody = { call.cancelBodyOnce(request.body) },
+            cancelDerivedSource = source.stream.takeIf { source.cancelSeparatelyFromRequestBody }
+                ?.let { stream -> stream::cancel },
+            cancelAttemptSource = source.cancelAttemptSource,
+            cancelNativeRequest = nativeRequest::cancel,
+            closePullBridge = {
+                pullBridge.closeFailure(CancellationException("Upload cancelled"))
+            },
+            cancelTransport = {
+                iosCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
+            }
+        )
+        call.addCancelHandler(cancellationOwners::cancelAll)
         if (call.isCancelled) {
             writer.cancel()
+            iosCurlRequestOwners.release(requestId, owner)
             return@coroutineScope cancelledResponse(request)
         }
         try {
@@ -183,14 +240,23 @@ internal class IosCurlNetworkEngine(
                 pullBridge.read(maxLength)?.also { bytes ->
                     if (bytes.isNotEmpty()) {
                         sent += bytes.size
-                        request.progress.uploadProgress?.invoke(
-                            NetworkTransferProgress(sent, source.contentLength)
-                        )
+                        call.runWhileActive {
+                            request.progress.uploadProgress?.invoke(
+                                NetworkTransferProgress(sent, source.contentLength)
+                            )
+                        }
                     }
                 }
             }
-            bridge.uploadStream(nativeRequest, uploadSource).toNetworkResponse(request)
+            val response = bridge.uploadStream(nativeRequest, uploadSource).toNetworkResponse(request)
+            if (response.error != null) cancellationOwners.releaseAttemptSourceOnFailure()
+            response
+        } catch (throwable: Throwable) {
+            cancellationOwners.releaseAttemptSourceOnFailure()
+            throw throwable
         } finally {
+            cancellationOwners.disarmNativeTransportOwners()
+            iosCurlRequestOwners.release(requestId, owner)
             writer.cancel()
         }
     }
@@ -213,6 +279,10 @@ internal class IosCurlNetworkEngine(
             method = method.name,
             headers = nativeHeaders,
             timeoutMillis = policy.timeoutMillis,
+            streamConnectTimeoutMillis = policy.streamTimeouts.connectTimeoutMillis,
+            streamResponseHeadersTimeoutMillis = policy.streamTimeouts.responseHeadersTimeoutMillis,
+            streamIdleTimeoutMillis = policy.streamTimeouts.interChunkIdleTimeoutMillis,
+            streamWholeTimeoutMillis = policy.streamTimeouts.wholeTransferTimeoutMillis,
             body = body,
             uploadContentLength = uploadContentLength,
             caInfoPath = checkNotNull(preparedCurlCaInfoPath(this)) {
@@ -232,6 +302,8 @@ internal class IosCurlNetworkEngine(
         ).toNetworkResponse(request)
 
 }
+
+private val iosCurlRequestOwners = RequestIdOwnerRegistry()
 
 internal class IosCurlUploadPullBridge {
     private val channel = Channel<ByteArray>(capacity = 4)

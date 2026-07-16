@@ -40,12 +40,28 @@ object VBPBRequestIdGenerator {
      */
     @ObjCName("pb_getRequestId")
     fun getRequestId(): Int {
-        return requestIdGenerator?.getRequestId() ?: run {
-            if (requestId.value == Int.MAX_VALUE) {
-                requestId.value = 0
-            }
-            requestId.incrementAndGet()
+        return requestIdGenerator?.getRequestId() ?: getFallbackRequestId()
+    }
+
+    internal fun getFallbackRequestId(): Int {
+        if (requestId.value == Int.MAX_VALUE) {
+            requestId.value = 0
         }
+        return requestId.incrementAndGet()
+    }
+
+    internal fun reserveRequestId(reserve: (Int) -> Boolean): Int {
+        requestIdGenerator?.let { custom ->
+            repeat(64) {
+                val candidate = custom.getRequestId()
+                if (reserve(candidate)) return candidate
+            }
+        }
+        repeat(1024) {
+            val candidate = getFallbackRequestId()
+            if (reserve(candidate)) return candidate
+        }
+        error("Unable to reserve a unique network request id")
     }
 
 }

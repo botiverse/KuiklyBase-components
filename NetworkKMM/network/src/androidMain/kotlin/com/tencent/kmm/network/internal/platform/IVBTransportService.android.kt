@@ -47,6 +47,9 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapRequest
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringCallback
 import com.tencent.kmm.network.internal.utils.readKnownSize
 import com.tencent.kmm.network.internal.utils.readUnknownSize
+import com.tencent.kmm.network.internal.remainingStreamWholeTimeoutMillis
+import com.tencent.kmm.network.internal.streamPhaseTimeoutMillis
+import com.tencent.kmm.network.internal.streamHeadersUpperBoundMillis
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.timeout
 import io.ktor.client.request.HttpRequestBuilder
@@ -74,6 +77,8 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
 import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
@@ -86,9 +91,10 @@ private val scope = CoroutineScope(Dispatchers.IO)
 // a fast-completing request cannot remove its entry before it exists (which
 // would leave a completed Job resident and invisible to cancel()).
 private val taskMap: ConcurrentHashMap<Int, Job> = ConcurrentHashMap()
+private val preparedTaskRegistry = AndroidPreparedTransportTaskRegistry()
 
-internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, requestId: Int, job: Job) {
-    taskMap[requestId] = job
+internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, requestId: Int, job: Job): Boolean {
+    if (taskMap.putIfAbsent(requestId, job) != null) return false
     // SOLE registry cleanup on Android — coroutine bodies and the common
     // callback helper must not remove entries (Android passes
     // removeOnComplete = false): a keyed remove racing an id reuse would
@@ -98,6 +104,7 @@ internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, request
     // replaced this one under the same id.
     job.invokeOnCompletion { taskMap.remove(requestId, job) }
     job.start()
+    return true
 }
 
 // Upper bound per streamed chunk read off the response channel (fork #8).
@@ -135,6 +142,22 @@ internal fun requireAndroidRequestTimeoutBudget(budget: AndroidRequestTimeoutBud
     }
 }
 
+internal fun androidAttemptTimeoutBudget(
+    totalTimeoutMillis: Long,
+    streamWholeTimeoutMillis: Long,
+    elapsedMillis: Long,
+    streamTimeouts: Boolean,
+): AndroidRequestTimeoutBudget {
+    if (!streamTimeouts) {
+        return androidRequestTimeoutBudget(totalTimeoutMillis, elapsedMillis)
+    }
+    return when (val remaining = remainingStreamWholeTimeoutMillis(streamWholeTimeoutMillis, elapsedMillis)) {
+        null -> AndroidRequestTimeoutBudget.Unlimited
+        0L -> AndroidRequestTimeoutBudget.Expired
+        else -> AndroidRequestTimeoutBudget.Remaining(remaining)
+    }
+}
+
 internal object AndroidTransportTestHooks {
     @Volatile
     var beforeTransportCoroutineStart: (() -> Unit)? = null
@@ -145,6 +168,12 @@ internal object AndroidTransportTestHooks {
 }
 
 object AndroidTransportImpl : IVBTransportService {
+    override fun prepareRequest(requestId: Int): Boolean = preparedTaskRegistry.prepare(requestId)
+
+    override fun abortPreparedRequest(requestId: Int) {
+        preparedTaskRegistry.abort(requestId)
+    }
+
     private fun triggerRequest(
         request: VBTransportBaseRequest,
         kmmCallback: (response: VBTransportBaseResponse) -> Unit,
@@ -157,6 +186,7 @@ object AndroidTransportImpl : IVBTransportService {
         lateinit var hardDeadline: AndroidTransportHardDeadline
         val guardedCallback: (VBTransportBaseResponse) -> Unit = { response ->
             if (hardDeadline.tryDeliverTransportCallback()) {
+                transportJob.get()?.let { preparedTaskRegistry.release(request.requestId, it) }
                 kmmCallback(response)
             }
         }
@@ -260,6 +290,7 @@ object AndroidTransportImpl : IVBTransportService {
                     }
                 },
                 onDeadline = { diagnostics ->
+                    transportJob.get()?.let { preparedTaskRegistry.release(request.requestId, it) }
                     AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
                     request.transportElapseStatistics = AndroidTransportPhaseTracer.complete(request.requestId)
                     logE(
@@ -293,7 +324,14 @@ object AndroidTransportImpl : IVBTransportService {
             )
         job.invokeOnCompletion(hardDeadline::transportJobCompleted)
         hardDeadline.start()
-        registerTransportTask(taskMap, request.requestId, job)
+        if (!preparedTaskRegistry.register(request.requestId, job)) {
+            job.cancel()
+            callbackFailure(
+                request,
+                IllegalStateException("Android transport request id already active"),
+                guardedCallback
+            )
+        }
     }
 
     override fun sendBytesRequest(
@@ -322,6 +360,7 @@ object AndroidTransportImpl : IVBTransportService {
                 "headerKeys:${kmmPostRequest.header.keys}", kmmPostRequest.logTag)
 
         if (!kmmPostRequest.isDataInitialize()) {
+            abortPreparedRequest(kmmPostRequest.requestId)
             callbackFailure(
                 kmmPostRequest,
                 IllegalArgumentException("Data is not initialized"),
@@ -361,12 +400,39 @@ object AndroidTransportImpl : IVBTransportService {
         onComplete: (response: VBTransportResponse) -> Unit
     ) {
         logI("stream ${kmmRequest.method} request, id:${kmmRequest.requestId}, url:${kmmRequest.url}", kmmRequest.logTag)
-        val job = scope.launch(start = CoroutineStart.LAZY) {
+        lateinit var job: Job
+        val deliverComplete: (VBTransportResponse) -> Unit = { response ->
+            preparedTaskRegistry.release(kmmRequest.requestId, job)
+            onComplete(response)
+        }
+        job = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
+                AndroidTransportTestHooks.beforeTransportCoroutineStart?.invoke()
+                val streamStart = kmmRequest.serviceRequestStartMark
+                    ?: kotlin.time.TimeSource.Monotonic.markNow()
                 AndroidTransportPhaseTracer.scheduled(kmmRequest.requestId)
                 AndroidTransportPhaseTracer.transportCoroutineStarted(kmmRequest.requestId)
-                val responseLease = executeWithReusedH2Recovery(kmmRequest, streamStart)
+                suspend fun openResponse() =
+                    executeWithReusedH2Recovery(
+                        kmmRequest,
+                        streamStart,
+                        streamTimeouts = true
+                    )
+                val responseHeadersBudget = streamPhaseTimeoutMillis(
+                    phaseMillis = streamHeadersUpperBoundMillis(
+                        kmmRequest.streamConnectTimeoutMillis,
+                        kmmRequest.streamResponseHeadersTimeoutMillis
+                    ),
+                    remainingWholeMillis = remainingStreamWholeTimeoutMillis(
+                        kmmRequest.streamWholeTimeoutMillis,
+                        streamStart.elapsedNow().inWholeMilliseconds,
+                    ),
+                )
+                val responseLease = if (responseHeadersBudget != null) {
+                    withTimeout(responseHeadersBudget) { openResponse() }
+                } else {
+                    openResponse()
+                }
                 val response = responseLease.response
                 try {
 
@@ -408,7 +474,7 @@ object AndroidTransportImpl : IVBTransportService {
                     AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = true)
                     kmmRequest.transportElapseStatistics = AndroidTransportPhaseTracer.complete(kmmRequest.requestId)
 
-                    onComplete(
+                    deliverComplete(
                         VBTransportResponse().apply {
                             this.errorCode = errorCode
                             this.errorMessage = errMsg
@@ -423,7 +489,7 @@ object AndroidTransportImpl : IVBTransportService {
                 }
             } catch (throwable: Throwable) {
                 AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = false)
-                if (throwable is CancellationException) {
+                if (throwable is CancellationException && throwable !is TimeoutCancellationException) {
                     AndroidTransportPhaseTracer.cancel(kmmRequest.requestId)
                     throw throwable
                 }
@@ -432,9 +498,14 @@ object AndroidTransportImpl : IVBTransportService {
                 // raft.9: classified failure reason, same shape as callbackFailure.
                 val describedFailure = describeTransportFailure(throwable)
                 logE("stream request failed, id:${kmmRequest.requestId}, error:$describedFailure", kmmRequest.logTag)
-                onComplete(
+                deliverComplete(
                     VBTransportResponse().apply {
-                        this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                        this.errorCode = if (throwable is TimeoutCancellationException ||
+                            describedFailure.startsWith("[timeout]")) {
+                            VBTransportResultCode.CODE_FORCE_TIMEOUT
+                        } else {
+                            VBTransportResultCode.CODE_NETWORK_ERROR
+                        }
                         this.errorMessage = describedFailure
                         this.data = null
                         this.request = kmmRequest
@@ -443,13 +514,23 @@ object AndroidTransportImpl : IVBTransportService {
                 )
             }
         }
-        registerTransportTask(taskMap, kmmRequest.requestId, job)
+        if (!preparedTaskRegistry.register(kmmRequest.requestId, job)) {
+            job.cancel()
+            onComplete(
+                VBTransportResponse().apply {
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = "Android transport request id already active"
+                    this.request = kmmRequest
+                }
+            )
+        }
     }
 
     private suspend fun executeWithReusedH2Recovery(
         request: VBTransportBaseRequest,
         overallStart: kotlin.time.TimeMark,
         uploadBody: StreamingUploadBody? = null,
+        streamTimeouts: Boolean = false,
     ): AndroidResponseLease {
         // Sample rollout settings once: a mid-request flag change must not send
         // the recovery attempt back through the retired shared pool.
@@ -462,9 +543,11 @@ object AndroidTransportImpl : IVBTransportService {
         )
         var avoidShard: Int? = null
         while (true) {
-            val budget = androidRequestTimeoutBudget(
-                request.totalTimeout,
-                overallStart.elapsedNow().inWholeMilliseconds,
+            val budget = androidAttemptTimeoutBudget(
+                totalTimeoutMillis = request.totalTimeout,
+                streamWholeTimeoutMillis = request.streamWholeTimeoutMillis,
+                elapsedMillis = overallStart.elapsedNow().inWholeMilliseconds,
+                streamTimeouts = streamTimeouts,
             )
             requireAndroidRequestTimeoutBudget(budget)
             val lease = AndroidTransportClientProvider.acquire(
@@ -481,14 +564,31 @@ object AndroidTransportImpl : IVBTransportService {
                 canFreshRetry = retryState.canFreshRetry,
             )
             try {
-                val requestBudget = androidRequestTimeoutBudget(
-                    request.totalTimeout,
-                    overallStart.elapsedNow().inWholeMilliseconds,
+                val requestBudget = androidAttemptTimeoutBudget(
+                    totalTimeoutMillis = request.totalTimeout,
+                    streamWholeTimeoutMillis = request.streamWholeTimeoutMillis,
+                    elapsedMillis = overallStart.elapsedNow().inWholeMilliseconds,
+                    streamTimeouts = streamTimeouts,
                 )
                 requireAndroidRequestTimeoutBudget(requestBudget)
                 val response = lease.client.request(request.url) {
                     method = HttpMethod(request.method.name)
-                    if (requestBudget is AndroidRequestTimeoutBudget.Remaining) {
+                    if (streamTimeouts) {
+                        val remainingWholeMillis = remainingStreamWholeTimeoutMillis(
+                            request.streamWholeTimeoutMillis,
+                            overallStart.elapsedNow().inWholeMilliseconds
+                        )
+                        if (remainingWholeMillis == 0L) {
+                            throw SocketTimeoutException("stream whole-transfer timeout exhausted")
+                        }
+                        timeout {
+                            if (remainingWholeMillis != null) {
+                                requestTimeoutMillis = remainingWholeMillis
+                            }
+                            connectTimeoutMillis = request.streamConnectTimeoutMillis
+                            socketTimeoutMillis = request.streamIdleTimeoutMillis
+                        }
+                    } else if (requestBudget is AndroidRequestTimeoutBudget.Remaining) {
                         timeout {
                             requestTimeoutMillis = requestBudget.millis
                             connectTimeoutMillis = transportConnectTimeoutMillis(requestBudget.millis)
@@ -511,12 +611,17 @@ object AndroidTransportImpl : IVBTransportService {
                     if (watchdogTriggered && !AndroidTransportClientProvider.isCurrent(transportConfiguration)) {
                         throw throwable
                     }
-                    val retryBudget = androidRequestTimeoutBudget(
-                        request.totalTimeout,
-                        overallStart.elapsedNow().inWholeMilliseconds,
+                    val retryBudget = androidAttemptTimeoutBudget(
+                        totalTimeoutMillis = request.totalTimeout,
+                        streamWholeTimeoutMillis = request.streamWholeTimeoutMillis,
+                        elapsedMillis = overallStart.elapsedNow().inWholeMilliseconds,
+                        streamTimeouts = streamTimeouts,
                     )
                     if (watchdogTriggered && retryBudget == AndroidRequestTimeoutBudget.Expired) {
-                        throw SocketTimeoutException("Request total timeout budget exhausted")
+                        throw SocketTimeoutException(
+                            if (streamTimeouts) "stream whole-transfer timeout exhausted"
+                            else "Request total timeout budget exhausted"
+                        )
                     }
                     val hasBudget = retryBudget != AndroidRequestTimeoutBudget.Expired
                     if (retryState.claimRetry(watchdogTriggered, hasBudget)) {
@@ -592,7 +697,7 @@ object AndroidTransportImpl : IVBTransportService {
 
     override fun cancel(requestId: Int) {
         logI("requestID -> $requestId task cancel by user")
-        taskMap[requestId]?.cancel()
+        preparedTaskRegistry.cancel(requestId)
     }
 
     private fun callbackFailure(
@@ -615,6 +720,84 @@ object AndroidTransportImpl : IVBTransportService {
             // Registry cleanup happens solely in the completion hook.
             removeOnComplete = false
         )
+    }
+}
+
+internal class AndroidPreparedTransportTaskRegistry {
+    private sealed interface Entry {
+        data object Reserved : Entry
+        data object Cancelled : Entry
+        class Running(val job: Job) : Entry
+    }
+
+    private val entries = mutableMapOf<Int, Entry>()
+
+    @Synchronized
+    fun prepare(requestId: Int): Boolean {
+        if (entries.containsKey(requestId)) return false
+        entries[requestId] = Entry.Reserved
+        return true
+    }
+
+    @Synchronized
+    fun abort(requestId: Int) {
+        val current = entries[requestId]
+        if (current === Entry.Reserved || current === Entry.Cancelled) entries.remove(requestId)
+    }
+
+    fun register(requestId: Int, job: Job): Boolean {
+        val start = synchronized(this) {
+            when (entries[requestId]) {
+                Entry.Reserved -> {
+                    entries[requestId] = Entry.Running(job)
+                    true
+                }
+                Entry.Cancelled -> {
+                    entries.remove(requestId)
+                    false
+                }
+                else -> return false
+            }
+        }
+        if (!start) {
+            job.cancel()
+            return true
+        }
+        job.invokeOnCompletion {
+            synchronized(this) {
+                val current = entries[requestId]
+                if (current is Entry.Running && current.job === job) entries.remove(requestId)
+            }
+        }
+        job.start()
+        return true
+    }
+
+    fun cancel(requestId: Int) {
+        val job = synchronized(this) {
+            val current = entries[requestId]
+            if (current is Entry.Running) {
+                entries.remove(requestId)
+                current.job
+            } else if (current === Entry.Reserved) {
+                entries[requestId] = Entry.Cancelled
+                null
+            } else {
+                null
+            }
+        }
+        job?.cancel()
+    }
+
+    @Synchronized
+    fun release(requestId: Int, job: Job): Boolean {
+        val current = entries[requestId]
+        return if (current is Entry.Running && current.job === job) {
+            entries.remove(requestId)
+            true
+        } else {
+            false
+        }
     }
 }
 

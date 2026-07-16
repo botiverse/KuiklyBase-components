@@ -16,6 +16,9 @@
  */
 package com.tencent.kmm.network.export
 
+import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import kotlin.math.min
 import kotlin.random.Random
 
@@ -45,8 +48,10 @@ class NetworkByteStream(
     val contentLength: Long? = null,
     private val readAllBlock: suspend () -> ByteArray,
     private val cancelBlock: (() -> Unit)? = null,
+    private val attemptCancelBlock: (() -> Unit)? = null,
     private val readChunksBlock: (suspend (NetworkByteStreamSink) -> Unit)? = null
 ) {
+    private val cancelArmed = atomic(true)
     suspend fun readAll(): ByteArray = readAllBlock()
 
     suspend fun readChunks(sink: NetworkByteStreamSink) {
@@ -59,13 +64,20 @@ class NetworkByteStream(
     }
 
     fun cancel() {
-        cancelBlock?.invoke()
+        if (cancelArmed.compareAndSet(expect = true, update = false)) {
+            cancelBlock?.invoke()
+        }
+    }
+
+    internal fun cancelAttempt() {
+        (attemptCancelBlock ?: cancelBlock)?.invoke()
     }
 
     companion object {
         fun fromChunks(
             contentLength: Long? = null,
             cancelBlock: (() -> Unit)? = null,
+            attemptCancelBlock: (() -> Unit)? = null,
             readChunksBlock: suspend (NetworkByteStreamSink) -> Unit
         ): NetworkByteStream {
             return NetworkByteStream(
@@ -80,6 +92,7 @@ class NetworkByteStream(
                     mergeByteArrays(chunks)
                 },
                 cancelBlock = cancelBlock,
+                attemptCancelBlock = attemptCancelBlock,
                 readChunksBlock = readChunksBlock
             )
         }
@@ -144,6 +157,8 @@ sealed class NetworkBody {
         private val cancelBlock: (() -> Unit)? = null,
         private val openStreamBlock: (suspend (path: String) -> NetworkByteStream)? = null
     ) : NetworkBody() {
+        private val cancelArmed = atomic(true)
+        internal val canOpenStream: Boolean = openStreamBlock != null
         override val repeatable: Boolean = readAllBlock != null || openStreamBlock != null
 
         suspend fun readAll(): ByteArray? = readAllBlock?.invoke(path)
@@ -151,7 +166,9 @@ sealed class NetworkBody {
         suspend fun openStream(): NetworkByteStream? = openStreamBlock?.invoke(path)
 
         fun cancel() {
-            cancelBlock?.invoke()
+            if (cancelArmed.compareAndSet(expect = true, update = false)) {
+                cancelBlock?.invoke()
+            }
         }
     }
 }
@@ -384,17 +401,39 @@ data class NetworkRequestPolicy(
     val timeoutMillis: Long = 0,
     val retry: NetworkRetryPolicy = NetworkRetryPolicy(),
     val priority: NetworkPriority = NetworkPriority.NORMAL,
-    val dispatcher: NetworkDispatcher = NetworkDispatcher.IO
+    val dispatcher: NetworkDispatcher = NetworkDispatcher.IO,
+    /**
+     * Streaming responses are not bounded by [timeoutMillis] as a whole by
+     * default: a healthy large download may legitimately outlive it. These
+     * phase deadlines preserve fast failure without killing active progress.
+     */
+    val streamTimeouts: NetworkStreamTimeoutPolicy = NetworkStreamTimeoutPolicy()
 ) {
     fun copyMutable(): NetworkRequestPolicy {
         return NetworkRequestPolicy(
             timeoutMillis = timeoutMillis,
             retry = retry,
             priority = priority,
-            dispatcher = dispatcher
+            dispatcher = dispatcher,
+            streamTimeouts = streamTimeouts
         )
     }
 }
+
+data class NetworkStreamTimeoutPolicy(
+    /** DNS, socket, proxy tunnel and TLS establishment budget. */
+    val connectTimeoutMillis: Long = 3_000,
+    /**
+     * Final origin response-header budget. Curl starts this phase after each
+     * connection/proxy/TLS pre-transfer point. Ktor transports enforce the
+     * conservative combined upper bound `connect + responseHeaders` because
+     * their public engine API does not expose a portable connection-ready event.
+     */
+    val responseHeadersTimeoutMillis: Long = 30_000,
+    val interChunkIdleTimeoutMillis: Long = 60_000,
+    /** Zero disables a whole-transfer deadline. */
+    val wholeTransferTimeoutMillis: Long = 0
+)
 
 internal class NetworkBodyBytes(
     val bytes: ByteArray?,
@@ -403,7 +442,8 @@ internal class NetworkBodyBytes(
 )
 
 internal suspend fun NetworkBody.toBytes(
-    progress: ((NetworkTransferProgress) -> Unit)? = null
+    progress: ((NetworkTransferProgress) -> Unit)? = null,
+    ownDerivedStream: ((NetworkByteStream) -> Boolean)? = null,
 ): NetworkBodyBytes {
     return when (this) {
         NetworkBody.Empty -> NetworkBodyBytes(null, null)
@@ -418,10 +458,19 @@ internal suspend fun NetworkBody.toBytes(
             },
             contentType
         )
-        is NetworkBody.Multipart -> multipartBodyBytes(this, progress)
+        is NetworkBody.Multipart -> multipartBodyBytes(this, progress, ownDerivedStream)
         is NetworkBody.Stream -> stream.readAllWithProgress(progress).toBodyBytes(contentType)
         is NetworkBody.FileRef -> {
-            val bytes = readAll() ?: openStream()?.readAllWithProgress(progress)
+            val directBytes = readAll()
+            val stream = if (directBytes == null) openStream() else null
+            if (stream != null && ownDerivedStream != null && !ownDerivedStream(stream)) {
+                return NetworkBodyBytes(
+                    null,
+                    contentType,
+                    NetworkError(NetworkErrorKind.CANCELLED, "FileRef derived stream opened after cancellation")
+                )
+            }
+            val bytes = directBytes ?: stream?.readAllWithProgress(progress)
             if (bytes == null) {
                 NetworkBodyBytes(
                     null,
@@ -440,20 +489,23 @@ internal suspend fun NetworkBody.toBytes(
 
 internal fun NetworkBody.cancel() {
     when (this) {
-        is NetworkBody.Stream -> stream.cancel()
-        is NetworkBody.FileRef -> this.cancel()
-        is NetworkBody.Multipart -> parts.forEach { it.body.cancel() }
+        is NetworkBody.Stream -> runCatching { stream.cancel() }
+        is NetworkBody.FileRef -> runCatching { this.cancel() }
+        is NetworkBody.Multipart -> parts.forEach { part ->
+            runCatching { part.body.cancel() }
+        }
         else -> Unit
     }
 }
 
 private suspend fun multipartBodyBytes(
     body: NetworkBody.Multipart,
-    progress: ((NetworkTransferProgress) -> Unit)? = null
+    progress: ((NetworkTransferProgress) -> Unit)? = null,
+    ownDerivedStream: ((NetworkByteStream) -> Boolean)? = null,
 ): NetworkBodyBytes {
     val builder = VBTransportMultipartBodyBuilder(body.boundary)
     body.parts.forEach { part ->
-        val bodyBytes = part.body.toBytes(progress)
+        val bodyBytes = part.body.toBytes(progress, ownDerivedStream)
         bodyBytes.error?.let {
             return NetworkBodyBytes(null, body.contentType, it)
         }
@@ -552,6 +604,19 @@ private fun encodeUrlComponent(value: String): String {
 internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): NetworkByteStream? {
     val hasStreamingPart = parts.any { it.body is NetworkBody.Stream || it.body is NetworkBody.FileRef }
     if (!hasStreamingPart) return null
+    // Nested multipart bodies are serialized recursively by toBytes(). If a
+    // nested body can open a stream, treating it as a scalar plan here would
+    // open/read that derived owner before the composite attempt owns it. Keep
+    // the whole outer body on the buffered path, whose owner callback is
+    // propagated through every recursive multipart level.
+    if (parts.any { part ->
+            (part.body as? NetworkBody.Multipart)?.containsPotentialStreamingSource() == true
+        }
+    ) return null
+    // A readAll-only FileRef has no attempt-scoped owner capable of unblocking
+    // a direct native early-error path. Keep the whole multipart on the
+    // buffered path, where logical-body cancellation owns that read.
+    if (parts.any { (it.body as? NetworkBody.FileRef)?.canOpenStream == false }) return null
 
     class PartPlan(
         val prologue: ByteArray,
@@ -586,6 +651,12 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
     }
     val epilogue = NetworkMultipartFraming.partEpilogue()
     val terminator = NetworkMultipartFraming.terminator(boundary)
+    val openedStreamLock = SynchronizedObject()
+    val openedStreams = mutableListOf<NetworkByteStream>()
+    var compositeCancelled = false
+    var attemptSequence = 0L
+    var activeAttempt = 0L
+    var cancelledAttempt = 0L
     val totalLength: Long? =
         if (plans.all { it.bodyLength != null }) {
             plans.sumOf { it.prologue.size.toLong() + it.bodyLength!! + epilogue.size } + terminator.size
@@ -595,28 +666,120 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
 
     return NetworkByteStream.fromChunks(
         contentLength = totalLength,
-        cancelBlock = { parts.forEach { it.body.cancel() } }
-    ) { sink ->
-        plans.forEach { plan ->
-            sink.write(plan.prologue)
-            when (val body = plan.streamBody) {
-                is NetworkBody.Stream -> body.stream.readChunks(sink)
-                is NetworkBody.FileRef -> {
-                    val stream = body.openStream()
-                    if (stream != null) {
-                        stream.readChunks(sink)
-                    } else {
-                        val bytes = body.readAll()
-                            ?: throw IllegalStateException(
-                                "FileRef part requires a readAllBlock or openStreamBlock on this engine."
-                            )
-                        sink.write(bytes)
-                    }
+        attemptCancelBlock = {
+            val derived = synchronized(openedStreamLock) {
+                cancelledAttempt = when {
+                    activeAttempt != 0L -> activeAttempt
+                    attemptSequence == 0L -> 1L
+                    else -> attemptSequence
                 }
-                else -> plan.scalarBytes?.let { if (it.isNotEmpty()) sink.write(it) }
+                openedStreams.toList().also { openedStreams.clear() }
             }
-            sink.write(epilogue)
+            plans.mapNotNull { it.streamBody as? NetworkBody.Stream }.forEach {
+                runCatching { it.cancel() }
+            }
+            derived.forEach { runCatching { it.cancel() } }
+        },
+        cancelBlock = {
+            val derived = synchronized(openedStreamLock) {
+                compositeCancelled = true
+                openedStreams.toList().also { openedStreams.clear() }
+            }
+            parts.forEach {
+                try {
+                    it.body.cancel()
+                } catch (_: Throwable) {
+                    // One broken owner must not strand the remaining parts.
+                }
+            }
+            derived.forEach {
+                try {
+                    it.cancel()
+                } catch (_: Throwable) {
+                    // Continue cancelling every lazily opened derived stream.
+                }
+            }
         }
-        sink.write(terminator)
+    ) { sink ->
+        val attemptId = synchronized(openedStreamLock) {
+            (++attemptSequence).also { activeAttempt = it }
+        }
+        fun attemptActive(): Boolean = synchronized(openedStreamLock) {
+            !compositeCancelled && activeAttempt == attemptId && cancelledAttempt != attemptId
+        }
+        val guardedSink = object : NetworkByteStreamSink {
+            override suspend fun write(bytes: ByteArray) {
+                if (attemptActive()) sink.write(bytes)
+            }
+        }
+        try {
+            plans.forEach { plan ->
+                if (!attemptActive()) return@fromChunks
+                guardedSink.write(plan.prologue)
+                if (!attemptActive()) return@fromChunks
+                when (val body = plan.streamBody) {
+                    is NetworkBody.Stream -> {
+                        body.stream.readChunks(guardedSink)
+                        if (!attemptActive()) return@fromChunks
+                    }
+                    is NetworkBody.FileRef -> {
+                        if (!attemptActive()) return@fromChunks
+                        val stream = body.openStream()
+                        if (stream != null) {
+                            val cancelNow = synchronized(openedStreamLock) {
+                                if (
+                                    compositeCancelled ||
+                                    activeAttempt != attemptId ||
+                                    cancelledAttempt == attemptId
+                                ) true
+                                else {
+                                    openedStreams += stream
+                                    false
+                                }
+                            }
+                            if (cancelNow) {
+                                runCatching { stream.cancel() }
+                                return@fromChunks
+                            } else {
+                                try {
+                                    stream.readChunks(guardedSink)
+                                } catch (throwable: Throwable) {
+                                    runCatching { stream.cancel() }
+                                    throw throwable
+                                } finally {
+                                    synchronized(openedStreamLock) {
+                                        openedStreams.removeAll { it === stream }
+                                    }
+                                }
+                                if (!attemptActive()) return@fromChunks
+                            }
+                    } else {
+                        throw IllegalStateException(
+                            "Streaming multipart FileRef requires an attempt-cancellable openStreamBlock."
+                        )
+                    }
+                    }
+                    else -> plan.scalarBytes?.let { if (it.isNotEmpty()) guardedSink.write(it) }
+                }
+                if (!attemptActive()) return@fromChunks
+                guardedSink.write(epilogue)
+            }
+            if (!attemptActive()) return@fromChunks
+            guardedSink.write(terminator)
+        } finally {
+            synchronized(openedStreamLock) {
+                if (activeAttempt == attemptId) activeAttempt = 0L
+            }
+        }
     }
 }
+
+private fun NetworkBody.Multipart.containsPotentialStreamingSource(): Boolean =
+    parts.any { part ->
+        when (val body = part.body) {
+            is NetworkBody.Stream,
+            is NetworkBody.FileRef -> true
+            is NetworkBody.Multipart -> body.containsPotentialStreamingSource()
+            else -> false
+        }
+    }

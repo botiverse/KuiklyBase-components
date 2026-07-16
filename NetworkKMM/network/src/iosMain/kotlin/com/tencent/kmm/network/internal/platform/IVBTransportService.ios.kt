@@ -43,6 +43,9 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringC
 import com.tencent.kmm.network.internal.utils.getHttpClient
 import com.tencent.kmm.network.internal.utils.readKnownSize
 import com.tencent.kmm.network.internal.utils.readUnknownSize
+import com.tencent.kmm.network.internal.streamHeadersUpperBoundMillis
+import com.tencent.kmm.network.internal.remainingStreamWholeTimeoutMillis
+import com.tencent.kmm.network.internal.streamPhaseTimeoutMillis
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.timeout
 import io.ktor.client.request.HttpRequestBuilder
@@ -63,26 +66,52 @@ import io.ktor.utils.io.core.isEmpty
 import io.ktor.utils.io.core.readBytes
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.withTimeout
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 
 private val iOSTransportImpl: IVBTransportService = IOSTransportImpl()
 private val scope = CoroutineScope(Dispatchers.IO)
-private val taskMap: MutableMap<Int, Job> = mutableMapOf()
+private val taskRegistry = IosTransportTaskRegistry()
 private const val TAG = "IOSTransportImpl"
+
+internal object IosTransportTestHooks {
+    var beforeStreamTransportCoroutineStart: (suspend () -> Unit)? = null
+    var beforeStreamTransportOpen: (() -> Unit)? = null
+
+    fun reset() {
+        beforeStreamTransportCoroutineStart = null
+        beforeStreamTransportOpen = null
+    }
+}
 
 // Upper bound per streamed chunk read off the response channel (fork #8).
 private const val STREAM_CHUNK_BYTES = 16L * 1024L
 
 class IOSTransportImpl : IVBTransportService {
+    override fun prepareRequest(requestId: Int): Boolean = taskRegistry.prepare(requestId)
+
+    override fun abortPreparedRequest(requestId: Int) {
+        taskRegistry.abort(requestId)
+    }
+
     private fun startRequest(
         request: VBTransportBaseRequest,
         kmmCallback: (response: VBTransportBaseResponse) -> Unit,
         uploadBody: IosStreamingUploadBody? = null
     ) {
-        val job = scope.launch {
+        lateinit var job: Job
+        val deliverCallback: (VBTransportBaseResponse) -> Unit = { response ->
+            taskRegistry.release(request.requestId, job)
+            kmmCallback(response)
+        }
+        job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val client = getHttpClient(request) as HttpClient
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
@@ -151,23 +180,29 @@ class IOSTransportImpl : IVBTransportService {
                 )
 
                 buildResponseAndCallback(
-                    taskMap,
+                    null,
                     errorCode,
                     errMsg,
                     response.headers.entries().associate { it.key to it.value },
                     data,
                     request,
-                    kmmCallback
+                    deliverCallback
                 )
             } catch (throwable: Throwable) {
                 if (throwable is CancellationException) {
-                    taskMap.remove(request.requestId)
                     throw throwable
                 }
-                callbackFailure(request, throwable, kmmCallback)
+                callbackFailure(request, throwable, deliverCallback)
             }
         }
-        taskMap[request.requestId] = job
+        if (!taskRegistry.register(request.requestId, job)) {
+            job.cancel()
+            callbackFailure(
+                request,
+                IllegalStateException("iOS transport request id already active"),
+                kmmCallback
+            )
+        }
     }
 
     override fun sendBytesRequest(
@@ -199,6 +234,7 @@ class IOSTransportImpl : IVBTransportService {
                 "headerKeys:${kmmPostRequest.header.keys}")
 
         if (!kmmPostRequest.isDataInitialize()) {
+            abortPreparedRequest(kmmPostRequest.requestId)
             callbackFailure(
                 kmmPostRequest,
                 IllegalArgumentException("Data is not initialized"),
@@ -241,23 +277,56 @@ class IOSTransportImpl : IVBTransportService {
     ) {
         VBPBLog.i(VBPBLog.HMTRANSPORTIMPL, "${kmmRequest.logTag} stream ${kmmRequest.method} request, " +
                 "id:${kmmRequest.requestId}, url:${kmmRequest.url}")
-        val job = scope.launch {
+        lateinit var job: Job
+        val deliverComplete: (VBTransportResponse) -> Unit = { response ->
+            taskRegistry.release(kmmRequest.requestId, job)
+            onComplete(response)
+        }
+        job = scope.launch(start = CoroutineStart.LAZY) {
             try {
+                IosTransportTestHooks.beforeStreamTransportCoroutineStart?.invoke()
+                val streamStart = kmmRequest.serviceRequestStartMark
+                    ?: kotlin.time.TimeSource.Monotonic.markNow()
+                val remainingAtTransportStart = remainingStreamWholeTimeoutMillis(
+                    kmmRequest.streamWholeTimeoutMillis,
+                    streamStart.elapsedNow().inWholeMilliseconds,
+                )
+                if (remainingAtTransportStart == 0L) {
+                    // Use the same classified coroutine timeout as Ktor, but
+                    // fail before constructing/opening a transport request.
+                    withTimeout(0L) { Unit }
+                }
+                IosTransportTestHooks.beforeStreamTransportOpen?.invoke()
                 val client = getHttpClient(kmmRequest) as HttpClient
-                val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
-                val response = client.request(kmmRequest.url) {
-                    method = HttpMethod(kmmRequest.method.name)
-                    if (kmmRequest.totalTimeout > 0) {
+                suspend fun openResponse() =
+                    client.request(kmmRequest.url) {
+                        method = HttpMethod(kmmRequest.method.name)
                         timeout {
-                            requestTimeoutMillis = kmmRequest.totalTimeout
-                            // raft.9: connect gets its own short budget so a dead
-                            // address family can't eat the whole request timeout
-                            // (see TransportTimeouts.kt for the 3s rationale).
-                            connectTimeoutMillis = transportConnectTimeoutMillis(kmmRequest.totalTimeout)
-                            socketTimeoutMillis = kmmRequest.totalTimeout
+                            remainingStreamWholeTimeoutMillis(
+                                kmmRequest.streamWholeTimeoutMillis,
+                                streamStart.elapsedNow().inWholeMilliseconds,
+                            )?.let { remainingWholeMillis ->
+                                requestTimeoutMillis = remainingWholeMillis.coerceAtLeast(1L)
+                            }
+                            connectTimeoutMillis = kmmRequest.streamConnectTimeoutMillis
+                            socketTimeoutMillis = kmmRequest.streamIdleTimeoutMillis
                         }
+                        constructRequest(kmmRequest)
                     }
-                    constructRequest(kmmRequest)
+                val responseHeadersBudget = streamPhaseTimeoutMillis(
+                    phaseMillis = streamHeadersUpperBoundMillis(
+                        kmmRequest.streamConnectTimeoutMillis,
+                        kmmRequest.streamResponseHeadersTimeoutMillis
+                    ),
+                    remainingWholeMillis = remainingStreamWholeTimeoutMillis(
+                        kmmRequest.streamWholeTimeoutMillis,
+                        streamStart.elapsedNow().inWholeMilliseconds,
+                    ),
+                )
+                val response = if (responseHeadersBudget != null) {
+                    withTimeout(responseHeadersBudget) { openResponse() }
+                } else {
+                    openResponse()
                 }
 
                 var errMsg = ""
@@ -298,8 +367,7 @@ class IOSTransportImpl : IVBTransportService {
                         "totalElapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}"
                 )
 
-                taskMap.remove(kmmRequest.requestId)
-                onComplete(
+                deliverComplete(
                     VBTransportResponse().apply {
                         this.errorCode = errorCode
                         this.errorMessage = errMsg
@@ -309,17 +377,20 @@ class IOSTransportImpl : IVBTransportService {
                     }
                 )
             } catch (throwable: Throwable) {
-                if (throwable is CancellationException) {
-                    taskMap.remove(kmmRequest.requestId)
+                if (throwable is CancellationException && throwable !is TimeoutCancellationException) {
                     throw throwable
                 }
-                taskMap.remove(kmmRequest.requestId)
                 // raft.9: classified failure reason, same shape as callbackFailure.
                 val describedFailure = describeTransportFailure(throwable)
                 VBPBLog.e(TAG, "${kmmRequest.logTag} stream request failed, id:${kmmRequest.requestId}, error:$describedFailure")
-                onComplete(
+                deliverComplete(
                     VBTransportResponse().apply {
-                        this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                        this.errorCode = if (throwable is TimeoutCancellationException ||
+                            describedFailure.startsWith("[timeout]")) {
+                            VBTransportResultCode.CODE_FORCE_TIMEOUT
+                        } else {
+                            VBTransportResultCode.CODE_NETWORK_ERROR
+                        }
                         this.errorMessage = describedFailure
                         this.data = null
                         this.request = kmmRequest
@@ -327,7 +398,16 @@ class IOSTransportImpl : IVBTransportService {
                 )
             }
         }
-        taskMap[kmmRequest.requestId] = job
+        if (!taskRegistry.register(kmmRequest.requestId, job)) {
+            job.cancel()
+            onComplete(
+                VBTransportResponse().apply {
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = "iOS transport request id already active"
+                    this.request = kmmRequest
+                }
+            )
+        }
     }
 
     private fun HttpRequestBuilder.constructRequest(kmmRequest: VBTransportBaseRequest) {
@@ -374,7 +454,7 @@ class IOSTransportImpl : IVBTransportService {
 
     override fun cancel(requestId: Int) {
         VBPBLog.i(TAG, "requestID -> $requestId task cancel by user")
-        taskMap[requestId]?.cancel()
+        taskRegistry.cancel(requestId)
     }
 
     private fun callbackFailure(
@@ -387,7 +467,7 @@ class IOSTransportImpl : IVBTransportService {
         val errorMessage = describeTransportFailure(throwable)
         VBPBLog.e(TAG, "${request.logTag} request failed, id:${request.requestId}, error:${errorMessage}")
         buildResponseAndCallback(
-            taskMap,
+            null,
             VBTransportResultCode.CODE_NETWORK_ERROR,
             errorMessage,
             emptyMap(),
@@ -395,6 +475,85 @@ class IOSTransportImpl : IVBTransportService {
             request,
             kmmCallback
         )
+    }
+}
+
+internal class IosTransportTaskRegistry : SynchronizedObject() {
+    private sealed interface Entry {
+        data object Reserved : Entry
+        data object Cancelled : Entry
+        class Running(val job: Job) : Entry
+    }
+
+    private val entries = mutableMapOf<Int, Entry>()
+
+    fun prepare(requestId: Int): Boolean = synchronized(this) {
+        if (entries.containsKey(requestId)) false
+        else {
+            entries[requestId] = Entry.Reserved
+            true
+        }
+    }
+
+    fun abort(requestId: Int) {
+        synchronized(this) {
+            val current = entries[requestId]
+            if (current === Entry.Reserved || current === Entry.Cancelled) entries.remove(requestId)
+        }
+    }
+
+    fun register(requestId: Int, job: Job): Boolean {
+        val start = synchronized(this) {
+            when (entries[requestId]) {
+                Entry.Reserved -> {
+                    entries[requestId] = Entry.Running(job)
+                    true
+                }
+                Entry.Cancelled -> {
+                    entries.remove(requestId)
+                    false
+                }
+                else -> return false
+            }
+        }
+        if (!start) {
+            job.cancel()
+            return true
+        }
+        job.invokeOnCompletion {
+            synchronized(this) {
+                val current = entries[requestId]
+                if (current is Entry.Running && current.job === job) entries.remove(requestId)
+            }
+        }
+        job.start()
+        return true
+    }
+
+    fun cancel(requestId: Int) {
+        val job = synchronized(this) {
+            val current = entries[requestId]
+            if (current is Entry.Running) {
+                entries.remove(requestId)
+                current.job
+            } else if (current === Entry.Reserved) {
+                entries[requestId] = Entry.Cancelled
+                null
+            } else {
+                null
+            }
+        }
+        job?.cancel()
+    }
+
+    fun release(requestId: Int, job: Job): Boolean = synchronized(this) {
+        val current = entries[requestId]
+        if (current is Entry.Running && current.job === job) {
+            entries.remove(requestId)
+            true
+        } else {
+            false
+        }
     }
 }
 

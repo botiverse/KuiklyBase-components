@@ -377,11 +377,17 @@ fi
 
 echo "==> Checking wrapper HTTP/3 control surface"
 WRAPPER_SYMBOLS="$("$LLVM_BIN/llvm-nm" -D "$WRAPPER_SO" 2>/dev/null || true)"
-for symbol in CurlSupportsHttp3 SetCurlHttp3Enabled GetCurlNegotiatedProtocol SetCurlResolve; do
+for symbol in CurlWrapperAbiVersion StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 CurlSupportsHttp3 SetCurlHttp3Enabled GetCurlNegotiatedProtocol SetCurlResolve; do
   if grep -Eq " [TW] ${symbol}$" <<<"$WRAPPER_SYMBOLS"; then
     echo "wrapper ${symbol}: EXPORTED"
   else
     echo "wrapper ${symbol}: MISSING" >&2
+    exit 1
+  fi
+done
+for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do
+  if grep -Eq " [TW] ${legacy_symbol}$" <<<"$WRAPPER_SYMBOLS"; then
+    echo "wrapper legacy ABI symbol ${legacy_symbol}: MUST NOT BE EXPORTED" >&2
     exit 1
   fi
 done
