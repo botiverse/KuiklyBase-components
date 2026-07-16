@@ -629,6 +629,9 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
     val openedStreamLock = SynchronizedObject()
     val openedStreams = mutableListOf<NetworkByteStream>()
     var compositeCancelled = false
+    var attemptSequence = 0L
+    var activeAttempt = 0L
+    var cancelledAttempt = 0L
     val totalLength: Long? =
         if (plans.all { it.bodyLength != null }) {
             plans.sumOf { it.prologue.size.toLong() + it.bodyLength!! + epilogue.size } + terminator.size
@@ -640,6 +643,7 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
         contentLength = totalLength,
         attemptCancelBlock = {
             val derived = synchronized(openedStreamLock) {
+                cancelledAttempt = activeAttempt
                 openedStreams.toList().also { openedStreams.clear() }
             }
             derived.forEach { runCatching { it.cancel() } }
@@ -665,6 +669,9 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
             }
         }
     ) { sink ->
+        val attemptId = synchronized(openedStreamLock) {
+            (++attemptSequence).also { activeAttempt = it }
+        }
         plans.forEach { plan ->
             sink.write(plan.prologue)
             when (val body = plan.streamBody) {
@@ -673,7 +680,11 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                     val stream = body.openStream()
                     if (stream != null) {
                         val cancelNow = synchronized(openedStreamLock) {
-                            if (compositeCancelled) true
+                            if (
+                                compositeCancelled ||
+                                activeAttempt != attemptId ||
+                                cancelledAttempt == attemptId
+                            ) true
                             else {
                                 openedStreams += stream
                                 false

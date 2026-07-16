@@ -80,7 +80,7 @@ class NetworkModelsTest {
     }
 
     @Test
-    fun multipartReadFailurePreservesCauseAndCancelsDerivedWhenFileOwnerThrows() = runBlocking {
+    fun multipartAttemptReadFailurePreservesLogicalFileAndCancelsDerived() = runBlocking {
         var fileRefCancels = 0
         var derivedCancels = 0
         val body = NetworkBody.Multipart(
@@ -111,8 +111,10 @@ class NetworkModelsTest {
         }.exceptionOrNull()
 
         assertEquals("source read failed", failure?.message)
-        assertEquals(1, fileRefCancels)
+        assertEquals(0, fileRefCancels)
         assertEquals(1, derivedCancels)
+        runCatching { body.cancel() }
+        assertEquals(1, fileRefCancels)
     }
 
     @Test
@@ -154,6 +156,44 @@ class NetworkModelsTest {
         assertEquals(0, fileCancels)
         body.cancel()
         assertEquals(1, fileCancels)
+    }
+
+    @Test
+    fun multipartAttemptCancelOwnsDerivedStreamOpenedAfterCancellation() = runBlocking {
+        val openStarted = CompletableDeferred<Unit>()
+        val releaseOpen = CompletableDeferred<Unit>()
+        var fileCancels = 0
+        var derivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/late-open",
+                        cancelBlock = { fileCancels++ },
+                        openStreamBlock = {
+                            openStarted.complete(Unit)
+                            releaseOpen.await()
+                            NetworkByteStream.fromChunks(cancelBlock = { derivedCancels++ }) {}
+                        },
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+        val reader = launch {
+            composite.readChunks(object : NetworkByteStreamSink {
+                override suspend fun write(bytes: ByteArray) = Unit
+            })
+        }
+        openStarted.await()
+
+        composite.cancelAttempt()
+        releaseOpen.complete(Unit)
+        reader.join()
+
+        assertEquals(0, fileCancels)
+        assertEquals(1, derivedCancels)
     }
 
     @Test

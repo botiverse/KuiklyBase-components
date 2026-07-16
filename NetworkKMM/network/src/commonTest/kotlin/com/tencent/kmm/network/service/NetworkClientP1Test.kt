@@ -1056,6 +1056,48 @@ class NetworkClientP1Test {
     }
 
     @Test
+    fun finalFailureContainsThrowingLogicalOwnerAndCleansRemainingBodies() {
+        var throwingCancels = 0
+        var remainingCancels = 0
+        var terminals = 0
+        val request = NetworkRequest()
+        val call = NetworkCall(request)
+        call.ownBody(
+            NetworkBody.FileRef(
+                path = "/virtual/throwing-final-owner",
+                cancelBlock = {
+                    throwingCancels++
+                    error("cleanup failed")
+                },
+            )
+        )
+        call.ownBody(
+            NetworkBody.Stream(
+                NetworkByteStream.fromChunks(cancelBlock = { remainingCancels++ }) {}
+            )
+        )
+        call.addCompletionHandler { terminals++ }
+
+        call.tryComplete(
+            NetworkResponse(
+                request,
+                503,
+                emptyMap(),
+                NetworkResponseBody(),
+                com.tencent.kmm.network.export.NetworkError(
+                    NetworkErrorKind.UNKNOWN,
+                    "final failure",
+                    503,
+                ),
+            )
+        )
+
+        assertEquals(1, throwingCancels)
+        assertEquals(1, remainingCancels)
+        assertEquals(1, terminals)
+    }
+
+    @Test
     fun fallbackCallbackAndTerminalObserverFailuresCannotEscapeOrHang() = runBlocking {
         var terminalCalls = 0
         val client = NetworkClient(
