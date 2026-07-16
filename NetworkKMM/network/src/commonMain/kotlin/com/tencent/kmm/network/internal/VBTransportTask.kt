@@ -393,8 +393,8 @@ class VBTransportTask(
             platformAbortPrepared(requestId)
             platformEntryPhase.value = PLATFORM_PHASE_ABORTED
         } catch (throwable: Throwable) {
-            platformEntryPhase.value = PLATFORM_PHASE_RESERVED
-            throw throwable
+            platformEntryPhase.value = PLATFORM_PHASE_ABORT_FAILED
+            logI("abort prepared request failed: ${throwable.message ?: throwable::class.simpleName}")
         }
         return true
     }
@@ -410,3 +410,4 @@ private const val PLATFORM_PHASE_RESERVED = 1
 private const val PLATFORM_PHASE_ENTERED = 2
 private const val PLATFORM_PHASE_ABORTING = 3
 private const val PLATFORM_PHASE_ABORTED = 4
+private const val PLATFORM_PHASE_ABORT_FAILED = 5

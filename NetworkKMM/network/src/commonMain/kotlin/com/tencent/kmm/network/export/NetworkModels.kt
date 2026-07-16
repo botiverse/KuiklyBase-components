@@ -48,6 +48,7 @@ class NetworkByteStream(
     val contentLength: Long? = null,
     private val readAllBlock: suspend () -> ByteArray,
     private val cancelBlock: (() -> Unit)? = null,
+    private val attemptCancelBlock: (() -> Unit)? = null,
     private val readChunksBlock: (suspend (NetworkByteStreamSink) -> Unit)? = null
 ) {
     private val cancelArmed = atomic(true)
@@ -68,10 +69,15 @@ class NetworkByteStream(
         }
     }
 
+    internal fun cancelAttempt() {
+        (attemptCancelBlock ?: cancelBlock)?.invoke()
+    }
+
     companion object {
         fun fromChunks(
             contentLength: Long? = null,
             cancelBlock: (() -> Unit)? = null,
+            attemptCancelBlock: (() -> Unit)? = null,
             readChunksBlock: suspend (NetworkByteStreamSink) -> Unit
         ): NetworkByteStream {
             return NetworkByteStream(
@@ -86,6 +92,7 @@ class NetworkByteStream(
                     mergeByteArrays(chunks)
                 },
                 cancelBlock = cancelBlock,
+                attemptCancelBlock = attemptCancelBlock,
                 readChunksBlock = readChunksBlock
             )
         }
@@ -631,6 +638,12 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
 
     return NetworkByteStream.fromChunks(
         contentLength = totalLength,
+        attemptCancelBlock = {
+            val derived = synchronized(openedStreamLock) {
+                openedStreams.toList().also { openedStreams.clear() }
+            }
+            derived.forEach { runCatching { it.cancel() } }
+        },
         cancelBlock = {
             val derived = synchronized(openedStreamLock) {
                 compositeCancelled = true
@@ -672,7 +685,6 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                             try {
                                 stream.readChunks(sink)
                             } catch (throwable: Throwable) {
-                                runCatching { body.cancel() }
                                 runCatching { stream.cancel() }
                                 throw throwable
                             } finally {

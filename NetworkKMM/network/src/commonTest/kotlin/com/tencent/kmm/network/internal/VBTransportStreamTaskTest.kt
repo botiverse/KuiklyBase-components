@@ -150,6 +150,48 @@ class VBTransportStreamTaskTest {
     }
 
     @Test
+    fun abortThrowBeforeRemoveStillContainsFailureAndNeverEntersPlatform() {
+        val task = registeredTask(991_007)
+        val terminals = atomic(0)
+        val platformEntries = atomic(0)
+        task.platformPrepare = { true }
+        task.platformAbortPrepared = { error("abort before remove") }
+        task.platformCancel = {}
+        task.afterStreamGateInstalledForTest = { task.cancel() }
+        task.platformRequestStream = { _, _, _, _ -> platformEntries.incrementAndGet() }
+
+        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) { terminals.incrementAndGet() }
+
+        assertEquals(1, terminals.value)
+        assertEquals(0, platformEntries.value)
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(task.requestId))
+    }
+
+    @Test
+    fun abortRemoveThenThrowStillAllowsSameIdReplacementAtTerminal() {
+        val requestId = 991_008
+        val reservation = CancellationAwareRegistry<Int, String>()
+        val task = registeredTask(requestId)
+        var replacementReserved = false
+        task.platformPrepare = { reservation.begin(it) }
+        task.platformAbortPrepared = {
+            reservation.remove(it)
+            error("abort after remove")
+        }
+        task.platformCancel = {}
+        task.afterStreamGateInstalledForTest = { task.cancel() }
+        task.platformRequestStream = { _, _, _, _ -> error("platform must not start") }
+
+        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
+            replacementReserved = reservation.begin(requestId)
+            reservation.remove(requestId)
+        }
+
+        assertEquals(true, replacementReserved)
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+    }
+
+    @Test
     fun midstreamCancelWinsOnceAndSuppressesLateChunkAndSuccess() {
         val task = registeredTask(991_002)
         var start: ((Int, Map<String, List<String>>) -> Unit)? = null

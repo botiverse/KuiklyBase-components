@@ -174,6 +174,7 @@ class NetworkCall internal constructor(
     private var terminalResponse: NetworkResponse? = null
     private var resolvedEngine: ResolvedNetworkEngine? = null
     private var engineSelectionReported = false
+    private var attemptBody: NetworkBody? = null
 
     val isCancelled: Boolean
         get() = synchronized(stateLock) { cancelled }
@@ -245,7 +246,7 @@ class NetworkCall internal constructor(
             cancelHandlers.clear()
             completionHandlers.toList().also { completionHandlers.clear() }
         }
-        if (response.error != null) {
+        if (!response.isSuccess) {
             try {
                 cancelRequestBodyOnce()
             } catch (_: Throwable) {
@@ -364,6 +365,12 @@ class NetworkCall internal constructor(
     internal fun ownCurrentBody(body: () -> NetworkBody) {
         addCancelHandler { cancelBodyOnce(body()) }
     }
+
+    internal fun markAttemptBody(body: NetworkBody) {
+        synchronized(stateLock) { attemptBody = body }
+    }
+
+    internal fun currentAttemptBody(): NetworkBody? = synchronized(stateLock) { attemptBody }
 
     internal fun cancelOwnedBodies() {
         val bodies = synchronized(stateLock) { ownedBodies.toList() }
@@ -565,12 +572,13 @@ class NetworkClient(
                 return cancelledResponse(prepared)
             }
             val response = executeWithInterceptors(prepared, call)
-            val authRetry = maybeRefreshAuth(prepared, response, refreshedAuth)
+            val actualBody = call.currentAttemptBody() ?: prepared.body
+            val authRetry = maybeRefreshAuth(prepared, response, refreshedAuth, actualBody)
             if (authRetry) {
                 refreshedAuth = true
                 continue
             }
-            if (!shouldRetry(response, policy, attempt, prepared.body)) {
+            if (!shouldRetry(response, policy, attempt, actualBody)) {
                 return observe(response)
             }
             delay(policy.retry.backoff.delayForAttempt(attempt))
@@ -605,11 +613,12 @@ class NetworkClient(
     private suspend fun maybeRefreshAuth(
         request: NetworkRequest,
         response: NetworkResponse,
-        alreadyRefreshed: Boolean
+        alreadyRefreshed: Boolean,
+        body: NetworkBody,
     ): Boolean {
         val auth = config.auth ?: return false
         val status = response.statusCode ?: return false
-        if (alreadyRefreshed || status !in auth.refreshStatusCodes) {
+        if (alreadyRefreshed || status !in auth.refreshStatusCodes || !body.repeatable) {
             return false
         }
         val token = refreshTokenDedup(request, response) ?: return false
@@ -861,11 +870,11 @@ object VBTransportNetworkEngine : NetworkEngine {
                 cancelPreparedRequestBody = { call.cancelBodyOnce(request.body) },
                 cancelDerivedSource = source.stream.takeIf { source.cancelSeparatelyFromRequestBody }
                     ?.let { stream -> stream::cancel },
+                cancelAttemptSource = source.cancelAttemptSource,
                 cancelNativeRequest = null,
                 closePullBridge = null,
                 cancelTransport = { VBTransportService.cancel(vbRequest.requestId) }
             )
-            call.addCancelHandler(cancellationOwners::cancelAll)
             try {
                 VBTransportService.uploadStream(vbRequest, source.contentLength, writeBody) { response ->
                     cancellationOwners.disarmTransport()
@@ -879,6 +888,7 @@ object VBTransportNetworkEngine : NetworkEngine {
                 cancellationOwners.releaseAttemptSourceOnFailure()
                 throw throwable
             }
+            call.addCancelHandler(cancellationOwners::cancelAll)
             continuation.invokeOnCancellation { cancellationOwners.cancelAll() }
         }
     }
@@ -892,7 +902,8 @@ internal class NetworkUploadStreamSource(
     val stream: NetworkByteStream,
     val contentType: String?,
     val contentLength: Long?,
-    val cancelSeparatelyFromRequestBody: Boolean = false
+    val cancelSeparatelyFromRequestBody: Boolean = false,
+    val cancelAttemptSource: () -> Unit = stream::cancel,
 )
 
 internal suspend fun networkUploadStreamSourceOrNull(request: NetworkRequest): NetworkUploadStreamSource? =
@@ -917,6 +928,7 @@ internal suspend fun networkUploadStreamSourceOrNull(request: NetworkRequest): N
                     body.contentType,
                     stream.contentLength,
                     cancelSeparatelyFromRequestBody = true,
+                    cancelAttemptSource = stream::cancelAttempt,
                 )
             }
         else -> null
@@ -932,6 +944,7 @@ internal class StreamingUploadCancellationOwners(
     private val cancelOriginalRequestBody: () -> Unit,
     private val cancelPreparedRequestBody: () -> Unit,
     private val cancelDerivedSource: (() -> Unit)?,
+    private val cancelAttemptSource: (() -> Unit)? = cancelDerivedSource,
     private val cancelNativeRequest: (() -> Unit)?,
     private val closePullBridge: (() -> Unit)?,
     private val cancelTransport: () -> Unit
@@ -939,6 +952,7 @@ internal class StreamingUploadCancellationOwners(
     private val originalRequestBodyArmed = atomic(true)
     private val preparedRequestBodyArmed = atomic(true)
     private val derivedSourceArmed = atomic(cancelDerivedSource != null)
+    private val attemptSourceArmed = atomic(cancelAttemptSource != null)
     private val nativeRequestArmed = atomic(cancelNativeRequest != null)
     private val pullBridgeArmed = atomic(closePullBridge != null)
     private val transportArmed = atomic(true)
@@ -957,7 +971,7 @@ internal class StreamingUploadCancellationOwners(
     }
 
     fun releaseAttemptSourceOnFailure() {
-        cancelDerivedSource?.let { cancelOnce(derivedSourceArmed, it) }
+        cancelAttemptSource?.let { cancelOnce(attemptSourceArmed, it) }
     }
 
     fun disarmNativeTransportOwners() {
@@ -983,6 +997,9 @@ private class RealNetworkInterceptorChain(
     override suspend fun proceed(request: NetworkRequest): NetworkResponse {
         if (index >= interceptors.size) {
             call.gateProgressCallbacks(request)
+            call.ownBody(request.body)
+            call.markAttemptBody(request.body)
+            if (call.isCancelled) return cancelledResponse(request)
             return engine.execute(request, call)
         }
         return interceptors[index].intercept(

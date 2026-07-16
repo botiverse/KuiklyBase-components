@@ -820,6 +820,133 @@ class NetworkClientP1Test {
     }
 
     @Test
+    fun interceptorActualNonrepeatableBodyOwnsFinalFailureAndDisablesRetry() = runBlocking {
+        var bodyCancels = 0
+        var engineAttempts = 0
+        val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+            policy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                    maxRetries = 1,
+                    backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(
+                        initialDelayMillis = 0,
+                        maxDelayMillis = 0,
+                    ),
+                )
+            )
+        }
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                interceptors = listOf(
+                    object : NetworkInterceptor {
+                        override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                            chain.request.body = NetworkBody.Stream(
+                                NetworkByteStream.fromChunks(cancelBlock = { bodyCancels++ }) {}
+                            )
+                            return chain.proceed(chain.request)
+                        }
+                    }
+                )
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineAttempts++
+                    return NetworkResponse(
+                        request,
+                        503,
+                        emptyMap(),
+                        NetworkResponseBody(),
+                        com.tencent.kmm.network.export.NetworkError(
+                            NetworkErrorKind.UNKNOWN,
+                            "retryable",
+                            503,
+                        ),
+                    )
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(503, client.execute(request).statusCode)
+        assertEquals(1, engineAttempts)
+        assertEquals(1, bodyCancels)
+    }
+
+    @Test
+    fun statusOnlyFinalFailureReleasesActualInterceptorBody() = runBlocking {
+        var bodyCancels = 0
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                interceptors = listOf(
+                    object : NetworkInterceptor {
+                        override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                            chain.request.body = NetworkBody.FileRef(
+                                path = "/virtual/status-only.bin",
+                                cancelBlock = { bodyCancels++ },
+                                readAllBlock = { byteArrayOf(1) },
+                            )
+                            return chain.proceed(chain.request)
+                        }
+                    }
+                )
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse =
+                    NetworkResponse(request, 503, emptyMap(), NetworkResponseBody(), error = null)
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(503, client.execute(NetworkRequest()).statusCode)
+        assertEquals(1, bodyCancels)
+    }
+
+    @Test
+    fun authRefreshDoesNotReplayNonrepeatableActualBody() = runBlocking {
+        var refreshCalls = 0
+        var engineAttempts = 0
+        val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+            body = NetworkBody.Stream(NetworkByteStream.fromChunks {})
+        }
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                auth = NetworkAuthConfig(
+                    tokenProvider = object : NetworkTokenProvider {
+                        override suspend fun currentToken(request: NetworkRequest): String? = "old"
+                        override suspend fun refreshToken(
+                            request: NetworkRequest,
+                            response: NetworkResponse,
+                        ): String? {
+                            refreshCalls++
+                            return "new"
+                        }
+                    }
+                )
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineAttempts++
+                    return NetworkResponse(
+                        request,
+                        401,
+                        emptyMap(),
+                        NetworkResponseBody(),
+                        com.tencent.kmm.network.export.NetworkError(
+                            NetworkErrorKind.UNKNOWN,
+                            "unauthorized",
+                            401,
+                        ),
+                    )
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(401, client.execute(request).statusCode)
+        assertEquals(1, engineAttempts)
+        assertEquals(0, refreshCalls)
+    }
+
+    @Test
     fun streamingSourceOpenFailureCancelsPreparedFileOwner() = runBlocking {
         var fileCancels = 0
         val request = NetworkRequest(method = VBTransportMethod.POST).apply {

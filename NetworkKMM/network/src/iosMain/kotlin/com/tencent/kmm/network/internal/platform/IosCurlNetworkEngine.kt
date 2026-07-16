@@ -216,6 +216,7 @@ internal class IosCurlNetworkEngine(
             cancelPreparedRequestBody = { call.cancelBodyOnce(request.body) },
             cancelDerivedSource = source.stream.takeIf { source.cancelSeparatelyFromRequestBody }
                 ?.let { stream -> stream::cancel },
+            cancelAttemptSource = source.cancelAttemptSource,
             cancelNativeRequest = nativeRequest::cancel,
             closePullBridge = {
                 pullBridge.closeFailure(CancellationException("Upload cancelled"))

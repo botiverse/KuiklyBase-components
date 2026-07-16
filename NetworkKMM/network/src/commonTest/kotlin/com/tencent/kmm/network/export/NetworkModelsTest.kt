@@ -116,6 +116,47 @@ class NetworkModelsTest {
     }
 
     @Test
+    fun multipartAttemptFailureKeepsLogicalFileRepeatableForNextAttempt() = runBlocking {
+        var opens = 0
+        var fileCancels = 0
+        var firstDerivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/retry-file",
+                        cancelBlock = { fileCancels++ },
+                        openStreamBlock = {
+                            opens++
+                            if (opens == 1) {
+                                NetworkByteStream.fromChunks(cancelBlock = { firstDerivedCancels++ }) {
+                                    error("first attempt failed")
+                                }
+                            } else {
+                                NetworkByteStream.fromChunks { sink -> sink.write(byteArrayOf(7)) }
+                            }
+                        },
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+        val sink = object : NetworkByteStreamSink {
+            override suspend fun write(bytes: ByteArray) = Unit
+        }
+
+        assertEquals("first attempt failed", runCatching { composite.readChunks(sink) }.exceptionOrNull()?.message)
+        composite.readChunks(sink)
+
+        assertEquals(2, opens)
+        assertEquals(1, firstDerivedCancels)
+        assertEquals(0, fileCancels)
+        body.cancel()
+        assertEquals(1, fileCancels)
+    }
+
+    @Test
     fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
         val defaults = NetworkRequestPolicy().streamTimeouts
         assertEquals(3_000L, defaults.connectTimeoutMillis)
