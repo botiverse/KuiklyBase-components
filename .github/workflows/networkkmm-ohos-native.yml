@@ -152,6 +152,25 @@ jobs:
           grep -q -- "--openssldir=/etc/ssl" "$script"
           echo "TLS verification + system CA path: OK"
 
+      - name: Build paired OHOS Kotlin/Native consumer
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd NetworkKMM
+          ./gradlew -c settings.ohos.gradle.kts :network:linkDebugSharedOhosArm64 \
+            --no-daemon --console=plain --stacktrace
+          source_lib="network/build/bin/ohosArm64/debugShared/libkn.so"
+          target_lib="ohosApp/entry/libs/arm64-v8a/libkn.so"
+          test -s "$source_lib"
+          cp "$source_lib" "$target_lib"
+          readelf -Ws "$target_lib" | grep -q ' UND StartRequestV27$'
+          readelf -Ws "$target_lib" | grep -q ' UND StartStreamRequestV27$'
+          readelf -Ws "$target_lib" | grep -q ' UND StartUploadRequestV27$'
+          if readelf -Ws "$target_lib" | grep -Eq ' UND Start(Request|StreamRequest|UploadRequest)$'; then
+            echo "OHOS Kotlin/Native consumer still imports legacy Start* symbols" >&2
+            exit 1
+          fi
+
       - name: Upload native artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -164,6 +183,7 @@ jobs:
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libpbcurlwrapper.so
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libopenssl.so
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libc++_shared.so
+            NetworkKMM/ohosApp/entry/libs/arm64-v8a/libkn.so
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libcurl.a
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libnghttp3.a
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
