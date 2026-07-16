@@ -22,11 +22,12 @@ on:
       - "NetworkKMM/scripts/build-ohos-native.sh"
       - "NetworkKMM/settings.gradle.kts"
       - "NetworkKMM/settings.ohos.gradle.kts"
+      - "NetworkKMM/build.ohos.gradle.kts"
       - "NetworkKMM/network/build.ohos.gradle.kts"
+      - "NetworkKMM/gradle/libs.versions.toml"
+      - "NetworkKMM/gradle.properties"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
-      - "NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/curl/**"
-      - "NetworkKMM/network/src/ohosArm64Main/kotlin/com/tencent/kmm/network/curl/**"
-      - "NetworkKMM/network/src/nativeInterop/cinterop/**"
+      - "NetworkKMM/network/src/**"
       - "NetworkKMM/network-host-native-tests/**"
       - ".github/workflows/networkkmm-ohos-native.yml"
   pull_request:
@@ -34,11 +35,12 @@ on:
       - "NetworkKMM/scripts/build-ohos-native.sh"
       - "NetworkKMM/settings.gradle.kts"
       - "NetworkKMM/settings.ohos.gradle.kts"
+      - "NetworkKMM/build.ohos.gradle.kts"
       - "NetworkKMM/network/build.ohos.gradle.kts"
+      - "NetworkKMM/gradle/libs.versions.toml"
+      - "NetworkKMM/gradle.properties"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
-      - "NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/curl/**"
-      - "NetworkKMM/network/src/ohosArm64Main/kotlin/com/tencent/kmm/network/curl/**"
-      - "NetworkKMM/network/src/nativeInterop/cinterop/**"
+      - "NetworkKMM/network/src/**"
       - "NetworkKMM/network-host-native-tests/**"
       - ".github/workflows/networkkmm-ohos-native.yml"
 
@@ -232,11 +234,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cp -a /tmp/networkkmm-ohos-native/network/libs/. NetworkKMM/network/libs/
-          cp -a /tmp/networkkmm-ohos-native/ohosApp/entry/libs/arm64-v8a/. \
-            NetworkKMM/ohosApp/entry/libs/arm64-v8a/
-          cp -a /tmp/networkkmm-ohos-native/ohosApp/pbcurlwrapper/libs/arm64-v8a/. \
-            NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/
+          artifact=/tmp/networkkmm-ohos-native
+          files=(
+            network/libs/libpbcurlwrapper.so
+            network/libs/libopenssl.so
+            network/libs/libc++_shared.so
+            ohosApp/entry/libs/arm64-v8a/libpbcurlwrapper.so
+            ohosApp/entry/libs/arm64-v8a/libopenssl.so
+            ohosApp/entry/libs/arm64-v8a/libc++_shared.so
+            ohosApp/entry/libs/arm64-v8a/libkn.so
+            ohosApp/pbcurlwrapper/libs/arm64-v8a/libcurl.a
+            ohosApp/pbcurlwrapper/libs/arm64-v8a/libnghttp3.a
+            ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
+          )
+          for file in "${files[@]}"; do
+            test -s "$artifact/$file" || { echo "missing paired artifact member: $file" >&2; exit 1; }
+          done
+
+          symbols="$(readelf --dyn-syms --wide "$artifact/ohosApp/entry/libs/arm64-v8a/libkn.so")"
+          printf '%s\n' "$symbols" | grep ' UND CurlWrapperAbiVersion$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartStreamRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartUploadRequestV27$' >/dev/null
+          legacy_matches="$(printf '%s\n' "$symbols" | grep -E ' UND Start(Request|StreamRequest|UploadRequest)$' || true)"
+          test -z "$legacy_matches" || { printf '%s\n' "$legacy_matches" >&2; exit 1; }
+
+          for file in "${files[@]}"; do
+            mkdir -p "NetworkKMM/$(dirname "$file")"
+            cp -f "$artifact/$file" "NetworkKMM/$file"
+          done
 
       - name: Commit refreshed binaries back
         shell: bash
