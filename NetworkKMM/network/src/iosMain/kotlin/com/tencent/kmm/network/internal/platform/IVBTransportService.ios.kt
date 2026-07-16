@@ -453,7 +453,8 @@ internal class IosTransportTaskRegistry : SynchronizedObject() {
 
     fun abort(requestId: Int) {
         synchronized(this) {
-            if (entries[requestId] === Entry.Reserved) entries.remove(requestId)
+            val current = entries[requestId]
+            if (current === Entry.Reserved || current === Entry.Cancelled) entries.remove(requestId)
         }
     }
 

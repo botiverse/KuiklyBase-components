@@ -205,12 +205,14 @@ object CurlRequestServiceHM : ICurlRequestService {
         }
     }
 
-    private fun publishNativeHandle(requestId: Int, handle: CPointer<out CPointed>, logTag: String) {
-        if (nativeHandles.publish(requestId, handle)) {
+    private fun publishNativeHandle(requestId: Int, handle: CPointer<out CPointed>, logTag: String): Boolean {
+        return if (nativeHandles.publish(requestId, handle)) {
             logI("[$logTag] native handle published, id:$requestId, handle:$handle")
+            true
         } else {
             logI("[$logTag] native handle consumed pre-cancel, id:$requestId, handle:$handle")
             Cancel(handle)
+            false
         }
     }
 
@@ -408,7 +410,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                 error("CreateCurlClient failed")
             }
             try {
-                publishNativeHandle(request.requestId, handle, logTag)
+                if (!publishNativeHandle(request.requestId, handle, logTag)) return@memScoped
                 configureCurlRuntime(handle, request)
                 val callback = object : ICurlCallback {
                     override fun onResponse(result: CurlResponse) {
@@ -527,7 +529,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                 error("CreateCurlClient failed")
             }
             try {
-                publishNativeHandle(request.requestId, handle, logTag)
+                if (!publishNativeHandle(request.requestId, handle, logTag)) return@memScoped
                 configureCurlRuntime(handle, request)
                 fun callbackFailureResponse(throwable: Throwable) =
                     VBTransportResponse().apply {
@@ -618,19 +620,7 @@ object CurlRequestServiceHM : ICurlRequestService {
         logTag: String
     ) {
         val bridge = UploadPullBridge()
-        // The writer pushes writeBody's chunks into the bridge from its own
-        // worker; the curl perform thread blocks in the READFUNCTION pulling
-        // them out. Dispatchers.IO keeps the (blocking) producer off the
-        // Default pool the perform coroutine already occupies.
-        val writerJob = uploadWriterScope.transportLaunch {
-            try {
-                writeBody(bridge.sink)
-                bridge.closeSuccess()
-            } catch (throwable: Throwable) {
-                logI("[$logTag] upload writeBody failed: ${throwable.message ?: throwable::class.simpleName}")
-                bridge.closeFailure(throwable)
-            }
-        }
+        var writerJob: kotlinx.coroutines.Job? = null
         try {
             memScoped {
                 val headers = toStringDic(buildRequestHeader(request), memScope)
@@ -641,8 +631,20 @@ object CurlRequestServiceHM : ICurlRequestService {
                     error("CreateCurlClient failed")
                 }
                 try {
-                    publishNativeHandle(request.requestId, handle, logTag)
+                    if (!publishNativeHandle(request.requestId, handle, logTag)) return@memScoped
                     configureCurlRuntime(handle, request)
+                    // Start the producer only after cancellation ownership was
+                    // published. A consumed pre-cancel must not read the body
+                    // or enter StartUploadRequestV27 at all.
+                    writerJob = uploadWriterScope.transportLaunch {
+                        try {
+                            writeBody(bridge.sink)
+                            bridge.closeSuccess()
+                        } catch (throwable: Throwable) {
+                            logI("[$logTag] upload writeBody failed: ${throwable.message ?: throwable::class.simpleName}")
+                            bridge.closeFailure(throwable)
+                        }
+                    }
                     val callback = object : ICurlCallback {
                         override fun onResponse(result: CurlResponse) {
                             nativeResponse = applyNegotiatedProtocol(
@@ -689,7 +691,7 @@ object CurlRequestServiceHM : ICurlRequestService {
         } finally {
             // perform is over — a writer still blocked in send() (abort paths)
             // must not leak.
-            writerJob.cancel()
+            writerJob?.cancel()
         }
     }
 

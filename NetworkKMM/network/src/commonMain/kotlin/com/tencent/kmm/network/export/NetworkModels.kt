@@ -643,8 +643,15 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
         contentLength = totalLength,
         attemptCancelBlock = {
             val derived = synchronized(openedStreamLock) {
-                cancelledAttempt = activeAttempt
+                cancelledAttempt = when {
+                    activeAttempt != 0L -> activeAttempt
+                    attemptSequence == 0L -> 1L
+                    else -> attemptSequence
+                }
                 openedStreams.toList().also { openedStreams.clear() }
+            }
+            plans.mapNotNull { it.streamBody as? NetworkBody.Stream }.forEach {
+                runCatching { it.cancel() }
             }
             derived.forEach { runCatching { it.cancel() } }
         },
@@ -680,62 +687,68 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                 if (attemptActive()) sink.write(bytes)
             }
         }
-        plans.forEach { plan ->
-            if (!attemptActive()) return@fromChunks
-            guardedSink.write(plan.prologue)
-            if (!attemptActive()) return@fromChunks
-            when (val body = plan.streamBody) {
-                is NetworkBody.Stream -> {
-                    body.stream.readChunks(guardedSink)
-                    if (!attemptActive()) return@fromChunks
-                }
-                is NetworkBody.FileRef -> {
-                    if (!attemptActive()) return@fromChunks
-                    val stream = body.openStream()
-                    if (stream != null) {
-                        val cancelNow = synchronized(openedStreamLock) {
-                            if (
-                                compositeCancelled ||
-                                activeAttempt != attemptId ||
-                                cancelledAttempt == attemptId
-                            ) true
-                            else {
-                                openedStreams += stream
-                                false
-                            }
-                        }
-                        if (cancelNow) {
-                            runCatching { stream.cancel() }
-                            return@fromChunks
-                        } else {
-                            try {
-                                stream.readChunks(guardedSink)
-                            } catch (throwable: Throwable) {
-                                runCatching { stream.cancel() }
-                                throw throwable
-                            } finally {
-                                synchronized(openedStreamLock) {
-                                    openedStreams.removeAll { it === stream }
+        try {
+            plans.forEach { plan ->
+                if (!attemptActive()) return@fromChunks
+                guardedSink.write(plan.prologue)
+                if (!attemptActive()) return@fromChunks
+                when (val body = plan.streamBody) {
+                    is NetworkBody.Stream -> {
+                        body.stream.readChunks(guardedSink)
+                        if (!attemptActive()) return@fromChunks
+                    }
+                    is NetworkBody.FileRef -> {
+                        if (!attemptActive()) return@fromChunks
+                        val stream = body.openStream()
+                        if (stream != null) {
+                            val cancelNow = synchronized(openedStreamLock) {
+                                if (
+                                    compositeCancelled ||
+                                    activeAttempt != attemptId ||
+                                    cancelledAttempt == attemptId
+                                ) true
+                                else {
+                                    openedStreams += stream
+                                    false
                                 }
                             }
+                            if (cancelNow) {
+                                runCatching { stream.cancel() }
+                                return@fromChunks
+                            } else {
+                                try {
+                                    stream.readChunks(guardedSink)
+                                } catch (throwable: Throwable) {
+                                    runCatching { stream.cancel() }
+                                    throw throwable
+                                } finally {
+                                    synchronized(openedStreamLock) {
+                                        openedStreams.removeAll { it === stream }
+                                    }
+                                }
+                                if (!attemptActive()) return@fromChunks
+                            }
+                        } else {
                             if (!attemptActive()) return@fromChunks
+                            val bytes = body.readAll()
+                                ?: throw IllegalStateException(
+                                    "FileRef part requires a readAllBlock or openStreamBlock on this engine."
+                                )
+                            if (!attemptActive()) return@fromChunks
+                            guardedSink.write(bytes)
                         }
-                    } else {
-                        if (!attemptActive()) return@fromChunks
-                        val bytes = body.readAll()
-                            ?: throw IllegalStateException(
-                                "FileRef part requires a readAllBlock or openStreamBlock on this engine."
-                            )
-                        if (!attemptActive()) return@fromChunks
-                        guardedSink.write(bytes)
                     }
+                    else -> plan.scalarBytes?.let { if (it.isNotEmpty()) guardedSink.write(it) }
                 }
-                else -> plan.scalarBytes?.let { if (it.isNotEmpty()) guardedSink.write(it) }
+                if (!attemptActive()) return@fromChunks
+                guardedSink.write(epilogue)
             }
             if (!attemptActive()) return@fromChunks
-            guardedSink.write(epilogue)
+            guardedSink.write(terminator)
+        } finally {
+            synchronized(openedStreamLock) {
+                if (activeAttempt == attemptId) activeAttempt = 0L
+            }
         }
-        if (!attemptActive()) return@fromChunks
-        guardedSink.write(terminator)
     }
 }

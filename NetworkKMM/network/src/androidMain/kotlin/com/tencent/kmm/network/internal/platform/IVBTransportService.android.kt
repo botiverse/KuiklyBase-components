@@ -724,7 +724,8 @@ internal class AndroidPreparedTransportTaskRegistry {
 
     @Synchronized
     fun abort(requestId: Int) {
-        if (entries[requestId] === Entry.Reserved) entries.remove(requestId)
+        val current = entries[requestId]
+        if (current === Entry.Reserved || current === Entry.Cancelled) entries.remove(requestId)
     }
 
     fun register(requestId: Int, job: Job): Boolean {

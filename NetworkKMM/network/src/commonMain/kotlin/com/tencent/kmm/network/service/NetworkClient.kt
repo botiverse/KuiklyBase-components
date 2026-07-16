@@ -1032,7 +1032,7 @@ private class RealNetworkInterceptorChain(
                 engine = engine,
                 outcomes = outcomes,
             )
-        ).also { outcomes.bindIfAbsent(it, request.body) }
+        ).also { outcomes.bindIfAbsent(it, it.request.body) }
     }
 }
 

@@ -22,6 +22,43 @@ import kotlin.test.assertTrue
 
 class VBTransportStreamTaskTest {
     @Test
+    fun cancelBetweenPlatformPrepareAndPhasePublishAbortsCancelledOwnerBeforeTerminalReuse() {
+        val requestId = 991_012
+        val task = registeredTask(requestId)
+        var platformOwner = "none"
+        var platformEntries = 0
+        var terminals = 0
+        var replacementReserved = false
+        var commonReplacementReserved = false
+        task.platformPrepare = {
+            if (platformOwner != "none") false else {
+                platformOwner = "reserved"
+                true
+            }
+        }
+        task.platformCancel = {
+            if (platformOwner == "reserved") platformOwner = "cancelled"
+        }
+        task.platformAbortPrepared = {
+            if (platformOwner == "reserved" || platformOwner == "cancelled") platformOwner = "none"
+        }
+        task.afterPlatformPreparedForTest = { task.cancel() }
+        task.platformRequestStream = { _, _, _, _ -> platformEntries++ }
+
+        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
+            terminals++
+            replacementReserved = task.platformPrepare(requestId)
+            commonReplacementReserved = VBTransportManager.onTaskPrepared(requestId)
+        }
+
+        assertEquals(1, terminals)
+        assertEquals(0, platformEntries)
+        assertTrue(replacementReserved)
+        assertTrue(commonReplacementReserved)
+        VBTransportManager.cancel(requestId)
+    }
+
+    @Test
     fun downloadCancelDuringPlatformHandoffWaitsThenCancelsBeforeTerminalAndIdReuse() = runBlocking {
         val requestId = 991_009
         val task = registeredTask(requestId)
@@ -29,6 +66,7 @@ class VBTransportStreamTaskTest {
         val release = CompletableDeferred<Unit>()
         val terminals = atomic(0)
         val platformCancels = atomic(0)
+        val platformExecutions = atomic(0)
         var replacementReserved = false
         task.platformPrepare = { true }
         task.platformAbortPrepared = {}
@@ -36,12 +74,13 @@ class VBTransportStreamTaskTest {
         task.platformRequestStream = { _, _, _, _ ->
             entered.complete(Unit)
             runBlocking { release.await() }
+            if (platformCancels.value == 0) platformExecutions.incrementAndGet()
         }
 
         val requestJob = launch(Dispatchers.Default) {
             task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
                 terminals.incrementAndGet()
-                replacementReserved = true
+                replacementReserved = VBTransportManager.onTaskPrepared(requestId)
             }
         }
         entered.await()
@@ -51,8 +90,10 @@ class VBTransportStreamTaskTest {
         requestJob.join()
 
         assertEquals(1, platformCancels.value)
+        assertEquals(0, platformExecutions.value)
         assertEquals(1, terminals.value)
         assertTrue(replacementReserved)
+        VBTransportManager.cancel(requestId)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
     }
 
@@ -64,6 +105,7 @@ class VBTransportStreamTaskTest {
         val release = CompletableDeferred<Unit>()
         val terminals = atomic(0)
         val platformCancels = atomic(0)
+        val platformExecutions = atomic(0)
         var replacementReserved = false
         task.platformPrepare = { true }
         task.platformAbortPrepared = {}
@@ -71,12 +113,13 @@ class VBTransportStreamTaskTest {
         task.platformRequestUpload = { _, _, _, _ ->
             entered.complete(Unit)
             runBlocking { release.await() }
+            if (platformCancels.value == 0) platformExecutions.incrementAndGet()
         }
 
         val requestJob = launch(Dispatchers.Default) {
             task.uploadStreamRequest(VBTransportRequest(), null, {}, handler = {
                 terminals.incrementAndGet()
-                replacementReserved = true
+                replacementReserved = VBTransportManager.onTaskPrepared(requestId)
             })
         }
         entered.await()
@@ -86,9 +129,50 @@ class VBTransportStreamTaskTest {
         requestJob.join()
 
         assertEquals(1, platformCancels.value)
+        assertEquals(0, platformExecutions.value)
         assertEquals(1, terminals.value)
         assertTrue(replacementReserved)
+        VBTransportManager.cancel(requestId)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+    }
+
+    @Test
+    fun bufferedCancelDuringPlatformHandoffCancelsOwnerWithoutExecutionAndAllowsReuse() = runBlocking {
+        val requestId = 991_013
+        val task = registeredTask(requestId)
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val cancelPublished = CompletableDeferred<Unit>()
+        val platformCancels = atomic(0)
+        val platformExecutions = atomic(0)
+        task.platformPrepare = { true }
+        task.platformAbortPrepared = {}
+        task.platformCancel = {
+            platformCancels.incrementAndGet()
+            cancelPublished.complete(Unit)
+        }
+        task.platformRequest = { _, _ ->
+            entered.complete(Unit)
+            runBlocking { release.await() }
+            if (platformCancels.value == 0) platformExecutions.incrementAndGet()
+        }
+
+        val requestJob = launch(Dispatchers.Default) {
+            task.sendRequest(VBTransportRequest()) { error("cancelled buffered request must not callback") }
+        }
+        entered.await()
+        val cancelJob = launch(Dispatchers.Default) { VBTransportManager.cancel(requestId) }
+        cancelPublished.await()
+        assertEquals(false, VBTransportManager.onTaskPrepared(requestId))
+        release.complete(Unit)
+        requestJob.join()
+        cancelJob.join()
+
+        assertEquals(1, platformCancels.value)
+        assertEquals(0, platformExecutions.value)
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+        assertTrue(VBTransportManager.onTaskPrepared(requestId))
+        VBTransportManager.cancel(requestId)
     }
 
     @Test
@@ -258,9 +342,14 @@ class VBTransportStreamTaskTest {
         val reservation = CancellationAwareRegistry<Int, String>()
         val task = registeredTask(requestId)
         var replacementReserved = false
+        var commonReplacementDuringRetry = false
+        var commonReplacementAtTerminal = false
         task.platformPrepare = { reservation.begin(it) }
         task.platformAbortPrepared = {
-            if (reservation.remove(it) != null) error("abort after remove")
+            if (reservation.remove(it) != null) {
+                commonReplacementDuringRetry = VBTransportManager.onTaskPrepared(requestId)
+                error("abort after remove")
+            }
         }
         task.platformCancel = {}
         task.afterStreamGateInstalledForTest = { task.cancel() }
@@ -268,10 +357,14 @@ class VBTransportStreamTaskTest {
 
         task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
             replacementReserved = reservation.begin(requestId)
+            commonReplacementAtTerminal = VBTransportManager.onTaskPrepared(requestId)
             reservation.remove(requestId)
         }
 
+        assertEquals(false, commonReplacementDuringRetry)
         assertEquals(true, replacementReserved)
+        assertEquals(true, commonReplacementAtTerminal)
+        VBTransportManager.cancel(requestId)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
     }
 

@@ -221,6 +221,80 @@ class NetworkModelsTest {
     }
 
     @Test
+    fun multipartAttemptCancelBeforeReaderStartsRejectsThePendingAttempt() = runBlocking {
+        var opens = 0
+        var bytes = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/must-not-open",
+                        openStreamBlock = {
+                            opens++
+                            NetworkByteStream.fromChunks { sink -> sink.write(byteArrayOf(1)) }
+                        },
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+
+        composite.cancelAttempt()
+        composite.readChunks(object : NetworkByteStreamSink {
+            override suspend fun write(value: ByteArray) {
+                bytes += value.size
+            }
+        })
+
+        assertEquals(0, opens)
+        assertEquals(0, bytes)
+    }
+
+    @Test
+    fun multipartAttemptCancelReleasesBlockingLogicalStreamAndStopsFurtherWrites() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        var streamCancels = 0
+        var bytes = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "stream",
+                    NetworkBody.Stream(
+                        NetworkByteStream.fromChunks(
+                            cancelBlock = {
+                                streamCancels++
+                                release.complete(Unit)
+                            }
+                        ) { sink ->
+                            entered.complete(Unit)
+                            release.await()
+                            sink.write(byteArrayOf(1, 2, 3))
+                        }
+                    ),
+                )
+            )
+        )
+        val composite = assertNotNull(body.streamingUploadStreamOrNull())
+        val reader = launch {
+            composite.readChunks(object : NetworkByteStreamSink {
+                override suspend fun write(value: ByteArray) {
+                    bytes += value.size
+                }
+            })
+        }
+        entered.await()
+        val bytesBeforeCancel = bytes
+
+        composite.cancelAttempt()
+        reader.join()
+
+        assertEquals(1, streamCancels)
+        assertEquals(0, bytes - bytesBeforeCancel)
+    }
+
+    @Test
     fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
         val defaults = NetworkRequestPolicy().streamTimeouts
         assertEquals(3_000L, defaults.connectTimeoutMillis)

@@ -46,7 +46,10 @@ object VBTransportManager {
 
     fun cancel(requestId: Int) {
         var taskToCancel: VBTransportTask? = null
-        tasks.cancelOrRemember(requestId, removePublished = true) { task ->
+        // Keep the common owner published until its platform reservation/job
+        // is synchronously cleaned. This closes same-id ABA between manager
+        // lookup and task.cancel(); onTaskFinish removes by identity.
+        tasks.cancelOrRemember(requestId, removePublished = false) { task ->
             taskToCancel = task
         }
         taskToCancel?.cancel()

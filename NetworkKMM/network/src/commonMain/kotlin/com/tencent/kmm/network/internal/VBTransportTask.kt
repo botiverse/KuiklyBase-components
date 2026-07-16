@@ -69,23 +69,23 @@ class VBTransportTask(
     ) -> Unit = { request, contentLength, writeBody, onComplete ->
         getIVBTransportService().requestUploadStream(request, contentLength, writeBody, onComplete)
     }
+    internal var platformRequest: (VBTransportRequest, (VBTransportResponse) -> Unit) -> Unit =
+        { request, onComplete -> getIVBTransportService().request(request, onComplete) }
     internal var platformCancel: (Int) -> Unit = { requestId ->
         getIVBTransportService().cancel(requestId)
     }
     internal var afterRunningPreparedForTest: (() -> Unit)? = null
+    internal var afterPlatformPreparedForTest: (() -> Unit)? = null
     internal var afterStreamGateInstalledForTest: (() -> Unit)? = null
 
     private fun finishCanceledBeforeStart(
         response: VBTransportBaseResponse,
         handler: ((VBTransportBaseResponse) -> Unit)?,
     ) {
-        try {
-            response.errorCode = VBTransportResultCode.CODE_CANCELED
-            response.errorMessage = "Request has been canceled"
-            handler?.invoke(response)
-        } finally {
-            taskManager.onTaskFinish(this)
-        }
+        response.errorCode = VBTransportResultCode.CODE_CANCELED
+        response.errorMessage = "Request has been canceled"
+        taskManager.onTaskFinish(this)
+        handler?.invoke(response)
     }
 
     private fun wrapGetResponse(
@@ -170,8 +170,10 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapBytesResponse(handler))
             return
         }
-        getIVBTransportService().sendBytesRequest(request) { response ->
-            handleResponse(request, response, wrapBytesResponse(handler))
+        enterBufferedPlatform {
+            getIVBTransportService().sendBytesRequest(request) { response ->
+                handleResponse(request, response, wrapBytesResponse(handler))
+            }
         }
     }
 
@@ -189,8 +191,10 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapStringResponse(handler))
             return
         }
-        getIVBTransportService().sendStringRequest(request) { response ->
-            handleResponse(request, response, wrapStringResponse(handler))
+        enterBufferedPlatform {
+            getIVBTransportService().sendStringRequest(request) { response ->
+                handleResponse(request, response, wrapStringResponse(handler))
+            }
         }
     }
 
@@ -204,8 +208,10 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapPostResponse(handler))
             return
         }
-        getIVBTransportService().post(request) { response ->
-            handleResponse(request, response, wrapPostResponse(handler))
+        enterBufferedPlatform {
+            getIVBTransportService().post(request) { response ->
+                handleResponse(request, response, wrapPostResponse(handler))
+            }
         }
     }
 
@@ -219,8 +225,10 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapGetResponse(handler))
             return
         }
-        getIVBTransportService().get(request) { response ->
-            handleResponse(request, response, wrapGetResponse(handler))
+        enterBufferedPlatform {
+            getIVBTransportService().get(request) { response ->
+                handleResponse(request, response, wrapGetResponse(handler))
+            }
         }
     }
 
@@ -234,8 +242,10 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapResponse(handler))
             return
         }
-        getIVBTransportService().request(request) { response ->
-            handleResponse(request, response, wrapResponse(handler))
+        enterBufferedPlatform {
+            platformRequest(request) { response ->
+                handleResponse(request, response, wrapResponse(handler))
+            }
         }
     }
 
@@ -281,6 +291,7 @@ class VBTransportTask(
             // cancel() recorded a pre-publish platform cancellation, but this
             // request will never enter platform code to consume it.
             abortUnusedPlatformReservation()
+            taskManager.onTaskFinish(this)
             gate.complete(cancelledStreamResponse(request))
             return
         }
@@ -327,6 +338,7 @@ class VBTransportTask(
         afterStreamGateInstalledForTest?.invoke()
         if (state.value == VBTransportState.Canceled) {
             abortUnusedPlatformReservation()
+            taskManager.onTaskFinish(this)
             gate.complete(cancelledStreamResponse(request))
             return
         }
@@ -347,6 +359,7 @@ class VBTransportTask(
             state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
             return false
         }
+        afterPlatformPreparedForTest?.invoke()
         platformEntryPhase.value = PLATFORM_PHASE_RESERVED
         if (state.value != VBTransportState.Running) {
             abortUnusedPlatformReservation()
@@ -400,21 +413,37 @@ class VBTransportTask(
                     platformCancel(requestId)
                     return
                 }
-                val won = gate.complete(cancelledStreamResponse()) {
+                gate.complete(cancelledStreamResponse()) {
                     state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
-                }
-                if (won && platformEntryPhase.value == PLATFORM_PHASE_ENTERED) {
-                    platformCancel(requestId)
+                    if (platformEntryPhase.value == PLATFORM_PHASE_ENTERED) {
+                        platformCancel(requestId)
+                    }
+                    taskManager.onTaskFinish(this)
                 }
                 return
             }
             if (current == VBTransportState.Running && abortUnusedPlatformReservation()) {
                 state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+                taskManager.onTaskFinish(this)
+                return
+            }
+            if (current == VBTransportState.Running && platformEntryPhase.value == PLATFORM_PHASE_CANCEL_PENDING) {
+                return
+            }
+            if (
+                current == VBTransportState.Running &&
+                platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_CANCEL_PENDING)
+            ) {
+                state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+                platformCancel(requestId)
                 return
             }
             if (state.compareAndSet(current, VBTransportState.Canceled)) {
                 if (current == VBTransportState.Running) {
                     platformCancel(requestId)
+                    if (platformEntryPhase.value == PLATFORM_PHASE_ENTERED) {
+                        taskManager.onTaskFinish(this)
+                    }
                 }
                 return
             }
@@ -464,7 +493,17 @@ class VBTransportTask(
         if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_CANCEL_PENDING, PLATFORM_PHASE_ENTERED)) {
             gate.complete(cancelledStreamResponse(request)) {
                 state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+                taskManager.onTaskFinish(this)
             }
+        }
+    }
+
+    private fun enterBufferedPlatform(block: () -> Unit) {
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) return
+        block()
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_ENTERED)) return
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_CANCEL_PENDING, PLATFORM_PHASE_ENTERED)) {
+            taskManager.onTaskFinish(this)
         }
     }
 

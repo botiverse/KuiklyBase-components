@@ -17,6 +17,16 @@ import kotlin.test.assertTrue
 
 class IosTransportTaskRegistryTest {
     @Test
+    fun abortAfterPreRegisterCancelRemovesCancelledReservation() {
+        val registry = IosTransportTaskRegistry()
+        assertTrue(registry.prepare(26))
+        registry.cancel(26)
+        registry.abort(26)
+        assertTrue(registry.prepare(26))
+        registry.abort(26)
+    }
+
+    @Test
     fun cancelBeforeRegisterConsumesOldOwnerWithoutExecutionAndAllowsImmediateReuse() = runBlocking {
         val registry = IosTransportTaskRegistry()
         val requestId = 27

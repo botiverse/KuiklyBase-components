@@ -992,6 +992,92 @@ class NetworkClientP1Test {
     }
 
     @Test
+    fun wrappedProceedResponseKeepsTheActualReplacementBodyBinding() = runBlocking {
+        var engineAttempts = 0
+        var bodyCancels = 0
+        val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+            policy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                    maxRetries = 1,
+                    backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(0, 0),
+                )
+            )
+        }
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                interceptors = listOf(object : NetworkInterceptor {
+                    override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                        chain.request.body = NetworkBody.Stream(
+                            NetworkByteStream.fromChunks(cancelBlock = { bodyCancels++ }) {}
+                        )
+                        val inner = chain.proceed(chain.request)
+                        return NetworkResponse(
+                            request = inner.request,
+                            statusCode = inner.statusCode,
+                            headers = inner.headers + ("X-Wrapped" to listOf("1")),
+                            body = inner.body,
+                            error = inner.error,
+                        )
+                    }
+                })
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineAttempts++
+                    return retryableFailure(request)
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(503, client.execute(request).statusCode)
+        assertEquals(1, engineAttempts)
+        assertEquals(1, bodyCancels)
+    }
+
+    @Test
+    fun distinctRequestShortCircuitBindsResponseRequestBodyAndFinalCleanup() = runBlocking {
+        var interceptorAttempts = 0
+        var engineAttempts = 0
+        var bodyCancels = 0
+        val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+            policy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                    maxRetries = 1,
+                    backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(0, 0),
+                )
+            )
+        }
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                interceptors = listOf(object : NetworkInterceptor {
+                    override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                        interceptorAttempts++
+                        val shortRequest = NetworkRequest(method = VBTransportMethod.POST).apply {
+                            body = NetworkBody.Stream(
+                                NetworkByteStream.fromChunks(cancelBlock = { bodyCancels++ }) {}
+                            )
+                        }
+                        return retryableFailure(shortRequest)
+                    }
+                })
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineAttempts++
+                    return retryableFailure(request)
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(503, client.execute(request).statusCode)
+        assertEquals(1, interceptorAttempts)
+        assertEquals(0, engineAttempts)
+        assertEquals(1, bodyCancels)
+    }
+
+    @Test
     fun statusOnlyFinalFailureReleasesActualInterceptorBody() = runBlocking {
         var bodyCancels = 0
         val client = NetworkClient(
