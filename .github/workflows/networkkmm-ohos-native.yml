@@ -210,7 +210,17 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Verify frozen dispatch exact
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ github.sha }}"
+          actual="$(git rev-parse HEAD)"
+          echo "writeback expected_sha=$expected actual_sha=$actual target_ref=${{ github.ref_name }}"
+          test "$actual" = "$expected"
 
       - name: Download paired artifact
         uses: actions/download-artifact@v4
@@ -242,5 +252,8 @@ jobs:
             echo "No binary changes to commit."
           else
             git commit -m "ci: refresh NetworkKMM OHOS native binaries [skip ci]"
-            git push
+            # The detached commit is based on the exact dispatch SHA. If the
+            # branch moved while this run was building, the non-force push is
+            # rejected rather than mixing old artifacts into newer source.
+            git push origin "HEAD:${{ github.ref_name }}"
           fi
