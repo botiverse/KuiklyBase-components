@@ -295,6 +295,28 @@ class NetworkModelsTest {
     }
 
     @Test
+    fun readAllOnlyFileRefKeepsMultipartOffTheDirectStreamingAttemptPath() = runBlocking {
+        var reads = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/read-all-only",
+                        readAllBlock = {
+                            reads++
+                            byteArrayOf(1, 2, 3)
+                        },
+                    ),
+                )
+            )
+        )
+
+        assertNull(body.streamingUploadStreamOrNull())
+        assertEquals(0, reads)
+    }
+
+    @Test
     fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
         val defaults = NetworkRequestPolicy().streamTimeouts
         assertEquals(3_000L, defaults.connectTimeoutMillis)

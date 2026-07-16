@@ -998,7 +998,10 @@ private class AttemptResponseBodyTracker : SynchronizedObject() {
 
     fun bindIfAbsent(response: NetworkResponse, body: NetworkBody) {
         synchronized(this) {
-            if (records.none { it.first === response }) records += response to body
+            if (records.none { it.first === response }) {
+                val provenanceBody = records.firstOrNull { it.first.body === response.body }?.second
+                records += response to (provenanceBody ?: body)
+            }
         }
     }
 

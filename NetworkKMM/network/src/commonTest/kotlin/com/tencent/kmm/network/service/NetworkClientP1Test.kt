@@ -1036,6 +1036,52 @@ class NetworkClientP1Test {
     }
 
     @Test
+    fun wrappedEarlyResponseKeepsBodyProvenanceAfterSameRequestIsMutatedAgain() = runBlocking {
+        var engineAttempts = 0
+        var firstBodyCancels = 0
+        val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+            policy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                    maxRetries = 1,
+                    backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(0, 0),
+                )
+            )
+        }
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                interceptors = listOf(object : NetworkInterceptor {
+                    override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                        chain.request.body = NetworkBody.Stream(
+                            NetworkByteStream.fromChunks(cancelBlock = { firstBodyCancels++ }) {}
+                        )
+                        val first = chain.proceed(chain.request)
+                        chain.request.body = NetworkBody.Bytes(byteArrayOf(2))
+                        chain.proceed(chain.request)
+                        return NetworkResponse(
+                            request = first.request,
+                            statusCode = first.statusCode,
+                            headers = first.headers + ("X-Wrapped" to listOf("early")),
+                            body = first.body,
+                            error = first.error,
+                        )
+                    }
+                })
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineAttempts++
+                    return retryableFailure(request)
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(503, client.execute(request).statusCode)
+        assertEquals(2, engineAttempts)
+        assertEquals(1, firstBodyCancels)
+    }
+
+    @Test
     fun distinctRequestShortCircuitBindsResponseRequestBodyAndFinalCleanup() = runBlocking {
         var interceptorAttempts = 0
         var engineAttempts = 0

@@ -158,6 +158,7 @@ sealed class NetworkBody {
         private val openStreamBlock: (suspend (path: String) -> NetworkByteStream)? = null
     ) : NetworkBody() {
         private val cancelArmed = atomic(true)
+        internal val canOpenStream: Boolean = openStreamBlock != null
         override val repeatable: Boolean = readAllBlock != null || openStreamBlock != null
 
         suspend fun readAll(): ByteArray? = readAllBlock?.invoke(path)
@@ -592,6 +593,10 @@ private fun encodeUrlComponent(value: String): String {
 internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): NetworkByteStream? {
     val hasStreamingPart = parts.any { it.body is NetworkBody.Stream || it.body is NetworkBody.FileRef }
     if (!hasStreamingPart) return null
+    // A readAll-only FileRef has no attempt-scoped owner capable of unblocking
+    // a direct native early-error path. Keep the whole multipart on the
+    // buffered path, where logical-body cancellation owns that read.
+    if (parts.any { (it.body as? NetworkBody.FileRef)?.canOpenStream == false }) return null
 
     class PartPlan(
         val prologue: ByteArray,
@@ -728,15 +733,11 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                                 }
                                 if (!attemptActive()) return@fromChunks
                             }
-                        } else {
-                            if (!attemptActive()) return@fromChunks
-                            val bytes = body.readAll()
-                                ?: throw IllegalStateException(
-                                    "FileRef part requires a readAllBlock or openStreamBlock on this engine."
-                                )
-                            if (!attemptActive()) return@fromChunks
-                            guardedSink.write(bytes)
-                        }
+                    } else {
+                        throw IllegalStateException(
+                            "Streaming multipart FileRef requires an attempt-cancellable openStreamBlock."
+                        )
+                    }
                     }
                     else -> plan.scalarBytes?.let { if (it.isNotEmpty()) guardedSink.write(it) }
                 }
