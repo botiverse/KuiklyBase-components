@@ -36,6 +36,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlinx.coroutines.yield
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -1404,6 +1405,7 @@ class NetworkClientP1Test {
     @Test
     fun fallbackCallbackAndTerminalObserverFailuresCannotEscapeOrHang() = runBlocking {
         var terminalCalls = 0
+        val terminalDelivered = CompletableDeferred<Unit>()
         val client = NetworkClient(
             engine = object : NetworkEngine {
                 override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse =
@@ -1423,10 +1425,12 @@ class NetworkClientP1Test {
             onChunk = {},
             onComplete = {
                 terminalCalls++
+                terminalDelivered.complete(Unit)
                 error("terminal observer failed")
             }
         )
         val awaited = call.await()
+        withTimeout(2_000) { terminalDelivered.await() }
 
         assertEquals(NetworkErrorKind.UNKNOWN, awaited.error?.kind)
         assertEquals("start failed", awaited.error?.message)
