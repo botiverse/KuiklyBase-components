@@ -285,6 +285,7 @@ class VBTransportTask(
                 logI("stream callback failed: ${throwable.message ?: throwable::class.simpleName}")
             }
         )
+        val terminalHandoff = PlatformTerminalHandoff<VBTransportResponse>()
         streamGate.value = gate
         afterStreamGateInstalledForTest?.invoke()
         if (state.value == VBTransportState.Canceled) {
@@ -298,8 +299,10 @@ class VBTransportTask(
         if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) {
             return
         }
-        platformRequestStream(request, gate::responseStart, gate::chunk, gate::complete)
-        completePlatformEntryHandoff(gate, request)
+        platformRequestStream(request, gate::responseStart, gate::chunk) { response ->
+            terminalHandoff.platformComplete(response, gate::complete)
+        }
+        completePlatformEntryHandoff(gate, request, terminalHandoff)
     }
 
     // issue #8: streaming upload — body pushed by [writeBody] into the
@@ -334,6 +337,7 @@ class VBTransportTask(
             },
             cancelTransport = { cancelTransport() },
         )
+        val terminalHandoff = PlatformTerminalHandoff<VBTransportResponse>()
         streamGate.value = gate
         afterStreamGateInstalledForTest?.invoke()
         if (state.value == VBTransportState.Canceled) {
@@ -345,8 +349,10 @@ class VBTransportTask(
         if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) {
             return
         }
-        platformRequestUpload(request, contentLength, writeBody, gate::complete)
-        completePlatformEntryHandoff(gate, request)
+        platformRequestUpload(request, contentLength, writeBody) { response ->
+            terminalHandoff.platformComplete(response, gate::complete)
+        }
+        completePlatformEntryHandoff(gate, request, terminalHandoff)
     }
 
     fun getState(): VBTransportState = state.value
@@ -488,9 +494,14 @@ class VBTransportTask(
     private fun completePlatformEntryHandoff(
         gate: StreamCallbackGate<VBTransportResponse>,
         request: VBTransportRequest,
+        terminalHandoff: PlatformTerminalHandoff<VBTransportResponse>,
     ) {
-        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_ENTERED)) return
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_ENTERED)) {
+            terminalHandoff.finish(cancelled = false, gate::complete)
+            return
+        }
         if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_CANCEL_PENDING, PLATFORM_PHASE_ENTERED)) {
+            terminalHandoff.finish(cancelled = true, gate::complete)
             gate.complete(cancelledStreamResponse(request)) {
                 state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
                 taskManager.onTaskFinish(this)
@@ -511,6 +522,33 @@ class VBTransportTask(
         VBPBLog.i(VBPBLog.TASK, "$logTag $content")
     }
 
+}
+
+private class PlatformTerminalHandoff<C> : kotlinx.atomicfu.locks.SynchronizedObject() {
+    private var finished = false
+    private var cancelled = false
+    private var pending: C? = null
+
+    fun platformComplete(completion: C, deliver: (C) -> Unit) {
+        val deliverNow = kotlinx.atomicfu.locks.synchronized(this) {
+            if (!finished) {
+                if (pending == null) pending = completion
+                false
+            } else {
+                !cancelled
+            }
+        }
+        if (deliverNow) deliver(completion)
+    }
+
+    fun finish(cancelled: Boolean, deliver: (C) -> Unit) {
+        val pendingCompletion = kotlinx.atomicfu.locks.synchronized(this) {
+            this.finished = true
+            this.cancelled = cancelled
+            pending.also { pending = null }.takeUnless { cancelled }
+        }
+        pendingCompletion?.let(deliver)
+    }
 }
 
 private const val PLATFORM_PHASE_NONE = 0
