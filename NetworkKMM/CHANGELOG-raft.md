@@ -1,6 +1,6 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased (raft.27 stream lifecycle hardening)
+## 0.1.0-raft.27 / 0.1.0-raft.27-ohos (stream lifecycle hardening)
 
 - Version the native curl wrapper ABI with pointer+size+version `Start*V27`
   entry points and remove the old by-value symbols. Both old-caller/new-runtime
