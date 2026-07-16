@@ -79,6 +79,7 @@ class VBTransportTask(
         getIVBTransportService().cancel(requestId)
     }
     internal var afterRunningPreparedForTest: (() -> Unit)? = null
+    internal var beforePlatformPrepareForTest: (() -> Unit)? = null
     internal var afterPlatformPreparedForTest: (() -> Unit)? = null
     internal var afterStreamGateInstalledForTest: (() -> Unit)? = null
 
@@ -378,11 +379,24 @@ class VBTransportTask(
     fun getState(): VBTransportState = state.value
 
     private fun trySetRunning(): Boolean {
+        // Publish prepare ownership before Running becomes externally visible;
+        // cancel can then never release the common id while an old thread is
+        // still able to create a platform reservation.
+        platformPrepareInProgress.value = true
         if (!state.compareAndSet(VBTransportState.Create, VBTransportState.Running)) {
+            platformPrepareInProgress.value = false
             return false
         }
-        platformPrepareInProgress.value = true
-        if (!platformPrepare(requestId)) {
+        beforePlatformPrepareForTest?.invoke()
+        if (state.value != VBTransportState.Running) {
+            platformPrepareInProgress.value = false
+            return false
+        }
+        val prepared = runCatching { platformPrepare(requestId) }.getOrElse { throwable ->
+            logI("platform prepare failed: ${throwable.message ?: throwable::class.simpleName}")
+            false
+        }
+        if (!prepared) {
             platformPrepareInProgress.value = false
             state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
             return false

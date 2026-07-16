@@ -22,6 +22,31 @@ import kotlin.test.assertTrue
 
 class VBTransportStreamTaskTest {
     @Test
+    fun cancelAfterRunningBeforePrepareDoesNotCreateOldPlatformReservation() {
+        val requestId = 991_015
+        val task = registeredTask(requestId)
+        var prepareCalls = 0
+        var commonReplacement = false
+        var platformReplacement = false
+        task.platformPrepare = {
+            prepareCalls++
+            true
+        }
+        task.platformCancel = {}
+        task.beforePlatformPrepareForTest = { task.cancel() }
+
+        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
+            commonReplacement = VBTransportManager.onTaskPrepared(requestId)
+            platformReplacement = task.platformPrepare(requestId)
+        }
+
+        assertEquals(1, prepareCalls)
+        assertTrue(commonReplacement)
+        assertTrue(platformReplacement)
+        VBTransportManager.cancel(requestId)
+    }
+
+    @Test
     fun throwingStartStagesFailureTerminalUntilPlatformOwnerIsReleased() = runBlocking {
         val requestId = 991_014
         val task = registeredTask(requestId)
