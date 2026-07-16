@@ -68,14 +68,18 @@ class VBTransportStreamTaskTest {
         val platformCancels = atomic(0)
         val platformExecutions = atomic(0)
         val terminalCode = atomic(0)
+        val starts = atomic(0)
+        val chunks = atomic(0)
         var replacementReserved = false
         task.platformPrepare = { true }
         task.platformAbortPrepared = {}
         task.platformCancel = { platformCancels.incrementAndGet() }
-        task.platformRequestStream = { request, _, _, onComplete ->
+        task.platformRequestStream = { request, onStart, onChunk, onComplete ->
             entered.complete(Unit)
             runBlocking { release.await() }
             if (platformCancels.value == 0) platformExecutions.incrementAndGet()
+            onStart(200, emptyMap())
+            onChunk(byteArrayOf(1, 2, 3))
             onComplete(
                 VBTransportResponse().apply {
                     this.request = request
@@ -85,7 +89,11 @@ class VBTransportStreamTaskTest {
         }
 
         val requestJob = launch(Dispatchers.Default) {
-            task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
+            task.streamRequest(
+                VBTransportRequest(),
+                { _, _ -> starts.incrementAndGet() },
+                { chunks.incrementAndGet() },
+            ) {
                 terminals.incrementAndGet()
                 terminalCode.value = it.errorCode
                 replacementReserved = VBTransportManager.onTaskPrepared(requestId)
@@ -99,6 +107,8 @@ class VBTransportStreamTaskTest {
 
         assertEquals(1, platformCancels.value)
         assertEquals(0, platformExecutions.value)
+        assertEquals(0, starts.value)
+        assertEquals(0, chunks.value)
         assertEquals(1, terminals.value)
         assertEquals(VBTransportResultCode.CODE_CANCELED, terminalCode.value)
         assertTrue(replacementReserved)
@@ -163,16 +173,30 @@ class VBTransportStreamTaskTest {
         val cancelPublished = CompletableDeferred<Unit>()
         val platformCancels = atomic(0)
         val platformExecutions = atomic(0)
-        task.platformPrepare = { true }
-        task.platformAbortPrepared = {}
+        var platformOwner = "none"
+        task.platformPrepare = {
+            if (platformOwner != "none") false else {
+                platformOwner = "reserved"
+                true
+            }
+        }
+        task.platformAbortPrepared = { platformOwner = "none" }
         task.platformCancel = {
             platformCancels.incrementAndGet()
+            platformOwner = "none"
             cancelPublished.complete(Unit)
         }
-        task.platformRequest = { _, _ ->
+        task.platformRequest = { request, onComplete ->
+            platformOwner = "running"
             entered.complete(Unit)
             runBlocking { release.await() }
             if (platformCancels.value == 0) platformExecutions.incrementAndGet()
+            onComplete(
+                VBTransportResponse().apply {
+                    this.request = request
+                    errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                }
+            )
         }
 
         val requestJob = launch(Dispatchers.Default) {
@@ -190,6 +214,8 @@ class VBTransportStreamTaskTest {
         assertEquals(0, platformExecutions.value)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
         assertTrue(VBTransportManager.onTaskPrepared(requestId))
+        assertTrue(task.platformPrepare(requestId))
+        task.platformAbortPrepared(requestId)
         VBTransportManager.cancel(requestId)
     }
 

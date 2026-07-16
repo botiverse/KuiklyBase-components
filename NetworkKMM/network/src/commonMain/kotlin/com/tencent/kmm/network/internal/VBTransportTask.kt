@@ -46,6 +46,7 @@ class VBTransportTask(
 
     private val state = atomic(VBTransportState.Create)
     private val streamGate = atomic<StreamCallbackGate<VBTransportResponse>?>(null)
+    private val platformCallbackHandoff = atomic<PlatformTerminalHandoff<VBTransportResponse>?>(null)
     private val platformEntryPhase = atomic(PLATFORM_PHASE_NONE)
     internal var platformPrepare: (Int) -> Boolean = { requestId ->
         getIVBTransportService().prepareRequest(requestId)
@@ -170,11 +171,12 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapBytesResponse(handler))
             return
         }
-        enterBufferedPlatform {
-            getIVBTransportService().sendBytesRequest(request) { response ->
+        enterBufferedPlatform(
+            start = { completion -> getIVBTransportService().sendBytesRequest(request, completion) },
+            onComplete = { response ->
                 handleResponse(request, response, wrapBytesResponse(handler))
-            }
-        }
+            },
+        )
     }
 
     private fun isCanceledOrRemoved(): Boolean =
@@ -191,11 +193,12 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapStringResponse(handler))
             return
         }
-        enterBufferedPlatform {
-            getIVBTransportService().sendStringRequest(request) { response ->
+        enterBufferedPlatform(
+            start = { completion -> getIVBTransportService().sendStringRequest(request, completion) },
+            onComplete = { response ->
                 handleResponse(request, response, wrapStringResponse(handler))
-            }
-        }
+            },
+        )
     }
 
     fun sendPostRequest(
@@ -208,11 +211,12 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapPostResponse(handler))
             return
         }
-        enterBufferedPlatform {
-            getIVBTransportService().post(request) { response ->
+        enterBufferedPlatform(
+            start = { completion -> getIVBTransportService().post(request, completion) },
+            onComplete = { response ->
                 handleResponse(request, response, wrapPostResponse(handler))
-            }
-        }
+            },
+        )
     }
 
     fun sendGetRequest(
@@ -225,11 +229,12 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapGetResponse(handler))
             return
         }
-        enterBufferedPlatform {
-            getIVBTransportService().get(request) { response ->
+        enterBufferedPlatform(
+            start = { completion -> getIVBTransportService().get(request, completion) },
+            onComplete = { response ->
                 handleResponse(request, response, wrapGetResponse(handler))
-            }
-        }
+            },
+        )
     }
 
     fun sendRequest(
@@ -242,11 +247,12 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapResponse(handler))
             return
         }
-        enterBufferedPlatform {
-            platformRequest(request) { response ->
+        enterBufferedPlatform(
+            start = { completion -> platformRequest(request, completion) },
+            onComplete = { response ->
                 handleResponse(request, response, wrapResponse(handler))
-            }
-        }
+            },
+        )
     }
 
     // fork #8: streaming download — response headers via [onResponseStart] as
@@ -286,6 +292,7 @@ class VBTransportTask(
             }
         )
         val terminalHandoff = PlatformTerminalHandoff<VBTransportResponse>()
+        platformCallbackHandoff.value = terminalHandoff
         streamGate.value = gate
         afterStreamGateInstalledForTest?.invoke()
         if (state.value == VBTransportState.Canceled) {
@@ -299,7 +306,11 @@ class VBTransportTask(
         if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) {
             return
         }
-        platformRequestStream(request, gate::responseStart, gate::chunk) { response ->
+        platformRequestStream(
+            request,
+            { status, headers -> terminalHandoff.businessCallback { gate.responseStart(status, headers) } },
+            { chunk -> terminalHandoff.businessCallback { gate.chunk(chunk) } },
+        ) { response ->
             terminalHandoff.platformComplete(response, gate::complete)
         }
         completePlatformEntryHandoff(gate, request, terminalHandoff)
@@ -338,6 +349,7 @@ class VBTransportTask(
             cancelTransport = { cancelTransport() },
         )
         val terminalHandoff = PlatformTerminalHandoff<VBTransportResponse>()
+        platformCallbackHandoff.value = terminalHandoff
         streamGate.value = gate
         afterStreamGateInstalledForTest?.invoke()
         if (state.value == VBTransportState.Canceled) {
@@ -416,6 +428,7 @@ class VBTransportTask(
                     // register/handoff cannot start work. Terminal delivery
                     // waits until the synchronous handoff returns, preventing
                     // same-id reuse from being consumed by the old request.
+                    platformCallbackHandoff.value?.cancelBusinessCallbacks()
                     platformCancel(requestId)
                     return
                 }
@@ -509,11 +522,19 @@ class VBTransportTask(
         }
     }
 
-    private fun enterBufferedPlatform(block: () -> Unit) {
+    private fun <C : VBTransportBaseResponse> enterBufferedPlatform(
+        start: ((C) -> Unit) -> Unit,
+        onComplete: (C) -> Unit,
+    ) {
         if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) return
-        block()
-        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_ENTERED)) return
+        val terminalHandoff = PlatformTerminalHandoff<C>()
+        start { response -> terminalHandoff.platformComplete(response, onComplete) }
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_ENTERED)) {
+            terminalHandoff.finish(cancelled = false, onComplete)
+            return
+        }
         if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_CANCEL_PENDING, PLATFORM_PHASE_ENTERED)) {
+            terminalHandoff.finish(cancelled = true, onComplete)
             taskManager.onTaskFinish(this)
         }
     }
@@ -525,9 +546,18 @@ class VBTransportTask(
 }
 
 private class PlatformTerminalHandoff<C> : kotlinx.atomicfu.locks.SynchronizedObject() {
+    private val businessGate = InflightCallbackGate()
     private var finished = false
     private var cancelled = false
     private var pending: C? = null
+
+    fun businessCallback(action: () -> Unit) {
+        businessGate.runIfOpen(action)
+    }
+
+    fun cancelBusinessCallbacks() {
+        businessGate.closeAndRun {}
+    }
 
     fun platformComplete(completion: C, deliver: (C) -> Unit) {
         val deliverNow = kotlinx.atomicfu.locks.synchronized(this) {
@@ -542,6 +572,7 @@ private class PlatformTerminalHandoff<C> : kotlinx.atomicfu.locks.SynchronizedOb
     }
 
     fun finish(cancelled: Boolean, deliver: (C) -> Unit) {
+        if (cancelled) cancelBusinessCallbacks()
         val pendingCompletion = kotlinx.atomicfu.locks.synchronized(this) {
             this.finished = true
             this.cancelled = cancelled
