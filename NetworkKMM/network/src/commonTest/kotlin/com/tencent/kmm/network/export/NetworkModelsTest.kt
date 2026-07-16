@@ -367,6 +367,64 @@ class NetworkModelsTest {
     }
 
     @Test
+    fun nestedStreamingMultipartFallsBackAndPublishesDerivedOwnerRecursively() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val owned = mutableListOf<NetworkByteStream>()
+        var derivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "direct",
+                    NetworkBody.Stream(
+                        NetworkByteStream.fromChunks { sink -> sink.write(byteArrayOf(1)) }
+                    ),
+                ),
+                NetworkMultipartPart(
+                    "nested",
+                    NetworkBody.Multipart(
+                        parts = listOf(
+                            NetworkMultipartPart(
+                                "file",
+                                NetworkBody.FileRef(
+                                    path = "/virtual/nested-open-stream",
+                                    openStreamBlock = {
+                                        NetworkByteStream.fromChunks(
+                                            cancelBlock = {
+                                                derivedCancels++
+                                                release.complete(Unit)
+                                            }
+                                        ) { sink ->
+                                            entered.complete(Unit)
+                                            release.await()
+                                            sink.write(byteArrayOf(2))
+                                        }
+                                    },
+                                ),
+                            )
+                        )
+                    ),
+                ),
+            )
+        )
+
+        assertNull(body.streamingUploadStreamOrNull())
+        val reader = launch {
+            body.toBytes(ownDerivedStream = {
+                owned += it
+                true
+            })
+        }
+        entered.await()
+
+        owned.forEach { it.cancel() }
+        reader.join()
+
+        assertEquals(1, owned.size)
+        assertEquals(1, derivedCancels)
+    }
+
+    @Test
     fun lateBufferedFileStreamOwnerRejectionPreventsReadAfterCancellation() = runBlocking {
         var reads = 0
         var cancels = 0

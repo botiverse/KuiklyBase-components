@@ -604,6 +604,15 @@ private fun encodeUrlComponent(value: String): String {
 internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): NetworkByteStream? {
     val hasStreamingPart = parts.any { it.body is NetworkBody.Stream || it.body is NetworkBody.FileRef }
     if (!hasStreamingPart) return null
+    // Nested multipart bodies are serialized recursively by toBytes(). If a
+    // nested body can open a stream, treating it as a scalar plan here would
+    // open/read that derived owner before the composite attempt owns it. Keep
+    // the whole outer body on the buffered path, whose owner callback is
+    // propagated through every recursive multipart level.
+    if (parts.any { part ->
+            (part.body as? NetworkBody.Multipart)?.containsPotentialStreamingSource() == true
+        }
+    ) return null
     // A readAll-only FileRef has no attempt-scoped owner capable of unblocking
     // a direct native early-error path. Keep the whole multipart on the
     // buffered path, where logical-body cancellation owns that read.
@@ -764,3 +773,13 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
         }
     }
 }
+
+private fun NetworkBody.Multipart.containsPotentialStreamingSource(): Boolean =
+    parts.any { part ->
+        when (val body = part.body) {
+            is NetworkBody.Stream,
+            is NetworkBody.FileRef -> true
+            is NetworkBody.Multipart -> body.containsPotentialStreamingSource()
+            else -> false
+        }
+    }
