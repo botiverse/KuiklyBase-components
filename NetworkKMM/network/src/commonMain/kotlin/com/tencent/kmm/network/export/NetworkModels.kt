@@ -443,7 +443,7 @@ internal class NetworkBodyBytes(
 
 internal suspend fun NetworkBody.toBytes(
     progress: ((NetworkTransferProgress) -> Unit)? = null,
-    ownDerivedStream: ((NetworkByteStream) -> Unit)? = null,
+    ownDerivedStream: ((NetworkByteStream) -> Boolean)? = null,
 ): NetworkBodyBytes {
     return when (this) {
         NetworkBody.Empty -> NetworkBodyBytes(null, null)
@@ -461,10 +461,16 @@ internal suspend fun NetworkBody.toBytes(
         is NetworkBody.Multipart -> multipartBodyBytes(this, progress, ownDerivedStream)
         is NetworkBody.Stream -> stream.readAllWithProgress(progress).toBodyBytes(contentType)
         is NetworkBody.FileRef -> {
-            val bytes = readAll() ?: openStream()?.let { stream ->
-                ownDerivedStream?.invoke(stream)
-                stream.readAllWithProgress(progress)
+            val directBytes = readAll()
+            val stream = if (directBytes == null) openStream() else null
+            if (stream != null && ownDerivedStream != null && !ownDerivedStream(stream)) {
+                return NetworkBodyBytes(
+                    null,
+                    contentType,
+                    NetworkError(NetworkErrorKind.CANCELLED, "FileRef derived stream opened after cancellation")
+                )
             }
+            val bytes = directBytes ?: stream?.readAllWithProgress(progress)
             if (bytes == null) {
                 NetworkBodyBytes(
                     null,
@@ -495,7 +501,7 @@ internal fun NetworkBody.cancel() {
 private suspend fun multipartBodyBytes(
     body: NetworkBody.Multipart,
     progress: ((NetworkTransferProgress) -> Unit)? = null,
-    ownDerivedStream: ((NetworkByteStream) -> Unit)? = null,
+    ownDerivedStream: ((NetworkByteStream) -> Boolean)? = null,
 ): NetworkBodyBytes {
     val builder = VBTransportMultipartBodyBuilder(body.boundary)
     body.parts.forEach { part ->

@@ -361,6 +361,11 @@ class NetworkCall internal constructor(
         addCancelHandler { cancelBodyOnce(body) }
     }
 
+    internal fun ownBodyIfActive(body: NetworkBody): Boolean {
+        ownBody(body)
+        return synchronized(stateLock) { !cancelled && terminalResponse == null }
+    }
+
     internal fun ownCurrentBody(body: () -> NetworkBody) {
         addCancelHandler { cancelBodyOnce(body()) }
     }
@@ -734,7 +739,7 @@ object VBTransportNetworkEngine : NetworkEngine {
             }
         }
         val bodyBytes = request.body.toBytes(request.progress.uploadProgress) { stream ->
-            call.ownBody(NetworkBody.Stream(stream))
+            call.ownBodyIfActive(NetworkBody.Stream(stream))
         }
         bodyBytes.error?.let {
             return NetworkResponse(
@@ -1007,7 +1012,7 @@ private class AttemptResponseBodyTracker : SynchronizedObject() {
     fun bindInterceptor(response: NetworkResponse, body: NetworkBody) {
         synchronized(this) {
             if (records.none { it.first === response }) {
-                val provenanceBody = records.firstOrNull { it.first.body === response.body }?.second
+                val provenanceBody = records.firstOrNull { it.first.request === response.request }?.second
                 records += response to (provenanceBody ?: body)
             }
         }

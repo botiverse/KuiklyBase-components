@@ -48,6 +48,7 @@ class VBTransportTask(
     private val streamGate = atomic<StreamCallbackGate<VBTransportResponse>?>(null)
     private val platformCallbackHandoff = atomic<PlatformTerminalHandoff<VBTransportResponse>?>(null)
     private val platformEntryPhase = atomic(PLATFORM_PHASE_NONE)
+    private val platformPrepareInProgress = atomic(false)
     private val bufferedTerminalLock = kotlinx.atomicfu.locks.SynchronizedObject()
     private var bufferedCompletionClaimed = false
     internal var platformPrepare: (Int) -> Boolean = { requestId ->
@@ -380,12 +381,15 @@ class VBTransportTask(
         if (!state.compareAndSet(VBTransportState.Create, VBTransportState.Running)) {
             return false
         }
+        platformPrepareInProgress.value = true
         if (!platformPrepare(requestId)) {
+            platformPrepareInProgress.value = false
             state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
             return false
         }
         afterPlatformPreparedForTest?.invoke()
         platformEntryPhase.value = PLATFORM_PHASE_RESERVED
+        platformPrepareInProgress.value = false
         if (state.value != VBTransportState.Running) {
             abortUnusedPlatformReservation()
             return false
@@ -481,7 +485,7 @@ class VBTransportTask(
         }
         if (state.compareAndSet(current, VBTransportState.Canceled) && current == VBTransportState.Running) {
             cancelPlatformContained()
-            taskManager.onTaskFinish(this)
+            if (!platformPrepareInProgress.value) taskManager.onTaskFinish(this)
         }
     }
 

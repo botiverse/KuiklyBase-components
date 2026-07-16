@@ -94,7 +94,12 @@ class IOSTransportImpl : IVBTransportService {
         kmmCallback: (response: VBTransportBaseResponse) -> Unit,
         uploadBody: IosStreamingUploadBody? = null
     ) {
-        val job = scope.launch(start = CoroutineStart.LAZY) {
+        lateinit var job: Job
+        val deliverCallback: (VBTransportBaseResponse) -> Unit = { response ->
+            taskRegistry.release(request.requestId, job)
+            kmmCallback(response)
+        }
+        job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val client = getHttpClient(request) as HttpClient
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
@@ -169,13 +174,13 @@ class IOSTransportImpl : IVBTransportService {
                     response.headers.entries().associate { it.key to it.value },
                     data,
                     request,
-                    kmmCallback
+                    deliverCallback
                 )
             } catch (throwable: Throwable) {
                 if (throwable is CancellationException) {
                     throw throwable
                 }
-                callbackFailure(request, throwable, kmmCallback)
+                callbackFailure(request, throwable, deliverCallback)
             }
         }
         if (!taskRegistry.register(request.requestId, job)) {
@@ -260,7 +265,12 @@ class IOSTransportImpl : IVBTransportService {
     ) {
         VBPBLog.i(VBPBLog.HMTRANSPORTIMPL, "${kmmRequest.logTag} stream ${kmmRequest.method} request, " +
                 "id:${kmmRequest.requestId}, url:${kmmRequest.url}")
-        val job = scope.launch(start = CoroutineStart.LAZY) {
+        lateinit var job: Job
+        val deliverComplete: (VBTransportResponse) -> Unit = { response ->
+            taskRegistry.release(kmmRequest.requestId, job)
+            onComplete(response)
+        }
+        job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val client = getHttpClient(kmmRequest) as HttpClient
                 val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
@@ -324,7 +334,7 @@ class IOSTransportImpl : IVBTransportService {
                         "totalElapsedMs:${streamStart.elapsedNow().inWholeMilliseconds}"
                 )
 
-                onComplete(
+                deliverComplete(
                     VBTransportResponse().apply {
                         this.errorCode = errorCode
                         this.errorMessage = errMsg
@@ -340,7 +350,7 @@ class IOSTransportImpl : IVBTransportService {
                 // raft.9: classified failure reason, same shape as callbackFailure.
                 val describedFailure = describeTransportFailure(throwable)
                 VBPBLog.e(TAG, "${kmmRequest.logTag} stream request failed, id:${kmmRequest.requestId}, error:$describedFailure")
-                onComplete(
+                deliverComplete(
                     VBTransportResponse().apply {
                         this.errorCode = if (throwable is TimeoutCancellationException ||
                             describedFailure.startsWith("[timeout]")) {
@@ -501,6 +511,16 @@ internal class IosTransportTaskRegistry : SynchronizedObject() {
             }
         }
         job?.cancel()
+    }
+
+    fun release(requestId: Int, job: Job): Boolean = synchronized(this) {
+        val current = entries[requestId]
+        if (current is Entry.Running && current.job === job) {
+            entries.remove(requestId)
+            true
+        } else {
+            false
+        }
     }
 }
 

@@ -18,6 +18,21 @@ import kotlin.test.assertTrue
 
 class IosTransportTaskRegistryTest {
     @Test
+    fun callbackReleaseAllowsSameIdPrepareBeforeJobCompletionHook() = runBlocking {
+        val registry = IosTransportTaskRegistry()
+        val job = launch(start = CoroutineStart.LAZY) { kotlinx.coroutines.awaitCancellation() }
+        assertTrue(registry.prepare(25))
+        assertTrue(registry.register(25, job))
+
+        assertTrue(registry.release(25, job))
+        assertTrue(registry.prepare(25))
+
+        registry.abort(25)
+        job.cancel()
+        job.join()
+    }
+
+    @Test
     fun uninitializedPostAbortsPreparedOwnerBeforeSynchronousFailure() {
         val request = VBTransportPostRequest().apply { requestId = 29 }
         var callbacks = 0

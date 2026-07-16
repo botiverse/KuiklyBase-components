@@ -352,7 +352,10 @@ class NetworkModelsTest {
             )
         )
         val reader = launch {
-            body.toBytes(ownDerivedStream = { owned += it })
+            body.toBytes(ownDerivedStream = {
+                owned += it
+                true
+            })
         }
         entered.await()
 
@@ -361,6 +364,29 @@ class NetworkModelsTest {
 
         assertEquals(1, owned.size)
         assertEquals(1, derivedCancels)
+    }
+
+    @Test
+    fun lateBufferedFileStreamOwnerRejectionPreventsReadAfterCancellation() = runBlocking {
+        var reads = 0
+        var cancels = 0
+        val body = NetworkBody.FileRef(
+            path = "/virtual/late-derived",
+            openStreamBlock = {
+                NetworkByteStream.fromChunks(cancelBlock = { cancels++ }) {
+                    reads++
+                }
+            },
+        )
+
+        val result = body.toBytes(ownDerivedStream = { stream ->
+            stream.cancel()
+            false
+        })
+
+        assertEquals(NetworkErrorKind.CANCELLED, result.error?.kind)
+        assertEquals(1, cancels)
+        assertEquals(0, reads)
     }
 
     @Test

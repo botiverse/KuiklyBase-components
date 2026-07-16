@@ -21,6 +21,7 @@ import com.tencent.kmm.network.curl.contentLength
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
+import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
@@ -89,7 +90,9 @@ internal class IosCurlNetworkEngine(
         streamingSource?.let { source ->
             return executeUpload(request, call, source)
         }
-        val body = request.body.toBytes(request.progress.uploadProgress)
+        val body = request.body.toBytes(request.progress.uploadProgress) { stream ->
+            call.ownBodyIfActive(NetworkBody.Stream(stream))
+        }
         body.error?.let { error ->
             return NetworkResponse(
                 request = request,

@@ -185,6 +185,7 @@ object AndroidTransportImpl : IVBTransportService {
         lateinit var hardDeadline: AndroidTransportHardDeadline
         val guardedCallback: (VBTransportBaseResponse) -> Unit = { response ->
             if (hardDeadline.tryDeliverTransportCallback()) {
+                transportJob.get()?.let { preparedTaskRegistry.release(request.requestId, it) }
                 kmmCallback(response)
             }
         }
@@ -288,6 +289,7 @@ object AndroidTransportImpl : IVBTransportService {
                     }
                 },
                 onDeadline = { diagnostics ->
+                    transportJob.get()?.let { preparedTaskRegistry.release(request.requestId, it) }
                     AndroidTransportPhaseTracer.markFreshRetryResult(request.requestId, success = false)
                     request.transportElapseStatistics = AndroidTransportPhaseTracer.complete(request.requestId)
                     logE(
@@ -397,7 +399,12 @@ object AndroidTransportImpl : IVBTransportService {
         onComplete: (response: VBTransportResponse) -> Unit
     ) {
         logI("stream ${kmmRequest.method} request, id:${kmmRequest.requestId}, url:${kmmRequest.url}", kmmRequest.logTag)
-        val job = scope.launch(start = CoroutineStart.LAZY) {
+        lateinit var job: Job
+        val deliverComplete: (VBTransportResponse) -> Unit = { response ->
+            preparedTaskRegistry.release(kmmRequest.requestId, job)
+            onComplete(response)
+        }
+        job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
                 AndroidTransportPhaseTracer.scheduled(kmmRequest.requestId)
@@ -458,7 +465,7 @@ object AndroidTransportImpl : IVBTransportService {
                     AndroidTransportPhaseTracer.markFreshRetryResult(kmmRequest.requestId, success = true)
                     kmmRequest.transportElapseStatistics = AndroidTransportPhaseTracer.complete(kmmRequest.requestId)
 
-                    onComplete(
+                    deliverComplete(
                         VBTransportResponse().apply {
                             this.errorCode = errorCode
                             this.errorMessage = errMsg
@@ -482,7 +489,7 @@ object AndroidTransportImpl : IVBTransportService {
                 // raft.9: classified failure reason, same shape as callbackFailure.
                 val describedFailure = describeTransportFailure(throwable)
                 logE("stream request failed, id:${kmmRequest.requestId}, error:$describedFailure", kmmRequest.logTag)
-                onComplete(
+                deliverComplete(
                     VBTransportResponse().apply {
                         this.errorCode = if (throwable is TimeoutCancellationException ||
                             describedFailure.startsWith("[timeout]")) {
@@ -771,6 +778,17 @@ internal class AndroidPreparedTransportTaskRegistry {
             }
         }
         job?.cancel()
+    }
+
+    @Synchronized
+    fun release(requestId: Int, job: Job): Boolean {
+        val current = entries[requestId]
+        return if (current is Entry.Running && current.job === job) {
+            entries.remove(requestId)
+            true
+        } else {
+            false
+        }
     }
 }
 

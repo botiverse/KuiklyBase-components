@@ -1103,7 +1103,14 @@ class NetworkClientP1Test {
                         chain.request.body = NetworkBody.Stream(NetworkByteStream.fromChunks {})
                         chain.proceed(chain.request)
                         chain.request.body = NetworkBody.Bytes(byteArrayOf(2))
-                        return chain.proceed(chain.request)
+                        val second = chain.proceed(chain.request)
+                        return NetworkResponse(
+                            request = second.request,
+                            statusCode = second.statusCode,
+                            headers = second.headers + ("X-Wrapped" to listOf("second")),
+                            body = sharedResponseBody,
+                            error = second.error,
+                        )
                     }
                 })
             ),
