@@ -672,11 +672,25 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
         val attemptId = synchronized(openedStreamLock) {
             (++attemptSequence).also { activeAttempt = it }
         }
+        fun attemptActive(): Boolean = synchronized(openedStreamLock) {
+            !compositeCancelled && activeAttempt == attemptId && cancelledAttempt != attemptId
+        }
+        val guardedSink = object : NetworkByteStreamSink {
+            override suspend fun write(bytes: ByteArray) {
+                if (attemptActive()) sink.write(bytes)
+            }
+        }
         plans.forEach { plan ->
-            sink.write(plan.prologue)
+            if (!attemptActive()) return@fromChunks
+            guardedSink.write(plan.prologue)
+            if (!attemptActive()) return@fromChunks
             when (val body = plan.streamBody) {
-                is NetworkBody.Stream -> body.stream.readChunks(sink)
+                is NetworkBody.Stream -> {
+                    body.stream.readChunks(guardedSink)
+                    if (!attemptActive()) return@fromChunks
+                }
                 is NetworkBody.FileRef -> {
+                    if (!attemptActive()) return@fromChunks
                     val stream = body.openStream()
                     if (stream != null) {
                         val cancelNow = synchronized(openedStreamLock) {
@@ -691,10 +705,11 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                             }
                         }
                         if (cancelNow) {
-                            stream.cancel()
+                            runCatching { stream.cancel() }
+                            return@fromChunks
                         } else {
                             try {
-                                stream.readChunks(sink)
+                                stream.readChunks(guardedSink)
                             } catch (throwable: Throwable) {
                                 runCatching { stream.cancel() }
                                 throw throwable
@@ -703,19 +718,24 @@ internal suspend fun NetworkBody.Multipart.streamingUploadStreamOrNull(): Networ
                                     openedStreams.removeAll { it === stream }
                                 }
                             }
+                            if (!attemptActive()) return@fromChunks
                         }
                     } else {
+                        if (!attemptActive()) return@fromChunks
                         val bytes = body.readAll()
                             ?: throw IllegalStateException(
                                 "FileRef part requires a readAllBlock or openStreamBlock on this engine."
                             )
-                        sink.write(bytes)
+                        if (!attemptActive()) return@fromChunks
+                        guardedSink.write(bytes)
                     }
                 }
-                else -> plan.scalarBytes?.let { if (it.isNotEmpty()) sink.write(it) }
+                else -> plan.scalarBytes?.let { if (it.isNotEmpty()) guardedSink.write(it) }
             }
-            sink.write(epilogue)
+            if (!attemptActive()) return@fromChunks
+            guardedSink.write(epilogue)
         }
-        sink.write(terminator)
+        if (!attemptActive()) return@fromChunks
+        guardedSink.write(terminator)
     }
 }

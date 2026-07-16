@@ -61,6 +61,14 @@ class VBTransportTask(
     ) -> Unit = { request, onStart, onChunk, onComplete ->
         getIVBTransportService().requestStream(request, onStart, onChunk, onComplete)
     }
+    internal var platformRequestUpload: (
+        VBTransportRequest,
+        Long?,
+        suspend (com.tencent.kmm.network.export.NetworkByteStreamSink) -> Unit,
+        (VBTransportResponse) -> Unit,
+    ) -> Unit = { request, contentLength, writeBody, onComplete ->
+        getIVBTransportService().requestUploadStream(request, contentLength, writeBody, onComplete)
+    }
     internal var platformCancel: (Int) -> Unit = { requestId ->
         getIVBTransportService().cancel(requestId)
     }
@@ -276,10 +284,11 @@ class VBTransportTask(
             gate.complete(cancelledStreamResponse(request))
             return
         }
-        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERED)) {
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) {
             return
         }
         platformRequestStream(request, gate::responseStart, gate::chunk, gate::complete)
+        completePlatformEntryHandoff(gate, request)
     }
 
     // issue #8: streaming upload — body pushed by [writeBody] into the
@@ -296,9 +305,36 @@ class VBTransportTask(
             finishCanceledBeforeStart(response, wrapResponse(handler))
             return
         }
-        getIVBTransportService().requestUploadStream(request, contentLength, writeBody) { response ->
-            handleResponse(request, response, wrapResponse(handler))
+        afterRunningPreparedForTest?.invoke()
+        val gate = StreamCallbackGate(
+            onStart = { _, _ -> },
+            onChunk = {},
+            onComplete = { response ->
+                response.request = request
+                state.compareAndSet(VBTransportState.Running, VBTransportState.Done)
+                handleResponse(request, response, wrapResponse(handler))
+            },
+            failureCompletion = { throwable ->
+                VBTransportResponse().apply {
+                    this.request = request
+                    this.errorCode = VBTransportResultCode.CODE_NETWORK_ERROR
+                    this.errorMessage = "upload callback failed: ${throwable.message ?: throwable::class.simpleName}"
+                }
+            },
+            cancelTransport = { cancelTransport() },
+        )
+        streamGate.value = gate
+        afterStreamGateInstalledForTest?.invoke()
+        if (state.value == VBTransportState.Canceled) {
+            abortUnusedPlatformReservation()
+            gate.complete(cancelledStreamResponse(request))
+            return
         }
+        if (!platformEntryPhase.compareAndSet(PLATFORM_PHASE_RESERVED, PLATFORM_PHASE_ENTERING)) {
+            return
+        }
+        platformRequestUpload(request, contentLength, writeBody, gate::complete)
+        completePlatformEntryHandoff(gate, request)
     }
 
     fun getState(): VBTransportState = state.value
@@ -355,12 +391,25 @@ class VBTransportTask(
                 if (!abortedBeforeEntry && platformEntryPhase.value == PLATFORM_PHASE_ABORTING) {
                     return
                 }
+                if (platformEntryPhase.value == PLATFORM_PHASE_CANCEL_PENDING) return
+                if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_CANCEL_PENDING)) {
+                    // Publish cancellation to the platform reservation now so
+                    // register/handoff cannot start work. Terminal delivery
+                    // waits until the synchronous handoff returns, preventing
+                    // same-id reuse from being consumed by the old request.
+                    platformCancel(requestId)
+                    return
+                }
                 val won = gate.complete(cancelledStreamResponse()) {
                     state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
                 }
                 if (won && platformEntryPhase.value == PLATFORM_PHASE_ENTERED) {
                     platformCancel(requestId)
                 }
+                return
+            }
+            if (current == VBTransportState.Running && abortUnusedPlatformReservation()) {
+                state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
                 return
             }
             if (state.compareAndSet(current, VBTransportState.Canceled)) {
@@ -393,10 +442,30 @@ class VBTransportTask(
             platformAbortPrepared(requestId)
             platformEntryPhase.value = PLATFORM_PHASE_ABORTED
         } catch (throwable: Throwable) {
-            platformEntryPhase.value = PLATFORM_PHASE_ABORT_FAILED
-            logI("abort prepared request failed: ${throwable.message ?: throwable::class.simpleName}")
+            val retryFailure = runCatching { platformAbortPrepared(requestId) }.exceptionOrNull()
+            platformEntryPhase.value = if (retryFailure == null) {
+                PLATFORM_PHASE_ABORTED
+            } else {
+                PLATFORM_PHASE_ABORT_FAILED
+            }
+            logI(
+                "abort prepared request failed: ${throwable.message ?: throwable::class.simpleName}" +
+                    (retryFailure?.let { "; retry failed: ${it.message ?: it::class.simpleName}" } ?: "; retry succeeded")
+            )
         }
         return true
+    }
+
+    private fun completePlatformEntryHandoff(
+        gate: StreamCallbackGate<VBTransportResponse>,
+        request: VBTransportRequest,
+    ) {
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_ENTERED)) return
+        if (platformEntryPhase.compareAndSet(PLATFORM_PHASE_CANCEL_PENDING, PLATFORM_PHASE_ENTERED)) {
+            gate.complete(cancelledStreamResponse(request)) {
+                state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+            }
+        }
     }
 
     private fun logI(content: String) {
@@ -411,3 +480,5 @@ private const val PLATFORM_PHASE_ENTERED = 2
 private const val PLATFORM_PHASE_ABORTING = 3
 private const val PLATFORM_PHASE_ABORTED = 4
 private const val PLATFORM_PHASE_ABORT_FAILED = 5
+private const val PLATFORM_PHASE_ENTERING = 6
+private const val PLATFORM_PHASE_CANCEL_PENDING = 7

@@ -90,6 +90,7 @@ private val scope = CoroutineScope(Dispatchers.IO)
 // a fast-completing request cannot remove its entry before it exists (which
 // would leave a completed Job resident and invisible to cancel()).
 private val taskMap: ConcurrentHashMap<Int, Job> = ConcurrentHashMap()
+private val preparedTaskRegistry = AndroidPreparedTransportTaskRegistry()
 
 internal fun registerTransportTask(taskMap: ConcurrentHashMap<Int, Job>, requestId: Int, job: Job): Boolean {
     if (taskMap.putIfAbsent(requestId, job) != null) return false
@@ -166,6 +167,12 @@ internal object AndroidTransportTestHooks {
 }
 
 object AndroidTransportImpl : IVBTransportService {
+    override fun prepareRequest(requestId: Int): Boolean = preparedTaskRegistry.prepare(requestId)
+
+    override fun abortPreparedRequest(requestId: Int) {
+        preparedTaskRegistry.abort(requestId)
+    }
+
     private fun triggerRequest(
         request: VBTransportBaseRequest,
         kmmCallback: (response: VBTransportBaseResponse) -> Unit,
@@ -314,7 +321,7 @@ object AndroidTransportImpl : IVBTransportService {
             )
         job.invokeOnCompletion(hardDeadline::transportJobCompleted)
         hardDeadline.start()
-        if (!registerTransportTask(taskMap, request.requestId, job)) {
+        if (!preparedTaskRegistry.register(request.requestId, job)) {
             job.cancel()
             callbackFailure(
                 request,
@@ -490,7 +497,7 @@ object AndroidTransportImpl : IVBTransportService {
                 )
             }
         }
-        if (!registerTransportTask(taskMap, kmmRequest.requestId, job)) {
+        if (!preparedTaskRegistry.register(kmmRequest.requestId, job)) {
             job.cancel()
             onComplete(
                 VBTransportResponse().apply {
@@ -673,7 +680,7 @@ object AndroidTransportImpl : IVBTransportService {
 
     override fun cancel(requestId: Int) {
         logI("requestID -> $requestId task cancel by user")
-        taskMap[requestId]?.cancel()
+        preparedTaskRegistry.cancel(requestId)
     }
 
     private fun callbackFailure(
@@ -696,6 +703,72 @@ object AndroidTransportImpl : IVBTransportService {
             // Registry cleanup happens solely in the completion hook.
             removeOnComplete = false
         )
+    }
+}
+
+internal class AndroidPreparedTransportTaskRegistry {
+    private sealed interface Entry {
+        data object Reserved : Entry
+        data object Cancelled : Entry
+        class Running(val job: Job) : Entry
+    }
+
+    private val entries = mutableMapOf<Int, Entry>()
+
+    @Synchronized
+    fun prepare(requestId: Int): Boolean {
+        if (entries.containsKey(requestId)) return false
+        entries[requestId] = Entry.Reserved
+        return true
+    }
+
+    @Synchronized
+    fun abort(requestId: Int) {
+        if (entries[requestId] === Entry.Reserved) entries.remove(requestId)
+    }
+
+    fun register(requestId: Int, job: Job): Boolean {
+        val start = synchronized(this) {
+            when (entries[requestId]) {
+                Entry.Reserved -> {
+                    entries[requestId] = Entry.Running(job)
+                    true
+                }
+                Entry.Cancelled -> {
+                    entries.remove(requestId)
+                    false
+                }
+                else -> return false
+            }
+        }
+        if (!start) {
+            job.cancel()
+            return true
+        }
+        job.invokeOnCompletion {
+            synchronized(this) {
+                val current = entries[requestId]
+                if (current is Entry.Running && current.job === job) entries.remove(requestId)
+            }
+        }
+        job.start()
+        return true
+    }
+
+    fun cancel(requestId: Int) {
+        val job = synchronized(this) {
+            val current = entries[requestId]
+            if (current is Entry.Running) {
+                entries.remove(requestId)
+                current.job
+            } else if (current === Entry.Reserved) {
+                entries[requestId] = Entry.Cancelled
+                null
+            } else {
+                null
+            }
+        }
+        job?.cancel()
     }
 }
 

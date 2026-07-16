@@ -214,9 +214,7 @@ object VBTransportService {
             val task = VBTransportTask(request.requestId, request.useCurl, request.logTag, taskManager)
             taskManager.onTaskBegin(task)
             task.uploadStreamRequest(request, contentLength, writeBody) { response ->
-                if (task.trySetDone()) {
-                    handler?.let { it(response) }
-                }
+                handler?.let { it(response) }
             }
         }
     }

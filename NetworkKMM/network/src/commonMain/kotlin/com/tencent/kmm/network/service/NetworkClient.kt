@@ -174,7 +174,6 @@ class NetworkCall internal constructor(
     private var terminalResponse: NetworkResponse? = null
     private var resolvedEngine: ResolvedNetworkEngine? = null
     private var engineSelectionReported = false
-    private var attemptBody: NetworkBody? = null
 
     val isCancelled: Boolean
         get() = synchronized(stateLock) { cancelled }
@@ -365,12 +364,6 @@ class NetworkCall internal constructor(
     internal fun ownCurrentBody(body: () -> NetworkBody) {
         addCancelHandler { cancelBodyOnce(body()) }
     }
-
-    internal fun markAttemptBody(body: NetworkBody) {
-        synchronized(stateLock) { attemptBody = body }
-    }
-
-    internal fun currentAttemptBody(): NetworkBody? = synchronized(stateLock) { attemptBody }
 
     internal fun cancelOwnedBodies() {
         val bodies = synchronized(stateLock) { ownedBodies.toList() }
@@ -571,8 +564,10 @@ class NetworkClient(
             if (call.isCancelled) {
                 return cancelledResponse(prepared)
             }
-            val response = executeWithInterceptors(prepared, call)
-            val actualBody = call.currentAttemptBody() ?: prepared.body
+            val outcome = executeWithInterceptors(prepared, call)
+            val response = outcome.response
+            val actualBody = outcome.body
+            call.ownBody(actualBody)
             val authRetry = maybeRefreshAuth(prepared, response, refreshedAuth, actualBody)
             if (authRetry) {
                 refreshedAuth = true
@@ -675,14 +670,17 @@ class NetworkClient(
     private suspend fun executeWithInterceptors(
         request: NetworkRequest,
         call: NetworkCall
-    ): NetworkResponse {
-        return RealNetworkInterceptorChain(
+    ): NetworkAttemptOutcome {
+        val outcomes = AttemptResponseBodyTracker()
+        val response = RealNetworkInterceptorChain(
             interceptors = config.interceptors,
             index = 0,
             request = request,
             call = call,
-            engine = engine
+            engine = engine,
+            outcomes = outcomes,
         ).proceed(request)
+        return NetworkAttemptOutcome(response, outcomes.bodyFor(response) ?: request.body)
     }
 
     private fun dispatcherFor(dispatcher: NetworkDispatcher): CoroutineDispatcher {
@@ -958,12 +956,15 @@ internal class StreamingUploadCancellationOwners(
     private val transportArmed = atomic(true)
 
     fun cancelAll() {
+        // Claim transport cancellation before closing the pull bridge: close
+        // can wake the transport coroutine, whose finally block disarms these
+        // owners. Reversing this order can therefore lose the native cancel.
+        cancelOnce(transportArmed, cancelTransport)
         cancelOnce(originalRequestBodyArmed, cancelOriginalRequestBody)
         cancelOnce(preparedRequestBodyArmed, cancelPreparedRequestBody)
         cancelDerivedSource?.let { cancelOnce(derivedSourceArmed, it) }
         cancelNativeRequest?.let { cancelOnce(nativeRequestArmed, it) }
         closePullBridge?.let { cancelOnce(pullBridgeArmed, it) }
-        cancelOnce(transportArmed, cancelTransport)
     }
 
     fun disarmTransport() {
@@ -987,30 +988,51 @@ internal class StreamingUploadCancellationOwners(
     }
 }
 
+internal data class NetworkAttemptOutcome(
+    val response: NetworkResponse,
+    val body: NetworkBody,
+)
+
+private class AttemptResponseBodyTracker : SynchronizedObject() {
+    private val records = mutableListOf<Pair<NetworkResponse, NetworkBody>>()
+
+    fun bindIfAbsent(response: NetworkResponse, body: NetworkBody) {
+        synchronized(this) {
+            if (records.none { it.first === response }) records += response to body
+        }
+    }
+
+    fun bodyFor(response: NetworkResponse): NetworkBody? = synchronized(this) {
+        records.firstOrNull { it.first === response }?.second
+    }
+}
+
 private class RealNetworkInterceptorChain(
     private val interceptors: List<NetworkInterceptor>,
     private val index: Int,
     override val request: NetworkRequest,
     override val call: NetworkCall,
-    private val engine: NetworkEngine
+    private val engine: NetworkEngine,
+    private val outcomes: AttemptResponseBodyTracker,
 ) : NetworkInterceptorChain {
     override suspend fun proceed(request: NetworkRequest): NetworkResponse {
         if (index >= interceptors.size) {
             call.gateProgressCallbacks(request)
             call.ownBody(request.body)
-            call.markAttemptBody(request.body)
             if (call.isCancelled) return cancelledResponse(request)
-            return engine.execute(request, call)
+            return engine.execute(request, call).also { outcomes.bindIfAbsent(it, request.body) }
         }
+        call.ownCurrentBody { request.body }
         return interceptors[index].intercept(
             RealNetworkInterceptorChain(
                 interceptors = interceptors,
                 index = index + 1,
                 request = request,
                 call = call,
-                engine = engine
+                engine = engine,
+                outcomes = outcomes,
             )
-        )
+        ).also { outcomes.bindIfAbsent(it, request.body) }
     }
 }
 

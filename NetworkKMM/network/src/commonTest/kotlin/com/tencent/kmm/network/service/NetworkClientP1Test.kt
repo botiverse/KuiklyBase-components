@@ -43,6 +43,18 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class NetworkClientP1Test {
+    private fun retryableFailure(request: NetworkRequest) = NetworkResponse(
+        request = request,
+        statusCode = 503,
+        headers = emptyMap(),
+        body = NetworkResponseBody(),
+        error = com.tencent.kmm.network.export.NetworkError(
+            NetworkErrorKind.UNKNOWN,
+            "retryable",
+            503,
+        ),
+    )
+
     @Test
     fun executeOnAlreadyCancelledScopeStillPublishesOneTerminal() = runBlocking {
         val parent = Job().apply { cancel() }
@@ -648,6 +660,25 @@ class NetworkClientP1Test {
     }
 
     @Test
+    fun uploadTransportCancelIsClaimedBeforePullCloseCanDisarmOwners() {
+        var transportCancels = 0
+        lateinit var owners: StreamingUploadCancellationOwners
+        owners = StreamingUploadCancellationOwners(
+            cancelOriginalRequestBody = {},
+            cancelPreparedRequestBody = {},
+            cancelDerivedSource = null,
+            cancelNativeRequest = null,
+            closePullBridge = { owners.disarmNativeTransportOwners() },
+            cancelTransport = { transportCancels++ },
+        )
+
+        owners.cancelAll()
+        owners.cancelAll()
+
+        assertEquals(1, transportCancels)
+    }
+
+    @Test
     fun unsupportedStreamingMethodDoesNotOpenTopLevelFileRef() = runBlocking {
         var opens = 0
         val request = NetworkRequest(method = VBTransportMethod.GET).apply {
@@ -869,6 +900,95 @@ class NetworkClientP1Test {
         assertEquals(503, client.execute(request).statusCode)
         assertEquals(1, engineAttempts)
         assertEquals(1, bodyCancels)
+    }
+
+    @Test
+    fun laterAttemptShortCircuitBindsItsOwnBodyInsteadOfPreviousEngineBody() = runBlocking {
+        var interceptorAttempts = 0
+        var engineAttempts = 0
+        var shortCircuitBodyCancels = 0
+        val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+            policy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                    maxRetries = 2,
+                    backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(0, 0),
+                )
+            )
+        }
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                interceptors = listOf(object : NetworkInterceptor {
+                    override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                        interceptorAttempts++
+                        return if (interceptorAttempts == 1) {
+                            chain.request.body = NetworkBody.Bytes(byteArrayOf(1))
+                            chain.proceed(chain.request)
+                        } else {
+                            chain.request.body = NetworkBody.Stream(
+                                NetworkByteStream.fromChunks(cancelBlock = { shortCircuitBodyCancels++ }) {}
+                            )
+                            retryableFailure(chain.request)
+                        }
+                    }
+                })
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineAttempts++
+                    return retryableFailure(request)
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(503, client.execute(request).statusCode)
+        assertEquals(2, interceptorAttempts)
+        assertEquals(1, engineAttempts)
+        assertEquals(1, shortCircuitBodyCancels)
+    }
+
+    @Test
+    fun multiProceedResponseIdentitySelectsTheBodyThatProducedReturnedResponse() = runBlocking {
+        suspend fun runCase(returnFirst: Boolean): Int {
+            var engineAttempts = 0
+            val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+                policy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                    retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                        maxRetries = 1,
+                        backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(0, 0),
+                    )
+                )
+            }
+            val client = NetworkClient(
+                config = NetworkClientConfig(
+                    interceptors = listOf(object : NetworkInterceptor {
+                        override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                            val firstRequest = chain.request.apply {
+                                body = NetworkBody.Stream(NetworkByteStream.fromChunks {})
+                            }
+                            val first = chain.proceed(firstRequest)
+                            val secondRequest = NetworkRequest(method = VBTransportMethod.POST).apply {
+                                body = NetworkBody.Bytes(byteArrayOf(2))
+                            }
+                            val second = chain.proceed(secondRequest)
+                            return if (returnFirst) first else second
+                        }
+                    })
+                ),
+                engine = object : NetworkEngine {
+                    override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                        engineAttempts++
+                        return retryableFailure(request)
+                    }
+                },
+                scope = CoroutineScope(coroutineContext + SupervisorJob()),
+            )
+            client.execute(request)
+            return engineAttempts
+        }
+
+        assertEquals(2, runCase(returnFirst = true))
+        assertEquals(4, runCase(returnFirst = false))
     }
 
     @Test

@@ -83,6 +83,12 @@ private const val TAG = "IOSTransportImpl"
 private const val STREAM_CHUNK_BYTES = 16L * 1024L
 
 class IOSTransportImpl : IVBTransportService {
+    override fun prepareRequest(requestId: Int): Boolean = taskRegistry.prepare(requestId)
+
+    override fun abortPreparedRequest(requestId: Int) {
+        taskRegistry.abort(requestId)
+    }
+
     private fun startRequest(
         request: VBTransportBaseRequest,
         kmmCallback: (response: VBTransportBaseResponse) -> Unit,
@@ -428,21 +434,51 @@ class IOSTransportImpl : IVBTransportService {
     }
 }
 
-private class IosTransportTaskRegistry : SynchronizedObject() {
-    private val jobs = mutableMapOf<Int, Job>()
+internal class IosTransportTaskRegistry : SynchronizedObject() {
+    private sealed interface Entry {
+        data object Reserved : Entry
+        data object Cancelled : Entry
+        class Running(val job: Job) : Entry
+    }
+
+    private val entries = mutableMapOf<Int, Entry>()
+
+    fun prepare(requestId: Int): Boolean = synchronized(this) {
+        if (entries.containsKey(requestId)) false
+        else {
+            entries[requestId] = Entry.Reserved
+            true
+        }
+    }
+
+    fun abort(requestId: Int) {
+        synchronized(this) {
+            if (entries[requestId] === Entry.Reserved) entries.remove(requestId)
+        }
+    }
 
     fun register(requestId: Int, job: Job): Boolean {
-        val inserted = synchronized(this) {
-            if (jobs.containsKey(requestId)) false
-            else {
-                jobs[requestId] = job
-                true
+        val start = synchronized(this) {
+            when (entries[requestId]) {
+                Entry.Reserved -> {
+                    entries[requestId] = Entry.Running(job)
+                    true
+                }
+                Entry.Cancelled -> {
+                    entries.remove(requestId)
+                    false
+                }
+                else -> return false
             }
         }
-        if (!inserted) return false
+        if (!start) {
+            job.cancel()
+            return true
+        }
         job.invokeOnCompletion {
             synchronized(this) {
-                if (jobs[requestId] === job) jobs.remove(requestId)
+                val current = entries[requestId]
+                if (current is Entry.Running && current.job === job) entries.remove(requestId)
             }
         }
         job.start()
@@ -450,7 +486,19 @@ private class IosTransportTaskRegistry : SynchronizedObject() {
     }
 
     fun cancel(requestId: Int) {
-        synchronized(this) { jobs[requestId] }?.cancel()
+        val job = synchronized(this) {
+            val current = entries[requestId]
+            if (current is Entry.Running) {
+                entries.remove(requestId)
+                current.job
+            } else if (current === Entry.Reserved) {
+                entries[requestId] = Entry.Cancelled
+                null
+            } else {
+                null
+            }
+        }
+        job?.cancel()
     }
 }
 

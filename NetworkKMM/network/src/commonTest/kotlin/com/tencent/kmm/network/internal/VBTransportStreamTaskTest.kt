@@ -18,8 +18,79 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.delay
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertTrue
 
 class VBTransportStreamTaskTest {
+    @Test
+    fun downloadCancelDuringPlatformHandoffWaitsThenCancelsBeforeTerminalAndIdReuse() = runBlocking {
+        val requestId = 991_009
+        val task = registeredTask(requestId)
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val terminals = atomic(0)
+        val platformCancels = atomic(0)
+        var replacementReserved = false
+        task.platformPrepare = { true }
+        task.platformAbortPrepared = {}
+        task.platformCancel = { platformCancels.incrementAndGet() }
+        task.platformRequestStream = { _, _, _, _ ->
+            entered.complete(Unit)
+            runBlocking { release.await() }
+        }
+
+        val requestJob = launch(Dispatchers.Default) {
+            task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
+                terminals.incrementAndGet()
+                replacementReserved = true
+            }
+        }
+        entered.await()
+        task.cancel()
+        assertEquals(0, terminals.value)
+        release.complete(Unit)
+        requestJob.join()
+
+        assertEquals(1, platformCancels.value)
+        assertEquals(1, terminals.value)
+        assertTrue(replacementReserved)
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+    }
+
+    @Test
+    fun uploadCancelDuringPlatformHandoffWaitsThenCancelsBeforeTerminalAndIdReuse() = runBlocking {
+        val requestId = 991_010
+        val task = registeredTask(requestId)
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val terminals = atomic(0)
+        val platformCancels = atomic(0)
+        var replacementReserved = false
+        task.platformPrepare = { true }
+        task.platformAbortPrepared = {}
+        task.platformCancel = { platformCancels.incrementAndGet() }
+        task.platformRequestUpload = { _, _, _, _ ->
+            entered.complete(Unit)
+            runBlocking { release.await() }
+        }
+
+        val requestJob = launch(Dispatchers.Default) {
+            task.uploadStreamRequest(VBTransportRequest(), null, {}, handler = {
+                terminals.incrementAndGet()
+                replacementReserved = true
+            })
+        }
+        entered.await()
+        task.cancel()
+        assertEquals(0, terminals.value)
+        release.complete(Unit)
+        requestJob.join()
+
+        assertEquals(1, platformCancels.value)
+        assertEquals(1, terminals.value)
+        assertTrue(replacementReserved)
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+    }
+
     @Test
     fun cancelBeforePlatformEntryPublishesOneCancelledTerminalAndAbortsReservation() {
         val task = registeredTask(991_001)
@@ -151,18 +222,32 @@ class VBTransportStreamTaskTest {
 
     @Test
     fun abortThrowBeforeRemoveStillContainsFailureAndNeverEntersPlatform() {
-        val task = registeredTask(991_007)
+        val requestId = 991_007
+        val reservation = CancellationAwareRegistry<Int, String>()
+        val task = registeredTask(requestId)
         val terminals = atomic(0)
         val platformEntries = atomic(0)
-        task.platformPrepare = { true }
-        task.platformAbortPrepared = { error("abort before remove") }
+        var abortCalls = 0
+        var replacementReserved = false
+        task.platformPrepare = { reservation.begin(it) }
+        task.platformAbortPrepared = {
+            abortCalls++
+            if (abortCalls == 1) error("abort before remove")
+            reservation.remove(it)
+        }
         task.platformCancel = {}
         task.afterStreamGateInstalledForTest = { task.cancel() }
         task.platformRequestStream = { _, _, _, _ -> platformEntries.incrementAndGet() }
 
-        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) { terminals.incrementAndGet() }
+        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) {
+            terminals.incrementAndGet()
+            replacementReserved = reservation.begin(requestId)
+            reservation.remove(requestId)
+        }
 
         assertEquals(1, terminals.value)
+        assertEquals(2, abortCalls)
+        assertTrue(replacementReserved)
         assertEquals(0, platformEntries.value)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(task.requestId))
     }
@@ -175,8 +260,7 @@ class VBTransportStreamTaskTest {
         var replacementReserved = false
         task.platformPrepare = { reservation.begin(it) }
         task.platformAbortPrepared = {
-            reservation.remove(it)
-            error("abort after remove")
+            if (reservation.remove(it) != null) error("abort after remove")
         }
         task.platformCancel = {}
         task.afterStreamGateInstalledForTest = { task.cancel() }
@@ -189,6 +273,29 @@ class VBTransportStreamTaskTest {
 
         assertEquals(true, replacementReserved)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
+    }
+
+    @Test
+    fun repeatedAbortFailurePublishesOneTerminalAndNeverEntersPlatform() {
+        val task = registeredTask(991_011)
+        var abortCalls = 0
+        var terminals = 0
+        var platformEntries = 0
+        task.platformPrepare = { true }
+        task.platformAbortPrepared = {
+            abortCalls++
+            error("reservation removal unavailable")
+        }
+        task.platformCancel = {}
+        task.afterStreamGateInstalledForTest = { task.cancel() }
+        task.platformRequestStream = { _, _, _, _ -> platformEntries++ }
+
+        task.streamRequest(VBTransportRequest(), { _, _ -> }, {}) { terminals++ }
+
+        assertEquals(2, abortCalls)
+        assertEquals(1, terminals)
+        assertEquals(0, platformEntries)
+        assertEquals(VBTransportState.Unknown, VBTransportManager.getState(task.requestId))
     }
 
     @Test

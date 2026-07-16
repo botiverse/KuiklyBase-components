@@ -164,6 +164,9 @@ class NetworkModelsTest {
         val releaseOpen = CompletableDeferred<Unit>()
         var fileCancels = 0
         var derivedCancels = 0
+        var laterOpens = 0
+        var laterReads = 0
+        var writtenBytes = 0
         val body = NetworkBody.Multipart(
             parts = listOf(
                 NetworkMultipartPart(
@@ -174,19 +177,37 @@ class NetworkModelsTest {
                         openStreamBlock = {
                             openStarted.complete(Unit)
                             releaseOpen.await()
-                            NetworkByteStream.fromChunks(cancelBlock = { derivedCancels++ }) {}
+                            NetworkByteStream.fromChunks(cancelBlock = { derivedCancels++ }) { sink ->
+                                sink.write(byteArrayOf(1, 2, 3))
+                            }
                         },
                     ),
-                )
+                ),
+                NetworkMultipartPart(
+                    "later",
+                    NetworkBody.FileRef(
+                        path = "/virtual/must-not-open",
+                        openStreamBlock = {
+                            laterOpens++
+                            NetworkByteStream.fromChunks { sink ->
+                                laterReads++
+                                sink.write(byteArrayOf(4, 5, 6))
+                            }
+                        },
+                    ),
+                ),
             )
         )
         val composite = assertNotNull(body.streamingUploadStreamOrNull())
         val reader = launch {
             composite.readChunks(object : NetworkByteStreamSink {
-                override suspend fun write(bytes: ByteArray) = Unit
+                override suspend fun write(bytes: ByteArray) {
+                    writtenBytes += bytes.size
+                }
             })
         }
         openStarted.await()
+        val bytesBeforeCancel = writtenBytes
 
         composite.cancelAttempt()
         releaseOpen.complete(Unit)
@@ -194,6 +215,9 @@ class NetworkModelsTest {
 
         assertEquals(0, fileCancels)
         assertEquals(1, derivedCancels)
+        assertEquals(0, writtenBytes - bytesBeforeCancel)
+        assertEquals(0, laterOpens)
+        assertEquals(0, laterReads)
     }
 
     @Test
