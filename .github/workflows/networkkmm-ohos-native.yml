@@ -163,13 +163,18 @@ jobs:
           target_lib="ohosApp/entry/libs/arm64-v8a/libkn.so"
           test -s "$source_lib"
           cp "$source_lib" "$target_lib"
-          readelf -Ws "$target_lib" | grep -q ' UND StartRequestV27$'
-          readelf -Ws "$target_lib" | grep -q ' UND StartStreamRequestV27$'
-          readelf -Ws "$target_lib" | grep -q ' UND StartUploadRequestV27$'
-          if readelf -Ws "$target_lib" | grep -Eq ' UND Start(Request|StreamRequest|UploadRequest)$'; then
+          symbols="$(readelf -Ws "$target_lib")"
+          printf '%s\n' "$symbols" | grep ' UND StartRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartStreamRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartUploadRequestV27$' >/dev/null
+          legacy_matches="$(printf '%s\n' "$symbols" | grep -E ' UND Start(Request|StreamRequest|UploadRequest)$' || true)"
+          if [[ -n "$legacy_matches" ]]; then
             echo "OHOS Kotlin/Native consumer still imports legacy Start* symbols" >&2
+            printf '%s\n' "$legacy_matches" >&2
             exit 1
           fi
+          echo "OHOS Kotlin/Native consumer V27 imports:"
+          printf '%s\n' "$symbols" | grep -E ' UND Start(Request|StreamRequest|UploadRequest)V27$'
 
       - name: Upload native artifacts
         uses: actions/upload-artifact@v4
