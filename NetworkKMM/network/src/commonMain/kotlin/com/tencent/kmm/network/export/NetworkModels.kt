@@ -442,7 +442,8 @@ internal class NetworkBodyBytes(
 )
 
 internal suspend fun NetworkBody.toBytes(
-    progress: ((NetworkTransferProgress) -> Unit)? = null
+    progress: ((NetworkTransferProgress) -> Unit)? = null,
+    ownDerivedStream: ((NetworkByteStream) -> Unit)? = null,
 ): NetworkBodyBytes {
     return when (this) {
         NetworkBody.Empty -> NetworkBodyBytes(null, null)
@@ -457,10 +458,13 @@ internal suspend fun NetworkBody.toBytes(
             },
             contentType
         )
-        is NetworkBody.Multipart -> multipartBodyBytes(this, progress)
+        is NetworkBody.Multipart -> multipartBodyBytes(this, progress, ownDerivedStream)
         is NetworkBody.Stream -> stream.readAllWithProgress(progress).toBodyBytes(contentType)
         is NetworkBody.FileRef -> {
-            val bytes = readAll() ?: openStream()?.readAllWithProgress(progress)
+            val bytes = readAll() ?: openStream()?.let { stream ->
+                ownDerivedStream?.invoke(stream)
+                stream.readAllWithProgress(progress)
+            }
             if (bytes == null) {
                 NetworkBodyBytes(
                     null,
@@ -490,11 +494,12 @@ internal fun NetworkBody.cancel() {
 
 private suspend fun multipartBodyBytes(
     body: NetworkBody.Multipart,
-    progress: ((NetworkTransferProgress) -> Unit)? = null
+    progress: ((NetworkTransferProgress) -> Unit)? = null,
+    ownDerivedStream: ((NetworkByteStream) -> Unit)? = null,
 ): NetworkBodyBytes {
     val builder = VBTransportMultipartBodyBuilder(body.boundary)
     body.parts.forEach { part ->
-        val bodyBytes = part.body.toBytes(progress)
+        val bodyBytes = part.body.toBytes(progress, ownDerivedStream)
         bodyBytes.error?.let {
             return NetworkBodyBytes(null, body.contentType, it)
         }

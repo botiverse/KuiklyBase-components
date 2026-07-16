@@ -440,13 +440,13 @@ class VBTransportTask(
                     // waits until the synchronous handoff returns, preventing
                     // same-id reuse from being consumed by the old request.
                     platformCallbackHandoff.value?.cancelBusinessCallbacks()
-                    platformCancel(requestId)
+                    cancelPlatformContained()
                     return
                 }
                 gate.complete(cancelledStreamResponse()) {
                     state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
                     if (platformEntryPhase.value == PLATFORM_PHASE_ENTERED) {
-                        platformCancel(requestId)
+                        cancelPlatformContained()
                     }
                     taskManager.onTaskFinish(this)
                 }
@@ -480,11 +480,11 @@ class VBTransportTask(
             platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_CANCEL_PENDING)
         ) {
             state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
-            platformCancel(requestId)
+            cancelPlatformContained()
             return
         }
         if (state.compareAndSet(current, VBTransportState.Canceled) && current == VBTransportState.Running) {
-            platformCancel(requestId)
+            cancelPlatformContained()
             if (platformEntryPhase.value == PLATFORM_PHASE_ENTERED) taskManager.onTaskFinish(this)
         }
     }
@@ -499,7 +499,13 @@ class VBTransportTask(
         }
 
     fun cancelTransport() {
-        platformCancel(requestId)
+        cancelPlatformContained()
+    }
+
+    private fun cancelPlatformContained() {
+        runCatching { platformCancel(requestId) }.onFailure { throwable ->
+            logI("platform cancel failed: ${throwable.message ?: throwable::class.simpleName}")
+        }
     }
 
     private fun abortUnusedPlatformReservation(): Boolean {

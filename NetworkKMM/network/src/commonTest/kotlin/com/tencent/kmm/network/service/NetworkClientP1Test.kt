@@ -1061,7 +1061,10 @@ class NetworkClientP1Test {
                             request = first.request,
                             statusCode = first.statusCode,
                             headers = first.headers + ("X-Wrapped" to listOf("early")),
-                            body = first.body,
+                            body = NetworkResponseBody(
+                                bytes = first.body.bytes,
+                                stream = first.body.stream,
+                            ),
                             error = first.error,
                         )
                     }
@@ -1079,6 +1082,48 @@ class NetworkClientP1Test {
         assertEquals(503, client.execute(request).statusCode)
         assertEquals(2, engineAttempts)
         assertEquals(1, firstBodyCancels)
+    }
+
+    @Test
+    fun sharedResponseBodyAcrossProceedsDoesNotOverrideSecondExactBodyBinding() = runBlocking {
+        var engineAttempts = 0
+        val sharedResponseBody = NetworkResponseBody(bytes = byteArrayOf(9))
+        val request = NetworkRequest(method = VBTransportMethod.POST).apply {
+            policy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                    maxRetries = 1,
+                    backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(0, 0),
+                )
+            )
+        }
+        val client = NetworkClient(
+            config = NetworkClientConfig(
+                interceptors = listOf(object : NetworkInterceptor {
+                    override suspend fun intercept(chain: NetworkInterceptorChain): NetworkResponse {
+                        chain.request.body = NetworkBody.Stream(NetworkByteStream.fromChunks {})
+                        chain.proceed(chain.request)
+                        chain.request.body = NetworkBody.Bytes(byteArrayOf(2))
+                        return chain.proceed(chain.request)
+                    }
+                })
+            ),
+            engine = object : NetworkEngine {
+                override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
+                    engineAttempts++
+                    return NetworkResponse(
+                        request,
+                        503,
+                        emptyMap(),
+                        sharedResponseBody,
+                        com.tencent.kmm.network.export.NetworkError(NetworkErrorKind.UNKNOWN, "retryable", 503),
+                    )
+                }
+            },
+            scope = CoroutineScope(coroutineContext + SupervisorJob()),
+        )
+
+        assertEquals(503, client.execute(request).statusCode)
+        assertEquals(4, engineAttempts)
     }
 
     @Test

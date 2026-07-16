@@ -317,6 +317,53 @@ class NetworkModelsTest {
     }
 
     @Test
+    fun bufferedMixedMultipartPublishesOpenedFileStreamToCancellationOwner() = runBlocking {
+        val entered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val owned = mutableListOf<NetworkByteStream>()
+        var derivedCancels = 0
+        val body = NetworkBody.Multipart(
+            parts = listOf(
+                NetworkMultipartPart(
+                    "metadata",
+                    NetworkBody.FileRef(
+                        path = "/virtual/read-all",
+                        readAllBlock = { byteArrayOf(1) },
+                    ),
+                ),
+                NetworkMultipartPart(
+                    "file",
+                    NetworkBody.FileRef(
+                        path = "/virtual/open-stream",
+                        openStreamBlock = {
+                            NetworkByteStream.fromChunks(
+                                cancelBlock = {
+                                    derivedCancels++
+                                    release.complete(Unit)
+                                }
+                            ) { sink ->
+                                entered.complete(Unit)
+                                release.await()
+                                sink.write(byteArrayOf(2))
+                            }
+                        },
+                    ),
+                ),
+            )
+        )
+        val reader = launch {
+            body.toBytes(ownDerivedStream = { owned += it })
+        }
+        entered.await()
+
+        owned.forEach { it.cancel() }
+        reader.join()
+
+        assertEquals(1, owned.size)
+        assertEquals(1, derivedCancels)
+    }
+
+    @Test
     fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
         val defaults = NetworkRequestPolicy().streamTimeouts
         assertEquals(3_000L, defaults.connectTimeoutMillis)

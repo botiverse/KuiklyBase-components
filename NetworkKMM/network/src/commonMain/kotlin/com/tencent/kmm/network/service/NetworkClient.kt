@@ -733,7 +733,9 @@ object VBTransportNetworkEngine : NetworkEngine {
                 return executeStreaming(request, call, it)
             }
         }
-        val bodyBytes = request.body.toBytes(request.progress.uploadProgress)
+        val bodyBytes = request.body.toBytes(request.progress.uploadProgress) { stream ->
+            call.ownBody(NetworkBody.Stream(stream))
+        }
         bodyBytes.error?.let {
             return NetworkResponse(
                 request = request,
@@ -996,7 +998,13 @@ internal data class NetworkAttemptOutcome(
 private class AttemptResponseBodyTracker : SynchronizedObject() {
     private val records = mutableListOf<Pair<NetworkResponse, NetworkBody>>()
 
-    fun bindIfAbsent(response: NetworkResponse, body: NetworkBody) {
+    fun bindEngine(response: NetworkResponse, body: NetworkBody) {
+        synchronized(this) {
+            if (records.none { it.first === response }) records += response to body
+        }
+    }
+
+    fun bindInterceptor(response: NetworkResponse, body: NetworkBody) {
         synchronized(this) {
             if (records.none { it.first === response }) {
                 val provenanceBody = records.firstOrNull { it.first.body === response.body }?.second
@@ -1020,10 +1028,13 @@ private class RealNetworkInterceptorChain(
 ) : NetworkInterceptorChain {
     override suspend fun proceed(request: NetworkRequest): NetworkResponse {
         if (index >= interceptors.size) {
-            call.gateProgressCallbacks(request)
-            call.ownBody(request.body)
-            if (call.isCancelled) return cancelledResponse(request)
-            return engine.execute(request, call).also { outcomes.bindIfAbsent(it, request.body) }
+            val engineRequest = request.copyMutable()
+            call.gateProgressCallbacks(engineRequest)
+            call.ownBody(engineRequest.body)
+            if (call.isCancelled) return cancelledResponse(engineRequest)
+            return engine.execute(engineRequest, call).also {
+                outcomes.bindEngine(it, engineRequest.body)
+            }
         }
         call.ownCurrentBody { request.body }
         return interceptors[index].intercept(
@@ -1035,7 +1046,7 @@ private class RealNetworkInterceptorChain(
                 engine = engine,
                 outcomes = outcomes,
             )
-        ).also { outcomes.bindIfAbsent(it, it.request.body) }
+        ).also { outcomes.bindInterceptor(it, it.request.body) }
     }
 }
 
