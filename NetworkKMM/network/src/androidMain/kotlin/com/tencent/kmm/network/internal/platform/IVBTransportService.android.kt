@@ -407,6 +407,7 @@ object AndroidTransportImpl : IVBTransportService {
         }
         job = scope.launch(start = CoroutineStart.LAZY) {
             try {
+                AndroidTransportTestHooks.beforeTransportCoroutineStart?.invoke()
                 val streamStart = kmmRequest.serviceRequestStartMark
                     ?: kotlin.time.TimeSource.Monotonic.markNow()
                 AndroidTransportPhaseTracer.scheduled(kmmRequest.requestId)

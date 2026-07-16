@@ -81,6 +81,14 @@ private val scope = CoroutineScope(Dispatchers.IO)
 private val taskRegistry = IosTransportTaskRegistry()
 private const val TAG = "IOSTransportImpl"
 
+internal object IosTransportTestHooks {
+    var beforeStreamTransportCoroutineStart: (suspend () -> Unit)? = null
+
+    fun reset() {
+        beforeStreamTransportCoroutineStart = null
+    }
+}
+
 // Upper bound per streamed chunk read off the response channel (fork #8).
 private const val STREAM_CHUNK_BYTES = 16L * 1024L
 
@@ -274,9 +282,19 @@ class IOSTransportImpl : IVBTransportService {
         }
         job = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                val client = getHttpClient(kmmRequest) as HttpClient
+                IosTransportTestHooks.beforeStreamTransportCoroutineStart?.invoke()
                 val streamStart = kmmRequest.serviceRequestStartMark
                     ?: kotlin.time.TimeSource.Monotonic.markNow()
+                val remainingAtTransportStart = remainingStreamWholeTimeoutMillis(
+                    kmmRequest.streamWholeTimeoutMillis,
+                    streamStart.elapsedNow().inWholeMilliseconds,
+                )
+                if (remainingAtTransportStart == 0L) {
+                    // Use the same classified coroutine timeout as Ktor, but
+                    // fail before constructing/opening a transport request.
+                    withTimeout(0L) { Unit }
+                }
+                val client = getHttpClient(kmmRequest) as HttpClient
                 suspend fun openResponse() =
                     client.request(kmmRequest.url) {
                         method = HttpMethod(kmmRequest.method.name)
