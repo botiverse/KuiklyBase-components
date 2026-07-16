@@ -48,6 +48,8 @@ class VBTransportTask(
     private val streamGate = atomic<StreamCallbackGate<VBTransportResponse>?>(null)
     private val platformCallbackHandoff = atomic<PlatformTerminalHandoff<VBTransportResponse>?>(null)
     private val platformEntryPhase = atomic(PLATFORM_PHASE_NONE)
+    private val bufferedTerminalLock = kotlinx.atomicfu.locks.SynchronizedObject()
+    private var bufferedCompletionClaimed = false
     internal var platformPrepare: (Int) -> Boolean = { requestId ->
         getIVBTransportService().prepareRequest(requestId)
     }
@@ -144,6 +146,11 @@ class VBTransportTask(
         response: VBTransportBaseResponse,
         handler: ((response: VBTransportBaseResponse) -> Unit)?
     ) {
+        if (streamGate.value == null) {
+            kotlinx.atomicfu.locks.synchronized(bufferedTerminalLock) {
+                bufferedCompletionClaimed = true
+            }
+        }
         try {
             handler?.let {
                 if (isCanceledOrRemoved()) {
@@ -271,7 +278,9 @@ class VBTransportTask(
             return
         }
         afterRunningPreparedForTest?.invoke()
-        val gate = StreamCallbackGate(
+        val terminalHandoff = PlatformTerminalHandoff<VBTransportResponse>()
+        lateinit var gate: StreamCallbackGate<VBTransportResponse>
+        gate = StreamCallbackGate(
             onStart = onResponseStart,
             onChunk = onChunk,
             onComplete = { response ->
@@ -287,11 +296,13 @@ class VBTransportTask(
                 }
             },
             cancelTransport = { cancelTransport() },
+            callbackFailureCompletion = { response ->
+                terminalHandoff.platformComplete(response, gate::complete)
+            },
             onCallbackFailure = { throwable ->
                 logI("stream callback failed: ${throwable.message ?: throwable::class.simpleName}")
             }
         )
-        val terminalHandoff = PlatformTerminalHandoff<VBTransportResponse>()
         platformCallbackHandoff.value = terminalHandoff
         streamGate.value = gate
         afterStreamGateInstalledForTest?.invoke()
@@ -441,31 +452,40 @@ class VBTransportTask(
                 }
                 return
             }
-            if (current == VBTransportState.Running && abortUnusedPlatformReservation()) {
-                state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
-                taskManager.onTaskFinish(this)
-                return
-            }
-            if (current == VBTransportState.Running && platformEntryPhase.value == PLATFORM_PHASE_CANCEL_PENDING) {
-                return
-            }
-            if (
-                current == VBTransportState.Running &&
-                platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_CANCEL_PENDING)
-            ) {
-                state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
-                platformCancel(requestId)
-                return
-            }
-            if (state.compareAndSet(current, VBTransportState.Canceled)) {
-                if (current == VBTransportState.Running) {
-                    platformCancel(requestId)
-                    if (platformEntryPhase.value == PLATFORM_PHASE_ENTERED) {
-                        taskManager.onTaskFinish(this)
-                    }
+            if (gate == null) {
+                kotlinx.atomicfu.locks.synchronized(bufferedTerminalLock) {
+                    if (bufferedCompletionClaimed) return
+                    cancelWithoutStreamGate()
                 }
                 return
             }
+        }
+    }
+
+    private fun cancelWithoutStreamGate() {
+        val current = state.value
+        if (
+            current == VBTransportState.Done ||
+            current == VBTransportState.Canceled ||
+            current == VBTransportState.Unknown
+        ) return
+        if (current == VBTransportState.Running && abortUnusedPlatformReservation()) {
+            state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+            taskManager.onTaskFinish(this)
+            return
+        }
+        if (current == VBTransportState.Running && platformEntryPhase.value == PLATFORM_PHASE_CANCEL_PENDING) return
+        if (
+            current == VBTransportState.Running &&
+            platformEntryPhase.compareAndSet(PLATFORM_PHASE_ENTERING, PLATFORM_PHASE_CANCEL_PENDING)
+        ) {
+            state.compareAndSet(VBTransportState.Running, VBTransportState.Canceled)
+            platformCancel(requestId)
+            return
+        }
+        if (state.compareAndSet(current, VBTransportState.Canceled) && current == VBTransportState.Running) {
+            platformCancel(requestId)
+            if (platformEntryPhase.value == PLATFORM_PHASE_ENTERED) taskManager.onTaskFinish(this)
         }
     }
 

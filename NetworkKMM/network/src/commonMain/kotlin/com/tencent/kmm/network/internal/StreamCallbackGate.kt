@@ -20,6 +20,7 @@ internal class StreamCallbackGate<C>(
     private val onComplete: (C) -> Unit,
     private val failureCompletion: (Throwable) -> C,
     private val cancelTransport: () -> Unit,
+    private val callbackFailureCompletion: ((C) -> Unit)? = null,
     private val onCallbackFailure: (Throwable) -> Unit = {}
 ) {
     private enum class Phase { Queued, Started, Terminal }
@@ -97,7 +98,8 @@ internal class StreamCallbackGate<C>(
                 // Close the business callback surface first. Transport cancel
                 // is a cleanup side effect and must not be the only route to a
                 // terminal response (some platform jobs rethrow cancellation).
-                complete(failureCompletion(throwable))
+                val completion = failureCompletion(throwable)
+                callbackFailureCompletion?.invoke(completion) ?: complete(completion)
                 try {
                     cancelTransport()
                 } catch (cancelFailure: Throwable) {

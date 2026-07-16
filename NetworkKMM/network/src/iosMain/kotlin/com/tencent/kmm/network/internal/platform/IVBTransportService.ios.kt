@@ -217,6 +217,7 @@ class IOSTransportImpl : IVBTransportService {
                 "headerKeys:${kmmPostRequest.header.keys}")
 
         if (!kmmPostRequest.isDataInitialize()) {
+            abortPreparedRequest(kmmPostRequest.requestId)
             callbackFailure(
                 kmmPostRequest,
                 IllegalArgumentException("Data is not initialized"),

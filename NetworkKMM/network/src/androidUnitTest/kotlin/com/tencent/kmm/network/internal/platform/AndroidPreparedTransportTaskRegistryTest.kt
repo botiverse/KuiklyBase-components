@@ -7,6 +7,7 @@
  */
 package com.tencent.kmm.network.internal.platform
 
+import com.tencent.kmm.network.export.VBTransportPostRequest
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -16,6 +17,19 @@ import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 class AndroidPreparedTransportTaskRegistryTest {
+    @Test
+    fun uninitializedPostAbortsPreparedOwnerBeforeSynchronousFailure() {
+        val request = VBTransportPostRequest().apply { requestId = 29 }
+        var callbacks = 0
+        assertTrue(AndroidTransportImpl.prepareRequest(request.requestId))
+
+        AndroidTransportImpl.post(request) { callbacks++ }
+
+        assertEquals(1, callbacks)
+        assertTrue(AndroidTransportImpl.prepareRequest(request.requestId))
+        AndroidTransportImpl.abortPreparedRequest(request.requestId)
+    }
+
     @Test
     fun abortAfterPreRegisterCancelRemovesCancelledReservation() {
         val registry = AndroidPreparedTransportTaskRegistry()

@@ -22,6 +22,53 @@ import kotlin.test.assertTrue
 
 class VBTransportStreamTaskTest {
     @Test
+    fun throwingStartStagesFailureTerminalUntilPlatformOwnerIsReleased() = runBlocking {
+        val requestId = 991_014
+        val task = registeredTask(requestId)
+        val failureTriggered = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val terminals = atomic(0)
+        var platformOwner = "none"
+        var platformCancelled = false
+        var commonReplacement = false
+        var platformReplacement = false
+        task.platformPrepare = {
+            if (platformOwner != "none") false else {
+                platformOwner = "reserved"
+                true
+            }
+        }
+        task.platformAbortPrepared = { platformOwner = "none" }
+        task.platformCancel = { platformCancelled = true }
+        task.platformRequestStream = { _, onStart, _, _ ->
+            platformOwner = "running"
+            onStart(200, emptyMap())
+            failureTriggered.complete(Unit)
+            runBlocking { release.await() }
+            assertTrue(platformCancelled)
+            platformOwner = "none"
+        }
+
+        val requestJob = launch(Dispatchers.Default) {
+            task.streamRequest(VBTransportRequest(), { _, _ -> error("start failed") }, {}) {
+                terminals.incrementAndGet()
+                commonReplacement = VBTransportManager.onTaskPrepared(requestId)
+                platformReplacement = task.platformPrepare(requestId)
+            }
+        }
+        failureTriggered.await()
+        assertEquals(0, terminals.value)
+        release.complete(Unit)
+        requestJob.join()
+
+        assertEquals(1, terminals.value)
+        assertTrue(commonReplacement)
+        assertTrue(platformReplacement)
+        task.platformAbortPrepared(requestId)
+        VBTransportManager.cancel(requestId)
+    }
+
+    @Test
     fun cancelBetweenPlatformPrepareAndPhasePublishAbortsCancelledOwnerBeforeTerminalReuse() {
         val requestId = 991_012
         val task = registeredTask(requestId)
