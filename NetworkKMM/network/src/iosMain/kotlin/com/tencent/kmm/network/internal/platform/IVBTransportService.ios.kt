@@ -83,9 +83,11 @@ private const val TAG = "IOSTransportImpl"
 
 internal object IosTransportTestHooks {
     var beforeStreamTransportCoroutineStart: (suspend () -> Unit)? = null
+    var beforeStreamTransportOpen: (() -> Unit)? = null
 
     fun reset() {
         beforeStreamTransportCoroutineStart = null
+        beforeStreamTransportOpen = null
     }
 }
 
@@ -294,6 +296,7 @@ class IOSTransportImpl : IVBTransportService {
                     // fail before constructing/opening a transport request.
                     withTimeout(0L) { Unit }
                 }
+                IosTransportTestHooks.beforeStreamTransportOpen?.invoke()
                 val client = getHttpClient(kmmRequest) as HttpClient
                 suspend fun openResponse() =
                     client.request(kmmRequest.url) {
