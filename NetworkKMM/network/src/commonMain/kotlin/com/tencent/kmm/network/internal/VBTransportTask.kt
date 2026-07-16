@@ -151,21 +151,17 @@ class VBTransportTask(
                 bufferedCompletionClaimed = true
             }
         }
-        try {
-            handler?.let {
-                if (isCanceledOrRemoved()) {
-                    logI("execute() request task is canceled")
-                    response.errorCode = VBTransportResultCode.CODE_CANCELED
-                    response.errorMessage = "Request has been canceled"
-                    logI("execute() invoke failHandler，task has been canceled")
-                }
-                it(response)
-            } ?: run {
-                logI("handler is null!")
-            }
-        } finally {
-            taskManager.onTaskFinish(this)
+        if (isCanceledOrRemoved()) {
+            logI("execute() request task is canceled")
+            response.errorCode = VBTransportResultCode.CODE_CANCELED
+            response.errorMessage = "Request has been canceled"
+            logI("execute() invoke failHandler，task has been canceled")
         }
+        // Platform handoff/cancel owns native cleanup. Release the common
+        // identity before making terminal visible so same-id replacement in a
+        // terminal handler cannot collide with the old common task.
+        taskManager.onTaskFinish(this)
+        handler?.invoke(response) ?: logI("handler is null!")
     }
 
     fun sendBytesRequest(
@@ -485,7 +481,7 @@ class VBTransportTask(
         }
         if (state.compareAndSet(current, VBTransportState.Canceled) && current == VBTransportState.Running) {
             cancelPlatformContained()
-            if (platformEntryPhase.value == PLATFORM_PHASE_ENTERED) taskManager.onTaskFinish(this)
+            taskManager.onTaskFinish(this)
         }
     }
 

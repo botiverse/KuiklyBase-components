@@ -10,7 +10,6 @@ package com.tencent.kmm.network.internal
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertSame
-import kotlin.test.assertFailsWith
 
 class VBTransportManagerTest {
     @Test
@@ -56,9 +55,7 @@ class VBTransportManagerTest {
         VBTransportManager.onTaskPrepared(requestId)
         VBTransportManager.onTaskBegin(task)
 
-        assertFailsWith<IllegalStateException> {
-            VBTransportManager.cancel(requestId)
-        }
+        VBTransportManager.cancel(requestId)
         assertEquals(VBTransportState.Unknown, VBTransportManager.getState(requestId))
 
         val replacement = VBTransportTask(

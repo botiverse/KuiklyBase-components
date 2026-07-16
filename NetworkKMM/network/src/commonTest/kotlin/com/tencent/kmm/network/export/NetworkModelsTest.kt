@@ -479,7 +479,7 @@ class NetworkModelsTest {
             sink.write(byteArrayOf(3, 4, 5))
         }
 
-        val bodyBytes = NetworkBody.Stream(stream).toBytes { progress.add(it) }
+        val bodyBytes = NetworkBody.Stream(stream).toBytes(progress = { progress.add(it) })
 
         assertEquals(listOf(1, 2, 3, 4, 5), assertNotNull(bodyBytes.bytes).map { it.toInt() })
         assertEquals(listOf(2L, 5L), progress.map { it.bytesTransferred })
