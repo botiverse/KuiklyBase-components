@@ -21,6 +21,8 @@ on:
     paths:
       - "NetworkKMM/scripts/build-ohos-native.sh"
       - "NetworkKMM/settings.gradle.kts"
+      - "NetworkKMM/settings.ohos.gradle.kts"
+      - "NetworkKMM/network/build.ohos.gradle.kts"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
       - "NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/curl/**"
       - "NetworkKMM/network/src/ohosArm64Main/kotlin/com/tencent/kmm/network/curl/**"
@@ -31,12 +33,18 @@ on:
     paths:
       - "NetworkKMM/scripts/build-ohos-native.sh"
       - "NetworkKMM/settings.gradle.kts"
+      - "NetworkKMM/settings.ohos.gradle.kts"
+      - "NetworkKMM/network/build.ohos.gradle.kts"
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
       - "NetworkKMM/network/src/commonMain/kotlin/com/tencent/kmm/network/curl/**"
       - "NetworkKMM/network/src/ohosArm64Main/kotlin/com/tencent/kmm/network/curl/**"
       - "NetworkKMM/network/src/nativeInterop/cinterop/**"
       - "NetworkKMM/network-host-native-tests/**"
       - ".github/workflows/networkkmm-ohos-native.yml"
+
+concurrency:
+  group: networkkmm-ohos-native-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   # Behavior-contract tests: the wrapper built for the HOST (same sources,
@@ -81,9 +89,6 @@ jobs:
   build-native:
     name: Cross-compile OHOS native (OpenSSL + curl + wrapper)
     runs-on: ubuntu-latest
-    # contents:write lets the commit_binaries dispatch push refreshed .so back.
-    permissions:
-      contents: write
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     steps:
@@ -163,7 +168,8 @@ jobs:
           target_lib="ohosApp/entry/libs/arm64-v8a/libkn.so"
           test -s "$source_lib"
           cp "$source_lib" "$target_lib"
-          symbols="$(readelf -Ws "$target_lib")"
+          symbols="$(readelf --dyn-syms --wide "$target_lib")"
+          printf '%s\n' "$symbols" | grep ' UND CurlWrapperAbiVersion$' >/dev/null
           printf '%s\n' "$symbols" | grep ' UND StartRequestV27$' >/dev/null
           printf '%s\n' "$symbols" | grep ' UND StartStreamRequestV27$' >/dev/null
           printf '%s\n' "$symbols" | grep ' UND StartUploadRequestV27$' >/dev/null
@@ -173,8 +179,8 @@ jobs:
             printf '%s\n' "$legacy_matches" >&2
             exit 1
           fi
-          echo "OHOS Kotlin/Native consumer V27 imports:"
-          printf '%s\n' "$symbols" | grep -E ' UND Start(Request|StreamRequest|UploadRequest)V27$'
+          echo "OHOS Kotlin/Native consumer ABI/V27 dynamic imports:"
+          printf '%s\n' "$symbols" | grep -E ' UND (CurlWrapperAbiVersion|Start(Request|StreamRequest|UploadRequest)V27)$'
 
       - name: Upload native artifacts
         uses: actions/upload-artifact@v4
@@ -193,8 +199,36 @@ jobs:
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libnghttp3.a
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
 
+  commit:
+    name: Commit paired OHOS native binaries
+    if: github.event_name == 'workflow_dispatch' && inputs.commit_binaries
+    needs: [wrapper-behavior-tests, build-native]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Download paired artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: networkkmm-ohos-native
+          path: /tmp/networkkmm-ohos-native
+
+      - name: Place paired artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp -a /tmp/networkkmm-ohos-native/network/libs/. NetworkKMM/network/libs/
+          cp -a /tmp/networkkmm-ohos-native/ohosApp/entry/libs/arm64-v8a/. \
+            NetworkKMM/ohosApp/entry/libs/arm64-v8a/
+          cp -a /tmp/networkkmm-ohos-native/ohosApp/pbcurlwrapper/libs/arm64-v8a/. \
+            NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/
+
       - name: Commit refreshed binaries back
-        if: github.event_name == 'workflow_dispatch' && inputs.commit_binaries
         shell: bash
         run: |
           set -euo pipefail
