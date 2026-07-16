@@ -18,3 +18,10 @@ internal fun remainingStreamWholeTimeoutMillis(wholeMillis: Long, elapsedMillis:
     if (wholeMillis <= 0) return null
     return (wholeMillis - elapsedMillis.coerceAtLeast(0)).coerceAtLeast(0)
 }
+
+internal fun streamPhaseTimeoutMillis(phaseMillis: Long?, remainingWholeMillis: Long?): Long? =
+    when {
+        phaseMillis == null -> remainingWholeMillis
+        remainingWholeMillis == null -> phaseMillis
+        else -> minOf(phaseMillis, remainingWholeMillis)
+    }

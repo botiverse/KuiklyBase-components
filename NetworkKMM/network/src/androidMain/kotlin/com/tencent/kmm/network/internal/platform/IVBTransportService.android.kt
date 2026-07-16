@@ -48,6 +48,7 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringC
 import com.tencent.kmm.network.internal.utils.readKnownSize
 import com.tencent.kmm.network.internal.utils.readUnknownSize
 import com.tencent.kmm.network.internal.remainingStreamWholeTimeoutMillis
+import com.tencent.kmm.network.internal.streamPhaseTimeoutMillis
 import com.tencent.kmm.network.internal.streamHeadersUpperBoundMillis
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.timeout
@@ -406,7 +407,8 @@ object AndroidTransportImpl : IVBTransportService {
         }
         job = scope.launch(start = CoroutineStart.LAZY) {
             try {
-                val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
+                val streamStart = kmmRequest.serviceRequestStartMark
+                    ?: kotlin.time.TimeSource.Monotonic.markNow()
                 AndroidTransportPhaseTracer.scheduled(kmmRequest.requestId)
                 AndroidTransportPhaseTracer.transportCoroutineStarted(kmmRequest.requestId)
                 suspend fun openResponse() =
@@ -415,9 +417,15 @@ object AndroidTransportImpl : IVBTransportService {
                         streamStart,
                         streamTimeouts = true
                     )
-                val responseHeadersBudget = streamHeadersUpperBoundMillis(
-                    kmmRequest.streamConnectTimeoutMillis,
-                    kmmRequest.streamResponseHeadersTimeoutMillis
+                val responseHeadersBudget = streamPhaseTimeoutMillis(
+                    phaseMillis = streamHeadersUpperBoundMillis(
+                        kmmRequest.streamConnectTimeoutMillis,
+                        kmmRequest.streamResponseHeadersTimeoutMillis
+                    ),
+                    remainingWholeMillis = remainingStreamWholeTimeoutMillis(
+                        kmmRequest.streamWholeTimeoutMillis,
+                        streamStart.elapsedNow().inWholeMilliseconds,
+                    ),
                 )
                 val responseLease = if (responseHeadersBudget != null) {
                     withTimeout(responseHeadersBudget) { openResponse() }

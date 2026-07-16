@@ -26,4 +26,13 @@ class StreamTimeoutPlanTest {
         assertEquals(0L, remainingStreamWholeTimeoutMillis(10_000, 11_000))
         assertNull(remainingStreamWholeTimeoutMillis(0, 11_000))
     }
+
+    @Test
+    fun responseHeaderPhaseCannotOutliveCallerWholeDeadline() {
+        assertEquals(2_000L, streamPhaseTimeoutMillis(5_000L, 2_000L))
+        assertEquals(5_000L, streamPhaseTimeoutMillis(5_000L, null))
+        assertEquals(2_000L, streamPhaseTimeoutMillis(null, 2_000L))
+        assertEquals(0L, streamPhaseTimeoutMillis(5_000L, 0L))
+        assertNull(streamPhaseTimeoutMillis(null, null))
+    }
 }

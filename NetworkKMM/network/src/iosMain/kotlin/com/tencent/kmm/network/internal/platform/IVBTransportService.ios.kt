@@ -44,6 +44,8 @@ import com.tencent.kmm.network.internal.utils.getHttpClient
 import com.tencent.kmm.network.internal.utils.readKnownSize
 import com.tencent.kmm.network.internal.utils.readUnknownSize
 import com.tencent.kmm.network.internal.streamHeadersUpperBoundMillis
+import com.tencent.kmm.network.internal.remainingStreamWholeTimeoutMillis
+import com.tencent.kmm.network.internal.streamPhaseTimeoutMillis
 import io.ktor.client.HttpClient
 import io.ktor.client.plugins.timeout
 import io.ktor.client.request.HttpRequestBuilder
@@ -273,22 +275,32 @@ class IOSTransportImpl : IVBTransportService {
         job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val client = getHttpClient(kmmRequest) as HttpClient
-                val streamStart = kotlin.time.TimeSource.Monotonic.markNow()
+                val streamStart = kmmRequest.serviceRequestStartMark
+                    ?: kotlin.time.TimeSource.Monotonic.markNow()
                 suspend fun openResponse() =
                     client.request(kmmRequest.url) {
                         method = HttpMethod(kmmRequest.method.name)
                         timeout {
-                            if (kmmRequest.streamWholeTimeoutMillis > 0) {
-                                requestTimeoutMillis = kmmRequest.streamWholeTimeoutMillis
+                            remainingStreamWholeTimeoutMillis(
+                                kmmRequest.streamWholeTimeoutMillis,
+                                streamStart.elapsedNow().inWholeMilliseconds,
+                            )?.let { remainingWholeMillis ->
+                                requestTimeoutMillis = remainingWholeMillis.coerceAtLeast(1L)
                             }
                             connectTimeoutMillis = kmmRequest.streamConnectTimeoutMillis
                             socketTimeoutMillis = kmmRequest.streamIdleTimeoutMillis
                         }
                         constructRequest(kmmRequest)
                     }
-                val responseHeadersBudget = streamHeadersUpperBoundMillis(
-                    kmmRequest.streamConnectTimeoutMillis,
-                    kmmRequest.streamResponseHeadersTimeoutMillis
+                val responseHeadersBudget = streamPhaseTimeoutMillis(
+                    phaseMillis = streamHeadersUpperBoundMillis(
+                        kmmRequest.streamConnectTimeoutMillis,
+                        kmmRequest.streamResponseHeadersTimeoutMillis
+                    ),
+                    remainingWholeMillis = remainingStreamWholeTimeoutMillis(
+                        kmmRequest.streamWholeTimeoutMillis,
+                        streamStart.elapsedNow().inWholeMilliseconds,
+                    ),
                 )
                 val response = if (responseHeadersBudget != null) {
                     withTimeout(responseHeadersBudget) { openResponse() }
