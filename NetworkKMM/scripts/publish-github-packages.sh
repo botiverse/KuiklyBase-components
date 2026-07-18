@@ -21,6 +21,7 @@ fi
 
 default_publish_tasks=(
   ":network:publishAndroidPublicationToGithubPackagesRepository"
+  ":network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository"
   ":network:publishIosX64PublicationToGithubPackagesRepository"
   ":network:publishIosArm64PublicationToGithubPackagesRepository"
   ":network:publishIosSimulatorArm64PublicationToGithubPackagesRepository"
@@ -117,6 +118,21 @@ fi
 
 echo "Publishing NetworkKMM publications to GitHub Packages:"
 printf '  %s\n' "${available_publish_tasks[@]}"
+
+verify_android_curl_runtime=false
+for publish_task in "${available_publish_tasks[@]}"; do
+  if [[ "$publish_task" == ":network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository" ]]; then
+    verify_android_curl_runtime=true
+    break
+  fi
+done
+
+if [[ "$verify_android_curl_runtime" == "true" && "$NETWORK_DRY_RUN" != "true" ]]; then
+  ./gradlew "${gradle_args[@]}" \
+    :network:assembleRelease \
+    :network-android-curl-runtime:assembleRelease
+  ./scripts/verify-android-curl-runtime-aar.sh
+fi
 
 if [[ "$NETWORK_DRY_RUN" == "true" ]]; then
   ./gradlew "${gradle_args[@]}" --dry-run "${available_publish_tasks[@]}"

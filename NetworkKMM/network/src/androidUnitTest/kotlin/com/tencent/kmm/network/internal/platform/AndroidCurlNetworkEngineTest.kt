@@ -45,6 +45,7 @@ import com.tencent.kmm.network.service.NetworkTransportEngine
 import com.tencent.kmm.network.service.AndroidCurlSystemProxyResolver
 import com.tencent.kmm.network.service.CurlSystemProxyResolution
 import com.tencent.kmm.network.service.NetworkEngineUnavailableReason
+import com.tencent.kmm.network.service.preparedCurlHttp3Requested
 import com.tencent.kmm.network.service.resolveAndroidCurlSystemProxy
 import com.tencent.kmm.network.service.resolveNetworkEngine
 import kotlinx.coroutines.CompletableDeferred
@@ -189,6 +190,28 @@ class AndroidCurlNetworkEngineTest {
         assertTrue(assertNotNull(bridge.lastRequest).http3Enabled)
         assertTrue(engine.capabilities.http3.rolloutEligible)
         assertEquals(NetworkHttpProtocol.HTTP_3, response.protocol)
+    }
+
+    @Test
+    fun perRequestHttp3DisableOverridesGlobalEnable() = runBlocking {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.direct(),
+                http3Enabled = true
+            )
+        )
+        val bridge = FakeBridge(supportsHttp3 = true)
+        val request = NetworkRequest(url = "https://example.test")
+            .setCurlHttp3Enabled(false)
+
+        AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertFalse(assertNotNull(bridge.lastRequest).http3Enabled)
+        assertEquals(false, preparedCurlHttp3Requested(request))
     }
 
     @Test
@@ -659,6 +682,30 @@ class AndroidCurlNetworkEngineTest {
         assertSame(curl, resolvedCurl.engine)
         assertTrue(resolvedCurl.diagnostics.capabilities.responseBodyStreaming)
         assertFalse(resolvedKtor.diagnostics.capabilities.responseBodyStreaming)
+    }
+
+    @Test
+    fun publicNativeStatusSeparatesLinkAndHttp3Capability() {
+        AndroidCurlEngineProvider.testBridge = FakeBridge(
+            isAvailable = false,
+            supportsHttp3 = true
+        )
+        assertFalse(VBTransportCurl.nativeStatus.linked)
+        assertFalse(VBTransportCurl.nativeStatus.http3FeatureAvailable)
+
+        AndroidCurlEngineProvider.testBridge = FakeBridge(
+            isAvailable = true,
+            supportsHttp3 = false
+        )
+        assertTrue(VBTransportCurl.nativeStatus.linked)
+        assertFalse(VBTransportCurl.nativeStatus.http3FeatureAvailable)
+
+        AndroidCurlEngineProvider.testBridge = FakeBridge(
+            isAvailable = true,
+            supportsHttp3 = true
+        )
+        assertTrue(VBTransportCurl.nativeStatus.linked)
+        assertTrue(VBTransportCurl.nativeStatus.http3FeatureAvailable)
     }
 
     @Test

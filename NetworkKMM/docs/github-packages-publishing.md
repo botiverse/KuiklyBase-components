@@ -22,6 +22,7 @@ The verified Maven artifact IDs are:
 ```text
 com.tencent.kuiklybase:network
 com.tencent.kuiklybase:network-android
+com.tencent.kuiklybase:network-android-curl-runtime
 com.tencent.kuiklybase:network-iosx64
 com.tencent.kuiklybase:network-iosarm64
 com.tencent.kuiklybase:network-iossimulatorarm64
@@ -31,6 +32,14 @@ com.tencent.kuiklybase:network-ohos-runtime-gradle-plugin
 ```
 
 `network-android` publishes both release and debug AAR variants because the module currently calls `publishLibraryVariants("release", "debug")`. `network-ohosarm64` also publishes the generated cinterop KLIB.
+`network-android-curl-runtime` is a payload-only, opt-in release AAR containing exactly:
+
+```text
+jni/arm64-v8a/libnetworkkmmcurl.so
+jni/x86_64/libnetworkkmmcurl.so
+```
+
+The normal `network-android` AAR intentionally remains zero-so.
 `network-ohos-runtime` is a zip artifact that contains the HarmonyOS runtime libraries:
 
 ```text
@@ -44,6 +53,16 @@ Consumers should depend on the root artifact and let Gradle metadata select the 
 ```kotlin
 implementation("com.tencent.kuiklybase:network:0.1.0-raft.0")
 ```
+
+Android apps that intentionally select the curl engine must also add the
+matching native runtime version explicitly:
+
+```kotlin
+implementation("com.tencent.kuiklybase:network-android-curl-runtime:0.1.0-raft.28")
+```
+
+Keep both versions identical. Omitting this coordinate preserves the existing
+OkHttp default and makes `VBTransportCurl.nativeStatus.linked` false.
 
 HarmonyOS apps still need these native runtime libraries in the app entry module. The Maven/KLIB publication provides the Kotlin artifact; the Gradle plugin resolves `network-ohos-runtime` and copies the `.so` files into `entry/libs/arm64-v8a/`.
 
@@ -201,6 +220,7 @@ By default the script publishes these tasks:
 
 ```text
 :network:publishAndroidPublicationToGithubPackagesRepository
+:network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository
 :network:publishIosX64PublicationToGithubPackagesRepository
 :network:publishIosArm64PublicationToGithubPackagesRepository
 :network:publishIosSimulatorArm64PublicationToGithubPackagesRepository
@@ -211,6 +231,11 @@ By default the script publishes these tasks:
 ```
 
 The script checks which publish tasks exist on the current host before invoking Gradle. On Linux/HarmonyOS hosts, Kotlin/Native does not create iOS publish tasks, so the script skips them unless `NETWORK_REQUIRE_TASKS=true` is set. Use `NETWORK_DRY_RUN=true` to validate task selection without uploading artifacts.
+
+Before publishing the Android curl runtime, the script assembles both Android
+AARs and runs `scripts/verify-android-curl-runtime-aar.sh`. The gate proves the
+normal AAR has zero native libraries, the runtime AAR has only the two expected
+ABIs, and each packaged byte stream equals the committed source `.so`.
 
 The root `kotlinMultiplatform` metadata publication is intentionally last in the default task list. If a target publication, runtime artifact, or plugin publication fails, consumers will not see new metadata that points at incomplete artifacts.
 
@@ -244,7 +269,7 @@ Or run **Publish NetworkKMM to GitHub Packages** from GitHub Actions and optiona
 
 The workflow splits publishing by host:
 
-- The Linux job uses `ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280`, matching the HarmonyOS command-line tools used by `bytemain/soduku-harmony`. It publishes Android, OHOS, OHOS runtime, and the Gradle plugin.
+- The Linux jobs use `ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280`, matching the HarmonyOS command-line tools used by `bytemain/soduku-harmony`. They publish Android (including the separately probed curl runtime), OHOS, OHOS runtime, and the Gradle plugin.
 - The Linux job maps the image-provided `OHOS_BASE_SDK_HOME` to `OHOS_SDK_HOME`, `OHOS_NDK_HOME`, `OHOS_LLVM_HOME`, and DevEco SDK variables so Kotlin/Native can find the HarmonyOS sysroot during `ohosArm64` cinterop.
 - The macOS iOS job runs in parallel with the Linux job and publishes the iOS KLIB artifacts.
 - The macOS metadata job runs after the platform jobs succeed and publishes the root `kotlinMultiplatform` metadata publication.

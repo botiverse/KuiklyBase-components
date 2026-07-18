@@ -31,6 +31,7 @@ rootProject.name = "NetworkKMM"
 // via buildFileName.
 include(":androidApp")
 include(":network")
+include(":network-android-curl-runtime")
 if (gradle.startParameter.projectProperties.containsKey("androidCurlSpike")) {
     include(":android-curl-spike")
     project(":android-curl-spike").projectDir = file("spikes/android-curl")

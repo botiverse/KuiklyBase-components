@@ -241,7 +241,7 @@ val client = NetworkClient(
 `httpDnsEnabled` 会以 `HTTPDNS_UNSUPPORTED` 使 curl ineligible。
 
 HTTP/3 是 native curl 的显式灰度 gate。当前 Android、iOS、OHOS curl 产物使用 curl 8.16.0、
-OpenSSL 3.5.4 QUIC 和 nghttp3 1.17.0；只能在已验证的 curl runtime 配置中开启：
+OpenSSL 3.5.4 QUIC 和 nghttp3 1.17.0；已有调用方可以继续用已验证 curl runtime 配置作为进程默认值：
 
 ```kotlin
 VBTransportCurl.configure(
@@ -253,16 +253,34 @@ VBTransportCurl.configure(
 )
 ```
 
+运行时 Settings 开关应优先写入请求自身，避免已复制或进行中的请求观察到后续全局切换：
+
+```kotlin
+val native = VBTransportCurl.nativeStatus
+val request = NetworkRequest(url = endpoint)
+    .setCurlHttp3Enabled(settingsHttp3Enabled)
+```
+
+该 override 支持 OHOS platform-default trust，并优先于
+`NetworkCurlRuntimeConfiguration.http3Enabled`；它本身不会选择 curl。
+`native.linked`、`native.http3FeatureAvailable`、
+`NetworkEngineExecutionDiagnostics.http3Requested`、`NetworkResponse.protocol`
+分别表示产物/ABI 存在、编译 H3 能力、单次请求意图、真实协商协议，不能互相替代。
+
 `http3Enabled = false` 仍是默认值，请求固定走 TLS 上的 h2，并保留 h1.1 回退。显式 h3 请求使用
 `CURL_HTTP_VERSION_3` 而不是 `3ONLY`，因此服务端或网络不支持 QUIC 时会无感回退 h2/h1.1。
 默认流量与 h3 灰度流量使用独立 native 连接池，已有 h3 连接不能通过复用把后续默认请求静默升级。
 `NetworkResponse.protocol` 返回真实协商结果（`HTTP_3`、`HTTP_2` 等）。runtime eligibility 读取链接
 产物的 `CURL_VERSION_HTTP3` feature bit，而不是只看 libcurl 版本号；旧产物会在 native I/O 前以
 `HTTP3_UNSUPPORTED` fail closed。Android/iOS 默认 engine 仍分别是 OkHttp/Darwin，OHOS 仍默认消费 curl。
+Android 真正选择 curl 还必须显式依赖同版本
+`com.tencent.kuiklybase:network-android-curl-runtime`；普通 NetworkKMM Android AAR 仍不含任何 `.so`。
 
 `NetworkEngineCapabilities.httpDns/http3` 会报告同一 runtime 事实。
 
 `NetworkEngineSelectionDiagnostics.capabilities` 描述的是**实际选中的 engine**，不是请求但未命中的 engine。
+宿主如需把选择结果关联到自己的配置快照，可写入
+`NetworkEngineSelection.hostSelectionTag`；diagnostics 只原样回传，routing 不解释也不参与选择。
 
 ## 恢复 Android 已复用但无响应头进展的 HTTP/2 连接
 

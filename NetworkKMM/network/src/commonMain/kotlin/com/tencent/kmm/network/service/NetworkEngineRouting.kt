@@ -51,7 +51,9 @@ data class NetworkEngineSelection(
     val allowedEngines: Set<NetworkTransportEngine> = NetworkTransportEngine.entries.toSet(),
     val forcePlatformDefault: Boolean = false,
     val externalValueValid: Boolean = true,
-    val rollout: NetworkEngineRolloutDiagnostics? = null
+    val rollout: NetworkEngineRolloutDiagnostics? = null,
+    /** Opaque host correlation only; never participates in engine selection. */
+    val hostSelectionTag: String? = null
 ) {
     companion object {
         /**
@@ -172,7 +174,9 @@ data class NetworkEngineSelectionDiagnostics(
     val capabilities: NetworkEngineCapabilities,
     val unavailableReason: NetworkEngineUnavailableReason? = null,
     val unavailableDetail: String? = null,
-    val rollout: NetworkEngineRolloutDiagnostics? = null
+    val rollout: NetworkEngineRolloutDiagnostics? = null,
+    /** Opaque host correlation copied from [NetworkEngineSelection]. */
+    val hostSelectionTag: String? = null
 )
 
 data class NetworkEngineExecutionDiagnostics(
@@ -180,7 +184,9 @@ data class NetworkEngineExecutionDiagnostics(
     val statusCode: Int?,
     val errorKind: NetworkErrorKind?,
     val timing: VBTransportElapseStatistics,
-    val negotiatedProtocol: NetworkHttpProtocol = NetworkHttpProtocol.UNKNOWN
+    val negotiatedProtocol: NetworkHttpProtocol = NetworkHttpProtocol.UNKNOWN,
+    /** Effective per-request curl H3 request, distinct from negotiated protocol. */
+    val http3Requested: Boolean? = null
 )
 
 /** Diagnostics callbacks run on the request dispatcher and must stay non-blocking. */
@@ -258,7 +264,9 @@ internal class RoutingNetworkEngine(
                     statusCode = response.statusCode,
                     errorKind = response.error?.kind,
                     timing = response.timing.copy(),
-                    negotiatedProtocol = response.protocol
+                    negotiatedProtocol = response.protocol,
+                    http3Requested = preparedCurlHttp3Requested(response.request)
+                        ?: response.request.curlHttp3EnabledOverride
                 )
             )
         }
@@ -344,7 +352,8 @@ internal fun resolveNetworkEngine(
             capabilities = delegate.capabilities,
             unavailableReason = unavailableReason,
             unavailableDetail = unavailableDetail,
-            rollout = selection.rollout
+            rollout = selection.rollout,
+            hostSelectionTag = selection.hostSelectionTag
         )
     )
 }

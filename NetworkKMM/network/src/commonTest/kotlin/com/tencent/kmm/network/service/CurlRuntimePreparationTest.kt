@@ -77,6 +77,54 @@ class CurlRuntimePreparationTest {
     }
 
     @Test
+    fun verifiedPlatformDefaultAcceptsPerRequestHttp3Override() {
+        val request = NetworkRequest(url = "https://example.com/api")
+            .setCurlHttp3Enabled(true)
+
+        val availability = prepareCurlRuntime(
+            request = request,
+            platformDefaultTrust = verifiedDefault,
+            nativeHttp3Supported = true
+        )
+
+        assertTrue(availability.available)
+        assertTrue(preparedCurlHttp3Enabled(request))
+        assertEquals(true, preparedCurlHttp3Requested(request))
+        assertEquals(CURL_RUNTIME_TRUST_PLATFORM_DEFAULT, preparedCurlTrustSource(request))
+    }
+
+    @Test
+    fun verifiedPlatformDefaultHttp3OverrideFailsClosedWithoutNativeFeature() {
+        val request = NetworkRequest(url = "https://example.com/api")
+            .setCurlHttp3Enabled(true)
+
+        val availability = prepareCurlRuntime(
+            request = request,
+            platformDefaultTrust = verifiedDefault,
+            nativeHttp3Supported = false
+        )
+
+        assertFalse(availability.available)
+        assertEquals(NetworkEngineUnavailableReason.HTTP3_UNSUPPORTED, availability.reason)
+        assertEquals(true, preparedCurlHttp3Requested(request))
+        assertNull(preparedCurlTrustSource(request))
+    }
+
+    @Test
+    fun requestCopyKeepsItsOwnHttp3Snapshot() {
+        val original = NetworkRequest(url = "https://example.com/api")
+            .setCurlHttp3Enabled(true)
+        val inFlightCopy = original.copyMutable()
+        original.setCurlHttp3Enabled(false)
+
+        assertTrue(prepareCurlRuntime(inFlightCopy, verifiedDefault, nativeHttp3Supported = true).available)
+        assertTrue(prepareCurlRuntime(original, verifiedDefault, nativeHttp3Supported = true).available)
+
+        assertTrue(preparedCurlHttp3Enabled(inFlightCopy))
+        assertFalse(preparedCurlHttp3Enabled(original))
+    }
+
+    @Test
     fun unconfiguredStaysGatedWithoutVerifiedPlatformDefault() {
         val request = NetworkRequest(url = "https://example.com/api")
 

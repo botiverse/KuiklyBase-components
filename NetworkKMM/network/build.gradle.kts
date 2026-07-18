@@ -174,6 +174,7 @@ kotlin {
                 kotlin.srcDir("src/iosMain/kotlin")
                 kotlin.srcDir("src/darwinBehaviorMain/kotlin")
                 kotlin.exclude("com/tencent/kmm/network/export/VBTransportIosCurl.kt")
+                kotlin.exclude("com/tencent/kmm/network/export/NetworkCurlNativeStatus.ios.kt")
                 kotlin.exclude("com/tencent/kmm/network/internal/platform/IosCurlNativeBridge.kt")
                 kotlin.exclude("com/tencent/kmm/network/internal/platform/IosCurlNetworkEngine.kt")
                 kotlin.exclude("com/tencent/kmm/network/internal/platform/PlatformNetworkEngines.ios.kt")

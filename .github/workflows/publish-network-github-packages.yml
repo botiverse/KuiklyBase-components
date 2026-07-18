@@ -44,9 +44,9 @@ jobs:
       NETWORK_SETTINGS_FILE: settings.ohos.gradle.kts
       NETWORK_PUBLISH_TASKS: >-
         :network:publishOhosArm64PublicationToGithubPackagesRepository
-        :network:publishKotlinMultiplatformPublicationToGithubPackagesRepository
         :network-ohos-runtime:publishAllPublicationsToGithubPackagesRepository
         :network-ohos-runtime-gradle-plugin:publishAllPublicationsToGithubPackagesRepository
+        :network:publishKotlinMultiplatformPublicationToGithubPackagesRepository
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -274,19 +274,28 @@ jobs:
       NETWORK_REQUIRE_TASKS: "true"
       NETWORK_PUBLISH_TASKS: >-
         :network:publishAndroidPublicationToGithubPackagesRepository
+        :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Resolve publish inputs
         shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
         run: |
           set -euo pipefail
-          if [[ -n "${INPUT_VERSION:-}" ]]; then
-            echo "MAVEN_VERSION=$INPUT_VERSION" >> "$GITHUB_ENV"
+          project_version="$(sed -n 's/^mavenVersion=//p' NetworkKMM/gradle.properties | tail -n 1)"
+          if [[ -n "${REQUESTED_VERSION:-}" ]]; then
+            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == network-v* ]]; then
+            tag_version="${GITHUB_REF_NAME#network-v}"
+            if [[ "$project_version" != "$tag_version" ]]; then
+              echo "Tag version $tag_version does not match NetworkKMM mavenVersion $project_version." >&2
+              exit 1
+            fi
+            echo "MAVEN_VERSION=$tag_version" >> "$GITHUB_ENV"
           fi
-        env:
-          INPUT_VERSION: ${{ inputs.version }}
 
       - name: Check existing NetworkKMM version
         id: check_version
@@ -305,11 +314,32 @@ jobs:
           if [[ -z "$MAVEN_VERSION" ]]; then
             exit 0
           fi
-          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-android/$MAVEN_VERSION/network-android-$MAVEN_VERSION.aar"
-          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
-            echo "NetworkKMM version $MAVEN_VERSION (android aar) already exists; skipping publish."
+          normal_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-android/$MAVEN_VERSION/network-android-$MAVEN_VERSION.aar"
+          runtime_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-android-curl-runtime/$MAVEN_VERSION/network-android-curl-runtime-$MAVEN_VERSION.aar"
+          normal_exists=false
+          runtime_exists=false
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$normal_url" -o /dev/null; then
+            normal_exists=true
+          fi
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$runtime_url" -o /dev/null; then
+            runtime_exists=true
+          fi
+
+          missing_tasks=()
+          if [[ "$normal_exists" != "true" ]]; then
+            missing_tasks+=(":network:publishAndroidPublicationToGithubPackagesRepository")
+          fi
+          if [[ "$runtime_exists" != "true" ]]; then
+            missing_tasks+=(":network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository")
+          fi
+
+          if (( ${#missing_tasks[@]} == 0 )); then
+            echo "NetworkKMM version $MAVEN_VERSION (Android AAR + curl runtime AAR) already exists; skipping publish."
             echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
             echo "skipped=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "NETWORK_PUBLISH_TASKS=${missing_tasks[*]}" >> "$GITHUB_ENV"
+            echo "Android artifacts missing for $MAVEN_VERSION: ${missing_tasks[*]}"
           fi
 
       - name: Publish NetworkKMM Android publication

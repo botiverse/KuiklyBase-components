@@ -255,8 +255,8 @@ is no SNI-safe custom resolver contract; setting `httpDnsEnabled` makes curl ine
 `HTTPDNS_UNSUPPORTED`.
 
 HTTP/3 is an explicit native curl gray gate. The current Android, iOS, and OHOS curl artifacts build
-curl 8.16.0 with OpenSSL 3.5.4 QUIC and nghttp3 1.17.0. Enable it only in the verified curl runtime
-configuration:
+curl 8.16.0 with OpenSSL 3.5.4 QUIC and nghttp3 1.17.0. Existing consumers can keep the process-wide
+default in the verified curl runtime configuration:
 
 ```kotlin
 VBTransportCurl.configure(
@@ -268,6 +268,22 @@ VBTransportCurl.configure(
 )
 ```
 
+For a runtime Settings toggle, prefer the request-owned override so a copied or
+in-flight request cannot observe a later global change:
+
+```kotlin
+val native = VBTransportCurl.nativeStatus
+val request = NetworkRequest(url = endpoint)
+    .setCurlHttp3Enabled(settingsHttp3Enabled)
+```
+
+The override works with OHOS platform-default trust and wins over
+`NetworkCurlRuntimeConfiguration.http3Enabled`. It does not select curl by
+itself. `native.linked`, `native.http3FeatureAvailable`,
+`NetworkEngineExecutionDiagnostics.http3Requested`, and
+`NetworkResponse.protocol` are four different facts: payload/ABI presence,
+compiled H3 capability, request intent, and actual negotiated protocol.
+
 `http3Enabled = false` remains the default and pins requests to h2-over-TLS with h1.1 fallback.
 Explicit h3 requests use `CURL_HTTP_VERSION_3`, not `3ONLY`, so a server or network without QUIC falls
 back to h2/h1.1. Default and h3 traffic use separate native connection pools; a live gray h3 connection
@@ -275,11 +291,17 @@ cannot silently upgrade a later default request. `NetworkResponse.protocol` repo
 (`HTTP_3`, `HTTP_2`, and so on). Runtime eligibility is based on `CURL_VERSION_HTTP3` from the linked
 artifact, not the libcurl version string; a stale artifact fails with `HTTP3_UNSUPPORTED` before native
 I/O. Android and iOS still select OkHttp/Darwin by default, while OHOS remains the default curl consumer.
+Android curl selection also requires the matching opt-in
+`com.tencent.kuiklybase:network-android-curl-runtime` dependency; the normal
+NetworkKMM Android AAR intentionally contains no `.so` files.
 
 `NetworkEngineCapabilities` reports the same runtime truth through `httpDns` and `http3`.
 
 `NetworkEngineSelectionDiagnostics.capabilities` always describes the engine that was actually
 selected, not the requested engine.
+Hosts that need to correlate a selection with their own config snapshot can
+set `NetworkEngineSelection.hostSelectionTag`; diagnostics copy it unchanged
+and routing never interprets it.
 
 ## Recover a stalled reused Android HTTP/2 connection
 
