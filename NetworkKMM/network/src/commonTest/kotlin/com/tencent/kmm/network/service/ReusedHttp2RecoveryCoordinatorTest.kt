@@ -350,6 +350,63 @@ class ReusedHttp2RecoveryCoordinatorTest {
         assertTrue(dead.deadClientGeneration == 1L)
     }
 
+    // PR #100 review round 3 (global cohort scope): the retired generation is
+    // process-wide, so a DIFFERENT origin still on the retired generation cannot
+    // fire a second global rollover; a higher generation on any origin still can.
+    @Test
+    fun otherOriginInRetiredGenerationCannotSecondDeclareButNewGenerationCan() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(
+            ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 0L)
+        )
+        coordinator.started(1L, 2L, 3L, 4L, 5L, 6L)
+
+        coordinator.onStallFact(fact(id = 1, origin = "a.example.com:443", connectionId = 7L), nowMillis = 0)
+        assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+            coordinator.onStallFact(fact(id = 2, origin = "a.example.com:443", connectionId = 7L), nowMillis = 10)
+        )
+        // Origin B still on the retired gen0 is rejected by the global watermark.
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(
+            coordinator.onStallFact(fact(id = 3, origin = "b.example.com:443", connectionId = 8L), nowMillis = 11)
+        )
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(
+            coordinator.onStallFact(fact(id = 4, origin = "b.example.com:443", connectionId = 8L), nowMillis = 12)
+        )
+        // Origin B on gen1 (above the watermark) can still declare.
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(
+            coordinator.onStallFact(fact(id = 5, origin = "b.example.com:443", generation = 1L, connectionId = 9L), nowMillis = 13)
+        )
+        val dead = assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+            coordinator.onStallFact(fact(id = 6, origin = "b.example.com:443", generation = 1L, connectionId = 9L), nowMillis = 14)
+        )
+        assertEquals(setOf(5L, 6L), dead.stalledRequestIds)
+    }
+
+    // PR #100 review round 3: a stale fact at (or below) the retired generation
+    // must not evict an attempt's live membership on a newer generation.
+    @Test
+    fun staleFactAtRetiredGenerationDoesNotEvictLiveNewerMembership() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(
+            ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 0L)
+        )
+        coordinator.started(1L, 2L, 3L)
+
+        coordinator.onStallFact(fact(id = 1, generation = 0L, connectionId = 7L), nowMillis = 0)
+        assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+            coordinator.onStallFact(fact(id = 2, generation = 0L, connectionId = 7L), nowMillis = 10)
+        )
+
+        // Attempt 3 is live on gen1.
+        coordinator.onStallFact(fact(id = 3, generation = 1L, connectionId = 9L), nowMillis = 11)
+        assertEquals(1, coordinator.liveStalledCount(origin, 1L, 9L))
+
+        // A stale gen0 late fact for attempt 3 is rejected AND must not disturb
+        // its live gen1 membership.
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(
+            coordinator.onStallFact(fact(id = 3, generation = 0L, connectionId = 7L), nowMillis = 12)
+        )
+        assertEquals(1, coordinator.liveStalledCount(origin, 1L, 9L))
+    }
+
     @Test
     fun attemptReboundToNewGenerationIsNotDoubleCounted() {
         val coordinator = ReusedHttp2RecoveryCoordinator(
@@ -395,5 +452,17 @@ class ReusedHttp2RecoveryCoordinatorTest {
             }
             assertTrue(threw, "quorum $invalid must be rejected")
         }
+    }
+
+    // "at most one fresh attempt" — the bound must reject values above 1.
+    @Test
+    fun configRejectsMaxFreshAttemptsAboveOne() {
+        var threw = false
+        try {
+            ReusedHttp2RecoveryConfig(maxFreshAttemptsPerRequest = 2)
+        } catch (e: IllegalArgumentException) {
+            threw = true
+        }
+        assertTrue(threw)
     }
 }

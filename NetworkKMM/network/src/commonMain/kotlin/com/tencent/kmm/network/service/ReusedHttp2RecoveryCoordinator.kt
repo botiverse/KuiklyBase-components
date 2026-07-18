@@ -20,7 +20,8 @@ import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
 
 /**
- * task #49 — shared quorum state machine for OHOS reused-HTTP/2 "no response
+ * task #49 — shared quorum state machine for the curl-lane (Android/iOS/OHOS)
+ * reused-HTTP/2 "no response
  * headers" recovery. This is the Kotlin/Native contract half of the recovery:
  * the native curl wrapper reports raw [ReusedHttp2StallFact]s (a reused-H2
  * transfer that has made no progress towards response headers past the
@@ -57,14 +58,15 @@ import kotlinx.atomicfu.locks.synchronized
  *   attempt fail-closed rather than leaving it counted;
  * - an attempt that settles/cancels is evicted immediately and fenced, so it
  *   can never contribute to a later quorum;
- * - declaring dead is once-per-origin-generation: because the downstream action
- *   is an origin/generation rollover (not a single-connection close), the first
- *   declaration retires that `(originId, clientGeneration)` and every later fact
- *   at or below it — a not-yet-quorum stream on the dead connection, or a
- *   sibling connection in the same generation — is rejected, so no second
- *   rollover fires before the routing layer settles the affected attempts; a
- *   genuine retry re-enters on a higher generation;
- * - `enabled` defaults to false: this is the `ohos_reused_h2_recovery_v0`
+ * - declaring dead is once-per-generation, process-wide: the curl connection
+ *   shares are process-level and cross-origin and a declaration rolls both
+ *   global cohorts together, so the first declaration advances a single global
+ *   retired high-watermark, and every later fact at or below it — a not-yet-
+ *   quorum stream on the dead connection, a sibling connection in the same
+ *   generation, or another origin still on that generation — is rejected, so no
+ *   second rollover fires before the routing layer settles the affected
+ *   attempts; a genuine retry re-enters on a higher generation;
+ * - `enabled` defaults to false: this is the `curl_reused_h2_recovery_v0`
  *   rollout latch and stays off until device calibration proves the watchdog
  *   threshold and that `CURLINFO_CONN_ID` truthfully populates.
  *
@@ -93,15 +95,16 @@ internal class ReusedHttp2RecoveryCoordinator(
     private val originBreakerUntil = mutableMapOf<String, Long>()
 
     /**
-     * Highest client generation already declared dead per origin. Declaring a
-     * connection dead retires the whole origin/generation (the downstream action
-     * is a generation rollover, not a single-connection close), so any later
-     * fact at or below the retired generation — a not-yet-quorum stream on the
-     * same connection, or another connection in the same generation — must not
-     * declare that generation dead a second time. One entry per origin (a max),
-     * so no unbounded dead-key set and no separate pruning.
+     * Highest client generation already declared dead, process-wide. The curl
+     * default and H3 connection shares are process-level and cross-origin, and a
+     * declaration rolls both global cohorts together, so retirement is a single
+     * global high-watermark — not per-origin. Any later fact at or below it — a
+     * not-yet-quorum stream on the dead connection, a sibling connection in the
+     * same generation, or another origin still on that generation — must not
+     * fire a second rollover. `null` until the first declaration; a single Long,
+     * so no unbounded dead-key set and no pruning.
      */
-    private val retiredGenerationByOrigin = mutableMapOf<String, Long>()
+    private var maxRetiredClientGeneration: Long? = null
 
     /**
      * Register an attempt as active when the routing layer dispatches it.
@@ -160,6 +163,20 @@ internal class ReusedHttp2RecoveryCoordinator(
                 return@synchronized ReusedHttp2QuorumOutcome.NoAction
             }
 
+            // Global retired-generation fence, placed BEFORE the rebound eviction
+            // so a stale old-generation late fact can never evict a valid
+            // membership on a live newer generation. A fact at or below the
+            // process-wide retired high-watermark declares nothing; it only
+            // clears the attempt's own membership when that membership is itself
+            // on a retired generation.
+            val retired = maxRetiredClientGeneration
+            if (retired != null && fact.clientGeneration <= retired) {
+                if (priorKey != null && priorKey.clientGeneration <= retired) {
+                    evictFromConnection(fact.transportRequestId, priorKey)
+                }
+                return@synchronized ReusedHttp2QuorumOutcome.NoAction
+            }
+
             // If this attempt was previously counted under a different key (its
             // connection was rebound to a new generation, or curl reused the
             // integer id in a fresh cache), drop the stale membership FIRST and
@@ -167,16 +184,6 @@ internal class ReusedHttp2RecoveryCoordinator(
             // attempt is only ever counted once, on its current connection.
             if (priorKey != null && priorKey != currentKey) {
                 evictFromConnection(fact.transportRequestId, priorKey)
-            }
-
-            // Once an origin generation has been declared dead, no fact at or
-            // below it may declare it again — independent of the churn breaker —
-            // so a not-yet-quorum stream on the dead connection, or any other
-            // connection in the retired generation, cannot fire a second
-            // rollover. A genuine retry re-enters on a higher generation.
-            val retiredGeneration = retiredGenerationByOrigin[fact.originId]
-            if (retiredGeneration != null && fact.clientGeneration <= retiredGeneration) {
-                return@synchronized ReusedHttp2QuorumOutcome.NoAction
             }
 
             // Churn breaker only gates registration/death on this origin; it must
@@ -195,21 +202,19 @@ internal class ReusedHttp2RecoveryCoordinator(
 
             if (set.size >= config.minimumConcurrentStalledRequests) {
                 val stalled = set.toSet()
-                // Retire the whole origin generation once (the downstream action
-                // is an origin/generation rollover, not a single-connection
-                // close). Mark it retired and drop ALL stalled membership +
-                // reverse index for this origin at or below the retired
-                // generation — this connection AND any sibling connection in the
-                // same generation — so neither can declare a second rollover.
-                // Active attempts are left for the routing layer to settle; we
-                // never fabricate completion here.
-                val retiredGeneration = retiredGenerationByOrigin[fact.originId]
+                // Retire the whole generation once, process-wide (a declaration
+                // rolls both global cohorts together, across origins). Advance
+                // the global high-watermark and drop ALL stalled membership +
+                // reverse index at or below it — this connection, any sibling
+                // connection in the generation, and any other origin still on it
+                // — so none can declare a second rollover. Active attempts are
+                // left for the routing layer to settle; we never fabricate
+                // completion here.
+                val retiredNow = maxRetiredClientGeneration
                     ?.let { maxOf(it, fact.clientGeneration) }
                     ?: fact.clientGeneration
-                retiredGenerationByOrigin[fact.originId] = retiredGeneration
-                val retiredKeys = stalledByConnection.keys.filter {
-                    it.originId == fact.originId && it.clientGeneration <= retiredGeneration
-                }
+                maxRetiredClientGeneration = retiredNow
+                val retiredKeys = stalledByConnection.keys.filter { it.clientGeneration <= retiredNow }
                 for (retiredKey in retiredKeys) {
                     stalledByConnection.remove(retiredKey)?.forEach { keyByAttempt.remove(it) }
                 }
@@ -319,11 +324,11 @@ internal sealed interface ReusedHttp2QuorumOutcome {
 /**
  * Rollout + threshold configuration, mirroring the Android
  * `VBTransportReusedHttp2Recovery` shape (task #587 / raft.25) but adapted to
- * the OHOS curl lane: no OkHttp shard/ping fields, plus a per-origin churn
+ * the curl lane (Android/iOS/OHOS): no OkHttp shard/ping fields, plus a per-origin churn
  * breaker and a one-fresh-attempt bound.
  */
 internal data class ReusedHttp2RecoveryConfig(
-    /** `ohos_reused_h2_recovery_v0` latch; stays false until device calibration. */
+    /** `curl_reused_h2_recovery_v0` latch; stays false until device calibration. */
     val enabled: Boolean = false,
     /** No-response-headers interval the native watchdog samples (device-calibrated). */
     val responseHeadersWatchdogMillis: Long = 7_000L,
@@ -346,8 +351,8 @@ internal data class ReusedHttp2RecoveryConfig(
         require(churnBreakerWindowMillis >= 0L) {
             "churnBreakerWindowMillis must be non-negative"
         }
-        require(maxFreshAttemptsPerRequest >= 0) {
-            "maxFreshAttemptsPerRequest must be non-negative"
+        require(maxFreshAttemptsPerRequest in 0..1) {
+            "maxFreshAttemptsPerRequest must be 0 or 1"
         }
     }
 }
