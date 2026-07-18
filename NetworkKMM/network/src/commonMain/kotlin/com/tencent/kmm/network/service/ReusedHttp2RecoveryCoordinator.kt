@@ -151,29 +151,33 @@ internal class ReusedHttp2RecoveryCoordinator(
             val currentKey = PhysicalConnectionKey(fact.originId, fact.clientGeneration, fact.connectionId)
             val priorKey = keyByAttempt[fact.transportRequestId]
 
-            // v0 predicate is the conjunction reused-candidate AND actual H2 AND
-            // awaiting-headers, re-verified here fail-closed. An attempt whose
-            // LATEST fact is ineligible has left the recoverable population, so
-            // it must be evicted rather than left counted on a stale key.
-            val eligible = fact.phase == ReusedHttp2StallPhase.AWAITING_HEADERS &&
-                fact.negotiatedHttp2 &&
-                fact.reusedConnectionCandidate
-            if (!eligible) {
-                if (priorKey != null) evictFromConnection(fact.transportRequestId, priorKey)
-                return@synchronized ReusedHttp2QuorumOutcome.NoAction
-            }
-
-            // Global retired-generation fence, placed BEFORE the rebound eviction
-            // so a stale old-generation late fact can never evict a valid
-            // membership on a live newer generation. A fact at or below the
-            // process-wide retired high-watermark declares nothing; it only
-            // clears the attempt's own membership when that membership is itself
-            // on a retired generation.
+            // Global retired-generation fence, placed BEFORE the eligibility
+            // predicate AND the rebound eviction: a fact at or below the
+            // process-wide retired high-watermark — eligible OR ineligible — is
+            // on a dead generation, declares nothing, and must never disturb a
+            // live newer-generation membership (an ineligible stale fact must not
+            // slip past into the unconditional eviction below). It only clears
+            // the attempt's own membership when that membership is itself at or
+            // below the watermark.
             val retired = maxRetiredClientGeneration
             if (retired != null && fact.clientGeneration <= retired) {
                 if (priorKey != null && priorKey.clientGeneration <= retired) {
                     evictFromConnection(fact.transportRequestId, priorKey)
                 }
+                return@synchronized ReusedHttp2QuorumOutcome.NoAction
+            }
+
+            // v0 predicate is the conjunction reused-candidate AND actual H2 AND
+            // awaiting-headers, re-verified here fail-closed. An attempt whose
+            // LATEST fact is ineligible has left the recoverable population, so
+            // it must be evicted rather than left counted on a stale key. This is
+            // reached only for facts above the retired watermark, so the eviction
+            // acts on a live-generation membership.
+            val eligible = fact.phase == ReusedHttp2StallPhase.AWAITING_HEADERS &&
+                fact.negotiatedHttp2 &&
+                fact.reusedConnectionCandidate
+            if (!eligible) {
+                if (priorKey != null) evictFromConnection(fact.transportRequestId, priorKey)
                 return@synchronized ReusedHttp2QuorumOutcome.NoAction
             }
 

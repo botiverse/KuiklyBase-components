@@ -407,6 +407,45 @@ class ReusedHttp2RecoveryCoordinatorTest {
         assertEquals(1, coordinator.liveStalledCount(origin, 1L, 9L))
     }
 
+    // PR #100 review round 3 final: a stale fact at the retired generation that
+    // is ALSO ineligible must be caught by the fence BEFORE the unconditional
+    // ineligible eviction, or it drops a live newer-generation membership and a
+    // real quorum is missed. Covers all three ineligible transition types.
+    @Test
+    fun ineligibleStaleFactAtRetiredGenerationDoesNotEvictLiveNewerMembership() {
+        val ineligibleStaleFacts = listOf(
+            fact(id = 3, generation = 0L, connectionId = 7L, phase = ReusedHttp2StallPhase.MID_BODY),
+            fact(id = 3, generation = 0L, connectionId = 7L, http2 = false),
+            fact(id = 3, generation = 0L, connectionId = 7L, reused = false)
+        )
+        for (stale in ineligibleStaleFacts) {
+            val coordinator = ReusedHttp2RecoveryCoordinator(
+                ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 0L)
+            )
+            coordinator.started(1L, 2L, 3L, 4L)
+
+            coordinator.onStallFact(fact(id = 1, generation = 0L, connectionId = 7L), nowMillis = 0)
+            assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+                coordinator.onStallFact(fact(id = 2, generation = 0L, connectionId = 7L), nowMillis = 10)
+            )
+
+            // token3 live on gen1.
+            coordinator.onStallFact(fact(id = 3, generation = 1L, connectionId = 9L), nowMillis = 11)
+            assertEquals(1, coordinator.liveStalledCount(origin, 1L, 9L))
+
+            // A stale gen0 fact that is also ineligible must not evict token3's
+            // live gen1 membership.
+            assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(stale, nowMillis = 12))
+            assertEquals(1, coordinator.liveStalledCount(origin, 1L, 9L))
+
+            // The real gen1 quorum still fires.
+            val dead = assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+                coordinator.onStallFact(fact(id = 4, generation = 1L, connectionId = 9L), nowMillis = 13)
+            )
+            assertEquals(setOf(3L, 4L), dead.stalledRequestIds)
+        }
+    }
+
     @Test
     fun attemptReboundToNewGenerationIsNotDoubleCounted() {
         val coordinator = ReusedHttp2RecoveryCoordinator(
