@@ -255,10 +255,12 @@ class ReusedHttp2RecoveryCoordinatorTest {
         // Its stale gen0/conn7 membership must be gone.
         assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
 
-        // After the window a fresh attempt on the stale connection must be alone.
+        // A fresh attempt on the now-retired gen0 is rejected outright — even
+        // after the breaker window — so no stale membership can ever complete a
+        // false quorum on the dead generation.
         val outcome = coordinator.onStallFact(fact(id = 4, generation = 0L, connectionId = 7L), nowMillis = 103)
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(outcome)
-        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
     }
 
     @Test
@@ -275,10 +277,10 @@ class ReusedHttp2RecoveryCoordinatorTest {
         assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
     }
 
-    // PR #100 successor review: declaring a connection dead is once-only. With
-    // no breaker window, late facts for the just-declared quorum members must be
-    // fenced (they were terminal-fenced at declaration), or the same physical
-    // connection is declared dead a second time before routing settles them.
+    // PR #100 successor review: declaring dead is once-per-origin-generation.
+    // With no breaker window, late facts for the just-declared quorum members
+    // are on the retired generation and must be rejected, or the same generation
+    // is declared dead a second time before routing settles them.
     @Test
     fun quorumDeclarationTerminalFencesMembersAgainstLateFacts() {
         val coordinator = ReusedHttp2RecoveryCoordinator(
@@ -294,6 +296,58 @@ class ReusedHttp2RecoveryCoordinatorTest {
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 1), nowMillis = 11))
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 2), nowMillis = 12))
         assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
+    }
+
+    // PR #100 review round 3: a not-yet-quorum active stream on the SAME dead
+    // connection must not fire a second declaration even with no breaker window.
+    @Test
+    fun otherActiveStreamOnDeadConnectionCannotSecondDeclare() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(
+            ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 0L)
+        )
+        coordinator.started(1L, 2L, 3L, 4L)
+
+        coordinator.onStallFact(fact(id = 1, connectionId = 7L), nowMillis = 0)
+        assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+            coordinator.onStallFact(fact(id = 2, connectionId = 7L), nowMillis = 10)
+        )
+        // Streams 3 and 4 were live on conn7 but never reached the first quorum;
+        // the retired generation rejects them, so no second rollover fires.
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 3, connectionId = 7L), nowMillis = 11))
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 4, connectionId = 7L), nowMillis = 12))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
+    }
+
+    // PR #100 review round 3: a sibling connection in the SAME retired generation
+    // cannot fire a second rollover; a genuine higher-generation retry still can.
+    @Test
+    fun siblingConnectionInRetiredGenerationCannotSecondDeclareButNewGenerationCan() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(
+            ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 0L)
+        )
+        coordinator.started(1L, 2L, 3L, 4L, 5L, 6L)
+
+        coordinator.onStallFact(fact(id = 1, generation = 0L, connectionId = 7L), nowMillis = 0)
+        assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+            coordinator.onStallFact(fact(id = 2, generation = 0L, connectionId = 7L), nowMillis = 10)
+        )
+        // conn8 is a different connection but in the retired gen0: rejected.
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(
+            coordinator.onStallFact(fact(id = 3, generation = 0L, connectionId = 8L), nowMillis = 11)
+        )
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(
+            coordinator.onStallFact(fact(id = 4, generation = 0L, connectionId = 8L), nowMillis = 12)
+        )
+
+        // A genuine retry on gen1 (fresh tokens) is above the retired generation
+        // and can still declare its own connection dead.
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(
+            coordinator.onStallFact(fact(id = 5, generation = 1L, connectionId = 9L), nowMillis = 13)
+        )
+        val outcome = coordinator.onStallFact(fact(id = 6, generation = 1L, connectionId = 9L), nowMillis = 14)
+        val dead = assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(outcome)
+        assertEquals(setOf(5L, 6L), dead.stalledRequestIds)
+        assertTrue(dead.deadClientGeneration == 1L)
     }
 
     @Test

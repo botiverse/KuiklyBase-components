@@ -57,10 +57,13 @@ import kotlinx.atomicfu.locks.synchronized
  *   attempt fail-closed rather than leaving it counted;
  * - an attempt that settles/cancels is evicted immediately and fenced, so it
  *   can never contribute to a later quorum;
- * - declaring a connection dead is once-only: its quorum members are also
- *   terminal-fenced out of the active set in the same lock, so late facts for
- *   them cannot rebuild the set and re-declare the same connection dead before
- *   the routing layer's settle callbacks land;
+ * - declaring dead is once-per-origin-generation: because the downstream action
+ *   is an origin/generation rollover (not a single-connection close), the first
+ *   declaration retires that `(originId, clientGeneration)` and every later fact
+ *   at or below it — a not-yet-quorum stream on the dead connection, or a
+ *   sibling connection in the same generation — is rejected, so no second
+ *   rollover fires before the routing layer settles the affected attempts; a
+ *   genuine retry re-enters on a higher generation;
  * - `enabled` defaults to false: this is the `ohos_reused_h2_recovery_v0`
  *   rollout latch and stays off until device calibration proves the watchdog
  *   threshold and that `CURLINFO_CONN_ID` truthfully populates.
@@ -88,6 +91,17 @@ internal class ReusedHttp2RecoveryCoordinator(
 
     /** Per-origin churn breaker: suppress new deaths until this instant. */
     private val originBreakerUntil = mutableMapOf<String, Long>()
+
+    /**
+     * Highest client generation already declared dead per origin. Declaring a
+     * connection dead retires the whole origin/generation (the downstream action
+     * is a generation rollover, not a single-connection close), so any later
+     * fact at or below the retired generation — a not-yet-quorum stream on the
+     * same connection, or another connection in the same generation — must not
+     * declare that generation dead a second time. One entry per origin (a max),
+     * so no unbounded dead-key set and no separate pruning.
+     */
+    private val retiredGenerationByOrigin = mutableMapOf<String, Long>()
 
     /**
      * Register an attempt as active when the routing layer dispatches it.
@@ -155,6 +169,16 @@ internal class ReusedHttp2RecoveryCoordinator(
                 evictFromConnection(fact.transportRequestId, priorKey)
             }
 
+            // Once an origin generation has been declared dead, no fact at or
+            // below it may declare it again — independent of the churn breaker —
+            // so a not-yet-quorum stream on the dead connection, or any other
+            // connection in the retired generation, cannot fire a second
+            // rollover. A genuine retry re-enters on a higher generation.
+            val retiredGeneration = retiredGenerationByOrigin[fact.originId]
+            if (retiredGeneration != null && fact.clientGeneration <= retiredGeneration) {
+                return@synchronized ReusedHttp2QuorumOutcome.NoAction
+            }
+
             // Churn breaker only gates registration/death on this origin; it must
             // never preserve stale membership (handled above).
             val breakerUntil = originBreakerUntil[fact.originId]
@@ -171,18 +195,24 @@ internal class ReusedHttp2RecoveryCoordinator(
 
             if (set.size >= config.minimumConcurrentStalledRequests) {
                 val stalled = set.toSet()
-                // Evict the whole dead connection: the routing layer now owns
-                // these attempts (drain/cancel/eligible-retry) and must not have
-                // them counted again. Terminal-fence the members out of the
-                // active set in the same lock so a late fact for one of them
-                // (delivered before routing's settle callback lands) cannot
-                // rebuild the set and declare the same connection dead twice.
-                // A genuine retry re-enters as a fresh token via onAttemptStarted.
-                for (id in stalled) {
-                    keyByAttempt.remove(id)
-                    activeAttempts.remove(id)
+                // Retire the whole origin generation once (the downstream action
+                // is an origin/generation rollover, not a single-connection
+                // close). Mark it retired and drop ALL stalled membership +
+                // reverse index for this origin at or below the retired
+                // generation — this connection AND any sibling connection in the
+                // same generation — so neither can declare a second rollover.
+                // Active attempts are left for the routing layer to settle; we
+                // never fabricate completion here.
+                val retiredGeneration = retiredGenerationByOrigin[fact.originId]
+                    ?.let { maxOf(it, fact.clientGeneration) }
+                    ?: fact.clientGeneration
+                retiredGenerationByOrigin[fact.originId] = retiredGeneration
+                val retiredKeys = stalledByConnection.keys.filter {
+                    it.originId == fact.originId && it.clientGeneration <= retiredGeneration
                 }
-                stalledByConnection.remove(currentKey)
+                for (retiredKey in retiredKeys) {
+                    stalledByConnection.remove(retiredKey)?.forEach { keyByAttempt.remove(it) }
+                }
                 originBreakerUntil[fact.originId] = nowMillis + config.churnBreakerWindowMillis
                 ReusedHttp2QuorumOutcome.DeclareConnectionDead(
                     originId = fact.originId,
