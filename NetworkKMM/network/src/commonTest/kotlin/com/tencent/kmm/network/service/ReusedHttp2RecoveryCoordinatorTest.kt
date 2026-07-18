@@ -23,17 +23,20 @@ import kotlin.test.assertTrue
 
 /**
  * task #49 gate #1: deterministic proofs that quorum counts DISTINCT LIVE
- * attempts on one physical connection, that terminal/cancel evicts, and that
+ * attempts on one physical connection, that terminal/cancel evicts and fences,
+ * that a rebound/ineligible latest fact never leaves stale membership, and that
  * the frozen predicate/scope/breaker invariants hold. Each test targets a
- * single invariant a wrong implementation would violate.
+ * single invariant a wrong implementation would violate; the B1/B2/B3 tests
+ * reproduce the exact false-quorum counterexamples from the PR #100 review.
  */
 class ReusedHttp2RecoveryCoordinatorTest {
 
+    private val origin = "api.example.com:443"
     private val enabled = ReusedHttp2RecoveryConfig(enabled = true)
 
     private fun fact(
         id: Long,
-        origin: String = "api.example.com:443",
+        origin: String = this.origin,
         generation: Long = 0L,
         connectionId: Long = 7L,
         phase: ReusedHttp2StallPhase = ReusedHttp2StallPhase.AWAITING_HEADERS,
@@ -49,9 +52,14 @@ class ReusedHttp2RecoveryCoordinatorTest {
         reusedConnectionCandidate = reused
     )
 
+    private fun ReusedHttp2RecoveryCoordinator.started(vararg ids: Long) {
+        for (id in ids) onAttemptStarted(id)
+    }
+
     @Test
     fun twoDistinctLiveAttemptsOnSameConnectionReachQuorum() {
         val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(1L, 2L)
 
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 1), nowMillis = 0))
         val outcome = coordinator.onStallFact(fact(id = 2), nowMillis = 10)
@@ -65,64 +73,87 @@ class ReusedHttp2RecoveryCoordinatorTest {
     @Test
     fun repeatedFactFromOneAttemptNeverReachesQuorum() {
         val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(1L)
 
-        // A single flapping request re-reporting must be idempotent: the live
-        // set stays size 1 no matter how many facts arrive.
         repeat(5) { i ->
             assertIs<ReusedHttp2QuorumOutcome.NoAction>(
                 coordinator.onStallFact(fact(id = 1), nowMillis = i.toLong())
             )
         }
-        assertEquals(1, coordinator.liveStalledCount("api.example.com:443", 0L, 7L))
+        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
+    }
+
+    @Test
+    fun factForNeverStartedAttemptIsFenced() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        // No onAttemptStarted: a fact for an unknown attempt is rejected fail-closed.
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 1), nowMillis = 0))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
     }
 
     @Test
     fun settledAttemptIsEvictedBeforeQuorum() {
         val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(1L, 2L)
 
         coordinator.onStallFact(fact(id = 1), nowMillis = 0)
         coordinator.onAttemptSettled(transportRequestId = 1)
-        // Attempt 1 no longer counts, so attempt 2 alone must not reach quorum.
         val outcome = coordinator.onStallFact(fact(id = 2), nowMillis = 10)
 
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(outcome)
-        assertEquals(1, coordinator.liveStalledCount("api.example.com:443", 0L, 7L))
+        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
+    }
+
+    // PR #100 review B3: settle/cancel wins before a queued native fact; the
+    // late fact must not resurrect the terminal attempt into a quorum.
+    @Test
+    fun settleBeforeFirstFactFencesLateFact() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(20L, 21L)
+
+        coordinator.onAttemptSettled(transportRequestId = 20) // cancelled before any fact
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 20), nowMillis = 5))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
+
+        val outcome = coordinator.onStallFact(fact(id = 21), nowMillis = 10)
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(outcome)
+        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
     }
 
     @Test
-    fun cancelledAttemptIsEvictedByTerminalSignal() {
+    fun settleAfterRegistrationFencesLateFact() {
         val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(20L, 21L)
 
-        coordinator.onStallFact(fact(id = 1), nowMillis = 0)
-        coordinator.onStallFact(fact(id = 2), nowMillis = 5).also {
-            // both live → this would have fired; consume it and reset breaker below
-            assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(it)
-        }
-        // After the death the connection set is cleared; a late cancel for an
-        // already-evicted attempt is a harmless no-op.
-        coordinator.onAttemptSettled(transportRequestId = 1)
-        assertEquals(0, coordinator.liveStalledCount("api.example.com:443", 0L, 7L))
+        coordinator.onStallFact(fact(id = 20), nowMillis = 0) // registered
+        coordinator.onAttemptSettled(transportRequestId = 20) // terminal → evict + fence
+        // A native fact delivered after the settle must be rejected, not re-added.
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 20), nowMillis = 5))
+
+        val outcome = coordinator.onStallFact(fact(id = 21), nowMillis = 10)
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(outcome)
+        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
     }
 
     @Test
     fun sameConnectionIdInDifferentGenerationIsNotTheSamePhysicalConnection() {
         val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(1L, 2L)
 
-        // CURLINFO_CONN_ID 7 means different physical connections across a
-        // generation swap: must NOT be deduplicated into one quorum set.
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(
             coordinator.onStallFact(fact(id = 1, generation = 0L, connectionId = 7L), nowMillis = 0)
         )
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(
             coordinator.onStallFact(fact(id = 2, generation = 1L, connectionId = 7L), nowMillis = 10)
         )
-        assertEquals(1, coordinator.liveStalledCount("api.example.com:443", 0L, 7L))
-        assertEquals(1, coordinator.liveStalledCount("api.example.com:443", 1L, 7L))
+        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
+        assertEquals(1, coordinator.liveStalledCount(origin, 1L, 7L))
     }
 
     @Test
     fun sameConnectionIdAcrossDifferentOriginsIsNotQuorum() {
         val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(1L, 2L)
 
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(
             coordinator.onStallFact(fact(id = 1, origin = "a.example.com:443"), nowMillis = 0)
@@ -135,25 +166,50 @@ class ReusedHttp2RecoveryCoordinatorTest {
     @Test
     fun ineligibleFactsAreRejectedAndDoNotRegister() {
         val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(1L, 2L, 3L, 4L)
 
-        // MID_BODY, non-H2, and non-reused facts must all be rejected AND leave
-        // no residual membership that a later eligible fact could complete.
         coordinator.onStallFact(fact(id = 1, phase = ReusedHttp2StallPhase.MID_BODY), nowMillis = 0)
         coordinator.onStallFact(fact(id = 2, http2 = false), nowMillis = 1)
         coordinator.onStallFact(fact(id = 3, reused = false), nowMillis = 2)
-        assertEquals(0, coordinator.liveStalledCount("api.example.com:443", 0L, 7L))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
 
         val outcome = coordinator.onStallFact(fact(id = 4), nowMillis = 3)
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(outcome)
     }
 
+    // PR #100 review B2: an ineligible LATEST fact for an already-registered
+    // attempt must evict it fail-closed, for every ineligible transition type.
+    @Test
+    fun ineligibleLatestFactEvictsPreviouslyEligibleMembership() {
+        val ineligibleTransitions = listOf(
+            fact(id = 10, phase = ReusedHttp2StallPhase.MID_BODY),
+            fact(id = 10, http2 = false),
+            fact(id = 10, reused = false)
+        )
+        for (ineligible in ineligibleTransitions) {
+            val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+            coordinator.started(10L, 11L)
+
+            coordinator.onStallFact(fact(id = 10), nowMillis = 0)
+            assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
+
+            assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(ineligible, nowMillis = 1))
+            assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
+
+            // Attempt 11 alone must not reach quorum: 10 is no longer counted.
+            val outcome = coordinator.onStallFact(fact(id = 11), nowMillis = 2)
+            assertIs<ReusedHttp2QuorumOutcome.NoAction>(outcome)
+        }
+    }
+
     @Test
     fun disabledCoordinatorNeverActs() {
         val coordinator = ReusedHttp2RecoveryCoordinator(ReusedHttp2RecoveryConfig(enabled = false))
+        coordinator.started(1L, 2L)
 
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 1), nowMillis = 0))
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 2), nowMillis = 10))
-        assertEquals(0, coordinator.liveStalledCount("api.example.com:443", 0L, 7L))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
     }
 
     @Test
@@ -161,38 +217,62 @@ class ReusedHttp2RecoveryCoordinatorTest {
         val coordinator = ReusedHttp2RecoveryCoordinator(
             ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 30_000L)
         )
+        coordinator.started(1L, 2L, 3L, 4L, 5L, 6L)
 
         coordinator.onStallFact(fact(id = 1), nowMillis = 0)
         assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
             coordinator.onStallFact(fact(id = 2), nowMillis = 100)
         )
 
-        // Within the 30s window a fresh quorum on the same origin is suppressed.
         coordinator.onStallFact(fact(id = 3, generation = 1L, connectionId = 9L), nowMillis = 1_000)
         assertIs<ReusedHttp2QuorumOutcome.NoAction>(
             coordinator.onStallFact(fact(id = 4, generation = 1L, connectionId = 9L), nowMillis = 2_000)
         )
 
-        // After the window elapses recovery re-arms.
         coordinator.onStallFact(fact(id = 5, generation = 2L, connectionId = 11L), nowMillis = 40_000)
         assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
             coordinator.onStallFact(fact(id = 6, generation = 2L, connectionId = 11L), nowMillis = 40_100)
         )
     }
 
+    // PR #100 review B1: an attempt that rebinds to a new key during the breaker
+    // window must still leave its prior physical membership, or a later attempt
+    // falsely completes a quorum on the stale connection after the window.
+    @Test
+    fun reboundDuringBreakerEvictsPriorPhysicalMembership() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(
+            ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 100L)
+        )
+        coordinator.started(1L, 2L, 3L, 4L)
+
+        coordinator.onStallFact(fact(id = 1, generation = 0L, connectionId = 7L), nowMillis = 0)
+        coordinator.onStallFact(fact(id = 2, generation = 0L, connectionId = 8L), nowMillis = 1)
+        assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+            coordinator.onStallFact(fact(id = 3, generation = 0L, connectionId = 8L), nowMillis = 2)
+        )
+        // Attempt 1 rebinds to gen1/conn9 while origin O is in the breaker window.
+        coordinator.onStallFact(fact(id = 1, generation = 1L, connectionId = 9L), nowMillis = 3)
+        // Its stale gen0/conn7 membership must be gone.
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
+
+        // After the window a fresh attempt on the stale connection must be alone.
+        val outcome = coordinator.onStallFact(fact(id = 4, generation = 0L, connectionId = 7L), nowMillis = 103)
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(outcome)
+        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
+    }
+
     @Test
     fun quorumFiresOnceThenConnectionSetIsCleared() {
         val coordinator = ReusedHttp2RecoveryCoordinator(
-            // Disable the breaker to isolate the "fires once" property from suppression.
             ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 0L)
         )
+        coordinator.started(1L, 2L)
 
         coordinator.onStallFact(fact(id = 1), nowMillis = 0)
         assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
             coordinator.onStallFact(fact(id = 2), nowMillis = 10)
         )
-        // The dead connection's set was cleared; ids 1 and 2 are evicted.
-        assertEquals(0, coordinator.liveStalledCount("api.example.com:443", 0L, 7L))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
     }
 
     @Test
@@ -200,14 +280,12 @@ class ReusedHttp2RecoveryCoordinatorTest {
         val coordinator = ReusedHttp2RecoveryCoordinator(
             ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 0L)
         )
+        coordinator.started(1L, 2L)
 
-        // Attempt 1 first stalls on gen 0/conn 7, then is observed on gen 1/conn 7
-        // (its connection was rebound). It must leave the stale set, so a second
-        // distinct attempt on gen 1/conn 7 is needed for quorum there.
         coordinator.onStallFact(fact(id = 1, generation = 0L, connectionId = 7L), nowMillis = 0)
         coordinator.onStallFact(fact(id = 1, generation = 1L, connectionId = 7L), nowMillis = 5)
-        assertEquals(0, coordinator.liveStalledCount("api.example.com:443", 0L, 7L))
-        assertEquals(1, coordinator.liveStalledCount("api.example.com:443", 1L, 7L))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
+        assertEquals(1, coordinator.liveStalledCount(origin, 1L, 7L))
 
         val outcome = coordinator.onStallFact(fact(id = 2, generation = 1L, connectionId = 7L), nowMillis = 10)
         val dead = assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(outcome)
@@ -215,14 +293,32 @@ class ReusedHttp2RecoveryCoordinatorTest {
         assertTrue(dead.deadClientGeneration == 1L)
     }
 
+    // PR #100 review B3 ABA hardening: a redundant start for an already-active,
+    // registered attempt must not evict its live membership (the residual-clear
+    // is guarded on !active). The recycled-id resurrection it defends against is
+    // prevented upstream by the token-uniqueness contract on onAttemptStarted.
     @Test
-    fun configRejectsNonPositiveThresholds() {
-        var threw = false
-        try {
-            ReusedHttp2RecoveryConfig(minimumConcurrentStalledRequests = 0)
-        } catch (e: IllegalArgumentException) {
-            threw = true
+    fun redundantStartDoesNotClobberLiveMembership() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(enabled)
+        coordinator.started(1L)
+
+        coordinator.onStallFact(fact(id = 1), nowMillis = 0)
+        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
+
+        coordinator.onAttemptStarted(1L)
+        assertEquals(1, coordinator.liveStalledCount(origin, 0L, 7L))
+    }
+
+    @Test
+    fun configRejectsQuorumBelowTwo() {
+        for (invalid in listOf(0, 1)) {
+            var threw = false
+            try {
+                ReusedHttp2RecoveryConfig(minimumConcurrentStalledRequests = invalid)
+            } catch (e: IllegalArgumentException) {
+                threw = true
+            }
+            assertTrue(threw, "quorum $invalid must be rejected")
         }
-        assertTrue(threw)
     }
 }

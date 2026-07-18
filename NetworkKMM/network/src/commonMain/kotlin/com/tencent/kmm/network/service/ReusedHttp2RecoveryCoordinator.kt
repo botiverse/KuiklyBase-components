@@ -29,7 +29,18 @@ import kotlinx.atomicfu.locks.synchronized
  * touches libcurl — those decisions/mechanisms belong to the routing layer and
  * the native wrapper respectively.
  *
- * Frozen contract invariants (see task #49 thread):
+ * ## Attempt lifecycle (K/N authoritative)
+ *
+ * The routing layer owns each attempt's lifecycle and must call
+ * [onAttemptStarted] when it dispatches an attempt and [onAttemptSettled] when
+ * the attempt reaches any terminal state (response headers started, completed,
+ * errored, or cancelled). Only facts for a currently-active attempt are
+ * counted, so a native fact that races a terminal transition — delivered after
+ * a settle/cancel because C→K/N callback order is not guaranteed — is fenced
+ * out instead of resurrecting a terminal attempt. The active set is bounded by
+ * the in-flight attempt count.
+ *
+ * ## Frozen contract invariants
  * - quorum is the SIZE of the set of DISTINCT, currently-live stalled attempts
  *   on one physical connection, never a cumulative event count: a single
  *   flapping request re-reporting the same fact can never reach the threshold;
@@ -37,20 +48,30 @@ import kotlinx.atomicfu.locks.synchronized
  *   `CURLINFO_CONN_ID` is only an identity WITHIN one connection cache
  *   generation, so a bare `connectionId` must never be deduplicated across a
  *   generation swap;
- * - an attempt that settles (headers arrive, completes, errors, or is
- *   cancelled) is evicted immediately, so it can never contribute to a later
- *   quorum;
+ * - an attempt only ever contributes to ONE physical connection — its latest
+ *   one; a fact that rebinds it to a new key evicts the stale membership first,
+ *   unconditionally, even while the origin's churn breaker is suppressing new
+ *   deaths;
+ * - an ineligible latest fact (outside the v0 `AWAITING_HEADERS` / negotiated
+ *   H2 / reuse-candidate population) evicts any existing membership for that
+ *   attempt fail-closed rather than leaving it counted;
+ * - an attempt that settles/cancels is evicted immediately and fenced, so it
+ *   can never contribute to a later quorum;
  * - `enabled` defaults to false: this is the `ohos_reused_h2_recovery_v0`
  *   rollout latch and stays off until device calibration proves the watchdog
  *   threshold and that `CURLINFO_CONN_ID` truthfully populates.
  *
  * All state is guarded by a single [SynchronizedObject]; `nowMillis` is injected
  * (commonMain owns no wall clock) so the churn breaker is deterministic in test.
+ * No callback or external side effect runs under the lock.
  */
 internal class ReusedHttp2RecoveryCoordinator(
     private val config: ReusedHttp2RecoveryConfig
 ) {
     private val lock = SynchronizedObject()
+
+    /** Attempts the routing layer has dispatched and not yet settled. */
+    private val activeAttempts = mutableSetOf<Long>()
 
     /** Distinct live stalled attempts per physical connection. */
     private val stalledByConnection = mutableMapOf<PhysicalConnectionKey, MutableSet<Long>>()
@@ -65,22 +86,73 @@ internal class ReusedHttp2RecoveryCoordinator(
     private val originBreakerUntil = mutableMapOf<String, Long>()
 
     /**
+     * Register an attempt as active when the routing layer dispatches it.
+     *
+     * [transportRequestId] MUST be unique per physical attempt for as long as a
+     * late native fact for it could still arrive; otherwise a recycled id lets
+     * an old attempt's late fact act on a newer attempt (an ABA hazard). The
+     * underlying VBTransport `requestId` is a recyclable `Int`, so the phase-#2
+     * native adapter must supply a monotonic/epoch-tagged token here rather than
+     * the bare id. As defence in depth a (re-)started token first drops any
+     * residual membership from a prior life of the same id, but only when it is
+     * not already active, so a redundant start never clobbers live membership.
+     */
+    fun onAttemptStarted(transportRequestId: Long) {
+        synchronized(lock) {
+            if (transportRequestId !in activeAttempts) {
+                keyByAttempt[transportRequestId]?.let { key ->
+                    evictFromConnection(transportRequestId, key)
+                }
+            }
+            activeAttempts.add(transportRequestId)
+        }
+    }
+
+    /**
      * Feed one raw stall fact. Returns [ReusedHttp2QuorumOutcome.DeclareConnectionDead]
      * exactly on the transition where this physical connection reaches quorum;
-     * otherwise [ReusedHttp2QuorumOutcome.NoAction]. Ineligible facts (recovery
-     * off, not `AWAITING_HEADERS`, not negotiated H2, or not a reuse candidate)
-     * are rejected fail-closed and never register an attempt.
+     * otherwise [ReusedHttp2QuorumOutcome.NoAction]. Facts for a non-active
+     * attempt (never started, or already settled/cancelled) and ineligible
+     * facts (recovery off, not `AWAITING_HEADERS`, not negotiated H2, or not a
+     * reuse candidate) are rejected fail-closed; an ineligible fact still evicts
+     * any stale membership the attempt held.
      */
     fun onStallFact(fact: ReusedHttp2StallFact, nowMillis: Long): ReusedHttp2QuorumOutcome {
         if (!config.enabled) return ReusedHttp2QuorumOutcome.NoAction
-        // v0 predicate is the conjunction reused-candidate AND actual H2 AND
-        // awaiting-headers; verified here so a mis-emitted native fact cannot
-        // widen recovery scope beyond the frozen contract.
-        if (fact.phase != ReusedHttp2StallPhase.AWAITING_HEADERS) return ReusedHttp2QuorumOutcome.NoAction
-        if (!fact.negotiatedHttp2) return ReusedHttp2QuorumOutcome.NoAction
-        if (!fact.reusedConnectionCandidate) return ReusedHttp2QuorumOutcome.NoAction
 
         return synchronized(lock) {
+            // Terminal fence: a fact that races (or follows) a settle/cancel must
+            // never resurrect the attempt. Only active attempts are counted.
+            if (fact.transportRequestId !in activeAttempts) {
+                return@synchronized ReusedHttp2QuorumOutcome.NoAction
+            }
+
+            val currentKey = PhysicalConnectionKey(fact.originId, fact.clientGeneration, fact.connectionId)
+            val priorKey = keyByAttempt[fact.transportRequestId]
+
+            // v0 predicate is the conjunction reused-candidate AND actual H2 AND
+            // awaiting-headers, re-verified here fail-closed. An attempt whose
+            // LATEST fact is ineligible has left the recoverable population, so
+            // it must be evicted rather than left counted on a stale key.
+            val eligible = fact.phase == ReusedHttp2StallPhase.AWAITING_HEADERS &&
+                fact.negotiatedHttp2 &&
+                fact.reusedConnectionCandidate
+            if (!eligible) {
+                if (priorKey != null) evictFromConnection(fact.transportRequestId, priorKey)
+                return@synchronized ReusedHttp2QuorumOutcome.NoAction
+            }
+
+            // If this attempt was previously counted under a different key (its
+            // connection was rebound to a new generation, or curl reused the
+            // integer id in a fresh cache), drop the stale membership FIRST and
+            // unconditionally — before any churn-breaker suppression — so the
+            // attempt is only ever counted once, on its current connection.
+            if (priorKey != null && priorKey != currentKey) {
+                evictFromConnection(fact.transportRequestId, priorKey)
+            }
+
+            // Churn breaker only gates registration/death on this origin; it must
+            // never preserve stale membership (handled above).
             val breakerUntil = originBreakerUntil[fact.originId]
             if (breakerUntil != null) {
                 if (nowMillis < breakerUntil) {
@@ -89,23 +161,9 @@ internal class ReusedHttp2RecoveryCoordinator(
                 originBreakerUntil.remove(fact.originId)
             }
 
-            val key = PhysicalConnectionKey(fact.originId, fact.clientGeneration, fact.connectionId)
-
-            // If this attempt was previously counted under a different key
-            // (its connection was rebound to a new generation, or curl reused
-            // the integer id in a fresh cache), drop the stale membership so it
-            // is only ever counted once, on its current physical connection.
-            val prior = keyByAttempt[fact.transportRequestId]
-            if (prior != null && prior != key) {
-                stalledByConnection[prior]?.let { priorSet ->
-                    priorSet.remove(fact.transportRequestId)
-                    if (priorSet.isEmpty()) stalledByConnection.remove(prior)
-                }
-            }
-
-            val set = stalledByConnection.getOrPut(key) { mutableSetOf() }
+            val set = stalledByConnection.getOrPut(currentKey) { mutableSetOf() }
             set.add(fact.transportRequestId) // Set membership → duplicate facts are idempotent.
-            keyByAttempt[fact.transportRequestId] = key
+            keyByAttempt[fact.transportRequestId] = currentKey
 
             if (set.size >= config.minimumConcurrentStalledRequests) {
                 val stalled = set.toSet()
@@ -115,7 +173,7 @@ internal class ReusedHttp2RecoveryCoordinator(
                 for (id in stalled) {
                     keyByAttempt.remove(id)
                 }
-                stalledByConnection.remove(key)
+                stalledByConnection.remove(currentKey)
                 originBreakerUntil[fact.originId] = nowMillis + config.churnBreakerWindowMillis
                 ReusedHttp2QuorumOutcome.DeclareConnectionDead(
                     originId = fact.originId,
@@ -131,12 +189,13 @@ internal class ReusedHttp2RecoveryCoordinator(
 
     /**
      * Report that an attempt has reached a terminal state (response headers
-     * started, completed, errored, or was cancelled). Idempotent and safe for
-     * an attempt that was never registered. After this returns the attempt can
-     * never contribute to a quorum until it emits a fresh fact again.
+     * started, completed, errored, or was cancelled). Removes it from the active
+     * set — fencing any later native fact — and evicts any live membership.
+     * Idempotent and safe for an attempt that was never registered.
      */
     fun onAttemptSettled(transportRequestId: Long) {
         synchronized(lock) {
+            activeAttempts.remove(transportRequestId)
             val key = keyByAttempt.remove(transportRequestId) ?: return
             stalledByConnection[key]?.let { set ->
                 set.remove(transportRequestId)
@@ -150,6 +209,15 @@ internal class ReusedHttp2RecoveryCoordinator(
         synchronized(lock) {
             stalledByConnection[PhysicalConnectionKey(originId, clientGeneration, connectionId)]?.size ?: 0
         }
+
+    /** Remove [id] from [key]'s set and the reverse index (only if still pointing there). */
+    private fun evictFromConnection(id: Long, key: PhysicalConnectionKey) {
+        stalledByConnection[key]?.let { set ->
+            set.remove(id)
+            if (set.isEmpty()) stalledByConnection.remove(key)
+        }
+        if (keyByAttempt[id] == key) keyByAttempt.remove(id)
+    }
 
     private data class PhysicalConnectionKey(
         val originId: String,
@@ -231,8 +299,10 @@ internal data class ReusedHttp2RecoveryConfig(
         require(responseHeadersWatchdogMillis > 0L) {
             "responseHeadersWatchdogMillis must be positive"
         }
-        require(minimumConcurrentStalledRequests > 0) {
-            "minimumConcurrentStalledRequests must be positive"
+        // Quorum is the false-positive guard; a single-request kill defeats it,
+        // so v0 mechanically forbids it (see task #49 review hardening).
+        require(minimumConcurrentStalledRequests >= 2) {
+            "minimumConcurrentStalledRequests must be at least 2"
         }
         require(churnBreakerWindowMillis >= 0L) {
             "churnBreakerWindowMillis must be non-negative"
