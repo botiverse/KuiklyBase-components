@@ -31,20 +31,16 @@ import kotlinx.atomicfu.locks.synchronized
  *    connection dead — asks to retire the generation its stalled attempts were
  *    on.
  *
- * Retirement rolls the process-wide default and H3 `CURLSH` cohorts together:
- * new requests atomically bind to a fresh generation's cohorts, and the retired
- * generation's cohorts are only marked for drain — never torn down while an
- * easy handle, native lease, or callback still references them (that lifecycle
- * is the platform [CurlCohortController]'s contract, exercised in phase-2
- * native work; here it is an injected seam so the CAS logic is deterministic in
- * common tests).
+ * Retirement rolls the process-wide default and H3 `CURLSH` cohorts together as
+ * a single all-or-nothing transaction ([CurlCohortController.rotateToGeneration]):
+ * either the fresh generation's cohorts become the sole active binding AND the
+ * retired generation is drain-registered, or nothing changes. There is no
+ * externally observable half state, so a failed rotation can be safely retried
+ * on the same generation without a double switch or a lost drain obligation.
  *
- * All generation state is guarded by one [SynchronizedObject]. The cohort
- * controller is invoked under that lock so a switch and its paired drain-mark
- * are atomic with the compare-and-swap; the controller must therefore be
- * non-reentrant (it must not call back into this manager) and must not block on
- * the retiring generation's in-flight work — it only flips new-request binding
- * and marks the old generation, deferring teardown to lease/refcount drain.
+ * All generation state is guarded by one [SynchronizedObject]; the manager
+ * commits its generation only after a successful ([true]) transaction, and that
+ * commit is an infallible in-memory assignment.
  */
 internal class NetworkGenerationManager(
     private val cohortController: CurlCohortController,
@@ -57,31 +53,43 @@ internal class NetworkGenerationManager(
     fun currentGeneration(): Long = synchronized(lock) { currentGeneration }
 
     /**
-     * Retire [observedGeneration] iff it is still the current one, advancing to
-     * a fresh generation. This is the compare-and-swap both triggers share:
+     * Retire [observedGeneration] iff it is still the current one, rotating to a
+     * fresh generation. This is the compare-and-swap both triggers share:
      *
-     * - if [observedGeneration] is current, roll the cohorts (switch new traffic
-     *   to the new generation, then mark the observed generation for drain) and
-     *   return [GenerationRetirementResult.Advanced];
-     * - otherwise the generation was already retired by the other trigger (or a
-     *   duplicate signal), so this is a no-op and returns
-     *   [GenerationRetirementResult.AlreadyAdvanced] — two triggers observing the
-     *   same generation cause exactly one rotation.
+     * - if [observedGeneration] is not current — already retired by the other
+     *   trigger, or a duplicate/stale signal, or a generation newer than current
+     *   (which can never legitimately be observed) — this is a no-op returning
+     *   [GenerationRetirementResult.AlreadyAdvanced]; two triggers observing the
+     *   same generation cause exactly one rotation;
+     * - otherwise the shared [CurlCohortController.rotateToGeneration] transaction
+     *   is attempted. On success the manager advances and returns
+     *   [GenerationRetirementResult.Advanced]; on failure — the transaction had
+     *   zero externally visible effect — the manager keeps its generation and
+     *   returns [GenerationRetirementResult.RotationFailed] so the caller may
+     *   safely retry the same generation.
      *
-     * A generation strictly newer than the current one cannot legitimately be
-     * observed (generations only advance here), so it is treated as already
-     * advanced rather than rolling backwards.
+     * Generation overflow is fail-closed *before* the controller is invoked: at
+     * `Long.MAX_VALUE` no fresh generation exists, so it returns
+     * [GenerationRetirementResult.RotationFailed] rather than wrapping.
      */
     fun retireIfCurrent(observedGeneration: Long): GenerationRetirementResult = synchronized(lock) {
         if (observedGeneration != currentGeneration) {
             return@synchronized GenerationRetirementResult.AlreadyAdvanced(currentGeneration)
         }
+        if (currentGeneration == Long.MAX_VALUE) {
+            return@synchronized GenerationRetirementResult.RotationFailed(currentGeneration)
+        }
         val newGeneration = currentGeneration + 1L
-        // Switch new-request binding to the fresh cohorts BEFORE marking the old
-        // generation for drain, so no request can bind to a generation that is
-        // already being retired.
-        cohortController.switchToGeneration(newGeneration)
-        cohortController.markGenerationForDrain(observedGeneration)
+        val rotated = cohortController.rotateToGeneration(
+            newGeneration = newGeneration,
+            retiredGeneration = observedGeneration
+        )
+        if (!rotated) {
+            // Zero externally visible effect: generation, active cohorts and drain
+            // obligation are all unchanged; the same generation can be retried.
+            return@synchronized GenerationRetirementResult.RotationFailed(currentGeneration)
+        }
+        // The transaction committed; only now advance (an infallible commit).
         currentGeneration = newGeneration
         GenerationRetirementResult.Advanced(
             retiredGeneration = observedGeneration,
@@ -91,28 +99,38 @@ internal class NetworkGenerationManager(
 }
 
 /**
- * Platform seam for the default/H3 `CURLSH` cohort lifecycle. The common CAS in
- * [NetworkGenerationManager] decides *when* to rotate; the native implementation
- * (phase-2) owns *how* — creating the fresh cohorts, atomically switching
- * new-request binding, and draining the retired cohorts only after every
- * referencing easy handle / lease / callback has exited (no teardown under
- * live references).
+ * Platform seam for the default/H3 `CURLSH` cohort lifecycle. The common
+ * compare-and-swap in [NetworkGenerationManager] decides *when* to rotate; the
+ * native implementation (phase-2) owns *how* — but as a single all-or-nothing
+ * transaction, not two separable steps.
  */
 internal interface CurlCohortController {
-    /** Atomically bind new requests to [newGeneration]'s fresh default + H3 cohorts. */
-    fun switchToGeneration(newGeneration: Long)
-
     /**
-     * Mark [retiredGeneration]'s default + H3 cohorts for drain. In-flight work
-     * on them continues to completion/cancel; teardown happens only once all
-     * references drain. Never tears down synchronously here.
+     * Atomically roll the cohorts: make [newGeneration]'s fresh default + H3
+     * pair the sole active binding AND irrevocably register [retiredGeneration]
+     * for drain, as one no-throw, all-or-nothing transaction.
+     *
+     * Returns `true` iff the whole transaction committed: at its single
+     * linearization point the new pair becomes the active binding, the old pair
+     * is drain-registered, and a request acquiring its `(generation, cohort
+     * lease)` never observes a half state. The retired cohorts are only marked
+     * for drain — torn down after every referencing easy handle / lease /
+     * callback has exited, never under live references.
+     *
+     * Returns `false` iff nothing changed — no active-binding switch, no drain
+     * registration, no orphan pair — so the same generation can be safely
+     * retried. Every fallible create/prepare MUST happen before the publish
+     * point; after publish only infallible in-memory commits may run. The
+     * implementation must not throw across this boundary and must not report a
+     * possibly-partial publish as `false`. It must also be non-reentrant (it
+     * must not call back into [NetworkGenerationManager]).
      */
-    fun markGenerationForDrain(retiredGeneration: Long)
+    fun rotateToGeneration(newGeneration: Long, retiredGeneration: Long): Boolean
 }
 
 /** Outcome of a [NetworkGenerationManager.retireIfCurrent] call. */
 internal sealed interface GenerationRetirementResult {
-    /** This call retired [retiredGeneration] and rolled to [newGeneration]. */
+    /** The rotation transaction committed: [retiredGeneration] rolled to [newGeneration]. */
     data class Advanced(
         val retiredGeneration: Long,
         val newGeneration: Long
@@ -120,8 +138,16 @@ internal sealed interface GenerationRetirementResult {
 
     /**
      * The observed generation was no longer current (already retired by the
-     * other trigger or a duplicate signal); no rotation happened. [currentGeneration]
-     * is the live generation.
+     * other trigger or a duplicate/stale signal); no rotation happened.
+     * [currentGeneration] is the live generation.
      */
     data class AlreadyAdvanced(val currentGeneration: Long) : GenerationRetirementResult
+
+    /**
+     * The observed generation was current but the rotation transaction did not
+     * commit (controller returned false, or generation overflow). The transaction
+     * had zero externally visible effect and [currentGeneration] is unchanged, so
+     * the same generation may be safely retried.
+     */
+    data class RotationFailed(val currentGeneration: Long) : GenerationRetirementResult
 }
