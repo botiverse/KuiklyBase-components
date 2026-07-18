@@ -107,6 +107,20 @@ data class NetworkCurlConfigurationStatus(
 )
 
 /**
+ * Native curl payload capability, independent of engine selection and the
+ * protocol negotiated by any individual request.
+ *
+ * [linked] means the platform wrapper is present and ABI-compatible with the
+ * Kotlin/JNI caller. [http3FeatureAvailable] only reports the linked libcurl
+ * feature bit; it does not mean curl is selected or a request negotiated H3.
+ */
+data class NetworkCurlNativeStatus(
+    val linked: Boolean,
+    val http3FeatureAvailable: Boolean,
+    val detail: String? = null
+)
+
+/**
  * Which trust source curl requests run with.
  *
  * PLATFORM_DEFAULT is the state before any [VBTransportCurl.configure] call
@@ -137,6 +151,10 @@ object VBTransportCurl {
 
     val trustMode: NetworkCurlTrustMode
         get() = trustModeState.value
+
+    /** Current platform-native payload status; evaluated on every read. */
+    val nativeStatus: NetworkCurlNativeStatus
+        get() = platformNetworkCurlNativeStatus()
 
     /**
      * Verifies the declared SHA-256 against the staged file before making the
@@ -269,6 +287,8 @@ object VBTransportCurl {
             detail = "Curl runtime configuration has not been installed by the app."
         )
 }
+
+internal expect fun platformNetworkCurlNativeStatus(): NetworkCurlNativeStatus
 
 internal expect fun readNetworkCurlFile(path: String): ByteArray?
 

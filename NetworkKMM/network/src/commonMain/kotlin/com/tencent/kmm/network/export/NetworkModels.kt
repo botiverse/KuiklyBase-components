@@ -191,6 +191,13 @@ class NetworkRequest(
     var policy: NetworkRequestPolicy = NetworkRequestPolicy(),
     var progress: NetworkProgressCallbacks = NetworkProgressCallbacks()
 ) {
+    /**
+     * Per-request curl HTTP/3 override. `null` preserves the process-wide
+     * [VBTransportCurl] configuration for existing consumers.
+     */
+    var curlHttp3EnabledOverride: Boolean? = null
+        private set
+
     fun addQuery(name: String, value: String): NetworkRequest {
         query.add(NetworkQueryParameter(name, value))
         return this
@@ -198,6 +205,16 @@ class NetworkRequest(
 
     fun setHeader(name: String, value: String): NetworkRequest {
         headers[name] = value
+        return this
+    }
+
+    /**
+     * Latches the desired curl HTTP/3 mode into this request. Request copies
+     * retain their own value, so a later Settings/global change cannot alter
+     * an in-flight request. This does not select the curl engine by itself.
+     */
+    fun setCurlHttp3Enabled(enabled: Boolean): NetworkRequest {
+        curlHttp3EnabledOverride = enabled
         return this
     }
 
@@ -227,7 +244,9 @@ class NetworkRequest(
             metadata = metadata.toMutableMap(),
             policy = policy.copyMutable(),
             progress = progress
-        )
+        ).also { copy ->
+            copy.curlHttp3EnabledOverride = curlHttp3EnabledOverride
+        }
     }
 }
 

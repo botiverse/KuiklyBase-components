@@ -90,10 +90,24 @@ internal fun prepareCurlRuntime(
         return NetworkEngineAvailability.Available
     }
     val configuration = VBTransportCurl.snapshot()
+    val http3Requested = request.curlHttp3EnabledOverride
+        ?: configuration?.http3Enabled
+        ?: false
+    // Record the effective per-request decision before eligibility checks so
+    // completion diagnostics can distinguish an H3 request that failed over
+    // or failed closed from ordinary curl/H2 traffic. CURL_RUNTIME_READY is
+    // still written only after every runtime input has been validated.
+    request.metadata[CURL_RUNTIME_HTTP3] = http3Requested.toString()
     if (configuration == null) {
         if (VBTransportCurl.trustMode == NetworkCurlTrustMode.PLATFORM_DEFAULT &&
             platformDefaultTrust.available
         ) {
+            if (http3Requested && !nativeHttp3Supported) {
+                return NetworkEngineAvailability.unavailable(
+                    reason = NetworkEngineUnavailableReason.HTTP3_UNSUPPORTED,
+                    detail = "HTTP/3 is not eligible: the linked curl artifact does not report CURL_VERSION_HTTP3."
+                )
+            }
             // Never explicitly configured: run on the platform's verified
             // compiled CA default. No CA path is handed to the wrapper (the
             // compiled CURL_CA_BUNDLE applies) and the proxy is pinned to
@@ -101,7 +115,6 @@ internal fun prepareCurlRuntime(
             // so the default's semantics are deterministic, not ambient.
             request.metadata[CURL_RUNTIME_PROXY_URL] = ""
             request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_PLATFORM_DEFAULT
-            request.metadata[CURL_RUNTIME_HTTP3] = "false"
             request.metadata[CURL_RUNTIME_READY] = "true"
             return NetworkEngineAvailability.Available
         }
@@ -131,7 +144,7 @@ internal fun prepareCurlRuntime(
             detail = "Custom HTTPDNS is not eligible: no resolver-to-IP injection contract preserves SNI, Host, and certificate verification yet."
         )
     }
-    if (configuration.http3Enabled) {
+    if (http3Requested) {
         if (!nativeHttp3Supported) {
             return NetworkEngineAvailability.unavailable(
                 reason = NetworkEngineUnavailableReason.HTTP3_UNSUPPORTED,
@@ -162,7 +175,6 @@ internal fun prepareCurlRuntime(
     request.metadata[CURL_RUNTIME_CA_PATH] = configuration.trustStore.path
     request.metadata[CURL_RUNTIME_PROXY_URL] = proxyUrl
     request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_APP_OWNED
-    request.metadata[CURL_RUNTIME_HTTP3] = configuration.http3Enabled.toString()
     request.metadata[CURL_RUNTIME_READY] = "true"
     return NetworkEngineAvailability.Available
 }
@@ -179,6 +191,15 @@ internal fun preparedCurlProxyUrl(request: NetworkRequest): String? =
 
 internal fun preparedCurlHttp3Enabled(request: NetworkRequest): Boolean =
     request.metadata[CURL_RUNTIME_HTTP3] == "true"
+
+internal fun preparedCurlHttp3Requested(request: NetworkRequest): Boolean? =
+    request.metadata[CURL_RUNTIME_HTTP3]?.let { value ->
+        when (value) {
+            "true" -> true
+            "false" -> false
+            else -> null
+        }
+    }
 
 internal fun curlRuntimeFailureResponse(
     request: NetworkRequest,

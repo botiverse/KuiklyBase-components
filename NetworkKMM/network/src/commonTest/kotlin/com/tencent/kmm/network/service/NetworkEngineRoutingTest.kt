@@ -17,6 +17,7 @@
 package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
+import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
@@ -66,12 +67,16 @@ class NetworkEngineRoutingTest {
         }
 
         val requested = resolveNetworkEngine(
-            selection = NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL),
+            selection = NetworkEngineSelection(
+                requestedEngine = NetworkTransportEngine.CURL,
+                hostSelectionTag = "config-generation-42"
+            ),
             platformDefault = NetworkTransportEngine.KTOR,
             resolver = resolver
         )
         assertEquals(NetworkTransportEngine.CURL, requested.diagnostics.selectedEngine)
         assertEquals(NetworkEngineSelectionReason.REQUESTED, requested.diagnostics.reason)
+        assertEquals("config-generation-42", requested.diagnostics.hostSelectionTag)
 
         val disallowed = resolveNetworkEngine(
             selection = NetworkEngineSelection(
@@ -163,6 +168,45 @@ class NetworkEngineRoutingTest {
         assertEquals("h2", completed.first().timing.protocol)
         assertEquals(2, completed.first().timing.connectionAttemptCount)
         assertEquals(3, completed.size)
+    }
+
+    @Test
+    fun completionDiagnosticsSeparateHttp3RequestFromH2Negotiation() = runBlocking {
+        val completed = mutableListOf<NetworkEngineExecutionDiagnostics>()
+        val curl = FakeEngine(
+            name = "curl",
+            protocol = NetworkHttpProtocol.HTTP_2
+        )
+        val router = RoutingNetworkEngine(
+            selector = { NetworkEngineSelection(requestedEngine = NetworkTransportEngine.CURL) },
+            diagnosticsListener = object : NetworkEngineDiagnosticsListener {
+                override fun onEngineCompleted(diagnostics: NetworkEngineExecutionDiagnostics) {
+                    completed += diagnostics
+                }
+            },
+            platformDefault = NetworkTransportEngine.KTOR,
+            resolver = { curl }
+        )
+        val verifiedDefault = CurlPlatformDefaultTrust(
+            available = true,
+            detail = "test compiled default"
+        )
+        val h3Requested = NetworkRequest(url = "https://example.test/h3")
+            .setCurlHttp3Enabled(true)
+        val ordinaryH2 = NetworkRequest(url = "https://example.test/h2")
+            .setCurlHttp3Enabled(false)
+        assertTrue(prepareCurlRuntime(h3Requested, verifiedDefault, nativeHttp3Supported = true).available)
+
+        router.execute(h3Requested, NetworkCall(h3Requested))
+        // Explicit false remains observable even when the selected platform
+        // engine never invokes curl runtime preparation (Android/iOS off).
+        router.execute(ordinaryH2, NetworkCall(ordinaryH2))
+
+        assertEquals(listOf(true, false), completed.map { it.http3Requested })
+        assertEquals(
+            listOf(NetworkHttpProtocol.HTTP_2, NetworkHttpProtocol.HTTP_2),
+            completed.map { it.negotiatedProtocol }
+        )
     }
 
     @Test
@@ -301,7 +345,8 @@ class NetworkEngineRoutingTest {
         private val name: String,
         override val capabilities: NetworkEngineCapabilities = NetworkEngineCapabilities(),
         private val timing: VBTransportElapseStatistics = VBTransportElapseStatistics(),
-        private val availability: NetworkEngineAvailability = NetworkEngineAvailability.Available
+        private val availability: NetworkEngineAvailability = NetworkEngineAvailability.Available,
+        private val protocol: NetworkHttpProtocol = NetworkHttpProtocol.UNKNOWN
     ) : NetworkEngine {
         val executed = mutableListOf<String>()
 
@@ -330,7 +375,8 @@ class NetworkEngineRoutingTest {
             statusCode = 200,
             headers = emptyMap(),
             body = NetworkResponseBody(),
-            timing = timing
+            timing = timing,
+            protocol = protocol
         )
     }
 }

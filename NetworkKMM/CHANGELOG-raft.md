@@ -1,5 +1,27 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.28 / 0.1.0-raft.28-ohos (opt-in Android curl runtime)
+
+- Publish `com.tencent.kuiklybase:network-android-curl-runtime` as an opt-in,
+  payload-only Android AAR containing the committed arm64-v8a and x86_64
+  `libnetworkkmmcurl.so` files. The normal `network-android` AAR remains
+  zero-so, so existing OkHttp consumers do not take an implicit native size
+  increase. Publication validates both AARs and supports immutable partial
+  retries without attempting to overwrite an already-published coordinate.
+- Add `VBTransportCurl.nativeStatus` so shared callers can distinguish a
+  linked/ABI-compatible native runtime from the linked artifact's HTTP/3
+  feature bit. This remains separate from curl engine selection and from each
+  request's actual negotiated protocol.
+- Add `NetworkRequest.setCurlHttp3Enabled(Boolean)` as a request-owned H3
+  override. It is copied with the request, wins over the legacy process-wide
+  configuration, works with OHOS platform-default trust, and fails closed
+  with `HTTP3_UNSUPPORTED` when the linked artifact lacks H3. Completion
+  diagnostics now expose `http3Requested` separately from
+  `negotiatedProtocol`, preserving truthful H3-to-H2/H1 fallback reporting.
+  `NetworkEngineSelection.hostSelectionTag` is copied unchanged into selection
+  diagnostics as a non-semantic host correlation hook (for example, a config
+  generation); it never affects routing.
+
 ## 0.1.0-raft.27 / 0.1.0-raft.27-ohos (stream lifecycle hardening)
 
 - Version the native curl wrapper ABI with pointer+size+version `Start*V27`
