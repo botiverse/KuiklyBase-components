@@ -57,6 +57,10 @@ import kotlinx.atomicfu.locks.synchronized
  *   attempt fail-closed rather than leaving it counted;
  * - an attempt that settles/cancels is evicted immediately and fenced, so it
  *   can never contribute to a later quorum;
+ * - declaring a connection dead is once-only: its quorum members are also
+ *   terminal-fenced out of the active set in the same lock, so late facts for
+ *   them cannot rebuild the set and re-declare the same connection dead before
+ *   the routing layer's settle callbacks land;
  * - `enabled` defaults to false: this is the `ohos_reused_h2_recovery_v0`
  *   rollout latch and stays off until device calibration proves the watchdog
  *   threshold and that `CURLINFO_CONN_ID` truthfully populates.
@@ -169,9 +173,14 @@ internal class ReusedHttp2RecoveryCoordinator(
                 val stalled = set.toSet()
                 // Evict the whole dead connection: the routing layer now owns
                 // these attempts (drain/cancel/eligible-retry) and must not have
-                // them counted again.
+                // them counted again. Terminal-fence the members out of the
+                // active set in the same lock so a late fact for one of them
+                // (delivered before routing's settle callback lands) cannot
+                // rebuild the set and declare the same connection dead twice.
+                // A genuine retry re-enters as a fresh token via onAttemptStarted.
                 for (id in stalled) {
                     keyByAttempt.remove(id)
+                    activeAttempts.remove(id)
                 }
                 stalledByConnection.remove(currentKey)
                 originBreakerUntil[fact.originId] = nowMillis + config.churnBreakerWindowMillis

@@ -275,6 +275,27 @@ class ReusedHttp2RecoveryCoordinatorTest {
         assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
     }
 
+    // PR #100 successor review: declaring a connection dead is once-only. With
+    // no breaker window, late facts for the just-declared quorum members must be
+    // fenced (they were terminal-fenced at declaration), or the same physical
+    // connection is declared dead a second time before routing settles them.
+    @Test
+    fun quorumDeclarationTerminalFencesMembersAgainstLateFacts() {
+        val coordinator = ReusedHttp2RecoveryCoordinator(
+            ReusedHttp2RecoveryConfig(enabled = true, churnBreakerWindowMillis = 0L)
+        )
+        coordinator.started(1L, 2L)
+
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 1), nowMillis = 0))
+        assertIs<ReusedHttp2QuorumOutcome.DeclareConnectionDead>(
+            coordinator.onStallFact(fact(id = 2), nowMillis = 10)
+        )
+
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 1), nowMillis = 11))
+        assertIs<ReusedHttp2QuorumOutcome.NoAction>(coordinator.onStallFact(fact(id = 2), nowMillis = 12))
+        assertEquals(0, coordinator.liveStalledCount(origin, 0L, 7L))
+    }
+
     @Test
     fun attemptReboundToNewGenerationIsNotDoubleCounted() {
         val coordinator = ReusedHttp2RecoveryCoordinator(
