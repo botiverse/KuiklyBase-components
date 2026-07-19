@@ -729,15 +729,34 @@ class AndroidCurlNetworkEngineTest {
     }
 
     @Test
-    fun jniCallbackAppliesTerminalTransferFactsWithoutCollapsingAbsentBody() {
-        var response: CurlNativeResponse? = null
+    fun jniCallbackPublishesTerminalOnlyAfterApplyingTransferFacts() {
+        var terminalInvoked = false
         val callback = AndroidCurlJniCallback(
             onResponseStartBlock = null,
             onChunkBlock = null,
             uploadSource = null,
             cancellationSignal = AndroidCurlCancellationSignal(),
-            onCompleteBlock = { response = it }
+            onCompleteBlock = { response ->
+                terminalInvoked = true
+                val timing = response.elapse
+                assertEquals(true, timing.curlFinalHeadersObserved)
+                assertEquals(false, timing.curlFirstBodyObserved)
+                assertEquals(false, timing.curlBodyProgressObserved)
+                assertEquals(9.0, timing.curlFinalHeadersElapsedMs)
+                assertEquals(0.0, timing.curlFirstBodyElapsedMs)
+                assertEquals(0L, timing.curlBodyBytes)
+            }
         )
+        callback.onTransferFacts(
+            finalHeadersObserved = true,
+            firstBodyObserved = false,
+            bodyProgressObserved = false,
+            finalHeadersElapsedMs = 9,
+            firstBodyElapsedMs = 0,
+            lastBodyProgressElapsedMs = 0,
+            bodyBytes = 0,
+        )
+        assertFalse(terminalInvoked)
         callback.onComplete(
             code = 28,
             httpCode = 200,
@@ -755,23 +774,7 @@ class AndroidCurlNetworkEngineTest {
             receiveTimeMs = 0.0,
             totalTimeMs = 510.0,
         )
-        callback.onTransferFacts(
-            finalHeadersObserved = true,
-            firstBodyObserved = false,
-            bodyProgressObserved = false,
-            finalHeadersElapsedMs = 9,
-            firstBodyElapsedMs = 0,
-            lastBodyProgressElapsedMs = 0,
-            bodyBytes = 0,
-        )
-
-        val timing = assertNotNull(response).elapse
-        assertEquals(true, timing.curlFinalHeadersObserved)
-        assertEquals(false, timing.curlFirstBodyObserved)
-        assertEquals(false, timing.curlBodyProgressObserved)
-        assertEquals(9.0, timing.curlFinalHeadersElapsedMs)
-        assertEquals(0.0, timing.curlFirstBodyElapsedMs)
-        assertEquals(0L, timing.curlBodyBytes)
+        assertTrue(terminalInvoked)
     }
 
     private open class FakeBridge(

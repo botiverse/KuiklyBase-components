@@ -68,6 +68,7 @@ struct CallbackContext {
     jmethodID is_cancelled = nullptr;
     jmethodID on_complete = nullptr;
     jmethodID on_transfer_facts = nullptr;
+    CurlResponse *pending_response = nullptr;
 };
 
 jstring NewString(JNIEnv *env, const char *value) {
@@ -164,8 +165,7 @@ int ReadUploadChunk(void *read_ref, char *buffer, int max_length) {
     return length;
 }
 
-void OnComplete(void *callback_ref, CurlResponse *response) {
-    auto *context = static_cast<CallbackContext *>(callback_ref);
+void DeliverComplete(CallbackContext *context, CurlResponse *response) {
     const CurlResponse fallback{
         kCurlEngineFailure,
         0,
@@ -218,6 +218,13 @@ void OnComplete(void *callback_ref, CurlResponse *response) {
     if (java_data != nullptr) {
         context->env->DeleteLocalRef(java_data);
     }
+}
+
+void OnComplete(void *callback_ref, CurlResponse *response) {
+    // Start* owns the response until DeleteCurlClient. Defer Java terminal
+    // publication until Start* returns so V1 facts can be attached first.
+    auto *context = static_cast<CallbackContext *>(callback_ref);
+    context->pending_response = response;
 }
 
 void DeliverTransferFacts(CallbackContext *context) {
@@ -273,7 +280,7 @@ void InvokeEngineFailure(CallbackContext *context, const char *message) {
     response.code = kCurlEngineFailure;
     response.errorMsg = message;
     response.errorMsgLen = static_cast<int>(std::char_traits<char>::length(message));
-    OnComplete(context, &response);
+    DeliverComplete(context, &response);
 }
 
 void NativePerform(
@@ -432,6 +439,7 @@ void NativePerform(
     // terminal callback and returned, while the handle is still alive.
     if (transfer_completed) {
         DeliverTransferFacts(&context);
+        DeliverComplete(&context, context.pending_response);
     }
 
     {

@@ -209,7 +209,7 @@ internal class AndroidCurlJniCallback(
     private val onCompleteBlock: (CurlNativeResponse) -> Unit
 ) {
     private val callbackFailure = AtomicReference<Throwable?>(null)
-    private var completedResponse: CurlNativeResponse? = null
+    private var pendingTransferFacts: CurlTransferFactsV1? = null
 
     @JvmName("onResponseStart")
     fun onResponseStart(httpCode: Long, headers: String) {
@@ -248,16 +248,14 @@ internal class AndroidCurlJniCallback(
         lastBodyProgressElapsedMs: Long,
         bodyBytes: Long,
     ) {
-        completedResponse?.elapse?.applyCurlTransferFacts(
-            CurlTransferFactsV1(
-                finalHeadersObserved = finalHeadersObserved,
-                firstBodyObserved = firstBodyObserved,
-                bodyProgressObserved = bodyProgressObserved,
-                finalHeadersElapsedMs = finalHeadersElapsedMs,
-                firstBodyElapsedMs = firstBodyElapsedMs,
-                lastBodyProgressElapsedMs = lastBodyProgressElapsedMs,
-                bodyBytes = bodyBytes,
-            )
+        pendingTransferFacts = CurlTransferFactsV1(
+            finalHeadersObserved = finalHeadersObserved,
+            firstBodyObserved = firstBodyObserved,
+            bodyProgressObserved = bodyProgressObserved,
+            finalHeadersElapsedMs = finalHeadersElapsedMs,
+            firstBodyElapsedMs = firstBodyElapsedMs,
+            lastBodyProgressElapsedMs = lastBodyProgressElapsedMs,
+            bodyBytes = bodyBytes,
         )
     }
 
@@ -310,7 +308,7 @@ internal class AndroidCurlJniCallback(
                     )
                 )
             )
-        completedResponse = response
+        response.elapse.applyCurlTransferFacts(pendingTransferFacts)
         onCompleteBlock(response)
     }
 }
