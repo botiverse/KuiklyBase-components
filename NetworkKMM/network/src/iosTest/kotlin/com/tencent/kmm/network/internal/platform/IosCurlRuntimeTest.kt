@@ -115,6 +115,18 @@ class IosCurlRuntimeTest {
                 assertEquals(true, result.response.elapse.curlFirstBodyObserved)
                 assertEquals(true, result.response.elapse.curlBodyProgressObserved)
                 assertTrue(result.response.elapse.curlBodyBytes > 0)
+
+                val capped = IosCurlCInteropBridge.executeWithOptionalApiDiagnostics(
+                    runtimeRequest(
+                        requestId = 900_004,
+                        url = url,
+                        caPath = caPath,
+                        maxBufferedResponseBytes = 1
+                    )
+                )
+                assertTrue(capped.optionalApi.maxBufferedResponseBytesSetterAvailable)
+                assertEquals(63, capped.response.code, capped.response.errorMsg)
+                assertEquals(0, capped.response.data?.size ?: 0)
             }
             else -> error("Unknown iOS curl optional API expectation: $expectation")
         }
@@ -329,13 +341,15 @@ class IosCurlRuntimeTest {
         caPath: String,
         method: String = "GET",
         headers: Map<String, String> = mapOf("Accept" to "text/plain"),
-        uploadContentLength: Long? = null
+        uploadContentLength: Long? = null,
+        maxBufferedResponseBytes: Long = 0
     ) = IosCurlNativeRequest(
         requestId = requestId,
         url = url,
         method = method,
         headers = headers,
         timeoutMillis = 30_000,
+        maxBufferedResponseBytes = maxBufferedResponseBytes,
         uploadContentLength = uploadContentLength,
         caInfoPath = caPath,
         proxyUrl = ""
