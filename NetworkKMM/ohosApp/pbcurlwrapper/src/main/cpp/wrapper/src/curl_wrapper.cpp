@@ -591,6 +591,12 @@ class CurlClient {
     // (fork #8). Everything except the write callback + perform is configured
     // here; the caller sets its own CURLOPT_WRITEFUNCTION and performs.
     bool ConfigureRequest(CurlRequest &request, std::string &method) {
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+        if (test_configure_failure_.exchange(false, std::memory_order_relaxed)) {
+            logE(log_tag_, "injected ConfigureRequest failure");
+            return false;
+        }
+#endif
         if (!curl_) {
             logE(log_tag_, "curl_easy_init() failed.");
             return false;
@@ -825,7 +831,11 @@ class CurlClient {
         CompleteBufferedRequest(curl_easy_perform(curl_), callback);
     }
 
-    bool PrepareBufferedRequest(CurlRequest request, CurlCallback *callback) {
+    bool PrepareBufferedRequest(CurlRequest request, CurlCallback *callback,
+                                bool *terminalDelivered = nullptr) {
+        if (terminalDelivered != nullptr) {
+            *terminalDelivered = false;
+        }
         std::string method;
         if (!ConfigureRequest(request, method)) {
             return false;
@@ -836,6 +846,9 @@ class CurlClient {
         if (cancel_flag_.load(std::memory_order_relaxed)) {
             logI(log_tag_, "cancelled before perform started.");
             FinishBufferedRequest(CURLE_ABORTED_BY_CALLBACK, callback);
+            if (terminalDelivered != nullptr) {
+                *terminalDelivered = true;
+            }
             return false;
         }
         // 响应数据 body 处理
@@ -854,6 +867,16 @@ class CurlClient {
     CURL *EasyHandle() const {
         return curl_;
     }
+
+    bool IsCancelled() const {
+        return cancel_flag_.load(std::memory_order_relaxed);
+    }
+
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    void SetTestConfigureFailure() {
+        test_configure_failure_.store(true, std::memory_order_relaxed);
+    }
+#endif
 
     void SetMultiQueueDelay(int64_t elapsedMs) {
         multi_queue_delay_ms_ = std::max<int64_t>(0, elapsedMs);
@@ -1310,6 +1333,9 @@ class CurlClient {
     bool http3_enabled_ = false;
     int64_t multi_queue_delay_ms_ = 0;
     bool multi_owner_thread_observed_ = false;
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    std::atomic<bool> test_configure_failure_{false};
+#endif
 };
 
 struct OwnedMultiBufferedRequest {
@@ -1434,13 +1460,24 @@ class CurlMultiEngine {
         curl_multi_wakeup(multi_);
     }
 
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    void SetTestFailureMode(int mode) {
+        test_failure_mode_.store(mode, std::memory_order_relaxed);
+        curl_multi_wakeup(multi_);
+    }
+#endif
+
  private:
     void Run() {
         while (true) {
             DrainPending();
             int runningHandles = 0;
-            curl_multi_perform(multi_, &runningHandles);
+            const CURLMcode performResult = MultiPerform(&runningHandles);
             (void)runningHandles;
+            if (performResult != CURLM_OK) {
+                FailAllAccepted(CURLE_FAILED_INIT);
+                return;
+            }
             DrainCompletions();
 
             bool shouldStop = false;
@@ -1454,9 +1491,35 @@ class CurlMultiEngine {
             }
 
             int descriptorCount = 0;
-            curl_multi_poll(multi_, nullptr, 0, 100, &descriptorCount);
+            const CURLMcode pollResult = MultiPoll(&descriptorCount);
             (void)descriptorCount;
+            if (pollResult != CURLM_OK) {
+                FailAllAccepted(CURLE_FAILED_INIT);
+                return;
+            }
         }
+    }
+
+    CURLMcode MultiPerform(int *runningHandles) {
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+        int expected = 1;
+        if (test_failure_mode_.compare_exchange_strong(
+                expected, 0, std::memory_order_relaxed)) {
+            return CURLM_INTERNAL_ERROR;
+        }
+#endif
+        return curl_multi_perform(multi_, runningHandles);
+    }
+
+    CURLMcode MultiPoll(int *descriptorCount) {
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+        int expected = 2;
+        if (test_failure_mode_.compare_exchange_strong(
+                expected, 0, std::memory_order_relaxed)) {
+            return CURLM_INTERNAL_ERROR;
+        }
+#endif
+        return curl_multi_poll(multi_, nullptr, 0, 100, descriptorCount);
     }
 
     void DrainPending() {
@@ -1472,8 +1535,13 @@ class CurlMultiEngine {
                 std::chrono::steady_clock::now() - job->enqueued_at).count();
             job->client->SetMultiQueueDelay(delay);
             job->RebuildPointers();
-            if (!job->client->PrepareBufferedRequest(job->request, &job->callback)) {
+            bool terminalDelivered = false;
+            if (!job->client->PrepareBufferedRequest(
+                    job->request, &job->callback, &terminalDelivered)) {
                 RemoveJobId(job->request_id);
+                if (!terminalDelivered) {
+                    job->client->CompleteBufferedRequest(CURLE_FAILED_INIT, &job->callback);
+                }
                 continue;
             }
             CURL *easy = job->client->EasyHandle();
@@ -1510,6 +1578,18 @@ class CurlMultiEngine {
     }
 
     void AbortAll() {
+        CompleteAllAccepted(CURLE_ABORTED_BY_CALLBACK, true);
+    }
+
+    void FailAllAccepted(CURLcode failure) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        CompleteAllAccepted(failure, false);
+    }
+
+    void CompleteAllAccepted(CURLcode failure, bool cancelAll) {
         std::deque<std::unique_ptr<OwnedMultiBufferedRequest>> pending;
         std::vector<std::unique_ptr<OwnedMultiBufferedRequest>> active;
         {
@@ -1525,12 +1605,28 @@ class CurlMultiEngine {
         while (!pending.empty()) {
             auto job = std::move(pending.front());
             pending.pop_front();
-            job->client->cancel_flag_.store(true, std::memory_order_relaxed);
+            if (cancelAll) {
+                job->client->cancel_flag_.store(true, std::memory_order_relaxed);
+            }
             job->RebuildPointers();
-            job->client->PrepareBufferedRequest(job->request, &job->callback);
+            bool terminalDelivered = false;
+            job->client->PrepareBufferedRequest(
+                job->request, &job->callback, &terminalDelivered);
+            if (!terminalDelivered) {
+                const CURLcode terminal = job->client->IsCancelled()
+                    ? CURLE_ABORTED_BY_CALLBACK
+                    : failure;
+                job->client->CompleteBufferedRequest(terminal, &job->callback);
+            }
         }
         for (auto &job : active) {
-            job->client->CompleteBufferedRequest(CURLE_ABORTED_BY_CALLBACK, &job->callback);
+            if (cancelAll) {
+                job->client->cancel_flag_.store(true, std::memory_order_relaxed);
+            }
+            const CURLcode terminal = job->client->IsCancelled()
+                ? CURLE_ABORTED_BY_CALLBACK
+                : failure;
+            job->client->CompleteBufferedRequest(terminal, &job->callback);
         }
     }
 
@@ -1549,6 +1645,9 @@ class CurlMultiEngine {
     std::deque<std::unique_ptr<OwnedMultiBufferedRequest>> pending_;
     std::unordered_map<int64_t, OwnedMultiBufferedRequest *> jobs_by_id_;
     std::unordered_map<CURL *, std::unique_ptr<OwnedMultiBufferedRequest>> active_by_easy_;
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    std::atomic<int> test_failure_mode_{0};
+#endif
 };
 
 static bool ValidateV27Request(const CurlRequest *request, size_t requestSize, int abiVersion) {
@@ -1629,6 +1728,20 @@ int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
     }
     return reinterpret_cast<CurlClient *>(handle)->GetMultiInfo(info, infoSize, abiVersion) ? 1 : 0;
 }
+
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode) {
+    if (engine != nullptr) {
+        reinterpret_cast<CurlMultiEngine *>(engine)->SetTestFailureMode(mode);
+    }
+}
+
+void SetCurlClientTestConfigureFailure(CurClientHandle handle) {
+    if (handle != nullptr) {
+        reinterpret_cast<CurlClient *>(handle)->SetTestConfigureFailure();
+    }
+}
+#endif
 
 CurClientHandle CreateCurlClient(const char *logTag) {
     if (logTag == nullptr) {

@@ -220,7 +220,10 @@ int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
 // before deleting it. Request strings/headers/body are copied at submission.
 // One engine accepts exactly one HTTP-version cohort (default h2/h1 or H3);
 // create a separate engine for the other cohort so a default request can never
-// silently acquire an H3 connection.
+// silently acquire an H3 connection. Delete cancels all accepted requests and
+// synchronously waits for their exactly-once callbacks to return. Therefore
+// DeleteCurlMultiEngine must never be called from one of the engine's callbacks;
+// the callback/client context must remain alive until that callback returns.
 CurlMultiEngineHandle CreateCurlMultiEngine(const char *logTag);
 void DeleteCurlMultiEngine(CurlMultiEngineHandle engine);
 int SubmitBufferedRequestV27(CurlMultiEngineHandle engine, int64_t requestId,
@@ -230,6 +233,12 @@ int SubmitBufferedRequestV27(CurlMultiEngineHandle engine, int64_t requestId,
 void CancelCurlMultiRequest(CurlMultiEngineHandle engine, int64_t requestId);
 int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
                        size_t infoSize, int abiVersion);
+
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+// Host-test-only seam: 1 fails the next multi perform, 2 the next multi poll.
+void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode);
+void SetCurlClientTestConfigureFailure(CurClientHandle handle);
+#endif
 
 // Curl 发送请求
 int StartRequestV27(CurClientHandle handle, const CurlRequest *request,

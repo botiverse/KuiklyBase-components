@@ -32,7 +32,7 @@ if grep -q 'CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT' \
 fi
 
 echo "==> Building wrapper + tests for host"
-g++ -std=c++17 -O1 -g \
+g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
   -I "$CPP_ROOT" \
   -I "$CPP_ROOT/wrapper/include" \
   "$CPP_ROOT/wrapper/src/curl_wrapper.cpp" \
