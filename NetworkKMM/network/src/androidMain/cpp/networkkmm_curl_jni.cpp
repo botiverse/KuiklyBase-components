@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -35,6 +36,10 @@ constexpr int kCurlEngineFailure = -1;
 
 std::mutex g_clients_mutex;
 std::unordered_map<int, CurClientHandle> g_clients;
+std::mutex g_multi_engines_mutex;
+CurlMultiEngineHandle g_default_multi_engine = nullptr;
+CurlMultiEngineHandle g_http3_multi_engine = nullptr;
+JavaVM *g_java_vm = nullptr;
 
 class JStringUtfChars {
  public:
@@ -62,6 +67,8 @@ struct CallbackContext {
     JNIEnv *env = nullptr;
     jobject callback = nullptr;
     CurClientHandle client = nullptr;
+    int request_id = 0;
+    bool owns_global_ref = false;
     jmethodID on_response_start = nullptr;
     jmethodID on_chunk = nullptr;
     jmethodID read_upload_chunk = nullptr;
@@ -70,6 +77,7 @@ struct CallbackContext {
     jmethodID max_buffered_response_bytes = nullptr;
     jmethodID on_complete = nullptr;
     jmethodID on_transfer_facts = nullptr;
+    jmethodID on_multi_facts = nullptr;
     CurlResponse *pending_response = nullptr;
 };
 
@@ -229,6 +237,62 @@ void OnComplete(void *callback_ref, CurlResponse *response) {
     context->pending_response = response;
 }
 
+void DeliverTransferFacts(CallbackContext *context);
+void DeliverMultiFacts(CallbackContext *context);
+
+void RemovePublishedClient(int request_id, CurClientHandle client) {
+    std::lock_guard<std::mutex> lock(g_clients_mutex);
+    const auto found = g_clients.find(request_id);
+    if (found != g_clients.end() && found->second == client) {
+        g_clients.erase(found);
+    }
+}
+
+void OnAsyncComplete(void *callback_ref, CurlResponse *response) {
+    auto *context = static_cast<CallbackContext *>(callback_ref);
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (g_java_vm == nullptr) {
+        RemovePublishedClient(context->request_id, context->client);
+        DeleteCurlClient(context->client);
+        delete context;
+        return;
+    }
+    if (g_java_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+#if defined(__ANDROID__)
+        const jint attach_result = g_java_vm->AttachCurrentThread(&env, nullptr);
+#else
+        const jint attach_result = g_java_vm->AttachCurrentThread(
+            reinterpret_cast<void **>(&env), nullptr);
+#endif
+        if (attach_result != JNI_OK || env == nullptr) {
+            RemovePublishedClient(context->request_id, context->client);
+            DeleteCurlClient(context->client);
+            delete context;
+            return;
+        }
+        attached = true;
+    }
+    context->env = env;
+
+    // Multi terminal callbacks run after the easy handle is finished, so facts
+    // are valid now. Publish facts before the Kotlin terminal response.
+    DeliverMultiFacts(context);
+    DeliverTransferFacts(context);
+    RemovePublishedClient(context->request_id, context->client);
+    DeliverComplete(context, response);
+    if (context->owns_global_ref && context->callback != nullptr) {
+        env->DeleteGlobalRef(context->callback);
+    }
+    CurClientHandle client = context->client;
+    context->client = nullptr;
+    delete context;
+    DeleteCurlClient(client);
+    if (attached) {
+        g_java_vm->DetachCurrentThread();
+    }
+}
+
 void DeliverTransferFacts(CallbackContext *context) {
     if (context->on_transfer_facts == nullptr || context->client == nullptr) {
         return;
@@ -251,6 +315,27 @@ void DeliverTransferFacts(CallbackContext *context) {
         static_cast<jlong>(facts.firstBodyElapsedMs),
         static_cast<jlong>(facts.lastBodyProgressElapsedMs),
         static_cast<jlong>(facts.bodyBytes)
+    );
+    CancelAfterCallbackException(context);
+}
+
+void DeliverMultiFacts(CallbackContext *context) {
+    if (context->on_multi_facts == nullptr || context->client == nullptr) {
+        return;
+    }
+    CurlMultiInfoV1 facts{};
+    if (GetCurlMultiInfoV1(
+            context->client,
+            &facts,
+            sizeof(facts),
+            CURL_MULTI_INFO_ABI_VERSION) == 0) {
+        return;
+    }
+    context->env->CallVoidMethod(
+        context->callback,
+        context->on_multi_facts,
+        static_cast<jlong>(facts.enqueueToNativeStartElapsedMs),
+        facts.ownerThreadObserved != 0 ? JNI_TRUE : JNI_FALSE
     );
     CancelAfterCallbackException(context);
 }
@@ -280,6 +365,10 @@ bool PopulateCallbackMethods(JNIEnv *env, jobject callback, CallbackContext *con
     if (context->on_transfer_facts == nullptr && env->ExceptionCheck()) {
         // Additive bridge method: an older Kotlin callback remains request-
         // compatible and simply receives no V1 facts.
+        env->ExceptionClear();
+    }
+    context->on_multi_facts = env->GetMethodID(callback_class, "onMultiFacts", "(JZ)V");
+    if (context->on_multi_facts == nullptr && env->ExceptionCheck()) {
         env->ExceptionClear();
     }
     env->DeleteLocalRef(callback_class);
@@ -316,6 +405,149 @@ void InvokeEngineFailure(CallbackContext *context, const char *message) {
     response.errorMsg = message;
     response.errorMsgLen = static_cast<int>(std::char_traits<char>::length(message));
     DeliverComplete(context, &response);
+}
+
+CurlMultiEngineHandle GetMultiEngine(bool http3_enabled) {
+    std::lock_guard<std::mutex> lock(g_multi_engines_mutex);
+    CurlMultiEngineHandle *slot = http3_enabled
+        ? &g_http3_multi_engine
+        : &g_default_multi_engine;
+    if (*slot == nullptr) {
+        *slot = CreateCurlMultiEngine(
+            http3_enabled ? "networkkmm-android-h3" : "networkkmm-android-default");
+    }
+    return *slot;
+}
+
+jboolean NativeSubmitBuffered(
+    JNIEnv *env,
+    jclass,
+    jint request_id,
+    jstring url,
+    jstring method,
+    jobjectArray header_names,
+    jobjectArray header_values,
+    jlong timeout_millis,
+    jbyteArray body,
+    jstring ca_info_path,
+    jstring proxy_url,
+    jboolean http3_enabled,
+    jobject callback
+) {
+    if (CurlWrapperAbiVersion() != CURL_WRAPPER_ABI_VERSION || callback == nullptr) {
+        return JNI_FALSE;
+    }
+    auto context = std::make_unique<CallbackContext>();
+    context->env = env;
+    context->request_id = request_id;
+    if (!PopulateCallbackMethods(env, callback, context.get())) {
+        return JNI_FALSE;
+    }
+    context->callback = env->NewGlobalRef(callback);
+    context->owns_global_ref = context->callback != nullptr;
+    if (context->callback == nullptr) {
+        return JNI_FALSE;
+    }
+
+    JStringUtfChars url_chars(env, url);
+    JStringUtfChars method_chars(env, method);
+    JStringUtfChars ca_chars(env, ca_info_path);
+    JStringUtfChars proxy_chars(env, proxy_url);
+    if (url_chars.get() == nullptr || method_chars.get() == nullptr) {
+        env->DeleteGlobalRef(context->callback);
+        return JNI_FALSE;
+    }
+
+    const jsize name_count = header_names == nullptr ? 0 : env->GetArrayLength(header_names);
+    const jsize value_count = header_values == nullptr ? 0 : env->GetArrayLength(header_values);
+    const jsize header_count = std::min(name_count, value_count);
+    std::vector<std::string> names;
+    std::vector<std::string> values;
+    names.reserve(header_count);
+    values.reserve(header_count);
+    for (jsize index = 0; index < header_count; ++index) {
+        auto *java_name = static_cast<jstring>(env->GetObjectArrayElement(header_names, index));
+        auto *java_value = static_cast<jstring>(env->GetObjectArrayElement(header_values, index));
+        {
+            JStringUtfChars name_chars(env, java_name);
+            JStringUtfChars value_chars(env, java_value);
+            names.emplace_back(name_chars.get() == nullptr ? "" : name_chars.get());
+            values.emplace_back(value_chars.get() == nullptr ? "" : value_chars.get());
+        }
+        env->DeleteLocalRef(java_name);
+        env->DeleteLocalRef(java_value);
+    }
+    std::vector<StringPair> pairs;
+    pairs.reserve(header_count);
+    for (jsize index = 0; index < header_count; ++index) {
+        pairs.push_back(StringPair{names[index].c_str(), values[index].c_str()});
+    }
+    StringDic headers{pairs.data(), static_cast<int>(pairs.size())};
+
+    std::vector<char> body_bytes;
+    if (body != nullptr) {
+        const jsize body_length = env->GetArrayLength(body);
+        body_bytes.resize(body_length);
+        if (body_length > 0) {
+            env->GetByteArrayRegion(
+                body, 0, body_length, reinterpret_cast<jbyte *>(body_bytes.data()));
+        }
+    }
+    CurlRequest request{};
+    request.url = url_chars.get();
+    request.method = method_chars.get();
+    request.headers = &headers;
+    request.timeout = timeout_millis;
+    request.postBodyLen = static_cast<int>(body_bytes.size());
+    request.postBody = body_bytes.empty() ? nullptr : body_bytes.data();
+
+    CurClientHandle client = CreateCurlClient("networkkmm-android-async");
+    if (client == nullptr) {
+        env->DeleteGlobalRef(context->callback);
+        return JNI_FALSE;
+    }
+    context->client = client;
+    ConfigureBufferedPolicy(context.get());
+    SetCurlCaInfo(client, ca_chars.get());
+    SetCurlProxy(client, proxy_chars.get());
+    if (SetCurlHttp3Enabled(client, http3_enabled == JNI_TRUE ? 1 : 0) == 0) {
+        env->DeleteGlobalRef(context->callback);
+        DeleteCurlClient(client);
+        return JNI_FALSE;
+    }
+    bool published = false;
+    {
+        std::lock_guard<std::mutex> lock(g_clients_mutex);
+        published = g_clients.emplace(request_id, client).second;
+    }
+    if (!published) {
+        env->DeleteGlobalRef(context->callback);
+        DeleteCurlClient(client);
+        return JNI_FALSE;
+    }
+    CancelIfSignalled(context.get());
+
+    CurlMultiEngineHandle engine = GetMultiEngine(http3_enabled == JNI_TRUE);
+    context->env = nullptr;
+    CallbackContext *submitted_context = context.release();
+    CurlCallback curl_callback{submitted_context, OnAsyncComplete};
+    const bool accepted = engine != nullptr && SubmitBufferedRequestV27(
+        engine,
+        request_id,
+        client,
+        &request,
+        sizeof(request),
+        CURL_WRAPPER_ABI_VERSION,
+        &curl_callback) != 0;
+    if (!accepted) {
+        std::unique_ptr<CallbackContext> rejected_context(submitted_context);
+        rejected_context->env = env;
+        RemovePublishedClient(request_id, client);
+        env->DeleteGlobalRef(rejected_context->callback);
+        DeleteCurlClient(client);
+        return JNI_FALSE;
+    }
+    return JNI_TRUE;
 }
 
 void NativePerform(
@@ -504,6 +736,7 @@ jboolean NativeSupportsHttp3(JNIEnv *, jclass) {
 }  // namespace
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+    g_java_vm = vm;
     JNIEnv *env = nullptr;
     if (vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
         return JNI_ERR;
@@ -513,6 +746,14 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
         return JNI_ERR;
     }
     JNINativeMethod methods[] = {
+        {
+            const_cast<char *>("nativeSubmitBuffered"),
+            const_cast<char *>(
+                "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;J[BLjava/lang/String;"
+                "Ljava/lang/String;ZLcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)Z"
+            ),
+            reinterpret_cast<void *>(NativeSubmitBuffered)
+        },
         {
             const_cast<char *>("nativePerform"),
             const_cast<char *>(
@@ -535,4 +776,19 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
     const jint result = env->RegisterNatives(bridge_class, methods, sizeof(methods) / sizeof(methods[0]));
     env->DeleteLocalRef(bridge_class);
     return result == JNI_OK ? JNI_VERSION_1_6 : JNI_ERR;
+}
+
+JNIEXPORT void JNICALL JNI_OnUnload(JavaVM *, void *) {
+    CurlMultiEngineHandle default_engine = nullptr;
+    CurlMultiEngineHandle http3_engine = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_multi_engines_mutex);
+        default_engine = g_default_multi_engine;
+        http3_engine = g_http3_multi_engine;
+        g_default_multi_engine = nullptr;
+        g_http3_multi_engine = nullptr;
+    }
+    DeleteCurlMultiEngine(default_engine);
+    DeleteCurlMultiEngine(http3_engine);
+    g_java_vm = nullptr;
 }

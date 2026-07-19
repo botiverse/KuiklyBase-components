@@ -32,18 +32,18 @@ if grep -q 'CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT' \
 fi
 
 echo "==> Building wrapper + tests for host"
-g++ -std=c++17 -O1 -g \
+g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
   -I "$CPP_ROOT" \
   -I "$CPP_ROOT/wrapper/include" \
   "$CPP_ROOT/wrapper/src/curl_wrapper.cpp" \
   "$CPP_ROOT/wrapper/src/log/curl_log.cpp" \
   "$CPP_ROOT/wrapper/src/utils/curl_utils.cpp" \
   "$SCRIPT_DIR/wrapper_behavior_test.cpp" \
-  -lcurl -lz \
+  -lcurl -lz -pthread \
   -o "$BUILD_DIR/wrapper_behavior_test"
 
 WRAPPER_SYMBOLS="$(nm "$BUILD_DIR/wrapper_behavior_test")"
-for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs; do
+for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs CreateCurlMultiEngine SubmitBufferedRequestV27 CancelCurlMultiRequest GetCurlMultiInfoV1; do
   grep -Eq " [Tt] ${symbol}$" <<<"$WRAPPER_SYMBOLS"
 done
 for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do

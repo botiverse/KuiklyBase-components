@@ -50,6 +50,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/slow":
             time.sleep(10)
             self._send(200, b'{"slow":true}')
+        elif self.path == "/multi-delay":
+            time.sleep(0.8)
+            self._send(200, b'{"multi":true}')
         elif self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/ok")

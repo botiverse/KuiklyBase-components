@@ -8,8 +8,11 @@
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <curl/curl.h>
@@ -35,6 +38,48 @@ struct Captured {
     long long connectTimeMs = -1;
     bool invoked = false;
 };
+
+struct MultiCaptured {
+    std::mutex mutex;
+    std::condition_variable condition;
+    int expected = 0;
+    int completed = 0;
+    std::vector<int> callbackCounts;
+    std::vector<int> codes;
+    std::vector<long> httpCodes;
+    std::thread::id ownerThread;
+    bool ownerThreadSet = false;
+    bool ownerThreadMismatch = false;
+};
+
+struct MultiCallbackRef {
+    MultiCaptured *batch = nullptr;
+    int index = 0;
+};
+
+static void OnMultiResponse(void *ref, CurlResponse *response) {
+    auto *item = static_cast<MultiCallbackRef *>(ref);
+    std::lock_guard<std::mutex> lock(item->batch->mutex);
+    item->batch->callbackCounts[item->index]++;
+    item->batch->codes[item->index] = response->code;
+    item->batch->httpCodes[item->index] = response->httpCode;
+    if (!item->batch->ownerThreadSet) {
+        item->batch->ownerThread = std::this_thread::get_id();
+        item->batch->ownerThreadSet = true;
+    } else if (item->batch->ownerThread != std::this_thread::get_id()) {
+        item->batch->ownerThreadMismatch = true;
+    }
+    item->batch->completed++;
+    item->batch->condition.notify_all();
+}
+
+static bool AwaitMulti(MultiCaptured &batch, int timeoutMs) {
+    std::unique_lock<std::mutex> lock(batch.mutex);
+    return batch.condition.wait_for(
+        lock,
+        std::chrono::milliseconds(timeoutMs),
+        [&batch]() { return batch.completed >= batch.expected; });
+}
 
 struct UploadBuffer {
     std::string data;
@@ -300,6 +345,239 @@ int main(int argc, char **argv) {
               "HTTP/3 enable result matches the linked feature bit");
         CHECK(std::strcmp(GetCurlNegotiatedProtocol(handle), "unknown") == 0,
               "protocol is unknown before a request completes");
+        DeleteCurlClient(handle);
+    }
+
+    {
+        constexpr int requestCount = 4;
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-owner");
+        CHECK(engine != nullptr, "single-owner multi engine starts");
+
+        MultiCaptured batch;
+        batch.expected = requestCount;
+        batch.callbackCounts.assign(requestCount, 0);
+        batch.codes.assign(requestCount, -1);
+        batch.httpCodes.assign(requestCount, -1);
+        std::vector<MultiCallbackRef> refs(requestCount);
+        std::vector<CurClientHandle> handles(requestCount, nullptr);
+        const std::string multiUrl = base + "/multi-delay";
+        StringDic headers{};
+        const auto started = std::chrono::steady_clock::now();
+        for (int index = 0; index < requestCount; ++index) {
+            refs[index] = MultiCallbackRef{&batch, index};
+            handles[index] = CreateCurlClient("wrapper-multi-request");
+            CurlRequest request{};
+            request.url = multiUrl.c_str();
+            request.method = "GET";
+            request.headers = &headers;
+            request.timeout = 5000;
+            CurlCallback callback{&refs[index], OnMultiResponse};
+            CHECK(
+                SubmitBufferedRequestV27(
+                    engine,
+                    10'000 + index,
+                    handles[index],
+                    &request,
+                    sizeof(request),
+                    CURL_WRAPPER_ABI_VERSION,
+                    &callback) == 1,
+                "multi engine accepts buffered request");
+        }
+        CHECK(AwaitMulti(batch, 5000), "multi owner completes every concurrent request");
+        CHECK(batch.ownerThreadSet && !batch.ownerThreadMismatch,
+              "every multi terminal callback runs on one owner thread");
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        CHECK(elapsed < 2200, "single owner advances four delayed requests concurrently");
+        for (int index = 0; index < requestCount; ++index) {
+            CHECK(batch.callbackCounts[index] == 1, "multi request completes exactly once");
+            CHECK(batch.codes[index] == 0, "multi request CURLcode is 0");
+            CHECK(batch.httpCodes[index] == 200, "multi request preserves HTTP 200");
+            CurlMultiInfoV1 info{};
+            CHECK(
+                GetCurlMultiInfoV1(
+                    handles[index],
+                    &info,
+                    sizeof(info),
+                    CURL_MULTI_INFO_ABI_VERSION) == 1,
+                "multi request exposes queue-delay facts");
+            CHECK(info.ownerThreadObserved == 1, "multi request ran on owner thread");
+            CHECK(info.enqueueToNativeStartElapsedMs >= 0, "multi queue delay is non-negative");
+            CurlMultiInfoV1 untouched{};
+            untouched.reserved = 77;
+            CHECK(
+                GetCurlMultiInfoV1(handles[index], &untouched, sizeof(untouched) - 1,
+                                   CURL_MULTI_INFO_ABI_VERSION) == 0,
+                "multi facts reject mismatched struct size");
+            CHECK(untouched.reserved == 77, "multi facts mismatch does not write caller memory");
+        }
+
+        MultiCaptured cancelled;
+        cancelled.expected = 1;
+        cancelled.callbackCounts.assign(1, 0);
+        cancelled.codes.assign(1, -1);
+        cancelled.httpCodes.assign(1, -1);
+        MultiCallbackRef cancelRef{&cancelled, 0};
+        CurClientHandle cancelHandle = CreateCurlClient("wrapper-multi-cancel");
+        const std::string slowUrl = base + "/slow";
+        CurlRequest cancelRequest{};
+        cancelRequest.url = slowUrl.c_str();
+        cancelRequest.method = "GET";
+        cancelRequest.headers = &headers;
+        cancelRequest.timeout = 30'000;
+        CurlCallback cancelCallback{&cancelRef, OnMultiResponse};
+        CHECK(
+            SubmitBufferedRequestV27(
+                engine,
+                20'000,
+                cancelHandle,
+                &cancelRequest,
+                sizeof(cancelRequest),
+                CURL_WRAPPER_ABI_VERSION,
+                &cancelCallback) == 1,
+            "multi engine accepts cancellable request");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CancelCurlMultiRequest(engine, 20'000);
+        CHECK(AwaitMulti(cancelled, 3000), "multi cancel wakes owner without worker starvation");
+        CHECK(cancelled.callbackCounts[0] == 1, "multi cancel completes exactly once");
+        CHECK(cancelled.codes[0] == 42, "multi cancel preserves CURLE_ABORTED_BY_CALLBACK");
+
+        DeleteCurlMultiEngine(engine);
+        for (CurClientHandle handle : handles) {
+            DeleteCurlClient(handle);
+        }
+        DeleteCurlClient(cancelHandle);
+    }
+
+    {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-config-failure");
+        CHECK(engine != nullptr, "configure-failure multi engine starts");
+        MultiCaptured captured;
+        captured.expected = 1;
+        captured.callbackCounts.assign(1, 0);
+        captured.codes.assign(1, -1);
+        captured.httpCodes.assign(1, -1);
+        MultiCallbackRef ref{&captured, 0};
+        CurClientHandle handle = CreateCurlClient("wrapper-multi-config-failure-request");
+        SetCurlClientTestConfigureFailure(handle);
+        StringDic headers{};
+        const std::string url = base + "/ok";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+        CurlCallback callback{&ref, OnMultiResponse};
+        CHECK(SubmitBufferedRequestV27(engine, 21'000, handle, &request, sizeof(request),
+                                       CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "multi accepts request before configure failure is observed");
+        CHECK(AwaitMulti(captured, 3000),
+              "accepted configure failure reaches a terminal callback");
+        CHECK(captured.callbackCounts[0] == 1,
+              "accepted configure failure completes exactly once");
+        CHECK(captured.codes[0] == CURLE_FAILED_INIT,
+              "accepted configure failure is classified as failed init");
+        DeleteCurlMultiEngine(engine);
+        DeleteCurlClient(handle);
+    }
+
+    {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-pre-cancel");
+        CHECK(engine != nullptr, "pre-cancel multi engine starts");
+        MultiCaptured captured;
+        captured.expected = 1;
+        captured.callbackCounts.assign(1, 0);
+        captured.codes.assign(1, -1);
+        captured.httpCodes.assign(1, -1);
+        MultiCallbackRef ref{&captured, 0};
+        CurClientHandle handle = CreateCurlClient("wrapper-multi-pre-cancel-request");
+        SetCurlClientTestConfigureFailure(handle);
+        StringDic headers{};
+        const std::string url = base + "/slow";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 30'000;
+        CurlCallback callback{&ref, OnMultiResponse};
+        CHECK(SubmitBufferedRequestV27(engine, 21'001, handle, &request, sizeof(request),
+                                       CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "multi accepts request before configure/pre-cancel race");
+        CancelCurlMultiRequest(engine, 21'001);
+        CHECK(AwaitMulti(captured, 3000),
+              "configure/pre-cancel race reaches one terminal callback");
+        CHECK(captured.callbackCounts[0] == 1,
+              "configure/pre-cancel race never double-completes");
+        CHECK(captured.codes[0] == CURLE_FAILED_INIT ||
+                  captured.codes[0] == CURLE_ABORTED_BY_CALLBACK,
+              "configure/pre-cancel race preserves the winning terminal cause");
+        DeleteCurlMultiEngine(engine);
+        DeleteCurlClient(handle);
+    }
+
+    for (int failureMode : {1, 2}) {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-owner-fatal");
+        CHECK(engine != nullptr, "owner-fatal multi engine starts");
+        MultiCaptured captured;
+        captured.expected = 1;
+        captured.callbackCounts.assign(1, 0);
+        captured.codes.assign(1, -1);
+        captured.httpCodes.assign(1, -1);
+        MultiCallbackRef ref{&captured, 0};
+        CurClientHandle handle = CreateCurlClient("wrapper-multi-owner-fatal-request");
+        StringDic headers{};
+        const std::string url = base + "/slow";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 30'000;
+        CurlCallback callback{&ref, OnMultiResponse};
+        CHECK(SubmitBufferedRequestV27(engine, 22'000 + failureMode, handle, &request,
+                                       sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "multi accepts request before owner API failure");
+        SetCurlMultiTestFailureMode(engine, failureMode);
+        CHECK(AwaitMulti(captured, 3000),
+              "multi API failure drains accepted request without an infinite loop");
+        CHECK(captured.callbackCounts[0] == 1,
+              "multi API failure completes accepted request exactly once");
+        CHECK(captured.codes[0] == CURLE_FAILED_INIT,
+              "multi API failure has a stable failed-init terminal");
+        DeleteCurlMultiEngine(engine);
+        DeleteCurlClient(handle);
+    }
+
+    for (int deleteDelayMs : {0, 100}) {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-delete");
+        CHECK(engine != nullptr, "delete-lifecycle multi engine starts");
+        MultiCaptured captured;
+        captured.expected = 1;
+        captured.callbackCounts.assign(1, 0);
+        captured.codes.assign(1, -1);
+        captured.httpCodes.assign(1, -1);
+        MultiCallbackRef ref{&captured, 0};
+        CurClientHandle handle = CreateCurlClient("wrapper-multi-delete-request");
+        StringDic headers{};
+        const std::string url = base + "/slow";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 30'000;
+        CurlCallback callback{&ref, OnMultiResponse};
+        CHECK(SubmitBufferedRequestV27(engine, 23'000 + deleteDelayMs, handle, &request,
+                                       sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "multi accepts request before engine deletion");
+        if (deleteDelayMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(deleteDelayMs));
+        }
+        DeleteCurlMultiEngine(engine);
+        CHECK(AwaitMulti(captured, 100),
+              "engine deletion synchronously drains pending or active request");
+        CHECK(captured.callbackCounts[0] == 1,
+              "engine deletion completes request exactly once");
+        CHECK(captured.codes[0] == CURLE_ABORTED_BY_CALLBACK,
+              "engine deletion classifies pending and active requests as cancelled");
         DeleteCurlClient(handle);
     }
 

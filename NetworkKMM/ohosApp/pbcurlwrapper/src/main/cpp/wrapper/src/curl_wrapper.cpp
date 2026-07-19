@@ -21,6 +21,7 @@
 #include <cctype>
 #include <chrono>
 #include <climits>
+#include <deque>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -28,6 +29,10 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 // Angle-bracket include so the REAL libcurl headers (cpp/include, 8.16 — the
 // version actually linked) win. The quoted form used to resolve to a stale
 // vendored 7.64.0-DEV copy next to the sources (Codex-KMP-Developer's find:
@@ -586,6 +591,12 @@ class CurlClient {
     // (fork #8). Everything except the write callback + perform is configured
     // here; the caller sets its own CURLOPT_WRITEFUNCTION and performs.
     bool ConfigureRequest(CurlRequest &request, std::string &method) {
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+        if (test_configure_failure_.exchange(false, std::memory_order_relaxed)) {
+            logE(log_tag_, "injected ConfigureRequest failure");
+            return false;
+        }
+#endif
         if (!curl_) {
             logE(log_tag_, "curl_easy_init() failed.");
             return false;
@@ -814,9 +825,20 @@ class CurlClient {
     }
 
     void StartRequest(CurlRequest request, CurlCallback *callback) {
+        if (!PrepareBufferedRequest(request, callback)) {
+            return;
+        }
+        CompleteBufferedRequest(curl_easy_perform(curl_), callback);
+    }
+
+    bool PrepareBufferedRequest(CurlRequest request, CurlCallback *callback,
+                                bool *terminalDelivered = nullptr) {
+        if (terminalDelivered != nullptr) {
+            *terminalDelivered = false;
+        }
         std::string method;
         if (!ConfigureRequest(request, method)) {
-            return;
+            return false;
         }
         // Cancel may land in the publish→perform window (RFC D-5): honor a
         // pre-set flag deterministically instead of relying on the first
@@ -824,16 +846,55 @@ class CurlClient {
         if (cancel_flag_.load(std::memory_order_relaxed)) {
             logI(log_tag_, "cancelled before perform started.");
             FinishBufferedRequest(CURLE_ABORTED_BY_CALLBACK, callback);
-            return;
+            if (terminalDelivered != nullptr) {
+                *terminalDelivered = true;
+            }
+            return false;
         }
         // 响应数据 body 处理
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, DataWriteCallback);
         curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
-        // curl 请求处理. libcurl transparently decodes the body per the negotiated
+        return true;
+    }
+
+    void CompleteBufferedRequest(CURLcode result, CurlCallback *callback) {
+        // libcurl transparently decodes the body per the negotiated
         // Content-Encoding (zlib/brotli/zstd), so content_data_ is already the
         // decompressed payload — no manual gzip pass.
-        CURLcode res = NormalizeBufferedTerminal(curl_easy_perform(curl_));
-        FinishBufferedRequest(res, callback);
+        FinishBufferedRequest(NormalizeBufferedTerminal(result), callback);
+    }
+
+    CURL *EasyHandle() const {
+        return curl_;
+    }
+
+    bool IsCancelled() const {
+        return cancel_flag_.load(std::memory_order_relaxed);
+    }
+
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    void SetTestConfigureFailure() {
+        test_configure_failure_.store(true, std::memory_order_relaxed);
+    }
+#endif
+
+    void SetMultiQueueDelay(int64_t elapsedMs) {
+        multi_queue_delay_ms_ = std::max<int64_t>(0, elapsedMs);
+        multi_owner_thread_observed_ = true;
+    }
+
+    bool GetMultiInfo(CurlMultiInfoV1 *info, size_t infoSize, int abiVersion) const {
+        if (info == nullptr || infoSize != sizeof(CurlMultiInfoV1) ||
+            abiVersion != CURL_MULTI_INFO_ABI_VERSION) {
+            return false;
+        }
+        CurlMultiInfoV1 snapshot{};
+        snapshot.abiVersion = CURL_MULTI_INFO_ABI_VERSION;
+        snapshot.structSize = sizeof(CurlMultiInfoV1);
+        snapshot.enqueueToNativeStartElapsedMs = std::max<int64_t>(0, multi_queue_delay_ms_);
+        snapshot.ownerThreadObserved = multi_owner_thread_observed_ ? 1 : 0;
+        *info = snapshot;
+        return true;
     }
 
     // issue #8 slice 3: streaming upload. The request body is pulled from the
@@ -1174,6 +1235,10 @@ class CurlClient {
         return true;
     }
 
+    bool Http3Enabled() const {
+        return http3_enabled_;
+    }
+
     void SetMaxBufferedResponseBytes(int64_t maxBytes) {
         max_buffered_response_bytes_ = std::max<int64_t>(0, maxBytes);
     }
@@ -1266,6 +1331,323 @@ class CurlClient {
     // bytes delivered to onChunk (determinate progress, no transparent decode).
     bool stream_mode_ = false;
     bool http3_enabled_ = false;
+    int64_t multi_queue_delay_ms_ = 0;
+    bool multi_owner_thread_observed_ = false;
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    std::atomic<bool> test_configure_failure_{false};
+#endif
+};
+
+struct OwnedMultiBufferedRequest {
+    int64_t request_id = 0;
+    CurlClient *client = nullptr;
+    CurlCallback callback{};
+    std::string url;
+    std::string method;
+    std::vector<std::pair<std::string, std::string>> header_values;
+    std::vector<StringPair> header_pairs;
+    std::vector<char> body;
+    StringDic headers{};
+    CurlRequest request{};
+    std::chrono::steady_clock::time_point enqueued_at{};
+
+    OwnedMultiBufferedRequest(int64_t id, CurlClient *clientValue,
+                              const CurlRequest &source, const CurlCallback &callbackValue)
+        : request_id(id), client(clientValue), callback(callbackValue),
+          url(source.url == nullptr ? "" : source.url),
+          method(source.method == nullptr ? "" : source.method),
+          enqueued_at(std::chrono::steady_clock::now()) {
+        if (source.headers != nullptr && source.headers->stringPairs != nullptr) {
+            for (int index = 0; index < source.headers->size; ++index) {
+                const StringPair &pair = source.headers->stringPairs[index];
+                header_values.emplace_back(
+                    pair.first == nullptr ? "" : pair.first,
+                    pair.second == nullptr ? "" : pair.second);
+            }
+        }
+        if (source.postBody != nullptr && source.postBodyLen > 0) {
+            body.assign(source.postBody, source.postBody + source.postBodyLen);
+        }
+        request = source;
+        RebuildPointers();
+    }
+
+    void RebuildPointers() {
+        header_pairs.clear();
+        header_pairs.reserve(header_values.size());
+        for (auto &pair : header_values) {
+            header_pairs.push_back(StringPair{
+                const_cast<char *>(pair.first.c_str()),
+                const_cast<char *>(pair.second.c_str())});
+        }
+        headers.size = static_cast<int>(header_pairs.size());
+        headers.stringPairs = header_pairs.empty() ? nullptr : header_pairs.data();
+        request.url = const_cast<char *>(url.c_str());
+        request.method = const_cast<char *>(method.c_str());
+        request.headers = &headers;
+        request.postBodyLen = static_cast<int>(body.size());
+        request.postBody = body.empty() ? nullptr : body.data();
+    }
+};
+
+class CurlMultiEngine {
+ public:
+    explicit CurlMultiEngine(std::string logTag) : log_tag_(std::move(logTag)) {
+        if (!EnsureCurlGlobalInit()) {
+            return;
+        }
+        multi_ = curl_multi_init();
+        if (multi_ != nullptr) {
+            owner_ = std::thread(&CurlMultiEngine::Run, this);
+        }
+    }
+
+    ~CurlMultiEngine() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            for (auto &entry : jobs_by_id_) {
+                entry.second->client->cancel_flag_.store(true, std::memory_order_relaxed);
+            }
+        }
+        if (multi_ != nullptr) {
+            curl_multi_wakeup(multi_);
+        }
+        if (owner_.joinable()) {
+            owner_.join();
+        }
+        if (multi_ != nullptr) {
+            curl_multi_cleanup(multi_);
+            multi_ = nullptr;
+        }
+    }
+
+    bool IsAvailable() const {
+        return multi_ != nullptr && owner_.joinable();
+    }
+
+    bool Submit(std::unique_ptr<OwnedMultiBufferedRequest> job) {
+        if (!IsAvailable() || job == nullptr || job->client == nullptr) {
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_ || jobs_by_id_.count(job->request_id) != 0) {
+                return false;
+            }
+            if (!cohort_initialized_) {
+                cohort_initialized_ = true;
+                http3_cohort_ = job->client->Http3Enabled();
+            } else if (http3_cohort_ != job->client->Http3Enabled()) {
+                return false;
+            }
+            jobs_by_id_[job->request_id] = job.get();
+            pending_.push_back(std::move(job));
+        }
+        curl_multi_wakeup(multi_);
+        return true;
+    }
+
+    void Cancel(int64_t requestId) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            auto found = jobs_by_id_.find(requestId);
+            if (found == jobs_by_id_.end()) {
+                return;
+            }
+            found->second->client->cancel_flag_.store(true, std::memory_order_relaxed);
+        }
+        curl_multi_wakeup(multi_);
+    }
+
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    void SetTestFailureMode(int mode) {
+        test_failure_mode_.store(mode, std::memory_order_relaxed);
+        curl_multi_wakeup(multi_);
+    }
+#endif
+
+ private:
+    void Run() {
+        while (true) {
+            DrainPending();
+            int runningHandles = 0;
+            const CURLMcode performResult = MultiPerform(&runningHandles);
+            (void)runningHandles;
+            if (performResult != CURLM_OK) {
+                FailAllAccepted(CURLE_FAILED_INIT);
+                return;
+            }
+            DrainCompletions();
+
+            bool shouldStop = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                shouldStop = stopping_;
+            }
+            if (shouldStop) {
+                AbortAll();
+                return;
+            }
+
+            int descriptorCount = 0;
+            const CURLMcode pollResult = MultiPoll(&descriptorCount);
+            (void)descriptorCount;
+            if (pollResult != CURLM_OK) {
+                FailAllAccepted(CURLE_FAILED_INIT);
+                return;
+            }
+        }
+    }
+
+    CURLMcode MultiPerform(int *runningHandles) {
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+        int expected = 1;
+        if (test_failure_mode_.compare_exchange_strong(
+                expected, 0, std::memory_order_relaxed)) {
+            return CURLM_INTERNAL_ERROR;
+        }
+#endif
+        return curl_multi_perform(multi_, runningHandles);
+    }
+
+    CURLMcode MultiPoll(int *descriptorCount) {
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+        int expected = 2;
+        if (test_failure_mode_.compare_exchange_strong(
+                expected, 0, std::memory_order_relaxed)) {
+            return CURLM_INTERNAL_ERROR;
+        }
+#endif
+        return curl_multi_poll(multi_, nullptr, 0, 100, descriptorCount);
+    }
+
+    void DrainPending() {
+        std::deque<std::unique_ptr<OwnedMultiBufferedRequest>> pending;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending.swap(pending_);
+        }
+        while (!pending.empty()) {
+            auto job = std::move(pending.front());
+            pending.pop_front();
+            const auto delay = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - job->enqueued_at).count();
+            job->client->SetMultiQueueDelay(delay);
+            job->RebuildPointers();
+            bool terminalDelivered = false;
+            if (!job->client->PrepareBufferedRequest(
+                    job->request, &job->callback, &terminalDelivered)) {
+                RemoveJobId(job->request_id);
+                if (!terminalDelivered) {
+                    job->client->CompleteBufferedRequest(CURLE_FAILED_INIT, &job->callback);
+                }
+                continue;
+            }
+            CURL *easy = job->client->EasyHandle();
+            if (easy == nullptr || curl_multi_add_handle(multi_, easy) != CURLM_OK) {
+                RemoveJobId(job->request_id);
+                job->client->CompleteBufferedRequest(CURLE_FAILED_INIT, &job->callback);
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            active_by_easy_[easy] = std::move(job);
+        }
+    }
+
+    void DrainCompletions() {
+        int remaining = 0;
+        while (CURLMsg *message = curl_multi_info_read(multi_, &remaining)) {
+            if (message->msg != CURLMSG_DONE) {
+                continue;
+            }
+            std::unique_ptr<OwnedMultiBufferedRequest> job;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                auto found = active_by_easy_.find(message->easy_handle);
+                if (found == active_by_easy_.end()) {
+                    continue;
+                }
+                job = std::move(found->second);
+                active_by_easy_.erase(found);
+                jobs_by_id_.erase(job->request_id);
+            }
+            curl_multi_remove_handle(multi_, message->easy_handle);
+            job->client->CompleteBufferedRequest(message->data.result, &job->callback);
+        }
+    }
+
+    void AbortAll() {
+        CompleteAllAccepted(CURLE_ABORTED_BY_CALLBACK, true);
+    }
+
+    void FailAllAccepted(CURLcode failure) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        CompleteAllAccepted(failure, false);
+    }
+
+    void CompleteAllAccepted(CURLcode failure, bool cancelAll) {
+        std::deque<std::unique_ptr<OwnedMultiBufferedRequest>> pending;
+        std::vector<std::unique_ptr<OwnedMultiBufferedRequest>> active;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            pending.swap(pending_);
+            for (auto &entry : active_by_easy_) {
+                curl_multi_remove_handle(multi_, entry.first);
+                active.push_back(std::move(entry.second));
+            }
+            active_by_easy_.clear();
+            jobs_by_id_.clear();
+        }
+        while (!pending.empty()) {
+            auto job = std::move(pending.front());
+            pending.pop_front();
+            if (cancelAll) {
+                job->client->cancel_flag_.store(true, std::memory_order_relaxed);
+            }
+            job->RebuildPointers();
+            bool terminalDelivered = false;
+            job->client->PrepareBufferedRequest(
+                job->request, &job->callback, &terminalDelivered);
+            if (!terminalDelivered) {
+                const CURLcode terminal = job->client->IsCancelled()
+                    ? CURLE_ABORTED_BY_CALLBACK
+                    : failure;
+                job->client->CompleteBufferedRequest(terminal, &job->callback);
+            }
+        }
+        for (auto &job : active) {
+            if (cancelAll) {
+                job->client->cancel_flag_.store(true, std::memory_order_relaxed);
+            }
+            const CURLcode terminal = job->client->IsCancelled()
+                ? CURLE_ABORTED_BY_CALLBACK
+                : failure;
+            job->client->CompleteBufferedRequest(terminal, &job->callback);
+        }
+    }
+
+    void RemoveJobId(int64_t requestId) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        jobs_by_id_.erase(requestId);
+    }
+
+    std::string log_tag_;
+    CURLM *multi_ = nullptr;
+    std::thread owner_;
+    mutable std::mutex mutex_;
+    bool stopping_ = false;
+    bool cohort_initialized_ = false;
+    bool http3_cohort_ = false;
+    std::deque<std::unique_ptr<OwnedMultiBufferedRequest>> pending_;
+    std::unordered_map<int64_t, OwnedMultiBufferedRequest *> jobs_by_id_;
+    std::unordered_map<CURL *, std::unique_ptr<OwnedMultiBufferedRequest>> active_by_easy_;
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    std::atomic<int> test_failure_mode_{0};
+#endif
 };
 
 static bool ValidateV27Request(const CurlRequest *request, size_t requestSize, int abiVersion) {
@@ -1303,6 +1685,63 @@ int StartUploadRequestV27(CurClientHandle handle, const CurlRequest *request,
     reinterpret_cast<CurlClient *>(handle)->StartUploadRequest(*request, source, callback);
     return 1;
 }
+
+CurlMultiEngineHandle CreateCurlMultiEngine(const char *logTag) {
+    auto *engine = new CurlMultiEngine(logTag == nullptr ? gDefaultTag : logTag);
+    if (!engine->IsAvailable()) {
+        delete engine;
+        return nullptr;
+    }
+    return engine;
+}
+
+void DeleteCurlMultiEngine(CurlMultiEngineHandle engine) {
+    delete reinterpret_cast<CurlMultiEngine *>(engine);
+}
+
+int SubmitBufferedRequestV27(CurlMultiEngineHandle engine, int64_t requestId,
+                             CurClientHandle handle, const CurlRequest *request,
+                             size_t requestSize, int abiVersion,
+                             const CurlCallback *callback) {
+    if (engine == nullptr || handle == nullptr || callback == nullptr ||
+        callback->callback == nullptr || !ValidateV27Request(request, requestSize, abiVersion)) {
+        return 0;
+    }
+    auto job = std::make_unique<OwnedMultiBufferedRequest>(
+        requestId,
+        reinterpret_cast<CurlClient *>(handle),
+        *request,
+        *callback);
+    return reinterpret_cast<CurlMultiEngine *>(engine)->Submit(std::move(job)) ? 1 : 0;
+}
+
+void CancelCurlMultiRequest(CurlMultiEngineHandle engine, int64_t requestId) {
+    if (engine != nullptr) {
+        reinterpret_cast<CurlMultiEngine *>(engine)->Cancel(requestId);
+    }
+}
+
+int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
+                       size_t infoSize, int abiVersion) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    return reinterpret_cast<CurlClient *>(handle)->GetMultiInfo(info, infoSize, abiVersion) ? 1 : 0;
+}
+
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode) {
+    if (engine != nullptr) {
+        reinterpret_cast<CurlMultiEngine *>(engine)->SetTestFailureMode(mode);
+    }
+}
+
+void SetCurlClientTestConfigureFailure(CurClientHandle handle) {
+    if (handle != nullptr) {
+        reinterpret_cast<CurlClient *>(handle)->SetTestConfigureFailure();
+    }
+}
+#endif
 
 CurClientHandle CreateCurlClient(const char *logTag) {
     if (logTag == nullptr) {
