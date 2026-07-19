@@ -336,6 +336,52 @@ int main(int argc, char **argv) {
     CHECK(bufferedIdle.data.empty(),
           "buffered idle timeout fences native partial body from the caller");
 
+    {
+        Captured factsResponse;
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/idle-stream";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+        request.streamIdleTimeoutMs = 500;
+
+        CurlCallback callback{&factsResponse, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-transfer-facts-test");
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+
+        CurlTransferInfoV1 untouched{};
+        untouched.abiVersion = 77;
+        CHECK(GetCurlTransferInfoV1(
+                  handle, &untouched, sizeof(untouched) - 1, CURL_TRANSFER_INFO_ABI_VERSION) == 0,
+              "transfer facts reject mismatched struct size");
+        CHECK(untouched.abiVersion == 77,
+              "transfer facts size mismatch does not write caller memory");
+        CHECK(GetCurlTransferInfoV1(handle, &untouched, sizeof(untouched), 99) == 0,
+              "transfer facts reject mismatched ABI version");
+        CHECK(untouched.abiVersion == 77,
+              "transfer facts version mismatch does not write caller memory");
+
+        CurlTransferInfoV1 facts{};
+        CHECK(GetCurlTransferInfoV1(
+                  handle, &facts, sizeof(facts), CURL_TRANSFER_INFO_ABI_VERSION) == 1,
+              "transfer facts V1 snapshot succeeds");
+        CHECK(facts.abiVersion == CURL_TRANSFER_INFO_ABI_VERSION &&
+                  facts.structSize == sizeof(CurlTransferInfoV1),
+              "transfer facts report their exact size and version");
+        CHECK(facts.finalHeadersObserved == 1 && facts.firstBodyObserved == 1 &&
+                  facts.bodyProgressObserved == 1,
+              "buffered callback facts observe headers and partial body progress");
+        CHECK(facts.finalHeadersElapsedMs >= 0 &&
+                  facts.firstBodyElapsedMs >= facts.finalHeadersElapsedMs &&
+                  facts.lastBodyProgressElapsedMs >= facts.firstBodyElapsedMs,
+              "buffered callback facts are non-negative and monotonic");
+        CHECK(facts.bodyBytes == 3,
+              "buffered callback facts retain received byte count after partial-body timeout");
+        DeleteCurlClient(handle);
+    }
+
     Captured bufferedFirstBody = Fetch(base + "/headers-only-stall", 5000, "GET", nullptr, 500);
     CHECK(bufferedFirstBody.code == 28,
           "buffered final-headers-to-first-body stall times out");

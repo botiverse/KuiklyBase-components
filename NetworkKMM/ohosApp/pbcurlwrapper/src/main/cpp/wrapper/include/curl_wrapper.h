@@ -128,6 +128,23 @@ typedef struct {
     int64_t totalLength;  // -1 = unknown
 } CurlUploadSource;
 
+// Additive transfer facts ABI. This is intentionally separate from
+// CurlResponse so existing callers keep their frozen response layout. Callers
+// pass both size and version; the runtime rejects mismatches before writing.
+#define CURL_TRANSFER_INFO_ABI_VERSION 1
+typedef struct {
+    int abiVersion;
+    uint32_t structSize;
+    int finalHeadersObserved;
+    int firstBodyObserved;
+    int bodyProgressObserved;
+    int reserved;
+    int64_t finalHeadersElapsedMs;
+    int64_t firstBodyElapsedMs;
+    int64_t lastBodyProgressElapsedMs;
+    int64_t bodyBytes;
+} CurlTransferInfoV1;
+
 // CurClient 对象指针
 typedef void* CurClientHandle;
 
@@ -169,6 +186,12 @@ int SetCurlHttp3Enabled(CurClientHandle handle, int enabled);
 // Actual protocol negotiated by the completed request. The returned pointer
 // is a process-lifetime string literal ("h3", "h2", "http/1.1", etc.).
 const char *GetCurlNegotiatedProtocol(CurClientHandle handle);
+
+// Snapshot callback-owned monotonic transfer facts for this client. Valid
+// during and after Start*Request returns, until DeleteCurlClient. Returns 0 on
+// null/mismatched ABI without writing to the output buffer.
+int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
+                          size_t infoSize, int abiVersion);
 
 // Curl 发送请求
 int StartRequestV27(CurClientHandle handle, const CurlRequest *request,

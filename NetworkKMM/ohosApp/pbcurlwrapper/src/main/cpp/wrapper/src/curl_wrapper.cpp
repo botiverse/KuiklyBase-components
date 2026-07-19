@@ -49,6 +49,10 @@ static_assert(offsetof(CurlRequest, streamResponseHeadersTimeoutMs) == 40,
               "CurlRequest.streamResponseHeadersTimeoutMs ABI offset drift");
 static_assert(offsetof(CurlRequest, streamIdleTimeoutMs) == 48,
               "CurlRequest.streamIdleTimeoutMs ABI offset drift");
+static_assert(sizeof(CurlTransferInfoV1) == 56,
+              "CurlTransferInfoV1 ABI size drift");
+static_assert(offsetof(CurlTransferInfoV1, finalHeadersElapsedMs) == 24,
+              "CurlTransferInfoV1 timing offset drift");
 static_assert(offsetof(CurlRequest, streamWholeTimeoutMs) == 56,
               "CurlRequest.streamWholeTimeoutMs ABI offset drift");
 static_assert(offsetof(CurlRequest, postBodyLen) == 64, "CurlRequest.postBodyLen ABI offset drift");
@@ -362,6 +366,14 @@ class CurlClient {
             return 0;
         }
         if (realsize > 0 && client->stream_callback_->onChunk != nullptr) {
+            const auto now = std::chrono::steady_clock::now();
+            const int64_t elapsed = client->ElapsedSinceRequestStartMs(now);
+            if (!client->first_body_seen_) {
+                client->first_body_seen_ = true;
+                client->first_body_elapsed_ms_ = elapsed;
+            }
+            client->last_body_progress_elapsed_ms_ = elapsed;
+            client->buffered_body_bytes_ += static_cast<int64_t>(realsize);
             client->stream_callback_->onChunk(
                 client->stream_callback_->callbackRef, reinterpret_cast<char *>(contents), static_cast<int>(realsize));
         }
@@ -1095,6 +1107,25 @@ class CurlClient {
         return CurlProtocolName(httpVersion);
     }
 
+    bool GetTransferInfo(CurlTransferInfoV1 *info, size_t infoSize, int abiVersion) const {
+        if (info == nullptr || infoSize != sizeof(CurlTransferInfoV1) ||
+            abiVersion != CURL_TRANSFER_INFO_ABI_VERSION) {
+            return false;
+        }
+        CurlTransferInfoV1 snapshot{};
+        snapshot.abiVersion = CURL_TRANSFER_INFO_ABI_VERSION;
+        snapshot.structSize = static_cast<uint32_t>(sizeof(CurlTransferInfoV1));
+        snapshot.finalHeadersObserved = final_headers_elapsed_ms_ >= 0 ? 1 : 0;
+        snapshot.firstBodyObserved = first_body_seen_ ? 1 : 0;
+        snapshot.bodyProgressObserved = last_body_progress_elapsed_ms_ >= 0 ? 1 : 0;
+        snapshot.finalHeadersElapsedMs = std::max<int64_t>(0, final_headers_elapsed_ms_);
+        snapshot.firstBodyElapsedMs = std::max<int64_t>(0, first_body_elapsed_ms_);
+        snapshot.lastBodyProgressElapsedMs = std::max<int64_t>(0, last_body_progress_elapsed_ms_);
+        snapshot.bodyBytes = std::max<int64_t>(0, buffered_body_bytes_);
+        *info = snapshot;
+        return true;
+    }
+
  private:
     std::string log_tag_;
     CURL *curl_ = nullptr;
@@ -1247,6 +1278,14 @@ const char *GetCurlNegotiatedProtocol(CurClientHandle handle) {
         return "unknown";
     }
     return reinterpret_cast<CurlClient *>(handle)->GetNegotiatedProtocol();
+}
+
+int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
+                          size_t infoSize, int abiVersion) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    return reinterpret_cast<CurlClient *>(handle)->GetTransferInfo(info, infoSize, abiVersion) ? 1 : 0;
 }
 int CurlWrapperAbiVersion(void) {
     return CURL_WRAPPER_ABI_VERSION;
