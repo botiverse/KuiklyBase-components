@@ -43,7 +43,7 @@ g++ -std=c++17 -O1 -g \
   -o "$BUILD_DIR/wrapper_behavior_test"
 
 WRAPPER_SYMBOLS="$(nm "$BUILD_DIR/wrapper_behavior_test")"
-for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1; do
+for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs; do
   grep -Eq " [Tt] ${symbol}$" <<<"$WRAPPER_SYMBOLS"
 done
 for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do

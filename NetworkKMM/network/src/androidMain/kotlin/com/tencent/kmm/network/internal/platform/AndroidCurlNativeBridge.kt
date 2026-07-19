@@ -48,6 +48,8 @@ internal data class AndroidCurlNativeRequest(
     val streamResponseHeadersTimeoutMillis: Long = 0,
     val streamIdleTimeoutMillis: Long = 0,
     val streamWholeTimeoutMillis: Long = 0,
+    val bufferedBodyIdleTimeoutMillis: Long = 0,
+    val maxBufferedResponseBytes: Long = 0,
     val body: ByteArray? = null,
     val uploadContentLength: Long? = null,
     val caInfoPath: String,
@@ -137,6 +139,8 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
             onChunkBlock = onChunk,
             uploadSource = uploadSource,
             cancellationSignal = request.cancellationSignal,
+            bufferedBodyIdleTimeoutMillis = request.bufferedBodyIdleTimeoutMillis,
+            maxBufferedResponseBytes = request.maxBufferedResponseBytes,
             onCompleteBlock = { response = it }
         )
         val names = request.headers.keys.toTypedArray()
@@ -206,6 +210,8 @@ internal class AndroidCurlJniCallback(
     private val onChunkBlock: ((ByteArray) -> Unit)?,
     private val uploadSource: AndroidCurlUploadSource?,
     private val cancellationSignal: AndroidCurlCancellationSignal,
+    private val bufferedBodyIdleTimeoutMillis: Long = 0,
+    private val maxBufferedResponseBytes: Long = 0,
     private val onCompleteBlock: (CurlNativeResponse) -> Unit
 ) {
     private val callbackFailure = AtomicReference<Throwable?>(null)
@@ -232,6 +238,12 @@ internal class AndroidCurlJniCallback(
 
     @JvmName("isCancelled")
     fun isCancelled(): Boolean = cancellationSignal.isCancelled()
+
+    @JvmName("bufferedBodyIdleTimeoutMillis")
+    fun bufferedBodyIdleTimeoutMillis(): Long = bufferedBodyIdleTimeoutMillis
+
+    @JvmName("maxBufferedResponseBytes")
+    fun maxBufferedResponseBytes(): Long = maxBufferedResponseBytes
 
     fun failureMessage(): String? = callbackFailure.get()?.let { failure ->
         "Android curl callback failed: ${failure.message ?: failure::class.simpleName.orEmpty()}"

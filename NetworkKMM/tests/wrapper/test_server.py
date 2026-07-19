@@ -161,6 +161,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/gzip":
             body = gzip.compress(ENCODED_BODY)
             self._send(200, body, {"Content-Encoding": "gzip"})
+        elif self.path == "/gzip-large":
+            body = gzip.compress(b"x" * 4096)
+            self._send(200, body, {"Content-Encoding": "gzip"})
         elif self.path == "/br":
             body = compress_with("brotli", ENCODED_BODY)
             self._send(200, body, {"Content-Encoding": "br"})

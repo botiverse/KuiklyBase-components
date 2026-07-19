@@ -36,6 +36,8 @@ import com.tencent.kmm.network.curl.native.CurlTransferInfoV1
 import com.tencent.kmm.network.curl.native.DeleteCurlClient
 import com.tencent.kmm.network.curl.native.GetCurlNegotiatedProtocol
 import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlTransferInfoV1IfAvailable
+import com.tencent.kmm.network.curl.native.NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable
+import com.tencent.kmm.network.curl.native.NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable
 import com.tencent.kmm.network.curl.native.SetCurlCaInfo
 import com.tencent.kmm.network.curl.native.SetCurlHttp3Enabled
 import com.tencent.kmm.network.curl.native.SetCurlProxy
@@ -109,6 +111,8 @@ internal data class IosCurlNativeRequest(
     val streamResponseHeadersTimeoutMillis: Long = 0,
     val streamIdleTimeoutMillis: Long = 0,
     val streamWholeTimeoutMillis: Long = 0,
+    val bufferedBodyIdleTimeoutMillis: Long = 0,
+    val maxBufferedResponseBytes: Long = 0,
     val body: ByteArray? = null,
     val uploadContentLength: Long? = null,
     val caInfoPath: String,
@@ -264,6 +268,14 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             }
             SetCurlCaInfo(handle, request.caInfoPath)
             SetCurlProxy(handle, request.proxyUrl)
+            NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable(
+                handle,
+                request.bufferedBodyIdleTimeoutMillis
+            )
+            NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable(
+                handle,
+                request.maxBufferedResponseBytes
+            )
             request.resolveEntry?.let { entry ->
                 if (SetCurlResolve(handle, entry) == 0) {
                     return@withContext unavailable("iOS curl failed to apply resolve entry")

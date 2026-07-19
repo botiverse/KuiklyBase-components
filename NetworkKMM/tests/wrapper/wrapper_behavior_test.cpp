@@ -156,7 +156,6 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     request.method = method;
     request.headers = &headers;
     request.timeout = timeoutMs;
-    request.streamIdleTimeoutMs = bufferedBodyIdleTimeoutMs;
     request.postBodyLen = body ? static_cast<int>(std::strlen(body)) : 0;
     request.postBody = body;
 
@@ -165,6 +164,24 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     // semantics crashed exactly this pattern.
     CurlCallback callback{&captured, OnResponse};
     CurClientHandle handle = CreateCurlClient("wrapper-test");
+    SetCurlBufferedBodyIdleTimeoutMs(handle, bufferedBodyIdleTimeoutMs);
+    StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+    DeleteCurlClient(handle);
+    return captured;
+}
+
+static Captured FetchCapped(const std::string &url, int64_t maxBytes) {
+    Captured captured;
+    StringDic headers{};
+    CurlRequest request{};
+    request.url = url.c_str();
+    request.method = "GET";
+    request.headers = &headers;
+    request.timeout = 5000;
+
+    CurlCallback callback{&captured, OnResponse};
+    CurClientHandle handle = CreateCurlClient("wrapper-response-cap-test");
+    SetCurlMaxBufferedResponseBytes(handle, maxBytes);
     StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
     DeleteCurlClient(handle);
     return captured;
@@ -325,6 +342,38 @@ int main(int argc, char **argv) {
     Captured slow = Fetch(base + "/slow", 1500);
     CHECK(slow.code == 28, "/slow times out with CURLE_OPERATION_TIMEDOUT");
 
+    Captured declaredOversize = FetchCapped(base + "/ok", 5);
+    CHECK(declaredOversize.code == 63,
+          "declared oversized buffered response fails as CURLE_FILESIZE_EXCEEDED");
+    CHECK(declaredOversize.errorMsg.find("buffered response exceeded 5 bytes") != std::string::npos,
+          "declared response cap carries a stable reason");
+    CHECK(declaredOversize.data.empty(),
+          "declared response cap exposes no body");
+
+    Captured exactCap = FetchCapped(base + "/ok", 11);
+    CHECK(exactCap.code == 0 && exactCap.data == "{\"ok\":true}",
+          "buffered response exactly equal to the cap succeeds");
+
+    Captured disabledCap = FetchCapped(base + "/gzip-large", 0);
+    CHECK(disabledCap.code == 0 && disabledCap.data.size() == 4096,
+          "zero buffered response cap remains disabled after decoding");
+
+    Captured receivedOversize = FetchCapped(base + "/chunked-stream", 5);
+    CHECK(receivedOversize.code == 63,
+          "unknown-length received-byte cap fails as CURLE_FILESIZE_EXCEEDED");
+    CHECK(receivedOversize.errorMsg.find("buffered response exceeded 5 bytes") != std::string::npos,
+          "received-byte cap carries a stable reason");
+    CHECK(receivedOversize.data.empty(),
+          "received-byte cap fences the native partial body");
+
+    Captured decodedOversize = FetchCapped(base + "/gzip-large", 100);
+    CHECK(decodedOversize.code == 63,
+          "decoded buffered response cap rejects compressed expansion");
+    CHECK(decodedOversize.errorMsg.find("buffered response exceeded 100 bytes") != std::string::npos,
+          "decoded response cap carries a stable reason");
+    CHECK(decodedOversize.data.empty(),
+          "decoded response cap fences expanded partial data");
+
     // Buffered GETs keep partial response bytes inside native until terminal
     // success. A body-progress stall must therefore abort as timeout and
     // expose no prefix to Kotlin/callers, preserving safe retry eligibility.
@@ -345,10 +394,10 @@ int main(int argc, char **argv) {
         request.method = "GET";
         request.headers = &headers;
         request.timeout = 5000;
-        request.streamIdleTimeoutMs = 500;
 
         CurlCallback callback{&factsResponse, OnResponse};
         CurClientHandle handle = CreateCurlClient("wrapper-transfer-facts-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 500);
         StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
 
         CurlTransferInfoV1 untouched{};
@@ -391,10 +440,10 @@ int main(int argc, char **argv) {
         request.method = "GET";
         request.headers = &headers;
         request.timeout = 5000;
-        request.streamIdleTimeoutMs = 500;
 
         CurlCallback callback{&bufferedFirstBody, OnResponse};
         CurClientHandle handle = CreateCurlClient("wrapper-headers-only-facts-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 500);
         StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
 
         CHECK(bufferedFirstBody.code == 28,
@@ -436,12 +485,12 @@ int main(int argc, char **argv) {
         request.method = "POST";
         request.headers = &headers;
         request.timeout = 5000;
-        request.streamIdleTimeoutMs = 500;
 
         CurlUploadSource source{&uploadBuffer, ReadUploadBuffer,
                                 static_cast<int64_t>(uploadBuffer.data.size())};
         CurlCallback callback{&uploadIdle, OnResponse};
         CurClientHandle handle = CreateCurlClient("wrapper-upload-idle-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 500);
         StartUploadRequestV27(
             handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &source, &callback);
         DeleteCurlClient(handle);
@@ -464,12 +513,12 @@ int main(int argc, char **argv) {
         request.method = "POST";
         request.headers = &headers;
         request.timeout = 5000;
-        request.streamIdleTimeoutMs = 5000;
 
         CurlUploadSource source{&uploadBuffer, ReadUploadBuffer,
                                 static_cast<int64_t>(uploadBuffer.data.size())};
         CurlCallback callback{&uploadCancelled, OnResponse};
         CurClientHandle handle = CreateCurlClient("wrapper-upload-cancel-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 5000);
         std::thread performThread([&] {
             StartUploadRequestV27(
                 handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &source, &callback);
@@ -499,10 +548,10 @@ int main(int argc, char **argv) {
         request.method = "GET";
         request.headers = &headers;
         request.timeout = 5000;
-        request.streamIdleTimeoutMs = 5000;
 
         CurlCallback callback{&cancelled, OnResponse};
         CurClientHandle handle = CreateCurlClient("wrapper-buffered-cancel-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 5000);
         std::thread performThread([&] {
             StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
         });

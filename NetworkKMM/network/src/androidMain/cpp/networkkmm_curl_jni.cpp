@@ -66,6 +66,8 @@ struct CallbackContext {
     jmethodID on_chunk = nullptr;
     jmethodID read_upload_chunk = nullptr;
     jmethodID is_cancelled = nullptr;
+    jmethodID buffered_body_idle_timeout_millis = nullptr;
+    jmethodID max_buffered_response_bytes = nullptr;
     jmethodID on_complete = nullptr;
     jmethodID on_transfer_facts = nullptr;
     CurlResponse *pending_response = nullptr;
@@ -259,6 +261,16 @@ bool PopulateCallbackMethods(JNIEnv *env, jobject callback, CallbackContext *con
     context->on_chunk = env->GetMethodID(callback_class, "onChunk", "([B)V");
     context->read_upload_chunk = env->GetMethodID(callback_class, "readUploadChunk", "(I)[B");
     context->is_cancelled = env->GetMethodID(callback_class, "isCancelled", "()Z");
+    context->buffered_body_idle_timeout_millis =
+        env->GetMethodID(callback_class, "bufferedBodyIdleTimeoutMillis", "()J");
+    if (context->buffered_body_idle_timeout_millis == nullptr && env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    context->max_buffered_response_bytes =
+        env->GetMethodID(callback_class, "maxBufferedResponseBytes", "()J");
+    if (context->max_buffered_response_bytes == nullptr && env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
     context->on_complete = env->GetMethodID(
         callback_class,
         "onComplete",
@@ -273,6 +285,29 @@ bool PopulateCallbackMethods(JNIEnv *env, jobject callback, CallbackContext *con
     env->DeleteLocalRef(callback_class);
     return !env->ExceptionCheck() && context->on_response_start != nullptr && context->on_chunk != nullptr &&
         context->read_upload_chunk != nullptr && context->is_cancelled != nullptr && context->on_complete != nullptr;
+}
+
+void ConfigureBufferedPolicy(CallbackContext *context) {
+    if (context->buffered_body_idle_timeout_millis != nullptr) {
+        const jlong timeout = context->env->CallLongMethod(
+            context->callback,
+            context->buffered_body_idle_timeout_millis);
+        if (!context->env->ExceptionCheck()) {
+            SetCurlBufferedBodyIdleTimeoutMs(context->client, static_cast<int64_t>(timeout));
+        } else {
+            context->env->ExceptionClear();
+        }
+    }
+    if (context->max_buffered_response_bytes != nullptr) {
+        const jlong max_bytes = context->env->CallLongMethod(
+            context->callback,
+            context->max_buffered_response_bytes);
+        if (!context->env->ExceptionCheck()) {
+            SetCurlMaxBufferedResponseBytes(context->client, static_cast<int64_t>(max_bytes));
+        } else {
+            context->env->ExceptionClear();
+        }
+    }
 }
 
 void InvokeEngineFailure(CallbackContext *context, const char *message) {
@@ -379,6 +414,7 @@ void NativePerform(
         return;
     }
     context.client = client;
+    ConfigureBufferedPolicy(&context);
     SetCurlCaInfo(client, ca_chars.get());
     SetCurlProxy(client, proxy_chars.get());
     if (SetCurlHttp3Enabled(client, http3_enabled == JNI_TRUE ? 1 : 0) == 0) {

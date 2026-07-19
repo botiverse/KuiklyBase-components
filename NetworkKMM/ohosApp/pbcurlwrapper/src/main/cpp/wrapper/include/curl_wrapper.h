@@ -165,6 +165,14 @@ void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath);
 // disables environment/system proxy discovery for direct mode.
 void SetCurlProxy(CurClientHandle handle, const char *proxyUrl);
 
+// Cap decoded bytes retained by buffered responses. Zero disables the cap.
+// Streaming downloads are not buffered and ignore this setting.
+void SetCurlMaxBufferedResponseBytes(CurClientHandle handle, int64_t maxBytes);
+
+// Set the body-progress idle deadline for buffered responses only. Zero
+// disables it. This is intentionally separate from streaming phase timeouts.
+void SetCurlBufferedBodyIdleTimeoutMs(CurClientHandle handle, int64_t timeoutMs);
+
 // Add one libcurl CURLOPT_RESOLVE entry for this client. The entry is copied
 // and follows libcurl's "host:port:address[,address]" format. This preserves
 // the URL hostname for TLS SNI/verification while allowing a caller to supply

@@ -39,6 +39,14 @@
 
 using namespace std;
 
+static bool CheckedCallbackSize(size_t size, size_t nmemb, size_t *result) {
+    if (result == nullptr || (nmemb != 0 && size > SIZE_MAX / nmemb)) {
+        return false;
+    }
+    *result = size * nmemb;
+    return true;
+}
+
 #if INTPTR_MAX == INT64_MAX
 static_assert(sizeof(CurlRequest) == 80, "CurlRequest ABI 27 must be 80 bytes on LP64");
 static_assert(alignof(CurlRequest) == 8, "CurlRequest ABI 27 must be 8-byte aligned on LP64");
@@ -322,16 +330,45 @@ class CurlClient {
 
     // 处理响应正文的回调函数
     static size_t DataWriteCallback(char *contents, size_t size, size_t nmemb, void *userp) {
-        size_t realsize = size * nmemb;
+        size_t realsize = 0;
         CurlClient *client = static_cast<CurlClient *>(userp);
         if (client == nullptr) {
             logE(gDefaultTag, "DataWriteCallback, client is nullptr!!!");
+            return 0;
+        }
+        if (!CheckedCallbackSize(size, nmemb, &realsize)) {
+            std::snprintf(
+                client->curl_error_msg_,
+                sizeof(client->curl_error_msg_),
+                "%s",
+                "response callback size overflow");
             return 0;
         }
         if (client->cancel_flag_.load(std::memory_order_relaxed)) {
             return 0;
         }
         if (realsize > 0) {
+            const uint64_t incoming = static_cast<uint64_t>(realsize);
+            const bool invalidCurrent = client->buffered_body_bytes_ < 0;
+            const uint64_t current = invalidCurrent
+                ? 0
+                : static_cast<uint64_t>(client->buffered_body_bytes_);
+            const uint64_t maximum = client->max_buffered_response_bytes_ > 0
+                ? static_cast<uint64_t>(client->max_buffered_response_bytes_)
+                : 0;
+            if (maximum > 0 &&
+                (invalidCurrent || current > maximum || incoming > maximum - current)) {
+                client->buffered_response_limit_reason_ =
+                    "buffered response exceeded " +
+                    std::to_string(client->max_buffered_response_bytes_) + " bytes";
+                std::snprintf(
+                    client->curl_error_msg_,
+                    sizeof(client->curl_error_msg_),
+                    "%s",
+                    client->buffered_response_limit_reason_.c_str());
+                logE(client->log_tag_, client->buffered_response_limit_reason_);
+                return 0;
+            }
             const auto now = std::chrono::steady_clock::now();
             const int64_t elapsed = client->ElapsedSinceRequestStartMs(now);
             if (!client->first_body_seen_) {
@@ -352,11 +389,15 @@ class CurlClient {
     // is delivered there exactly once. Streaming requests do not negotiate gzip
     // (identity only), so chunks are the raw response bytes.
     static size_t StreamWriteCallback(char *contents, size_t size, size_t nmemb, void *userp) {
-        size_t realsize = size * nmemb;
+        size_t realsize = 0;
         CurlClient *client = static_cast<CurlClient *>(userp);
         if (client == nullptr || client->stream_callback_ == nullptr) {
             logE(gDefaultTag, "StreamWriteCallback, client/callback is nullptr!!!");
-            return realsize;
+            return 0;
+        }
+        if (!CheckedCallbackSize(size, nmemb, &realsize)) {
+            logE(client->log_tag_, "StreamWriteCallback size overflow.");
+            return 0;
         }
         if (client->cancel_flag_.load(std::memory_order_relaxed)) {
             logI(client->log_tag_, "StreamWriteCallback cancel by user.");
@@ -628,7 +669,9 @@ class CurlClient {
             : 3000L;
         curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, connectTimeout);
         curl_easy_setopt(curl_, CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200L);
-        // Pool connections/DNS/TLS sessions across per-request easy handles.
+        // Share DNS/TLS sessions across per-request easy handles. Connection
+        // caches deliberately remain easy-owned; cross-thread sharing is not
+        // supported by libcurl and does not provide multiplexing.
         CURLSH *share = GetCurlShare(http3_enabled_);
         if (share != nullptr) {
             curl_easy_setopt(curl_, CURLOPT_SHARE, share);
@@ -695,6 +738,15 @@ class CurlClient {
         curl_easy_setopt(curl_, CURLOPT_XFERINFODATA, this);
         curl_easy_setopt(curl_, CURLOPT_NOPROGRESS, 0L);
 
+        if (!stream_mode_ && max_buffered_response_bytes_ > 0) {
+            // Declared Content-Length preflight. The decoded-byte callback cap
+            // below remains authoritative for chunked/compressed responses.
+            curl_easy_setopt(
+                curl_,
+                CURLOPT_MAXFILESIZE_LARGE,
+                static_cast<curl_off_t>(max_buffered_response_bytes_));
+        }
+
         if (method == "POST") {
             curl_easy_setopt(curl_, CURLOPT_POST, 1L);
         } else if (method == "HEAD") {
@@ -743,11 +795,11 @@ class CurlClient {
         buffered_body_bytes_ = 0;
         first_body_seen_ = false;
         buffered_timeout_reason_.clear();
+        buffered_response_limit_reason_.clear();
         // Detection and replay eligibility are deliberately separate:
         // every buffered response (including POST/upload responses) must stop
         // on body-idle, while the routing layer may later replay only explicit
         // idempotent/replay-safe requests.
-        buffered_body_idle_timeout_ms_ = !stream_mode_ ? request.streamIdleTimeoutMs : 0;
         last_buffered_body_activity_ = request_started_;
         return true;
     }
@@ -844,6 +896,13 @@ class CurlClient {
     }
 
     CURLcode NormalizeBufferedTerminal(CURLcode result) {
+        if (result == CURLE_FILESIZE_EXCEEDED &&
+            buffered_response_limit_reason_.empty() &&
+            max_buffered_response_bytes_ > 0) {
+            buffered_response_limit_reason_ =
+                "buffered response exceeded " +
+                std::to_string(max_buffered_response_bytes_) + " bytes";
+        }
         const bool callbackAbort =
             result == CURLE_WRITE_ERROR || result == CURLE_ABORTED_BY_CALLBACK;
         if (callbackAbort && cancel_flag_.load(std::memory_order_relaxed)) {
@@ -861,6 +920,14 @@ class CurlClient {
             // the shared terminal boundary for buffered and upload requests.
             std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
             return CURLE_OPERATION_TIMEDOUT;
+        }
+        if (!buffered_response_limit_reason_.empty()) {
+            std::snprintf(
+                curl_error_msg_,
+                sizeof(curl_error_msg_),
+                "%s",
+                buffered_response_limit_reason_.c_str());
+            return CURLE_FILESIZE_EXCEEDED;
         }
         return result;
     }
@@ -1098,6 +1165,14 @@ class CurlClient {
         return true;
     }
 
+    void SetMaxBufferedResponseBytes(int64_t maxBytes) {
+        max_buffered_response_bytes_ = std::max<int64_t>(0, maxBytes);
+    }
+
+    void SetBufferedBodyIdleTimeoutMs(int64_t timeoutMs) {
+        buffered_body_idle_timeout_ms_ = std::max<int64_t>(0, timeoutMs);
+    }
+
     const char *GetNegotiatedProtocol() {
         if (curl_ == nullptr) {
             return "unknown";
@@ -1149,6 +1224,8 @@ class CurlClient {
     int64_t buffered_body_bytes_ = 0;
     bool first_body_seen_ = false;
     std::string buffered_timeout_reason_;
+    int64_t max_buffered_response_bytes_ = 0;
+    std::string buffered_response_limit_reason_;
     CurlResponse *curl_response_ = nullptr;  // destructor deletes it — must not start wild
     // Caller-pinned Accept-Encoding (from the request header); empty = advertise
     // all codecs libcurl supports and let it decode transparently.
@@ -1255,6 +1332,20 @@ void SetCurlProxy(CurClientHandle handle, const char *proxyUrl) {
         return;
     }
     reinterpret_cast<CurlClient *>(handle)->SetProxy(proxyUrl);
+}
+
+void SetCurlMaxBufferedResponseBytes(CurClientHandle handle, int64_t maxBytes) {
+    if (handle == nullptr) {
+        return;
+    }
+    reinterpret_cast<CurlClient *>(handle)->SetMaxBufferedResponseBytes(maxBytes);
+}
+
+void SetCurlBufferedBodyIdleTimeoutMs(CurClientHandle handle, int64_t timeoutMs) {
+    if (handle == nullptr) {
+        return;
+    }
+    reinterpret_cast<CurlClient *>(handle)->SetBufferedBodyIdleTimeoutMs(timeoutMs);
 }
 
 int SetCurlResolve(CurClientHandle handle, const char *resolveEntry) {

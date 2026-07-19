@@ -38,3 +38,15 @@ internal fun VBTransportElapseStatistics.applyCurlTransferFacts(facts: CurlTrans
     curlLastBodyProgressElapsedMs = facts.lastBodyProgressElapsedMs.toDouble()
     curlBodyBytes = facts.bodyBytes
 }
+
+internal fun VBTransportElapseStatistics.retainFirstAttemptCurlFacts(
+    firstAttempt: VBTransportElapseStatistics
+) {
+    curlFirstAttemptFinalHeadersObserved = firstAttempt.curlFinalHeadersObserved
+    curlFirstAttemptFirstBodyObserved = firstAttempt.curlFirstBodyObserved
+    curlFirstAttemptBodyProgressObserved = firstAttempt.curlBodyProgressObserved
+    curlFirstAttemptFinalHeadersElapsedMs = firstAttempt.curlFinalHeadersElapsedMs
+    curlFirstAttemptFirstBodyElapsedMs = firstAttempt.curlFirstBodyElapsedMs
+    curlFirstAttemptLastBodyProgressElapsedMs = firstAttempt.curlLastBodyProgressElapsedMs
+    curlFirstAttemptBodyBytes = firstAttempt.curlBodyBytes
+}

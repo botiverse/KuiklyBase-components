@@ -43,6 +43,8 @@ import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlUploadSource
 import com.tencent.qqlive.kmm.native.libcurl.CurlTransferInfoV1
 import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmGetCurlTransferInfoV1IfAvailable
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable
 import com.tencent.qqlive.kmm.native.libcurl.StartRequestV27
 import com.tencent.qqlive.kmm.native.libcurl.StartStreamRequestV27
 import com.tencent.qqlive.kmm.native.libcurl.StartUploadRequestV27
@@ -158,6 +160,14 @@ object CurlRequestServiceHM : ICurlRequestService {
             "OHOS curl request is missing its explicit proxy decision"
         }
         SetCurlProxy(handle, proxyUrl)
+        NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable(
+            handle,
+            request.curlBufferedBodyIdleTimeoutMillis
+        )
+        NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable(
+            handle,
+            request.curlMaxBufferedResponseBytes
+        )
         check(SetCurlHttp3Enabled(handle, if (request.curlHttp3Enabled) 1 else 0) != 0) {
             "HTTP/3 requested but OHOS curl backend is unavailable"
         }

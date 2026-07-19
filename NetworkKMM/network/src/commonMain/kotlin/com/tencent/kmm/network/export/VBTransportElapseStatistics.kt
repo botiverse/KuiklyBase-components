@@ -91,7 +91,7 @@ data class VBTransportElapseStatistics(
     var connectionRolloverRateLimited: Boolean = false,
     /** This logical request made its one allowed fresh-generation retry. */
     var freshRetry: Boolean = false,
-    /** `success`, `failure`, or null when no fresh retry occurred. */
+    /** Retry transport terminal: `success` means CURLcode 0, independent of HTTP status. */
     var freshRetryResult: String? = null,
     /** Duration observed when the stale-h2 watchdog fired. */
     var noResponseHeadersDurationMs: Double = 0.0,
@@ -111,4 +111,14 @@ data class VBTransportElapseStatistics(
     var curlLastBodyProgressElapsedMs: Double = 0.0,
     /** Native response bytes observed before the terminal result; 0 when unavailable/absent. */
     var curlBodyBytes: Long = 0,
+    /** Buffered curl response body-progress watchdog fired on the first attempt. */
+    var curlBodyStallDetected: Boolean = false,
+    /** First (stalled) attempt facts retained when a fresh retry is made. */
+    var curlFirstAttemptFinalHeadersObserved: Boolean? = null,
+    var curlFirstAttemptFirstBodyObserved: Boolean? = null,
+    var curlFirstAttemptBodyProgressObserved: Boolean? = null,
+    var curlFirstAttemptFinalHeadersElapsedMs: Double = 0.0,
+    var curlFirstAttemptFirstBodyElapsedMs: Double = 0.0,
+    var curlFirstAttemptLastBodyProgressElapsedMs: Double = 0.0,
+    var curlFirstAttemptBodyBytes: Long = 0,
 )
