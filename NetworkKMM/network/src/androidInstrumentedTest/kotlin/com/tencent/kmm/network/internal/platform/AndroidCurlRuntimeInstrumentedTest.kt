@@ -206,7 +206,7 @@ class AndroidCurlRuntimeInstrumentedTest {
         assertTrue("coroutine cancellation must abort the native buffered transfer",
             server.awaitBufferedSlowDisconnect())
         delay(100)
-        val reusedIdResponse = AndroidCurlJniBridge.execute(request)
+        val reusedIdResponse = AndroidCurlJniBridge.execute(nativeRequest("/slow-buffer"))
         assertEquals("cancel terminal must release the request-id mapping", 0, reusedIdResponse.code)
         assertEquals("slow-buffer-reused", reusedIdResponse.data?.decodeToString())
     }
