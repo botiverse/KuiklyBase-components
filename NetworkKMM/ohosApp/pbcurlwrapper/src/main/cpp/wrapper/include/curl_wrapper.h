@@ -159,10 +159,11 @@ int SetCurlResolve(CurClientHandle handle, const char *resolveEntry);
 int CurlSupportsHttp3(void);
 
 // Select explicit HTTP/3-with-fallback for this client. Disabled clients are
-// pinned to HTTP/2-over-TLS with HTTP/1.1 fallback and use a separate shared
-// connection pool, so an earlier gray request cannot upgrade default traffic
-// through connection reuse. Returns 0 only when HTTP/3 was requested but the
-// linked artifact lacks the backend.
+// pinned to HTTP/2-over-TLS with HTTP/1.1 fallback. Default and H3 clients use
+// separate DNS/TLS-session shares; connection caches are intentionally not
+// shared across concurrent per-request easy handles because libcurl does not
+// support that cross-thread topology. Returns 0 only when HTTP/3 was requested
+// but the linked artifact lacks the backend.
 int SetCurlHttp3Enabled(CurClientHandle handle, int enabled);
 
 // Actual protocol negotiated by the completed request. The returned pointer

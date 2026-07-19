@@ -317,14 +317,17 @@ int main(int argc, char **argv) {
     CHECK(post.data.find("\"echoLen\":13") != std::string::npos,
           "POST body length echoed");
 
-    // 7. Connection pooling: a second request to the same host should reuse
-    //    the pooled connection via the process-wide share handle, reporting
-    //    (near-)zero connect time.
+    // 7. Independent per-request clients remain functional. Connection-cache
+    //    sharing across these clients is intentionally forbidden: libcurl
+    //    does not support one shared connection cache across concurrent
+    //    easy_perform threads. DNS/TLS-session sharing is not observable via
+    //    connectTimeMs, so this behavior test only guards request continuity;
+    //    run_tests.sh has the structural CONNECT-share prohibition.
     Captured first = Fetch(base + "/ok");
     Captured second = Fetch(base + "/ok");
-    CHECK(first.invoked && second.invoked, "pooling probes ran");
-    CHECK(second.connectTimeMs == 0,
-          "second request reuses pooled connection (connectTimeMs == 0)");
+    CHECK(first.invoked && second.invoked, "independent per-request clients complete");
+    CHECK(first.httpCode == 200 && second.httpCode == 200,
+          "independent per-request clients preserve HTTP success");
 
     // 8b. task #24 (RFC D-5): a cancel that lands BEFORE perform starts must
     //     fail deterministically with CURLE_ABORTED_BY_CALLBACK and exactly

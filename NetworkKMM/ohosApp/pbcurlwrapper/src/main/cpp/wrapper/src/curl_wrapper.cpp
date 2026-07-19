@@ -89,12 +89,13 @@ static const char *CurlProtocolName(long httpVersion) {
     return "unknown";
 }
 
-// Connection pooling across the per-request easy handles. libcurl documents
-// CURLOPT_HTTP_VERSION as a preference and may otherwise reuse a connection
-// negotiated at another version. Keep default h2/h1 traffic and explicit h3
-// gray traffic in separate connection caches so a prior h3 request cannot
-// silently upgrade a default request. DNS/TLS sharing remains pooled within
-// each cohort. Guarded by per-lock-kind mutexes as libcurl requires.
+// Share only thread-safe cache classes across the per-request easy handles.
+// libcurl explicitly does not support sharing one connection cache between
+// concurrent easy_perform calls on different threads: lock callbacks prevent
+// data races but do not turn CURL_LOCK_DATA_CONNECT into a supported
+// cross-thread pool or provide multiplexing. Keep separate default/H3 shares
+// for DNS and TLS-session isolation only. A future single-owner curl_multi
+// loop must own connection reuse and H2/H3 multiplexing.
 static CURLSH *gCurlDefaultShare = nullptr;
 static CURLSH *gCurlHttp3Share = nullptr;
 static std::mutex gShareInitMutex;
@@ -120,7 +121,6 @@ static CURLSH *GetCurlShare(bool http3Enabled) {
         if (*slot != nullptr) {
             curl_share_setopt(*slot, CURLSHOPT_LOCKFUNC, ShareLockCallback);
             curl_share_setopt(*slot, CURLSHOPT_UNLOCKFUNC, ShareUnlockCallback);
-            curl_share_setopt(*slot, CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT);
             curl_share_setopt(*slot, CURLSHOPT_SHARE, CURL_LOCK_DATA_DNS);
             curl_share_setopt(*slot, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
         }

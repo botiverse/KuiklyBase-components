@@ -3,7 +3,7 @@
 # the behavior-contract tests against a local server. Locks down the wrapper's
 # observable contract on every PR — status passthrough (the raft.3 bug class),
 # error bodies, timeouts, redirects, POST bodies, content-encoding decode, and
-# share-handle pooling.
+# share-handle safety.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -20,6 +20,16 @@ TLS_CERT="${BUILD_DIR}/phase-test-cert.pem"
 TLS_KEY="${BUILD_DIR}/phase-test-key.pem"
 
 mkdir -p "$BUILD_DIR"
+
+# libcurl does not support sharing one connection cache between concurrent
+# easy_perform calls on different threads. The production wrapper uses one
+# easy handle per request, so keep DNS/SSL-session sharing but fail the gate if
+# unsupported cross-thread connection-cache sharing is reintroduced.
+if grep -q 'CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT' \
+  "$CPP_ROOT/wrapper/src/curl_wrapper.cpp"; then
+  echo "unsupported cross-thread CURLSH connection-cache sharing is enabled" >&2
+  exit 1
+fi
 
 echo "==> Building wrapper + tests for host"
 g++ -std=c++17 -O1 -g \
