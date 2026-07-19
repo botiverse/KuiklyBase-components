@@ -319,6 +319,53 @@ int main(int argc, char **argv) {
     CHECK(bufferedIdle.data.empty(),
           "buffered idle timeout fences native partial body from the caller");
 
+    Captured bufferedFirstBody = Fetch(base + "/headers-only-stall", 5000, "GET", nullptr, 500);
+    CHECK(bufferedFirstBody.code == 28,
+          "buffered final-headers-to-first-body stall times out");
+    CHECK(bufferedFirstBody.errorMsg.find("buffered body idle timeout") != std::string::npos,
+          "first-body stall carries the buffered timeout reason");
+    CHECK(bufferedFirstBody.data.empty(),
+          "first-body stall exposes no body to the caller");
+
+    Captured postIdle =
+        Fetch(base + "/post-idle-response", 5000, "POST", "request-body", 500);
+    CHECK(postIdle.code == 28,
+          "buffered write-request response still receives body-idle protection");
+    CHECK(postIdle.data.empty(),
+          "write-request response timeout exposes no partial response body");
+
+    // Cancellation may be first observed inside DataWriteCallback, where
+    // libcurl reports a short write as CURLE_WRITE_ERROR. The wrapper must
+    // normalize that terminal result back to the public cancel code and keep
+    // its partial native buffer private.
+    {
+        Captured cancelled;
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/idle-stream";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+        request.streamIdleTimeoutMs = 5000;
+
+        CurlCallback callback{&cancelled, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-buffered-cancel-test");
+        std::thread performThread([&] {
+            StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        Cancel(handle);
+        performThread.join();
+        DeleteCurlClient(handle);
+
+        CHECK(cancelled.invoked, "buffered mid-body cancel completes");
+        CHECK(cancelled.code == 42,
+              "buffered mid-body cancel preserves CURLE_ABORTED_BY_CALLBACK");
+        CHECK(cancelled.data.empty(),
+              "buffered mid-body cancel fences partial body from the caller");
+    }
+
     // 5. Redirect is followed to /ok.
     Captured redir = Fetch(base + "/redirect");
     CHECK(redir.httpCode == 200, "/redirect followed to 200");

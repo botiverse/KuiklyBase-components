@@ -255,7 +255,7 @@ class CurlClient {
         headers_ = final_headers_;
         final_headers_ready_ = true;
         final_headers_elapsed_ms_ = ElapsedSinceRequestStartMs();
-        // Buffered GETs have not exposed any response bytes to the caller.
+        // Buffered responses have not exposed any response bytes to the caller.
         // Start their body-progress deadline at the final header boundary so
         // a server that sends 200 and then never produces the first body byte
         // is covered by the same idle contract as a mid-body stall.
@@ -729,8 +729,11 @@ class CurlClient {
         buffered_body_bytes_ = 0;
         first_body_seen_ = false;
         buffered_timeout_reason_.clear();
-        buffered_body_idle_timeout_ms_ =
-            !stream_mode_ && method == "GET" ? request.streamIdleTimeoutMs : 0;
+        // Detection and replay eligibility are deliberately separate:
+        // every buffered response (including POST/upload responses) must stop
+        // on body-idle, while the routing layer may later replay only explicit
+        // idempotent/replay-safe requests.
+        buffered_body_idle_timeout_ms_ = !stream_mode_ ? request.streamIdleTimeoutMs : 0;
         last_buffered_body_activity_ = request_started_;
         return true;
     }
@@ -755,7 +758,14 @@ class CurlClient {
         // Content-Encoding (zlib/brotli/zstd), so content_data_ is already the
         // decompressed payload — no manual gzip pass.
         CURLcode res = curl_easy_perform(curl_);
-        if (!buffered_timeout_reason_.empty()) {
+        if (cancel_flag_.load(std::memory_order_relaxed)) {
+            // A write callback observes cancellation by returning 0, which
+            // libcurl reports as CURLE_WRITE_ERROR. Preserve the public
+            // cancellation contract at the terminal boundary; user cancel
+            // also wins over a simultaneous watchdog timeout.
+            res = CURLE_ABORTED_BY_CALLBACK;
+            std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", "cancelled by caller");
+        } else if (!buffered_timeout_reason_.empty()) {
             res = CURLE_OPERATION_TIMEDOUT;
             // libcurl owns CURLOPT_ERRORBUFFER while perform is running and
             // may replace the callback's classified reason with a generic

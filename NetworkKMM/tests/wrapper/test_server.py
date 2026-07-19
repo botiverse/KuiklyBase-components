@@ -146,6 +146,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        elif self.path == "/headers-only-stall":
+            self.send_response(200)
+            self.send_header("Content-Length", "3")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(1.5)
         elif self.path == "/echo-headers":
             # Echo every received header name:value pair, one per line, so the
             # test can assert each request header arrives exactly once
@@ -167,6 +173,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        if self.path == "/post-idle-response":
+            self.send_response(200)
+            self.send_header("Content-Length", "6")
+            self.end_headers()
+            try:
+                self.wfile.write(b"abc")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            time.sleep(1.5)
+            try:
+                self.wfile.write(b"def")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         self._send(200, b'{"echoLen":%d}' % len(body))
 
     def do_HEAD(self):
