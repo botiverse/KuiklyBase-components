@@ -382,13 +382,40 @@ int main(int argc, char **argv) {
         DeleteCurlClient(handle);
     }
 
-    Captured bufferedFirstBody = Fetch(base + "/headers-only-stall", 5000, "GET", nullptr, 500);
-    CHECK(bufferedFirstBody.code == 28,
-          "buffered final-headers-to-first-body stall times out");
-    CHECK(bufferedFirstBody.errorMsg.find("buffered body idle timeout") != std::string::npos,
-          "first-body stall carries the buffered timeout reason");
-    CHECK(bufferedFirstBody.data.empty(),
-          "first-body stall exposes no body to the caller");
+    {
+        Captured bufferedFirstBody;
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/headers-only-stall";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+        request.streamIdleTimeoutMs = 500;
+
+        CurlCallback callback{&bufferedFirstBody, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-headers-only-facts-test");
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+
+        CHECK(bufferedFirstBody.code == 28,
+              "buffered final-headers-to-first-body stall times out");
+        CHECK(bufferedFirstBody.errorMsg.find("buffered body idle timeout") != std::string::npos,
+              "first-body stall carries the buffered timeout reason");
+        CHECK(bufferedFirstBody.data.empty(),
+              "first-body stall exposes no body to the caller");
+
+        CurlTransferInfoV1 facts{};
+        CHECK(GetCurlTransferInfoV1(
+                  handle, &facts, sizeof(facts), CURL_TRANSFER_INFO_ABI_VERSION) == 1,
+              "headers-only timeout transfer facts snapshot succeeds");
+        CHECK(facts.finalHeadersObserved == 1 && facts.firstBodyObserved == 0 &&
+                  facts.bodyProgressObserved == 0,
+              "headers-only timeout observes headers without fabricating body facts");
+        CHECK(facts.firstBodyElapsedMs == 0 && facts.lastBodyProgressElapsedMs == 0 &&
+                  facts.bodyBytes == 0,
+              "headers-only timeout keeps absent body facts at zero");
+        DeleteCurlClient(handle);
+    }
 
     Captured postIdle =
         Fetch(base + "/post-idle-response", 5000, "POST", "request-body", 500);
@@ -585,6 +612,51 @@ int main(int argc, char **argv) {
         CHECK(stream.chunks >= 2, "known-length response is delivered in multiple chunks");
         CHECK(stream.data == "alphabetagamma", "stream chunks preserve complete byte order");
         CHECK(stream.completes == 1 && stream.code == 0, "stream completes successfully exactly once");
+    }
+
+    // Native transfer facts are transport observations, not consumer callback
+    // observations. A caller may omit onChunk and still inspect the completed
+    // stream's byte/progress facts after the terminal callback returns.
+    {
+        StreamCaptured stream;
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/stream";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.streamConnectTimeoutMs = 1000;
+        request.streamResponseHeadersTimeoutMs = 1000;
+        request.streamIdleTimeoutMs = 1000;
+
+        CurlStreamCallback callback{};
+        callback.callbackRef = &stream;
+        callback.onResponseStart = OnStreamStart;
+        callback.onChunk = nullptr;
+        callback.onComplete = OnStreamComplete;
+
+        CurClientHandle handle = CreateCurlClient("wrapper-stream-facts-no-chunk-test");
+        StartStreamRequestV27(
+            handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+
+        CHECK(stream.starts == 1 && stream.completes == 1 && stream.code == 0,
+              "stream without onChunk reaches one successful terminal callback");
+        CHECK(stream.chunks == 0 && stream.data.empty(),
+              "stream without onChunk does not invoke a consumer chunk callback");
+        CurlTransferInfoV1 facts{};
+        CHECK(GetCurlTransferInfoV1(
+                  handle, &facts, sizeof(facts), CURL_TRANSFER_INFO_ABI_VERSION) == 1,
+              "completed stream transfer facts snapshot succeeds");
+        CHECK(facts.finalHeadersObserved == 1 && facts.firstBodyObserved == 1 &&
+                  facts.bodyProgressObserved == 1,
+              "stream without onChunk still records native header and body progress");
+        CHECK(facts.finalHeadersElapsedMs >= 0 &&
+                  facts.firstBodyElapsedMs >= facts.finalHeadersElapsedMs &&
+                  facts.lastBodyProgressElapsedMs >= facts.firstBodyElapsedMs,
+              "completed stream transfer facts are non-negative and monotonic");
+        CHECK(facts.bodyBytes == 14,
+              "stream without onChunk records the complete native byte count");
+        DeleteCurlClient(handle);
     }
 
     // 8e. Redirect intermediates never escape as response-start; only the

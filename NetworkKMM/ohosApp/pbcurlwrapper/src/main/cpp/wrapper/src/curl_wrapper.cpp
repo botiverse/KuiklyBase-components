@@ -365,7 +365,7 @@ class CurlClient {
         if (!client->DeliverStreamResponseStart()) {
             return 0;
         }
-        if (realsize > 0 && client->stream_callback_->onChunk != nullptr) {
+        if (realsize > 0) {
             const auto now = std::chrono::steady_clock::now();
             const int64_t elapsed = client->ElapsedSinceRequestStartMs(now);
             if (!client->first_body_seen_) {
@@ -374,8 +374,10 @@ class CurlClient {
             }
             client->last_body_progress_elapsed_ms_ = elapsed;
             client->buffered_body_bytes_ += static_cast<int64_t>(realsize);
-            client->stream_callback_->onChunk(
-                client->stream_callback_->callbackRef, reinterpret_cast<char *>(contents), static_cast<int>(realsize));
+            if (client->stream_callback_->onChunk != nullptr) {
+                client->stream_callback_->onChunk(
+                    client->stream_callback_->callbackRef, reinterpret_cast<char *>(contents), static_cast<int>(realsize));
+            }
         }
         client->last_stream_activity_ = std::chrono::steady_clock::now();
         // Kotlin callback failures request cancellation synchronously. Recheck

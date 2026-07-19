@@ -187,9 +187,10 @@ int SetCurlHttp3Enabled(CurClientHandle handle, int enabled);
 // is a process-lifetime string literal ("h3", "h2", "http/1.1", etc.).
 const char *GetCurlNegotiatedProtocol(CurClientHandle handle);
 
-// Snapshot callback-owned monotonic transfer facts for this client. Valid
-// during and after Start*Request returns, until DeleteCurlClient. Returns 0 on
-// null/mismatched ABI without writing to the output buffer.
+// Snapshot callback-owned monotonic transfer facts for this client. Read only
+// after Start*Request has completed its terminal callback and returned, and
+// before DeleteCurlClient; concurrent during-transfer reads are not supported.
+// Returns 0 on a null/mismatched ABI without writing to the output buffer.
 int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
                           size_t infoSize, int abiVersion);
 
