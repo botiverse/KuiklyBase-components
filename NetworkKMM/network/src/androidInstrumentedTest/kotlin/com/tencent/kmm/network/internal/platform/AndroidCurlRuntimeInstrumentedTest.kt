@@ -113,18 +113,18 @@ class AndroidCurlRuntimeInstrumentedTest {
             assertTrue("instrumentation APK must load the committed curl artifact", VBTransportAndroidCurl.nativeAvailable)
             val engine = requireNotNull(AndroidCurlEngineProvider.resolve())
 
-            bufferedSelectorRequestUsesCurl()
-            concurrentBufferedRequestsShareOneNativeOwner()
-            bufferedCoroutineCancellationWakesNativeOwner()
-            streamingDownloadPreservesCallbackThread()
-            streamingUploadUsesNativePullAndProgress()
-            externalCancelStopsBodyCallbacks(engine)
-            highLevelPreCancelNeverStartsNative(engine)
-            nativePreStartCancelCoversAllThreeEntrypoints()
-            callbackFailureAbortsAndSuppressesLaterChunks(engine)
-            concurrentUploadsDoNotStarveDispatcher()
-            certificateAcceptanceMatrixAndManualProxy()
-            publicHttp3NegotiationContract()
+            runtimeGate("buffered") { bufferedSelectorRequestUsesCurl() }
+            runtimeGate("buffered-multi") { concurrentBufferedRequestsShareOneNativeOwner() }
+            runtimeGate("buffered-cancel") { bufferedCoroutineCancellationWakesNativeOwner() }
+            runtimeGate("download") { streamingDownloadPreservesCallbackThread() }
+            runtimeGate("upload") { streamingUploadUsesNativePullAndProgress() }
+            runtimeGate("external-cancel") { externalCancelStopsBodyCallbacks(engine) }
+            runtimeGate("pre-cancel") { highLevelPreCancelNeverStartsNative(engine) }
+            runtimeGate("native-pre-start") { nativePreStartCancelCoversAllThreeEntrypoints() }
+            runtimeGate("callback-failure") { callbackFailureAbortsAndSuppressesLaterChunks(engine) }
+            runtimeGate("concurrent-upload") { concurrentUploadsDoNotStarveDispatcher() }
+            runtimeGate("cert-proxy") { certificateAcceptanceMatrixAndManualProxy() }
+            runtimeGate("http3") { publicHttp3NegotiationContract() }
 
             Log.i(
                 TAG,
@@ -132,6 +132,17 @@ class AndroidCurlRuntimeInstrumentedTest {
                     "pre-start,cross-thread,callback-failure,concurrent-upload,cert-matrix," +
                     "manual-proxy,android-system-pac-proxy,h3,h3-default-isolation,h3-h2-fallback," +
                     "h3-total-failure"
+            )
+        }
+    }
+
+    private suspend fun runtimeGate(name: String, block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (throwable: Throwable) {
+            throw AssertionError(
+                "Android curl runtime gate '$name' failed: ${throwable.message ?: throwable}",
+                throwable
             )
         }
     }
