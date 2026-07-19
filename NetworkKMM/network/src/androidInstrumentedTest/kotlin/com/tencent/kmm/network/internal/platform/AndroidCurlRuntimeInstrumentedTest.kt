@@ -143,7 +143,7 @@ class AndroidCurlRuntimeInstrumentedTest {
 
         val response = client.execute(request)
 
-        assertTrue(response.isSuccess)
+        assertTrue("buffered selector response failed: ${response.error}", response.isSuccess)
         assertEquals(200, response.statusCode)
         assertEquals("buffer-ok", response.body.text())
         val selection = selections.single()
