@@ -19,6 +19,7 @@ package com.tencent.kmm.network.service
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.export.NetworkBody
+import com.tencent.kmm.network.export.NetworkBodyBytes
 import com.tencent.kmm.network.export.streamingUploadStreamOrNull
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkByteStreamSink
