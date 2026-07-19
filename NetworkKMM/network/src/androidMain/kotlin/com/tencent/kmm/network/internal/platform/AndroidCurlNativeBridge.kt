@@ -27,6 +27,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.resume
 import kotlin.jvm.JvmName
 
 internal class AndroidCurlCancellationSignal {
@@ -139,10 +140,14 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
 
     private suspend fun performBuffered(request: AndroidCurlNativeRequest): CurlNativeResponse =
         suspendCancellableCoroutine { continuation ->
-            if (!loaded) {
-                continuation.tryResume(unavailableResponse())?.let { token ->
-                    continuation.completeResume(token)
+            val terminalDelivered = AtomicBoolean(false)
+            fun resumeOnce(response: CurlNativeResponse) {
+                if (terminalDelivered.compareAndSet(false, true) && continuation.isActive) {
+                    continuation.resume(response)
                 }
+            }
+            if (!loaded) {
+                resumeOnce(unavailableResponse())
                 return@suspendCancellableCoroutine
             }
             lateinit var callback: AndroidCurlJniCallback
@@ -155,9 +160,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
                 maxBufferedResponseBytes = request.maxBufferedResponseBytes,
                 onCompleteBlock = { response ->
                     val terminal = callback.failureMessage()?.let(::unavailableResponse) ?: response
-                    continuation.tryResume(terminal)?.let { token ->
-                        continuation.completeResume(token)
-                    }
+                    resumeOnce(terminal)
                 }
             )
             continuation.invokeOnCancellation {
@@ -180,9 +183,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
                 callback = callback
             )
             if (!accepted) {
-                continuation.tryResume(
-                    unavailableResponse("Android curl async submit was rejected")
-                )?.let { token -> continuation.completeResume(token) }
+                resumeOnce(unavailableResponse("Android curl async submit was rejected"))
             } else if (!continuation.isActive) {
                 // Cancellation may race before native publication. Recheck
                 // immediately after accepted submit so the native handle sees it.

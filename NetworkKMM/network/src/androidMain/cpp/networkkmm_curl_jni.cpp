@@ -259,8 +259,13 @@ void OnAsyncComplete(void *callback_ref, CurlResponse *response) {
         return;
     }
     if (g_java_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
-        if (g_java_vm->AttachCurrentThread(
-                reinterpret_cast<void **>(&env), nullptr) != JNI_OK || env == nullptr) {
+#if defined(__ANDROID__)
+        const jint attach_result = g_java_vm->AttachCurrentThread(&env, nullptr);
+#else
+        const jint attach_result = g_java_vm->AttachCurrentThread(
+            reinterpret_cast<void **>(&env), nullptr);
+#endif
+        if (attach_result != JNI_OK || env == nullptr) {
             RemovePublishedClient(context->request_id, context->client);
             DeleteCurlClient(context->client);
             delete context;
