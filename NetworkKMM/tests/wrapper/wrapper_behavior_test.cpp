@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <thread>
@@ -34,6 +35,22 @@ struct Captured {
     long long connectTimeMs = -1;
     bool invoked = false;
 };
+
+struct UploadBuffer {
+    std::string data;
+    size_t offset = 0;
+};
+
+static int ReadUploadBuffer(void *ref, char *buffer, int maxLen) {
+    auto *source = static_cast<UploadBuffer *>(ref);
+    if (source == nullptr || buffer == nullptr || maxLen <= 0) return -1;
+    const size_t remaining = source->data.size() - source->offset;
+    if (remaining == 0) return 0;
+    const size_t count = std::min(remaining, static_cast<size_t>(maxLen));
+    std::memcpy(buffer, source->data.data() + source->offset, count);
+    source->offset += count;
+    return static_cast<int>(count);
+}
 
 struct StreamCaptured {
     int starts = 0;
@@ -333,6 +350,68 @@ int main(int argc, char **argv) {
           "buffered write-request response still receives body-idle protection");
     CHECK(postIdle.data.empty(),
           "write-request response timeout exposes no partial response body");
+
+    // Exercise the real streaming-upload entrypoint, whose response is still
+    // buffered. It must share the same timeout normalization as StartRequest.
+    {
+        Captured uploadIdle;
+        UploadBuffer uploadBuffer{"stream-upload-body"};
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/post-idle-response";
+        request.url = url.c_str();
+        request.method = "POST";
+        request.headers = &headers;
+        request.timeout = 5000;
+        request.streamIdleTimeoutMs = 500;
+
+        CurlUploadSource source{&uploadBuffer, ReadUploadBuffer,
+                                static_cast<int64_t>(uploadBuffer.data.size())};
+        CurlCallback callback{&uploadIdle, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-upload-idle-test");
+        StartUploadRequestV27(
+            handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &source, &callback);
+        DeleteCurlClient(handle);
+
+        CHECK(uploadIdle.code == 28,
+              "stream-upload buffered response idle normalizes to timeout");
+        CHECK(uploadIdle.errorMsg.find("buffered body idle timeout") != std::string::npos,
+              "stream-upload response idle carries stable timeout reason");
+        CHECK(uploadIdle.data.empty(),
+              "stream-upload response idle fences partial response body");
+    }
+
+    {
+        Captured uploadCancelled;
+        UploadBuffer uploadBuffer{"stream-upload-body"};
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/post-idle-response";
+        request.url = url.c_str();
+        request.method = "POST";
+        request.headers = &headers;
+        request.timeout = 5000;
+        request.streamIdleTimeoutMs = 5000;
+
+        CurlUploadSource source{&uploadBuffer, ReadUploadBuffer,
+                                static_cast<int64_t>(uploadBuffer.data.size())};
+        CurlCallback callback{&uploadCancelled, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-upload-cancel-test");
+        std::thread performThread([&] {
+            StartUploadRequestV27(
+                handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &source, &callback);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        Cancel(handle);
+        performThread.join();
+        DeleteCurlClient(handle);
+
+        CHECK(uploadCancelled.invoked, "stream-upload response cancel completes");
+        CHECK(uploadCancelled.code == 42,
+              "stream-upload response cancel normalizes to CURLE_ABORTED_BY_CALLBACK");
+        CHECK(uploadCancelled.data.empty(),
+              "stream-upload response cancel fences partial response body");
+    }
 
     // Cancellation may be first observed inside DataWriteCallback, where
     // libcurl reports a short write as CURLE_WRITE_ERROR. The wrapper must

@@ -757,22 +757,7 @@ class CurlClient {
         // curl 请求处理. libcurl transparently decodes the body per the negotiated
         // Content-Encoding (zlib/brotli/zstd), so content_data_ is already the
         // decompressed payload — no manual gzip pass.
-        CURLcode res = curl_easy_perform(curl_);
-        if (cancel_flag_.load(std::memory_order_relaxed)) {
-            // A write callback observes cancellation by returning 0, which
-            // libcurl reports as CURLE_WRITE_ERROR. Preserve the public
-            // cancellation contract at the terminal boundary; user cancel
-            // also wins over a simultaneous watchdog timeout.
-            res = CURLE_ABORTED_BY_CALLBACK;
-            std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", "cancelled by caller");
-        } else if (!buffered_timeout_reason_.empty()) {
-            res = CURLE_OPERATION_TIMEDOUT;
-            // libcurl owns CURLOPT_ERRORBUFFER while perform is running and
-            // may replace the callback's classified reason with a generic
-            // abort string. Restore our stable ABI-visible timeout reason at
-            // the terminal boundary.
-            std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
-        }
+        CURLcode res = NormalizeBufferedTerminal(curl_easy_perform(curl_));
         FinishBufferedRequest(res, callback);
     }
 
@@ -840,8 +825,30 @@ class CurlClient {
         // Buffered response, same as StartRequest.
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, DataWriteCallback);
         curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
-        CURLcode res = curl_easy_perform(curl_);
+        CURLcode res = NormalizeBufferedTerminal(curl_easy_perform(curl_));
         FinishBufferedRequest(res, callback);
+    }
+
+    CURLcode NormalizeBufferedTerminal(CURLcode result) {
+        const bool callbackAbort =
+            result == CURLE_WRITE_ERROR || result == CURLE_ABORTED_BY_CALLBACK;
+        if (callbackAbort && cancel_flag_.load(std::memory_order_relaxed)) {
+            // DataWriteCallback reports cancellation as a short write while
+            // XFERINFO reports it as callback-aborted. Normalize only those
+            // abort-shaped results: a cancel arriving after CURLE_OK must not
+            // rewrite an already-completed success into a false cancellation.
+            std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", "cancelled by caller");
+            return CURLE_ABORTED_BY_CALLBACK;
+        }
+        if (!buffered_timeout_reason_.empty()) {
+            // libcurl owns CURLOPT_ERRORBUFFER while perform is running and
+            // may replace the callback's classified reason with a generic
+            // abort string. Restore our stable ABI-visible timeout reason at
+            // the shared terminal boundary for buffered and upload requests.
+            std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
+            return CURLE_OPERATION_TIMEDOUT;
+        }
+        return result;
     }
 
     // Shared post-perform tail of StartRequest/StartUploadRequest: build the
