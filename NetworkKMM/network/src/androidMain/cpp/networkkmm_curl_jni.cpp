@@ -67,6 +67,7 @@ struct CallbackContext {
     jmethodID read_upload_chunk = nullptr;
     jmethodID is_cancelled = nullptr;
     jmethodID on_complete = nullptr;
+    jmethodID on_transfer_facts = nullptr;
 };
 
 jstring NewString(JNIEnv *env, const char *value) {
@@ -219,6 +220,32 @@ void OnComplete(void *callback_ref, CurlResponse *response) {
     }
 }
 
+void DeliverTransferFacts(CallbackContext *context) {
+    if (context->on_transfer_facts == nullptr || context->client == nullptr) {
+        return;
+    }
+    CurlTransferInfoV1 facts{};
+    if (GetCurlTransferInfoV1(
+            context->client,
+            &facts,
+            sizeof(facts),
+            CURL_TRANSFER_INFO_ABI_VERSION) == 0) {
+        return;
+    }
+    context->env->CallVoidMethod(
+        context->callback,
+        context->on_transfer_facts,
+        facts.finalHeadersObserved != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.firstBodyObserved != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.bodyProgressObserved != 0 ? JNI_TRUE : JNI_FALSE,
+        static_cast<jlong>(facts.finalHeadersElapsedMs),
+        static_cast<jlong>(facts.firstBodyElapsedMs),
+        static_cast<jlong>(facts.lastBodyProgressElapsedMs),
+        static_cast<jlong>(facts.bodyBytes)
+    );
+    CancelAfterCallbackException(context);
+}
+
 bool PopulateCallbackMethods(JNIEnv *env, jobject callback, CallbackContext *context) {
     jclass callback_class = env->GetObjectClass(callback);
     context->on_response_start = env->GetMethodID(callback_class, "onResponseStart", "(JLjava/lang/String;)V");
@@ -230,6 +257,12 @@ bool PopulateCallbackMethods(JNIEnv *env, jobject callback, CallbackContext *con
         "onComplete",
         "(IJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[BLjava/lang/String;DDDDDDDD)V"
     );
+    context->on_transfer_facts = env->GetMethodID(callback_class, "onTransferFacts", "(ZZZJJJJ)V");
+    if (context->on_transfer_facts == nullptr && env->ExceptionCheck()) {
+        // Additive bridge method: an older Kotlin callback remains request-
+        // compatible and simply receives no V1 facts.
+        env->ExceptionClear();
+    }
     env->DeleteLocalRef(callback_class);
     return !env->ExceptionCheck() && context->on_response_start != nullptr && context->on_chunk != nullptr &&
         context->read_upload_chunk != nullptr && context->is_cancelled != nullptr && context->on_complete != nullptr;
@@ -360,14 +393,16 @@ void NativePerform(
     }
     CancelIfSignalled(&context);
 
+    bool transfer_completed = false;
     if (mode == kModeStreamDownload) {
         CurlStreamCallback stream_callback{};
         stream_callback.callbackRef = &context;
         stream_callback.onResponseStart = OnResponseStart;
         stream_callback.onChunk = OnChunk;
         stream_callback.onComplete = OnComplete;
-        if (StartStreamRequestV27(
-                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &stream_callback) == 0) {
+        transfer_completed = StartStreamRequestV27(
+            client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &stream_callback) != 0;
+        if (!transfer_completed) {
             InvokeEngineFailure(&context, "NetworkKMM stream request ABI rejected");
         }
     } else if (mode == kModeStreamUpload) {
@@ -376,19 +411,27 @@ void NativePerform(
         upload_source.readChunk = ReadUploadChunk;
         upload_source.totalLength = upload_content_length;
         CurlCallback curl_callback{&context, OnComplete};
-        if (StartUploadRequestV27(
-                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION,
-                &upload_source, &curl_callback) == 0) {
+        transfer_completed = StartUploadRequestV27(
+            client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION,
+            &upload_source, &curl_callback) != 0;
+        if (!transfer_completed) {
             InvokeEngineFailure(&context, "NetworkKMM upload request ABI rejected");
         }
     } else if (mode == kModeBuffered) {
         CurlCallback curl_callback{&context, OnComplete};
-        if (StartRequestV27(
-                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &curl_callback) == 0) {
+        transfer_completed = StartRequestV27(
+            client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &curl_callback) != 0;
+        if (!transfer_completed) {
             InvokeEngineFailure(&context, "NetworkKMM request ABI rejected");
         }
     } else {
         InvokeEngineFailure(&context, "unknown Android curl request mode");
+    }
+
+    // The V1 native contract permits reads only after Start* has completed its
+    // terminal callback and returned, while the handle is still alive.
+    if (transfer_completed) {
+        DeliverTransferFacts(&context);
     }
 
     {

@@ -19,18 +19,23 @@ package com.tencent.kmm.network.internal.platform
 import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.CurlResponseCodec
 import com.tencent.kmm.network.curl.CurlResponseFields
+import com.tencent.kmm.network.curl.CurlTransferFactsV1
+import com.tencent.kmm.network.curl.applyCurlTransferFacts
 import com.tencent.kmm.network.curl.native.Cancel as cancelNative
 import com.tencent.kmm.network.curl.native.CreateCurlClient
 import com.tencent.kmm.network.curl.native.CurlSupportsHttp3
 import com.tencent.kmm.network.curl.native.CurlWrapperAbiVersion
 import com.tencent.kmm.network.curl.native.CURL_WRAPPER_ABI_VERSION
+import com.tencent.kmm.network.curl.native.CURL_TRANSFER_INFO_ABI_VERSION
 import com.tencent.kmm.network.curl.native.CurlCallback
 import com.tencent.kmm.network.curl.native.CurlRequest
 import com.tencent.kmm.network.curl.native.CurlResponse
 import com.tencent.kmm.network.curl.native.CurlStreamCallback
 import com.tencent.kmm.network.curl.native.CurlUploadSource
+import com.tencent.kmm.network.curl.native.CurlTransferInfoV1
 import com.tencent.kmm.network.curl.native.DeleteCurlClient
 import com.tencent.kmm.network.curl.native.GetCurlNegotiatedProtocol
+import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlTransferInfoV1IfAvailable
 import com.tencent.kmm.network.curl.native.SetCurlCaInfo
 import com.tencent.kmm.network.curl.native.SetCurlHttp3Enabled
 import com.tencent.kmm.network.curl.native.SetCurlProxy
@@ -284,6 +289,7 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             response.elapse.protocol = GetCurlNegotiatedProtocol(handle)
                 ?.toKString()
                 ?.takeIf { it != "unknown" }
+            response.elapse.applyCurlTransferFacts(readCurlTransferFacts(handle))
             response
         } finally {
             IosCurlHandleRegistry.remove(request.requestId, handle)
@@ -293,6 +299,28 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
     }
 
     private fun unavailable(message: String) = CurlNativeResponse(code = -1, errorMsg = message)
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun readCurlTransferFacts(handle: COpaquePointer): CurlTransferFactsV1? = memScoped {
+    val native = alloc<CurlTransferInfoV1>()
+    if (NetworkKmmGetCurlTransferInfoV1IfAvailable(
+            handle,
+            native.ptr,
+            sizeOf<CurlTransferInfoV1>().convert(),
+            CURL_TRANSFER_INFO_ABI_VERSION
+        ) == 0) {
+        return@memScoped null
+    }
+    CurlTransferFactsV1(
+        finalHeadersObserved = native.finalHeadersObserved != 0,
+        firstBodyObserved = native.firstBodyObserved != 0,
+        bodyProgressObserved = native.bodyProgressObserved != 0,
+        finalHeadersElapsedMs = native.finalHeadersElapsedMs,
+        firstBodyElapsedMs = native.firstBodyElapsedMs,
+        lastBodyProgressElapsedMs = native.lastBodyProgressElapsedMs,
+        bodyBytes = native.bodyBytes,
+    )
 }
 
 @OptIn(ExperimentalForeignApi::class)

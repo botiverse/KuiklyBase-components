@@ -97,4 +97,18 @@ data class VBTransportElapseStatistics(
     var noResponseHeadersDurationMs: Double = 0.0,
     /** Concurrent no-headers calls observed on the same reused h2 connection. */
     var staleH2ConcurrentRequestCount: Int = 0,
+    /** null when the native curl artifact does not expose transfer facts V1. */
+    var curlFinalHeadersObserved: Boolean? = null,
+    /** null when unavailable; false means the transfer ended before any body byte. */
+    var curlFirstBodyObserved: Boolean? = null,
+    /** null when unavailable; false means no positive-length body callback occurred. */
+    var curlBodyProgressObserved: Boolean? = null,
+    /** Meaningful only when [curlFinalHeadersObserved] is true. */
+    var curlFinalHeadersElapsedMs: Double = 0.0,
+    /** Meaningful only when [curlFirstBodyObserved] is true. */
+    var curlFirstBodyElapsedMs: Double = 0.0,
+    /** Meaningful only when [curlBodyProgressObserved] is true. */
+    var curlLastBodyProgressElapsedMs: Double = 0.0,
+    /** Native response bytes observed before the terminal result; 0 when unavailable/absent. */
+    var curlBodyBytes: Long = 0,
 )

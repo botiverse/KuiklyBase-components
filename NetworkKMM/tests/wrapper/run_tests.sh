@@ -53,6 +53,13 @@ for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do
   fi
 done
 
+echo "==> Verifying missing additive facts symbol fails closed"
+g++ -std=c++17 \
+  -I "$CPP_ROOT/wrapper/include" \
+  "$SCRIPT_DIR/transfer_facts_missing_symbol_test.cpp" \
+  -o "$BUILD_DIR/transfer_facts_missing_symbol_test"
+"$BUILD_DIR/transfer_facts_missing_symbol_test"
+
 echo "==> Verifying bidirectional ABI skew fails at link time"
 if g++ -std=c++17 \
   -I "$SCRIPT_DIR/abi_v26" \

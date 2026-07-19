@@ -728,6 +728,52 @@ class AndroidCurlNetworkEngineTest {
         )
     }
 
+    @Test
+    fun jniCallbackAppliesTerminalTransferFactsWithoutCollapsingAbsentBody() {
+        var response: CurlNativeResponse? = null
+        val callback = AndroidCurlJniCallback(
+            onResponseStartBlock = null,
+            onChunkBlock = null,
+            uploadSource = null,
+            cancellationSignal = AndroidCurlCancellationSignal(),
+            onCompleteBlock = { response = it }
+        )
+        callback.onComplete(
+            code = 28,
+            httpCode = 200,
+            errorMessage = "buffered body idle timeout",
+            headers = "HTTP/1.1 200 OK\r\n",
+            redirectUrl = "",
+            data = null,
+            protocol = "h2",
+            nameLookupTimeMs = 1.0,
+            connectTimeMs = 2.0,
+            sslCostTimeMs = 3.0,
+            preTransferTimeMs = 4.0,
+            startTransferTimeMs = 5.0,
+            redirectTimeMs = 0.0,
+            receiveTimeMs = 0.0,
+            totalTimeMs = 510.0,
+        )
+        callback.onTransferFacts(
+            finalHeadersObserved = true,
+            firstBodyObserved = false,
+            bodyProgressObserved = false,
+            finalHeadersElapsedMs = 9,
+            firstBodyElapsedMs = 0,
+            lastBodyProgressElapsedMs = 0,
+            bodyBytes = 0,
+        )
+
+        val timing = assertNotNull(response).elapse
+        assertEquals(true, timing.curlFinalHeadersObserved)
+        assertEquals(false, timing.curlFirstBodyObserved)
+        assertEquals(false, timing.curlBodyProgressObserved)
+        assertEquals(9.0, timing.curlFinalHeadersElapsedMs)
+        assertEquals(0.0, timing.curlFirstBodyElapsedMs)
+        assertEquals(0L, timing.curlBodyBytes)
+    }
+
     private open class FakeBridge(
         override val isAvailable: Boolean = true,
         override val supportsHttp3: Boolean = false
