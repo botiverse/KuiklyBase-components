@@ -112,7 +112,10 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
         }
         return try {
             performBuffered(request)
-        } catch (_: LinkageError) {
+        } catch (error: LinkageError) {
+            if (error !is UnsatisfiedLinkError && error !is NoSuchMethodError) {
+                throw error
+            }
             // A committed older .so does not export the additive async submit
             // entry yet. Preserve request compatibility through the blocking
             // V27 path until the host updates its native artifact.
