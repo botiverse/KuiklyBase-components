@@ -93,6 +93,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
     private const val MODE_BUFFERED = 0
     private const val MODE_STREAM_DOWNLOAD = 1
     private const val MODE_STREAM_UPLOAD = 2
+    private val asyncSubmitAvailable = AtomicBoolean(true)
 
     private val loaded: Boolean by lazy {
         runCatching { System.loadLibrary("networkkmmcurl") }.isSuccess
@@ -104,8 +105,20 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
     override val supportsHttp3: Boolean
         get() = loaded && runCatching { nativeSupportsHttp3() }.getOrDefault(false)
 
-    override suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse =
-        performBuffered(request)
+    override suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse {
+        if (!asyncSubmitAvailable.get()) {
+            return perform(request, MODE_BUFFERED, null, null, null)
+        }
+        return try {
+            performBuffered(request)
+        } catch (_: UnsatisfiedLinkError) {
+            // A committed older .so does not export the additive async submit
+            // entry yet. Preserve request compatibility through the blocking
+            // V27 path until the host updates its native artifact.
+            asyncSubmitAvailable.set(false)
+            perform(request, MODE_BUFFERED, null, null, null)
+        }
+    }
 
     override suspend fun downloadStream(
         request: AndroidCurlNativeRequest,
@@ -153,21 +166,19 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
             }
             val names = request.headers.keys.toTypedArray()
             val values = request.headers.values.toTypedArray()
-            val accepted = runCatching {
-                nativeSubmitBuffered(
-                    requestId = request.requestId,
-                    url = request.url,
-                    method = request.method,
-                    headerNames = names,
-                    headerValues = values,
-                    timeoutMillis = request.timeoutMillis,
-                    body = request.body,
-                    caInfoPath = request.caInfoPath,
-                    proxyUrl = request.proxyUrl,
-                    http3Enabled = request.http3Enabled,
-                    callback = callback
-                )
-            }.getOrDefault(false)
+            val accepted = nativeSubmitBuffered(
+                requestId = request.requestId,
+                url = request.url,
+                method = request.method,
+                headerNames = names,
+                headerValues = values,
+                timeoutMillis = request.timeoutMillis,
+                body = request.body,
+                caInfoPath = request.caInfoPath,
+                proxyUrl = request.proxyUrl,
+                http3Enabled = request.http3Enabled,
+                callback = callback
+            )
             if (!accepted) {
                 continuation.tryResume(
                     unavailableResponse("Android curl async submit was rejected")
