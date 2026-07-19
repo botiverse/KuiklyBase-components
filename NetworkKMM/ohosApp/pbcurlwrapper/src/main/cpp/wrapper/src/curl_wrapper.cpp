@@ -254,6 +254,14 @@ class CurlClient {
         final_headers_ = current_headers_;
         headers_ = final_headers_;
         final_headers_ready_ = true;
+        final_headers_elapsed_ms_ = ElapsedSinceRequestStartMs();
+        // Buffered GETs have not exposed any response bytes to the caller.
+        // Start their body-progress deadline at the final header boundary so
+        // a server that sends 200 and then never produces the first body byte
+        // is covered by the same idle contract as a mid-body stall.
+        if (!stream_mode_ && buffered_body_idle_timeout_ms_ > 0) {
+            last_buffered_body_activity_ = std::chrono::steady_clock::now();
+        }
         if (stream_mode_ && final_headers_ready_) {
             return DeliverStreamResponseStart();
         }
@@ -311,7 +319,26 @@ class CurlClient {
     // 处理响应正文的回调函数
     static size_t DataWriteCallback(char *contents, size_t size, size_t nmemb, void *userp) {
         size_t realsize = size * nmemb;
-        reinterpret_cast<std::string *>(userp)->append(reinterpret_cast<char *>(contents), realsize);
+        CurlClient *client = static_cast<CurlClient *>(userp);
+        if (client == nullptr) {
+            logE(gDefaultTag, "DataWriteCallback, client is nullptr!!!");
+            return 0;
+        }
+        if (client->cancel_flag_.load(std::memory_order_relaxed)) {
+            return 0;
+        }
+        if (realsize > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const int64_t elapsed = client->ElapsedSinceRequestStartMs(now);
+            if (!client->first_body_seen_) {
+                client->first_body_seen_ = true;
+                client->first_body_elapsed_ms_ = elapsed;
+            }
+            client->last_body_progress_elapsed_ms_ = elapsed;
+            client->buffered_body_bytes_ += static_cast<int64_t>(realsize);
+            client->last_buffered_body_activity_ = now;
+            client->content_data_.append(reinterpret_cast<char *>(contents), realsize);
+        }
         return realsize;
     }
 
@@ -419,7 +446,26 @@ class CurlClient {
         if (client->stream_mode_ && client->StreamPhaseTimedOut()) {
             return 1;
         }
+        if (!client->stream_mode_ && client->BufferedBodyTimedOut()) {
+            return 1;
+        }
         return 0;
+    }
+
+    bool BufferedBodyTimedOut() {
+        if (!final_headers_ready_ || buffered_body_idle_timeout_ms_ <= 0) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto idle = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_buffered_body_activity_).count();
+        if (idle < buffered_body_idle_timeout_ms_) {
+            return false;
+        }
+        buffered_timeout_reason_ = "buffered body idle timeout after " + std::to_string(idle) + "ms";
+        std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
+        logE(log_tag_, buffered_timeout_reason_);
+        return true;
     }
 
     bool StreamPhaseTimedOut() {
@@ -676,6 +722,16 @@ class CurlClient {
             stream_pretransfer_baseline_seconds_ = 0.0;
             stream_timeout_reason_.clear();
         }
+        request_started_ = std::chrono::steady_clock::now();
+        final_headers_elapsed_ms_ = -1;
+        first_body_elapsed_ms_ = -1;
+        last_body_progress_elapsed_ms_ = -1;
+        buffered_body_bytes_ = 0;
+        first_body_seen_ = false;
+        buffered_timeout_reason_.clear();
+        buffered_body_idle_timeout_ms_ =
+            !stream_mode_ && method == "GET" ? request.streamIdleTimeoutMs : 0;
+        last_buffered_body_activity_ = request_started_;
         return true;
     }
 
@@ -694,11 +750,19 @@ class CurlClient {
         }
         // 响应数据 body 处理
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, DataWriteCallback);
-        curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &content_data_);
+        curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
         // curl 请求处理. libcurl transparently decodes the body per the negotiated
         // Content-Encoding (zlib/brotli/zstd), so content_data_ is already the
         // decompressed payload — no manual gzip pass.
         CURLcode res = curl_easy_perform(curl_);
+        if (!buffered_timeout_reason_.empty()) {
+            res = CURLE_OPERATION_TIMEDOUT;
+            // libcurl owns CURLOPT_ERRORBUFFER while perform is running and
+            // may replace the callback's classified reason with a generic
+            // abort string. Restore our stable ABI-visible timeout reason at
+            // the terminal boundary.
+            std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
+        }
         FinishBufferedRequest(res, callback);
     }
 
@@ -765,7 +829,7 @@ class CurlClient {
 
         // Buffered response, same as StartRequest.
         curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, DataWriteCallback);
-        curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &content_data_);
+        curl_easy_setopt(curl_, CURLOPT_WRITEDATA, this);
         CURLcode res = curl_easy_perform(curl_);
         FinishBufferedRequest(res, callback);
     }
@@ -805,6 +869,11 @@ class CurlClient {
         curl_response_->errorMsg = curl_error_msg_;
         curl_response_->errorMsgLen = strlen(curl_error_msg_);
         HandleElapseStatisticsInfo(curl_response_);
+
+        logI(log_tag_, "buffered_progress finalHeadersMs:" + std::to_string(final_headers_elapsed_ms_)
+            + ", firstBodyMs:" + std::to_string(first_body_elapsed_ms_)
+            + ", lastBodyProgressMs:" + std::to_string(last_body_progress_elapsed_ms_)
+            + ", bodyBytes:" + std::to_string(buffered_body_bytes_));
 
         logI(log_tag_, "libcurl callback.");
         // Ownership: the callback struct is BORROWED — the caller allocates
@@ -891,6 +960,11 @@ class CurlClient {
     }
 
  private:
+    int64_t ElapsedSinceRequestStartMs(
+        std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) const {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(now - request_started_).count();
+    }
+
     // 请求结束清理任务
     void CleanupCurl() {
         logI(log_tag_, "cleanup curl client");
@@ -1016,6 +1090,15 @@ class CurlClient {
     std::string pending_redirect_headers_;
     std::string redirect_url_;
     std::string content_data_;
+    std::chrono::steady_clock::time_point request_started_{};
+    std::chrono::steady_clock::time_point last_buffered_body_activity_{};
+    int64_t buffered_body_idle_timeout_ms_ = 0;
+    int64_t final_headers_elapsed_ms_ = -1;
+    int64_t first_body_elapsed_ms_ = -1;
+    int64_t last_body_progress_elapsed_ms_ = -1;
+    int64_t buffered_body_bytes_ = 0;
+    bool first_body_seen_ = false;
+    std::string buffered_timeout_reason_;
     CurlResponse *curl_response_ = nullptr;  // destructor deletes it — must not start wild
     // Caller-pinned Accept-Encoding (from the request header); empty = advertise
     // all codecs libcurl supports and let it decode transparently.

@@ -127,7 +127,8 @@ static void OnResponse(void *ref, CurlResponse *response) {
 }
 
 static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
-                      const char *method = "GET", const char *body = nullptr) {
+                      const char *method = "GET", const char *body = nullptr,
+                      int64_t bufferedBodyIdleTimeoutMs = 0) {
     Captured captured;
     StringDic headers{};
     headers.size = 0;
@@ -138,6 +139,7 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     request.method = method;
     request.headers = &headers;
     request.timeout = timeoutMs;
+    request.streamIdleTimeoutMs = bufferedBodyIdleTimeoutMs;
     request.postBodyLen = body ? static_cast<int>(std::strlen(body)) : 0;
     request.postBody = body;
 
@@ -305,6 +307,17 @@ int main(int argc, char **argv) {
     // 4. Timeout: server sleeps 10s, request allows 1.5s.
     Captured slow = Fetch(base + "/slow", 1500);
     CHECK(slow.code == 28, "/slow times out with CURLE_OPERATION_TIMEDOUT");
+
+    // Buffered GETs keep partial response bytes inside native until terminal
+    // success. A body-progress stall must therefore abort as timeout and
+    // expose no prefix to Kotlin/callers, preserving safe retry eligibility.
+    Captured bufferedIdle = Fetch(base + "/idle-stream", 5000, "GET", nullptr, 500);
+    CHECK(bufferedIdle.code == 28,
+          "buffered inter-chunk idle completes as CURLE_OPERATION_TIMEDOUT");
+    CHECK(bufferedIdle.errorMsg.find("buffered body idle timeout") != std::string::npos,
+          "buffered idle timeout reason crosses the wrapper response ABI");
+    CHECK(bufferedIdle.data.empty(),
+          "buffered idle timeout fences native partial body from the caller");
 
     // 5. Redirect is followed to /ok.
     Captured redir = Fetch(base + "/redirect");
