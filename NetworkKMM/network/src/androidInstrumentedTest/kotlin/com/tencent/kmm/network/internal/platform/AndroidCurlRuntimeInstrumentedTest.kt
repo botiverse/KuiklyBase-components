@@ -164,7 +164,7 @@ class AndroidCurlRuntimeInstrumentedTest {
         }
         val elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
 
-        assertTrue(responses.all { it.code == 0 && it.httpCode == 200L })
+        assertTrue(responses.all { it.code == 0 && it.httpCode == 200 })
         assertTrue(responses.all { it.data?.decodeToString() == "buffer-delay-ok" })
         assertTrue(responses.all { it.elapse.curlMultiOwnerThreadObserved == true })
         assertTrue(responses.all { it.elapse.curlEnqueueToNativeStartElapsedMs >= 0.0 })
