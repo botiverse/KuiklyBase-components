@@ -147,6 +147,17 @@ typedef struct {
 
 // CurClient 对象指针
 typedef void* CurClientHandle;
+typedef void* CurlMultiEngineHandle;
+
+#define CURL_MULTI_INFO_ABI_VERSION 1
+
+typedef struct CurlMultiInfoV1 {
+    int abiVersion;
+    int structSize;
+    int64_t enqueueToNativeStartElapsedMs;
+    int ownerThreadObserved;
+    int reserved;
+} CurlMultiInfoV1;
 
 // 创建 CurClient 对象
 CurClientHandle CreateCurlClient(const char *logTag);
@@ -201,6 +212,24 @@ const char *GetCurlNegotiatedProtocol(CurClientHandle handle);
 // Returns 0 on a null/mismatched ABI without writing to the output buffer.
 int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
                           size_t infoSize, int abiVersion);
+
+// Single-owner multi engine for buffered requests. Submit is non-blocking:
+// one native owner thread drives every accepted easy handle through CURLM and
+// invokes the copied callback exactly once at transport terminal. The caller
+// keeps `handle` alive through that callback and may read transfer/multi facts
+// before deleting it. Request strings/headers/body are copied at submission.
+// One engine accepts exactly one HTTP-version cohort (default h2/h1 or H3);
+// create a separate engine for the other cohort so a default request can never
+// silently acquire an H3 connection.
+CurlMultiEngineHandle CreateCurlMultiEngine(const char *logTag);
+void DeleteCurlMultiEngine(CurlMultiEngineHandle engine);
+int SubmitBufferedRequestV27(CurlMultiEngineHandle engine, int64_t requestId,
+                             CurClientHandle handle, const CurlRequest *request,
+                             size_t requestSize, int abiVersion,
+                             const CurlCallback *callback);
+void CancelCurlMultiRequest(CurlMultiEngineHandle engine, int64_t requestId);
+int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
+                       size_t infoSize, int abiVersion);
 
 // Curl 发送请求
 int StartRequestV27(CurClientHandle handle, const CurlRequest *request,

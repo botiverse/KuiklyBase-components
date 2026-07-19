@@ -8,8 +8,11 @@
 #include <cstdlib>
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <curl/curl.h>
@@ -35,6 +38,48 @@ struct Captured {
     long long connectTimeMs = -1;
     bool invoked = false;
 };
+
+struct MultiCaptured {
+    std::mutex mutex;
+    std::condition_variable condition;
+    int expected = 0;
+    int completed = 0;
+    std::vector<int> callbackCounts;
+    std::vector<int> codes;
+    std::vector<long> httpCodes;
+    std::thread::id ownerThread;
+    bool ownerThreadSet = false;
+    bool ownerThreadMismatch = false;
+};
+
+struct MultiCallbackRef {
+    MultiCaptured *batch = nullptr;
+    int index = 0;
+};
+
+static void OnMultiResponse(void *ref, CurlResponse *response) {
+    auto *item = static_cast<MultiCallbackRef *>(ref);
+    std::lock_guard<std::mutex> lock(item->batch->mutex);
+    item->batch->callbackCounts[item->index]++;
+    item->batch->codes[item->index] = response->code;
+    item->batch->httpCodes[item->index] = response->httpCode;
+    if (!item->batch->ownerThreadSet) {
+        item->batch->ownerThread = std::this_thread::get_id();
+        item->batch->ownerThreadSet = true;
+    } else if (item->batch->ownerThread != std::this_thread::get_id()) {
+        item->batch->ownerThreadMismatch = true;
+    }
+    item->batch->completed++;
+    item->batch->condition.notify_all();
+}
+
+static bool AwaitMulti(MultiCaptured &batch, int timeoutMs) {
+    std::unique_lock<std::mutex> lock(batch.mutex);
+    return batch.condition.wait_for(
+        lock,
+        std::chrono::milliseconds(timeoutMs),
+        [&batch]() { return batch.completed >= batch.expected; });
+}
 
 struct UploadBuffer {
     std::string data;
@@ -301,6 +346,107 @@ int main(int argc, char **argv) {
         CHECK(std::strcmp(GetCurlNegotiatedProtocol(handle), "unknown") == 0,
               "protocol is unknown before a request completes");
         DeleteCurlClient(handle);
+    }
+
+    {
+        constexpr int requestCount = 4;
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-owner");
+        CHECK(engine != nullptr, "single-owner multi engine starts");
+
+        MultiCaptured batch;
+        batch.expected = requestCount;
+        batch.callbackCounts.assign(requestCount, 0);
+        batch.codes.assign(requestCount, -1);
+        batch.httpCodes.assign(requestCount, -1);
+        std::vector<MultiCallbackRef> refs(requestCount);
+        std::vector<CurClientHandle> handles(requestCount, nullptr);
+        const std::string multiUrl = base + "/multi-delay";
+        StringDic headers{};
+        const auto started = std::chrono::steady_clock::now();
+        for (int index = 0; index < requestCount; ++index) {
+            refs[index] = MultiCallbackRef{&batch, index};
+            handles[index] = CreateCurlClient("wrapper-multi-request");
+            CurlRequest request{};
+            request.url = multiUrl.c_str();
+            request.method = "GET";
+            request.headers = &headers;
+            request.timeout = 5000;
+            CurlCallback callback{&refs[index], OnMultiResponse};
+            CHECK(
+                SubmitBufferedRequestV27(
+                    engine,
+                    10'000 + index,
+                    handles[index],
+                    &request,
+                    sizeof(request),
+                    CURL_WRAPPER_ABI_VERSION,
+                    &callback) == 1,
+                "multi engine accepts buffered request");
+        }
+        CHECK(AwaitMulti(batch, 5000), "multi owner completes every concurrent request");
+        CHECK(batch.ownerThreadSet && !batch.ownerThreadMismatch,
+              "every multi terminal callback runs on one owner thread");
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        CHECK(elapsed < 2200, "single owner advances four delayed requests concurrently");
+        for (int index = 0; index < requestCount; ++index) {
+            CHECK(batch.callbackCounts[index] == 1, "multi request completes exactly once");
+            CHECK(batch.codes[index] == 0, "multi request CURLcode is 0");
+            CHECK(batch.httpCodes[index] == 200, "multi request preserves HTTP 200");
+            CurlMultiInfoV1 info{};
+            CHECK(
+                GetCurlMultiInfoV1(
+                    handles[index],
+                    &info,
+                    sizeof(info),
+                    CURL_MULTI_INFO_ABI_VERSION) == 1,
+                "multi request exposes queue-delay facts");
+            CHECK(info.ownerThreadObserved == 1, "multi request ran on owner thread");
+            CHECK(info.enqueueToNativeStartElapsedMs >= 0, "multi queue delay is non-negative");
+            CurlMultiInfoV1 untouched{};
+            untouched.reserved = 77;
+            CHECK(
+                GetCurlMultiInfoV1(handles[index], &untouched, sizeof(untouched) - 1,
+                                   CURL_MULTI_INFO_ABI_VERSION) == 0,
+                "multi facts reject mismatched struct size");
+            CHECK(untouched.reserved == 77, "multi facts mismatch does not write caller memory");
+        }
+
+        MultiCaptured cancelled;
+        cancelled.expected = 1;
+        cancelled.callbackCounts.assign(1, 0);
+        cancelled.codes.assign(1, -1);
+        cancelled.httpCodes.assign(1, -1);
+        MultiCallbackRef cancelRef{&cancelled, 0};
+        CurClientHandle cancelHandle = CreateCurlClient("wrapper-multi-cancel");
+        const std::string slowUrl = base + "/slow";
+        CurlRequest cancelRequest{};
+        cancelRequest.url = slowUrl.c_str();
+        cancelRequest.method = "GET";
+        cancelRequest.headers = &headers;
+        cancelRequest.timeout = 30'000;
+        CurlCallback cancelCallback{&cancelRef, OnMultiResponse};
+        CHECK(
+            SubmitBufferedRequestV27(
+                engine,
+                20'000,
+                cancelHandle,
+                &cancelRequest,
+                sizeof(cancelRequest),
+                CURL_WRAPPER_ABI_VERSION,
+                &cancelCallback) == 1,
+            "multi engine accepts cancellable request");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CancelCurlMultiRequest(engine, 20'000);
+        CHECK(AwaitMulti(cancelled, 3000), "multi cancel wakes owner without worker starvation");
+        CHECK(cancelled.callbackCounts[0] == 1, "multi cancel completes exactly once");
+        CHECK(cancelled.codes[0] == 42, "multi cancel preserves CURLE_ABORTED_BY_CALLBACK");
+
+        DeleteCurlMultiEngine(engine);
+        for (CurClientHandle handle : handles) {
+            DeleteCurlClient(handle);
+        }
+        DeleteCurlClient(cancelHandle);
     }
 
     // CURLOPT_RESOLVE keeps the URL hostname while bypassing the process DNS
