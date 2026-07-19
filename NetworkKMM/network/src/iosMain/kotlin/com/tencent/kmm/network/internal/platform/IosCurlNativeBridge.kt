@@ -152,6 +152,17 @@ internal interface IosCurlNativeBridge {
     fun cancel(requestId: Int)
 }
 
+internal data class IosCurlOptionalApiDiagnostics(
+    val bufferedBodyIdleTimeoutSetterAvailable: Boolean,
+    val maxBufferedResponseBytesSetterAvailable: Boolean,
+    val transferFactsAvailable: Boolean
+)
+
+internal data class IosCurlDiagnosticResponse(
+    val response: CurlNativeResponse,
+    val optionalApi: IosCurlOptionalApiDiagnostics
+)
+
 @OptIn(ExperimentalForeignApi::class)
 internal object IosCurlCInteropBridge : IosCurlNativeBridge {
     override val isAvailable: Boolean
@@ -160,25 +171,29 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
         get() = CurlSupportsHttp3() != 0
 
     override suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse =
-        perform(request) { handle, callbackContext ->
-            withCurlRequest(request) { nativeRequest ->
-                memScoped {
-                    val callback = alloc<CurlCallback> {
-                        callbackRef = callbackContext.stableRef.asCPointer()
-                        callback = staticCFunction(::iosCurlComplete)
-                    }
-                    check(
-                        StartRequestV27(
-                            handle,
-                            nativeRequest,
-                            sizeOf<CurlRequest>().convert(),
-                            CURL_WRAPPER_ABI_VERSION,
-                            callback.ptr
-                        ) != 0
-                    ) { "iOS curl request ABI rejected" }
+        executeWithOptionalApiDiagnostics(request).response
+
+    internal suspend fun executeWithOptionalApiDiagnostics(
+        request: IosCurlNativeRequest
+    ): IosCurlDiagnosticResponse = performWithDiagnostics(request) { handle, callbackContext ->
+        withCurlRequest(request) { nativeRequest ->
+            memScoped {
+                val callback = alloc<CurlCallback> {
+                    callbackRef = callbackContext.stableRef.asCPointer()
+                    callback = staticCFunction(::iosCurlComplete)
                 }
+                check(
+                    StartRequestV27(
+                        handle,
+                        nativeRequest,
+                        sizeOf<CurlRequest>().convert(),
+                        CURL_WRAPPER_ABI_VERSION,
+                        callback.ptr
+                    ) != 0
+                ) { "iOS curl request ABI rejected" }
             }
         }
+    }
 
     override suspend fun downloadStream(
         request: IosCurlNativeRequest,
@@ -248,12 +263,34 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
         onChunk: ((ByteArray) -> Unit)? = null,
         uploadSource: IosCurlUploadSource? = null,
         start: (COpaquePointer, IosCurlCallbackContext) -> Unit
-    ): CurlNativeResponse = withContext(IosCurlExecutionDispatchers.perform) {
+    ): CurlNativeResponse = performWithDiagnostics(
+        request = request,
+        onResponseStart = onResponseStart,
+        onChunk = onChunk,
+        uploadSource = uploadSource,
+        start = start
+    ).response
+
+    private suspend fun performWithDiagnostics(
+        request: IosCurlNativeRequest,
+        onResponseStart: ((Long, String) -> Unit)? = null,
+        onChunk: ((ByteArray) -> Unit)? = null,
+        uploadSource: IosCurlUploadSource? = null,
+        start: (COpaquePointer, IosCurlCallbackContext) -> Unit
+    ): IosCurlDiagnosticResponse = withContext(IosCurlExecutionDispatchers.perform) {
+        fun unavailableWithDiagnostics(message: String) = IosCurlDiagnosticResponse(
+            response = unavailable(message),
+            optionalApi = IosCurlOptionalApiDiagnostics(
+                bufferedBodyIdleTimeoutSetterAvailable = false,
+                maxBufferedResponseBytesSetterAvailable = false,
+                transferFactsAvailable = false
+            )
+        )
         if (!isAvailable) {
-            return@withContext unavailable("iOS curl wrapper ABI mismatch")
+            return@withContext unavailableWithDiagnostics("iOS curl wrapper ABI mismatch")
         }
         val handle = CreateCurlClient("NetworkKMM-iOS-${request.requestId}")
-            ?: return@withContext unavailable("iOS curl failed to create native client")
+            ?: return@withContext unavailableWithDiagnostics("iOS curl failed to create native client")
         val callbackContext = IosCurlCallbackContext(
             request = request,
             onResponseStart = onResponseStart,
@@ -262,47 +299,65 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
         )
         try {
             if (SetCurlHttp3Enabled(handle, if (request.http3Enabled) 1 else 0) == 0) {
-                return@withContext unavailable(
+                return@withContext unavailableWithDiagnostics(
                     "HTTP/3 requested but iOS curl backend is unavailable"
                 )
             }
             SetCurlCaInfo(handle, request.caInfoPath)
             SetCurlProxy(handle, request.proxyUrl)
-            NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable(
-                handle,
-                request.bufferedBodyIdleTimeoutMillis
-            )
-            NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable(
-                handle,
-                request.maxBufferedResponseBytes
-            )
+            val bufferedBodyIdleTimeoutSetterAvailable =
+                NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable(
+                    handle,
+                    request.bufferedBodyIdleTimeoutMillis
+                ) != 0
+            val maxBufferedResponseBytesSetterAvailable =
+                NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable(
+                    handle,
+                    request.maxBufferedResponseBytes
+                ) != 0
             request.resolveEntry?.let { entry ->
                 if (SetCurlResolve(handle, entry) == 0) {
-                    return@withContext unavailable("iOS curl failed to apply resolve entry")
+                    return@withContext unavailableWithDiagnostics(
+                        "iOS curl failed to apply resolve entry"
+                    )
                 }
             }
             if (!IosCurlHandleRegistry.publish(request.requestId, handle)) {
-                return@withContext unavailable("iOS curl request id already active")
+                return@withContext unavailableWithDiagnostics(
+                    "iOS curl request id already active"
+                )
             }
             if (request.cancellationSignal.isCancelled()) {
                 cancelNative(handle)
             }
             runCatching { start(handle, callbackContext) }
                 .getOrElse { throwable ->
-                    return@withContext unavailable(
+                    return@withContext unavailableWithDiagnostics(
                         throwable.message ?: "iOS curl cinterop invocation failed"
                     )
                 }
             callbackContext.failureMessage()?.let { message ->
-                return@withContext unavailable(message)
+                return@withContext unavailableWithDiagnostics(message)
             }
             val response = callbackContext.response
-                ?: return@withContext unavailable("iOS curl returned without a completion callback")
+                ?: return@withContext unavailableWithDiagnostics(
+                    "iOS curl returned without a completion callback"
+                )
             response.elapse.protocol = GetCurlNegotiatedProtocol(handle)
                 ?.toKString()
                 ?.takeIf { it != "unknown" }
-            response.elapse.applyCurlTransferFacts(readCurlTransferFacts(handle))
-            response
+            val transferFacts = readCurlTransferFacts(handle)
+            response.elapse.applyCurlTransferFacts(transferFacts)
+            IosCurlDiagnosticResponse(
+                response = response,
+                optionalApi = IosCurlOptionalApiDiagnostics(
+                    bufferedBodyIdleTimeoutSetterAvailable =
+                        bufferedBodyIdleTimeoutSetterAvailable,
+                    maxBufferedResponseBytesSetterAvailable =
+                        maxBufferedResponseBytesSetterAvailable,
+                    transferFactsAvailable = transferFacts != null
+                )
+            )
         } finally {
             IosCurlHandleRegistry.remove(request.requestId, handle)
             callbackContext.dispose()

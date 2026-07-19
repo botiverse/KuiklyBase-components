@@ -39,6 +39,15 @@
 
 using namespace std;
 
+#if defined(__APPLE__)
+// These additive entry points are resolved with dlsym so binaries built
+// against an older static archive do not gain strong undefined references.
+// Keep the fresh-archive definitions in the final Mach-O despite dead-strip.
+#define NETWORKKMM_OPTIONAL_API __attribute__((used, retain, visibility("default")))
+#else
+#define NETWORKKMM_OPTIONAL_API
+#endif
+
 static bool CheckedCallbackSize(size_t size, size_t nmemb, size_t *result) {
     if (result == nullptr || (nmemb != 0 && size > SIZE_MAX / nmemb)) {
         return false;
@@ -1334,6 +1343,7 @@ void SetCurlProxy(CurClientHandle handle, const char *proxyUrl) {
     reinterpret_cast<CurlClient *>(handle)->SetProxy(proxyUrl);
 }
 
+NETWORKKMM_OPTIONAL_API
 void SetCurlMaxBufferedResponseBytes(CurClientHandle handle, int64_t maxBytes) {
     if (handle == nullptr) {
         return;
@@ -1341,6 +1351,7 @@ void SetCurlMaxBufferedResponseBytes(CurClientHandle handle, int64_t maxBytes) {
     reinterpret_cast<CurlClient *>(handle)->SetMaxBufferedResponseBytes(maxBytes);
 }
 
+NETWORKKMM_OPTIONAL_API
 void SetCurlBufferedBodyIdleTimeoutMs(CurClientHandle handle, int64_t timeoutMs) {
     if (handle == nullptr) {
         return;
@@ -1373,6 +1384,7 @@ const char *GetCurlNegotiatedProtocol(CurClientHandle handle) {
     return reinterpret_cast<CurlClient *>(handle)->GetNegotiatedProtocol();
 }
 
+NETWORKKMM_OPTIONAL_API
 int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
                           size_t infoSize, int abiVersion) {
     if (handle == nullptr) {

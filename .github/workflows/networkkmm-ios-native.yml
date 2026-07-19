@@ -18,7 +18,10 @@ on:
   pull_request:
     paths:
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
+      - "NetworkKMM/network/src/iosMain/**"
+      - "NetworkKMM/network/src/iosTest/**"
       - "NetworkKMM/scripts/build-ios-curl.sh"
+      - "NetworkKMM/scripts/run-ios-curl-runtime-tests.sh"
       - ".github/workflows/networkkmm-ios-native.yml"
 
 permissions:
@@ -65,6 +68,18 @@ jobs:
             exit 1
           }
           echo "Layout OK: $(du -sh "$root" | cut -f1)"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Run production runtime against fresh xcframework
+        shell: bash
+        env:
+          NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION: available
+        run: NetworkKMM/scripts/run-ios-curl-runtime-tests.sh
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
