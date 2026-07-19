@@ -111,6 +111,10 @@ data class VBTransportElapseStatistics(
     var curlLastBodyProgressElapsedMs: Double = 0.0,
     /** Native response bytes observed before the terminal result; 0 when unavailable/absent. */
     var curlBodyBytes: Long = 0,
+    /** curl multi submit accepted -> native owner began configuring the easy handle. */
+    var curlEnqueueToNativeStartElapsedMs: Double = 0.0,
+    /** null for legacy/blocking artifacts; true when a CURLM owner advanced this request. */
+    var curlMultiOwnerThreadObserved: Boolean? = null,
     /** Buffered curl response body-progress watchdog fired on the first attempt. */
     var curlBodyStallDetected: Boolean = false,
     /** First (stalled) attempt facts retained when a fresh retry is made. */

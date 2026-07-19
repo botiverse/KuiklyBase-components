@@ -899,6 +899,8 @@ class AndroidCurlNetworkEngineTest {
                 assertEquals(9.0, timing.curlFinalHeadersElapsedMs)
                 assertEquals(0.0, timing.curlFirstBodyElapsedMs)
                 assertEquals(0L, timing.curlBodyBytes)
+                assertEquals(4.0, timing.curlEnqueueToNativeStartElapsedMs)
+                assertEquals(true, timing.curlMultiOwnerThreadObserved)
             }
         )
         callback.onTransferFacts(
@@ -909,6 +911,10 @@ class AndroidCurlNetworkEngineTest {
             firstBodyElapsedMs = 0,
             lastBodyProgressElapsedMs = 0,
             bodyBytes = 0,
+        )
+        callback.onMultiFacts(
+            enqueueToNativeStartElapsedMs = 4,
+            ownerThreadObserved = true,
         )
         assertFalse(terminalInvoked)
         callback.onComplete(

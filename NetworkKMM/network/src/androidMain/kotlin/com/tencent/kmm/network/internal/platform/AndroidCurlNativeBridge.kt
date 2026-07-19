@@ -23,6 +23,7 @@ import com.tencent.kmm.network.curl.CurlTransferFactsV1
 import com.tencent.kmm.network.curl.applyCurlTransferFacts
 import com.tencent.kmm.network.export.VBTransportElapseStatistics
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -104,7 +105,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
         get() = loaded && runCatching { nativeSupportsHttp3() }.getOrDefault(false)
 
     override suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse =
-        perform(request, MODE_BUFFERED, null, null, null)
+        performBuffered(request)
 
     override suspend fun downloadStream(
         request: AndroidCurlNativeRequest,
@@ -122,6 +123,62 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
             nativeCancel(requestId)
         }
     }
+
+    private suspend fun performBuffered(request: AndroidCurlNativeRequest): CurlNativeResponse =
+        suspendCancellableCoroutine { continuation ->
+            if (!loaded) {
+                continuation.tryResume(unavailableResponse())?.let { token ->
+                    continuation.completeResume(token)
+                }
+                return@suspendCancellableCoroutine
+            }
+            lateinit var callback: AndroidCurlJniCallback
+            callback = AndroidCurlJniCallback(
+                onResponseStartBlock = null,
+                onChunkBlock = null,
+                uploadSource = null,
+                cancellationSignal = request.cancellationSignal,
+                bufferedBodyIdleTimeoutMillis = request.bufferedBodyIdleTimeoutMillis,
+                maxBufferedResponseBytes = request.maxBufferedResponseBytes,
+                onCompleteBlock = { response ->
+                    val terminal = callback.failureMessage()?.let(::unavailableResponse) ?: response
+                    continuation.tryResume(terminal)?.let { token ->
+                        continuation.completeResume(token)
+                    }
+                }
+            )
+            continuation.invokeOnCancellation {
+                request.cancel()
+                nativeCancel(request.requestId)
+            }
+            val names = request.headers.keys.toTypedArray()
+            val values = request.headers.values.toTypedArray()
+            val accepted = runCatching {
+                nativeSubmitBuffered(
+                    requestId = request.requestId,
+                    url = request.url,
+                    method = request.method,
+                    headerNames = names,
+                    headerValues = values,
+                    timeoutMillis = request.timeoutMillis,
+                    body = request.body,
+                    caInfoPath = request.caInfoPath,
+                    proxyUrl = request.proxyUrl,
+                    http3Enabled = request.http3Enabled,
+                    callback = callback
+                )
+            }.getOrDefault(false)
+            if (!accepted) {
+                continuation.tryResume(
+                    unavailableResponse("Android curl async submit was rejected")
+                )?.let { token -> continuation.completeResume(token) }
+            } else if (!continuation.isActive) {
+                // Cancellation may race before native publication. Recheck
+                // immediately after accepted submit so the native handle sees it.
+                request.cancel()
+                nativeCancel(request.requestId)
+            }
+        }
 
     private suspend fun perform(
         request: AndroidCurlNativeRequest,
@@ -199,6 +256,21 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
     )
 
     @JvmStatic
+    private external fun nativeSubmitBuffered(
+        requestId: Int,
+        url: String,
+        method: String,
+        headerNames: Array<String>,
+        headerValues: Array<String>,
+        timeoutMillis: Long,
+        body: ByteArray?,
+        caInfoPath: String,
+        proxyUrl: String,
+        http3Enabled: Boolean,
+        callback: AndroidCurlJniCallback
+    ): Boolean
+
+    @JvmStatic
     private external fun nativeCancel(requestId: Int)
 
     @JvmStatic
@@ -216,6 +288,8 @@ internal class AndroidCurlJniCallback(
 ) {
     private val callbackFailure = AtomicReference<Throwable?>(null)
     private var pendingTransferFacts: CurlTransferFactsV1? = null
+    private var pendingMultiQueueDelayMs: Long = 0
+    private var pendingMultiOwnerObserved: Boolean? = null
 
     @JvmName("onResponseStart")
     fun onResponseStart(httpCode: Long, headers: String) {
@@ -271,6 +345,12 @@ internal class AndroidCurlJniCallback(
         )
     }
 
+    @JvmName("onMultiFacts")
+    fun onMultiFacts(enqueueToNativeStartElapsedMs: Long, ownerThreadObserved: Boolean) {
+        pendingMultiQueueDelayMs = enqueueToNativeStartElapsedMs
+        pendingMultiOwnerObserved = ownerThreadObserved
+    }
+
     private fun recordFailure(throwable: Throwable) {
         if (callbackFailure.compareAndSet(null, throwable)) {
             cancellationSignal.cancel()
@@ -321,6 +401,8 @@ internal class AndroidCurlJniCallback(
                 )
             )
         response.elapse.applyCurlTransferFacts(pendingTransferFacts)
+        response.elapse.curlEnqueueToNativeStartElapsedMs = pendingMultiQueueDelayMs.toDouble()
+        response.elapse.curlMultiOwnerThreadObserved = pendingMultiOwnerObserved
         onCompleteBlock(response)
     }
 }
