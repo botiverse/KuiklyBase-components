@@ -60,6 +60,13 @@ g++ -std=c++17 \
   -o "$BUILD_DIR/transfer_facts_missing_symbol_test"
 "$BUILD_DIR/transfer_facts_missing_symbol_test"
 
+echo "==> Verifying partial multi symbol surface fails closed"
+g++ -std=c++17 \
+  -I "$CPP_ROOT/wrapper/include" \
+  "$SCRIPT_DIR/multi_partial_symbol_test.cpp" \
+  -o "$BUILD_DIR/multi_partial_symbol_test"
+"$BUILD_DIR/multi_partial_symbol_test"
+
 echo "==> Verifying bidirectional ABI skew fails at link time"
 if g++ -std=c++17 \
   -I "$SCRIPT_DIR/abi_v26" \
