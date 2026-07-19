@@ -2,9 +2,8 @@
 # staticLibraries = libcurl.a
 package = com.tencent.qqlive.kmm.native.libcurl
 # headers = curl.h
-headers = curl_wrapper.h
+headers = networkkmm_curl_facts_compat.h
 # headerFilter = *
 
  #libraryPaths = libs
 linkerOpts = -lhilog_ndk.z -lace_napi.z -lc++_shared
-

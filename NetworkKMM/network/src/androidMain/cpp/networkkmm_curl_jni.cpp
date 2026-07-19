@@ -66,7 +66,11 @@ struct CallbackContext {
     jmethodID on_chunk = nullptr;
     jmethodID read_upload_chunk = nullptr;
     jmethodID is_cancelled = nullptr;
+    jmethodID buffered_body_idle_timeout_millis = nullptr;
+    jmethodID max_buffered_response_bytes = nullptr;
     jmethodID on_complete = nullptr;
+    jmethodID on_transfer_facts = nullptr;
+    CurlResponse *pending_response = nullptr;
 };
 
 jstring NewString(JNIEnv *env, const char *value) {
@@ -163,8 +167,7 @@ int ReadUploadChunk(void *read_ref, char *buffer, int max_length) {
     return length;
 }
 
-void OnComplete(void *callback_ref, CurlResponse *response) {
-    auto *context = static_cast<CallbackContext *>(callback_ref);
+void DeliverComplete(CallbackContext *context, CurlResponse *response) {
     const CurlResponse fallback{
         kCurlEngineFailure,
         0,
@@ -219,20 +222,92 @@ void OnComplete(void *callback_ref, CurlResponse *response) {
     }
 }
 
+void OnComplete(void *callback_ref, CurlResponse *response) {
+    // Start* owns the response until DeleteCurlClient. Defer Java terminal
+    // publication until Start* returns so V1 facts can be attached first.
+    auto *context = static_cast<CallbackContext *>(callback_ref);
+    context->pending_response = response;
+}
+
+void DeliverTransferFacts(CallbackContext *context) {
+    if (context->on_transfer_facts == nullptr || context->client == nullptr) {
+        return;
+    }
+    CurlTransferInfoV1 facts{};
+    if (GetCurlTransferInfoV1(
+            context->client,
+            &facts,
+            sizeof(facts),
+            CURL_TRANSFER_INFO_ABI_VERSION) == 0) {
+        return;
+    }
+    context->env->CallVoidMethod(
+        context->callback,
+        context->on_transfer_facts,
+        facts.finalHeadersObserved != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.firstBodyObserved != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.bodyProgressObserved != 0 ? JNI_TRUE : JNI_FALSE,
+        static_cast<jlong>(facts.finalHeadersElapsedMs),
+        static_cast<jlong>(facts.firstBodyElapsedMs),
+        static_cast<jlong>(facts.lastBodyProgressElapsedMs),
+        static_cast<jlong>(facts.bodyBytes)
+    );
+    CancelAfterCallbackException(context);
+}
+
 bool PopulateCallbackMethods(JNIEnv *env, jobject callback, CallbackContext *context) {
     jclass callback_class = env->GetObjectClass(callback);
     context->on_response_start = env->GetMethodID(callback_class, "onResponseStart", "(JLjava/lang/String;)V");
     context->on_chunk = env->GetMethodID(callback_class, "onChunk", "([B)V");
     context->read_upload_chunk = env->GetMethodID(callback_class, "readUploadChunk", "(I)[B");
     context->is_cancelled = env->GetMethodID(callback_class, "isCancelled", "()Z");
+    context->buffered_body_idle_timeout_millis =
+        env->GetMethodID(callback_class, "bufferedBodyIdleTimeoutMillis", "()J");
+    if (context->buffered_body_idle_timeout_millis == nullptr && env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
+    context->max_buffered_response_bytes =
+        env->GetMethodID(callback_class, "maxBufferedResponseBytes", "()J");
+    if (context->max_buffered_response_bytes == nullptr && env->ExceptionCheck()) {
+        env->ExceptionClear();
+    }
     context->on_complete = env->GetMethodID(
         callback_class,
         "onComplete",
         "(IJLjava/lang/String;Ljava/lang/String;Ljava/lang/String;[BLjava/lang/String;DDDDDDDD)V"
     );
+    context->on_transfer_facts = env->GetMethodID(callback_class, "onTransferFacts", "(ZZZJJJJ)V");
+    if (context->on_transfer_facts == nullptr && env->ExceptionCheck()) {
+        // Additive bridge method: an older Kotlin callback remains request-
+        // compatible and simply receives no V1 facts.
+        env->ExceptionClear();
+    }
     env->DeleteLocalRef(callback_class);
     return !env->ExceptionCheck() && context->on_response_start != nullptr && context->on_chunk != nullptr &&
         context->read_upload_chunk != nullptr && context->is_cancelled != nullptr && context->on_complete != nullptr;
+}
+
+void ConfigureBufferedPolicy(CallbackContext *context) {
+    if (context->buffered_body_idle_timeout_millis != nullptr) {
+        const jlong timeout = context->env->CallLongMethod(
+            context->callback,
+            context->buffered_body_idle_timeout_millis);
+        if (!context->env->ExceptionCheck()) {
+            SetCurlBufferedBodyIdleTimeoutMs(context->client, static_cast<int64_t>(timeout));
+        } else {
+            context->env->ExceptionClear();
+        }
+    }
+    if (context->max_buffered_response_bytes != nullptr) {
+        const jlong max_bytes = context->env->CallLongMethod(
+            context->callback,
+            context->max_buffered_response_bytes);
+        if (!context->env->ExceptionCheck()) {
+            SetCurlMaxBufferedResponseBytes(context->client, static_cast<int64_t>(max_bytes));
+        } else {
+            context->env->ExceptionClear();
+        }
+    }
 }
 
 void InvokeEngineFailure(CallbackContext *context, const char *message) {
@@ -240,7 +315,7 @@ void InvokeEngineFailure(CallbackContext *context, const char *message) {
     response.code = kCurlEngineFailure;
     response.errorMsg = message;
     response.errorMsgLen = static_cast<int>(std::char_traits<char>::length(message));
-    OnComplete(context, &response);
+    DeliverComplete(context, &response);
 }
 
 void NativePerform(
@@ -339,6 +414,7 @@ void NativePerform(
         return;
     }
     context.client = client;
+    ConfigureBufferedPolicy(&context);
     SetCurlCaInfo(client, ca_chars.get());
     SetCurlProxy(client, proxy_chars.get());
     if (SetCurlHttp3Enabled(client, http3_enabled == JNI_TRUE ? 1 : 0) == 0) {
@@ -360,14 +436,16 @@ void NativePerform(
     }
     CancelIfSignalled(&context);
 
+    bool transfer_completed = false;
     if (mode == kModeStreamDownload) {
         CurlStreamCallback stream_callback{};
         stream_callback.callbackRef = &context;
         stream_callback.onResponseStart = OnResponseStart;
         stream_callback.onChunk = OnChunk;
         stream_callback.onComplete = OnComplete;
-        if (StartStreamRequestV27(
-                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &stream_callback) == 0) {
+        transfer_completed = StartStreamRequestV27(
+            client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &stream_callback) != 0;
+        if (!transfer_completed) {
             InvokeEngineFailure(&context, "NetworkKMM stream request ABI rejected");
         }
     } else if (mode == kModeStreamUpload) {
@@ -376,19 +454,28 @@ void NativePerform(
         upload_source.readChunk = ReadUploadChunk;
         upload_source.totalLength = upload_content_length;
         CurlCallback curl_callback{&context, OnComplete};
-        if (StartUploadRequestV27(
-                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION,
-                &upload_source, &curl_callback) == 0) {
+        transfer_completed = StartUploadRequestV27(
+            client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION,
+            &upload_source, &curl_callback) != 0;
+        if (!transfer_completed) {
             InvokeEngineFailure(&context, "NetworkKMM upload request ABI rejected");
         }
     } else if (mode == kModeBuffered) {
         CurlCallback curl_callback{&context, OnComplete};
-        if (StartRequestV27(
-                client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &curl_callback) == 0) {
+        transfer_completed = StartRequestV27(
+            client, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &curl_callback) != 0;
+        if (!transfer_completed) {
             InvokeEngineFailure(&context, "NetworkKMM request ABI rejected");
         }
     } else {
         InvokeEngineFailure(&context, "unknown Android curl request mode");
+    }
+
+    // The V1 native contract permits reads only after Start* has completed its
+    // terminal callback and returned, while the handle is still alive.
+    if (transfer_completed) {
+        DeliverTransferFacts(&context);
+        DeliverComplete(&context, context.pending_response);
     }
 
     {

@@ -128,6 +128,23 @@ typedef struct {
     int64_t totalLength;  // -1 = unknown
 } CurlUploadSource;
 
+// Additive transfer facts ABI. This is intentionally separate from
+// CurlResponse so existing callers keep their frozen response layout. Callers
+// pass both size and version; the runtime rejects mismatches before writing.
+#define CURL_TRANSFER_INFO_ABI_VERSION 1
+typedef struct {
+    int abiVersion;
+    uint32_t structSize;
+    int finalHeadersObserved;
+    int firstBodyObserved;
+    int bodyProgressObserved;
+    int reserved;
+    int64_t finalHeadersElapsedMs;
+    int64_t firstBodyElapsedMs;
+    int64_t lastBodyProgressElapsedMs;
+    int64_t bodyBytes;
+} CurlTransferInfoV1;
+
 // CurClient 对象指针
 typedef void* CurClientHandle;
 
@@ -148,6 +165,14 @@ void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath);
 // disables environment/system proxy discovery for direct mode.
 void SetCurlProxy(CurClientHandle handle, const char *proxyUrl);
 
+// Cap decoded bytes retained by buffered responses. Zero disables the cap.
+// Streaming downloads are not buffered and ignore this setting.
+void SetCurlMaxBufferedResponseBytes(CurClientHandle handle, int64_t maxBytes);
+
+// Set the body-progress idle deadline for buffered responses only. Zero
+// disables it. This is intentionally separate from streaming phase timeouts.
+void SetCurlBufferedBodyIdleTimeoutMs(CurClientHandle handle, int64_t timeoutMs);
+
 // Add one libcurl CURLOPT_RESOLVE entry for this client. The entry is copied
 // and follows libcurl's "host:port:address[,address]" format. This preserves
 // the URL hostname for TLS SNI/verification while allowing a caller to supply
@@ -159,15 +184,23 @@ int SetCurlResolve(CurClientHandle handle, const char *resolveEntry);
 int CurlSupportsHttp3(void);
 
 // Select explicit HTTP/3-with-fallback for this client. Disabled clients are
-// pinned to HTTP/2-over-TLS with HTTP/1.1 fallback and use a separate shared
-// connection pool, so an earlier gray request cannot upgrade default traffic
-// through connection reuse. Returns 0 only when HTTP/3 was requested but the
-// linked artifact lacks the backend.
+// pinned to HTTP/2-over-TLS with HTTP/1.1 fallback. Default and H3 clients use
+// separate DNS/TLS-session shares; connection caches are intentionally not
+// shared across concurrent per-request easy handles because libcurl does not
+// support that cross-thread topology. Returns 0 only when HTTP/3 was requested
+// but the linked artifact lacks the backend.
 int SetCurlHttp3Enabled(CurClientHandle handle, int enabled);
 
 // Actual protocol negotiated by the completed request. The returned pointer
 // is a process-lifetime string literal ("h3", "h2", "http/1.1", etc.).
 const char *GetCurlNegotiatedProtocol(CurClientHandle handle);
+
+// Snapshot callback-owned monotonic transfer facts for this client. Read only
+// after Start*Request has completed its terminal callback and returned, and
+// before DeleteCurlClient; concurrent during-transfer reads are not supported.
+// Returns 0 on a null/mismatched ABI without writing to the output buffer.
+int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
+                          size_t infoSize, int abiVersion);
 
 // Curl 发送请求
 int StartRequestV27(CurClientHandle handle, const CurlRequest *request,

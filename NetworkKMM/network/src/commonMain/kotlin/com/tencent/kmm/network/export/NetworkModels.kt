@@ -426,7 +426,10 @@ data class NetworkRequestPolicy(
      * default: a healthy large download may legitimately outlive it. These
      * phase deadlines preserve fast failure without killing active progress.
      */
-    val streamTimeouts: NetworkStreamTimeoutPolicy = NetworkStreamTimeoutPolicy()
+    val streamTimeouts: NetworkStreamTimeoutPolicy = NetworkStreamTimeoutPolicy(),
+    /** Curl-only buffered response safety/recovery policy. */
+    val curlBufferedResponse: NetworkCurlBufferedResponsePolicy =
+        NetworkCurlBufferedResponsePolicy(),
 ) {
     fun copyMutable(): NetworkRequestPolicy {
         return NetworkRequestPolicy(
@@ -434,10 +437,20 @@ data class NetworkRequestPolicy(
             retry = retry,
             priority = priority,
             dispatcher = dispatcher,
-            streamTimeouts = streamTimeouts
+            streamTimeouts = streamTimeouts,
+            curlBufferedResponse = curlBufferedResponse,
         )
     }
 }
+
+data class NetworkCurlBufferedResponsePolicy(
+    /** Final headers -> first byte and inter-body-progress idle deadline. */
+    val bodyIdleTimeoutMillis: Long = 7_000,
+    /** Decoded bytes retained in memory. Zero disables the cap. */
+    val maxDecodedBytes: Long = 16L * 1024L * 1024L,
+    /** One fresh physical attempt for replay-safe GET/HEAD body stalls. */
+    val freshRetryEnabled: Boolean = true,
+)
 
 data class NetworkStreamTimeoutPolicy(
     /** DNS, socket, proxy tunnel and TLS establishment budget. */

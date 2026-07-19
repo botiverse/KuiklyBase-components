@@ -23,6 +23,7 @@ import com.tencent.kmm.network.export.NetworkEngineCapabilities
 import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
+import com.tencent.kmm.network.export.NetworkRequestPolicy
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
@@ -163,6 +164,57 @@ class IosCurlNetworkEngineTest {
         assertContentEquals("{\"ok\":true}".encodeToByteArray(), nativeRequest.body)
         assertEquals(trustStorePath, nativeRequest.caInfoPath)
         assertEquals("", nativeRequest.proxyUrl)
+        assertEquals(7_000L, nativeRequest.bufferedBodyIdleTimeoutMillis)
+        assertEquals(16L * 1024L * 1024L, nativeRequest.maxBufferedResponseBytes)
+    }
+
+    @Test
+    fun bufferedBodyStallRetriesGetOnceAndNeverReplaysPost() = runBlocking {
+        val firstTiming = VBTransportElapseStatistics(
+            curlFinalHeadersObserved = true,
+            curlFirstBodyObserved = true,
+            curlBodyProgressObserved = true,
+            curlLastBodyProgressElapsedMs = 11.0,
+            curlBodyBytes = 3,
+        )
+        val bridge = FakeBridge().apply {
+            executeResponses += CurlNativeResponse(
+                code = 28,
+                errorMsg = "buffered body idle timeout after 7000ms",
+                elapse = firstTiming,
+            )
+            executeResponses += CurlNativeResponse(code = 0, httpCode = 200, data = "ok".encodeToByteArray())
+        }
+        val get = NetworkRequest(
+            method = VBTransportMethod.GET,
+            url = "https://example.test",
+            policy = NetworkRequestPolicy(timeoutMillis = 20_000),
+        )
+
+        val recovered = IosCurlNetworkEngine(bridge).execute(get, NetworkCall(get))
+
+        assertEquals(2, bridge.executeRequests.size)
+        assertTrue(bridge.executeRequests[0].requestId != bridge.executeRequests[1].requestId)
+        assertEquals("ok", recovered.body.text())
+        assertTrue(recovered.timing.freshRetry)
+        assertEquals(3L, recovered.timing.curlFirstAttemptBodyBytes)
+        assertEquals(11.0, recovered.timing.curlFirstAttemptLastBodyProgressElapsedMs)
+
+        val postBridge = FakeBridge().apply {
+            executeResponses += CurlNativeResponse(
+                code = 28,
+                errorMsg = "buffered body idle timeout after 7000ms"
+            )
+        }
+        val post = NetworkRequest(
+            method = VBTransportMethod.POST,
+            url = "https://example.test",
+            body = NetworkBody.Text("write")
+        )
+        val failedWrite = IosCurlNetworkEngine(postBridge).execute(post, NetworkCall(post))
+        assertEquals(1, postBridge.executeRequests.size)
+        assertTrue(failedWrite.timing.curlBodyStallDetected)
+        assertFalse(failedWrite.timing.freshRetry)
     }
 
     @Test
@@ -481,6 +533,8 @@ class IosCurlNetworkEngineTest {
         override val supportsHttp3: Boolean = false
     ) : IosCurlNativeBridge {
         var executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val executeResponses = mutableListOf<CurlNativeResponse>()
+        val executeRequests = mutableListOf<IosCurlNativeRequest>()
         var streamResponse = CurlNativeResponse(code = 0, httpCode = 200)
         var uploadResponse = CurlNativeResponse(code = 0, httpCode = 200)
         var streamStatus = 200L
@@ -494,7 +548,8 @@ class IosCurlNetworkEngineTest {
 
         override suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse {
             lastRequest = request
-            return executeResponse
+            executeRequests += request
+            return if (executeResponses.isEmpty()) executeResponse else executeResponses.removeAt(0)
         }
 
         override suspend fun downloadStream(

@@ -17,6 +17,10 @@
 package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.curl.contentLength
+import com.tencent.kmm.network.curl.CurlNativeResponse
+import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
+import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
+import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
@@ -48,6 +52,8 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 
 internal object AndroidCurlEngineProvider {
     @Volatile
@@ -103,31 +109,44 @@ internal class AndroidCurlNetworkEngine(
                 error = error
             )
         }
-        val owner = Any()
-        val requestId = androidCurlRequestOwners.reserve(owner)
-        val nativeRequest = try {
-            request.toNativeRequest(
-                requestId = requestId,
-                body = body.bytes,
-                contentType = body.contentType
-            )
-        } catch (throwable: Throwable) {
-            androidCurlRequestOwners.release(requestId, owner)
-            throw throwable
+        val startedAt = TimeSource.Monotonic.markNow()
+        val first = executeBufferedAttempt(
+            request = request,
+            call = call,
+            body = body.bytes,
+            contentType = body.contentType,
+            timeoutMillis = request.policy.timeoutMillis,
+        )
+        if (!first.isBufferedBodyIdleTimeout()) {
+            return first.toNetworkResponse(request)
         }
-        call.addCancelHandler {
-            nativeRequest.cancel()
-            androidCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
+        first.elapse.curlBodyStallDetected = true
+        val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
+        if (!shouldFreshRetryCurlBufferedStall(
+                method = request.method,
+                bodyRepeatable = request.body.repeatable,
+                policy = request.policy.curlBufferedResponse,
+                cancelled = call.isCancelled,
+                remainingTimeoutMillis = remainingTimeout,
+            )) {
+            return first.toNetworkResponse(request)
         }
-        if (call.isCancelled) {
-            androidCurlRequestOwners.release(requestId, owner)
-            return cancelledResponse(request)
-        }
-        return try {
-            bridge.execute(nativeRequest).toNetworkResponse(request)
-        } finally {
-            androidCurlRequestOwners.release(requestId, owner)
-        }
+
+        // Each attempt reserves a new request id; the JNI bridge creates a new
+        // easy/client handle. CONNECT sharing is disabled, so the retry cannot
+        // re-enter the failed attempt's connection cache.
+        val retried = executeBufferedAttempt(
+            request = request,
+            call = call,
+            body = body.bytes,
+            contentType = body.contentType,
+            timeoutMillis = remainingTimeout ?: 0L,
+        )
+        retried.elapse.curlBodyStallDetected = true
+        retried.elapse.retainFirstAttemptCurlFacts(first.elapse)
+        retried.elapse.freshRetry = true
+        retried.elapse.freshRetryResult = if (retried.code == 0) "success" else "failure"
+        return retried.toNetworkResponse(request)
     }
 
     override suspend fun downloadStream(
@@ -250,8 +269,11 @@ internal class AndroidCurlNetworkEngine(
                     }
                 }
             }
-            val response = bridge.uploadStream(nativeRequest, uploadSource)
-                .toNetworkResponse(request)
+            val nativeResponse = bridge.uploadStream(nativeRequest, uploadSource)
+            if (nativeResponse.isBufferedBodyIdleTimeout()) {
+                nativeResponse.elapse.curlBodyStallDetected = true
+            }
+            val response = nativeResponse.toNetworkResponse(request)
             if (response.error != null) cancellationOwners.releaseAttemptSourceOnFailure()
             response
         } catch (throwable: Throwable) {
@@ -264,11 +286,47 @@ internal class AndroidCurlNetworkEngine(
         }
     }
 
+    private suspend fun executeBufferedAttempt(
+        request: NetworkRequest,
+        call: NetworkCall,
+        body: ByteArray?,
+        contentType: String?,
+        timeoutMillis: Long,
+    ): CurlNativeResponse {
+        val owner = Any()
+        val requestId = androidCurlRequestOwners.reserve(owner)
+        val nativeRequest = try {
+            request.toNativeRequest(
+                requestId = requestId,
+                body = body,
+                contentType = contentType,
+                timeoutMillis = timeoutMillis,
+            )
+        } catch (throwable: Throwable) {
+            androidCurlRequestOwners.release(requestId, owner)
+            throw throwable
+        }
+        call.addCancelHandler {
+            nativeRequest.cancel()
+            androidCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
+        }
+        if (call.isCancelled) {
+            androidCurlRequestOwners.release(requestId, owner)
+            return CurlNativeResponse(code = 42, errorMsg = "cancelled before Android curl native start")
+        }
+        return try {
+            bridge.execute(nativeRequest)
+        } finally {
+            androidCurlRequestOwners.release(requestId, owner)
+        }
+    }
+
     private fun NetworkRequest.toNativeRequest(
         requestId: Int,
         body: ByteArray? = null,
         contentType: String? = null,
-        uploadContentLength: Long? = null
+        uploadContentLength: Long? = null,
+        timeoutMillis: Long = policy.timeoutMillis,
     ): AndroidCurlNativeRequest {
         val nativeHeaders = headers.toMutableMap()
         contentType?.let { type ->
@@ -281,11 +339,13 @@ internal class AndroidCurlNetworkEngine(
             url = resolvedUrl(),
             method = method.name,
             headers = nativeHeaders,
-            timeoutMillis = policy.timeoutMillis,
+            timeoutMillis = timeoutMillis,
             streamConnectTimeoutMillis = policy.streamTimeouts.connectTimeoutMillis,
             streamResponseHeadersTimeoutMillis = policy.streamTimeouts.responseHeadersTimeoutMillis,
             streamIdleTimeoutMillis = policy.streamTimeouts.interChunkIdleTimeoutMillis,
             streamWholeTimeoutMillis = policy.streamTimeouts.wholeTransferTimeoutMillis,
+            bufferedBodyIdleTimeoutMillis = policy.curlBufferedResponse.bodyIdleTimeoutMillis,
+            maxBufferedResponseBytes = policy.curlBufferedResponse.maxDecodedBytes,
             body = body,
             uploadContentLength = uploadContentLength,
             caInfoPath = checkNotNull(preparedCurlCaInfoPath(this)) {
@@ -304,6 +364,11 @@ internal class AndroidCurlNetworkEngine(
             errorMsg = "cancelled before Android curl native start"
         ).toNetworkResponse(request)
 
+}
+
+private fun remainingCurlTimeoutMillis(totalTimeoutMillis: Long, startedAt: TimeMark): Long? {
+    if (totalTimeoutMillis <= 0) return null
+    return (totalTimeoutMillis - startedAt.elapsedNow().inWholeMilliseconds).coerceAtLeast(0)
 }
 
 private val androidCurlRequestOwners = RequestIdOwnerRegistry()

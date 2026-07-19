@@ -196,6 +196,8 @@ jobs:
 
       - name: Run production iOS curl runtime tests
         shell: bash
+        env:
+          NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION: unavailable
         run: NetworkKMM/scripts/run-ios-curl-runtime-tests.sh
 
       - name: Upload iOS curl test reports

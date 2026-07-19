@@ -29,6 +29,7 @@ import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapStringC
 import com.tencent.qqlive.kmm.native.libcurl.Cancel
 import com.tencent.qqlive.kmm.native.libcurl.CurlWrapperAbiVersion
 import com.tencent.qqlive.kmm.native.libcurl.CURL_WRAPPER_ABI_VERSION
+import com.tencent.qqlive.kmm.native.libcurl.CURL_TRANSFER_INFO_ABI_VERSION
 import com.tencent.qqlive.kmm.native.libcurl.CreateCurlClient
 import com.tencent.qqlive.kmm.native.libcurl.GetCurlNegotiatedProtocol
 import com.tencent.qqlive.kmm.native.libcurl.CurlCallback
@@ -40,6 +41,10 @@ import com.tencent.qqlive.kmm.native.libcurl.SetCurlHttp3Enabled
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlProxy
 import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlUploadSource
+import com.tencent.qqlive.kmm.native.libcurl.CurlTransferInfoV1
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmGetCurlTransferInfoV1IfAvailable
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable
 import com.tencent.qqlive.kmm.native.libcurl.StartRequestV27
 import com.tencent.qqlive.kmm.native.libcurl.StartStreamRequestV27
 import com.tencent.qqlive.kmm.native.libcurl.StartUploadRequestV27
@@ -155,18 +160,50 @@ object CurlRequestServiceHM : ICurlRequestService {
             "OHOS curl request is missing its explicit proxy decision"
         }
         SetCurlProxy(handle, proxyUrl)
+        NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable(
+            handle,
+            request.curlBufferedBodyIdleTimeoutMillis
+        )
+        NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable(
+            handle,
+            request.curlMaxBufferedResponseBytes
+        )
         check(SetCurlHttp3Enabled(handle, if (request.curlHttp3Enabled) 1 else 0) != 0) {
             "HTTP/3 requested but OHOS curl backend is unavailable"
         }
     }
 
-    private fun applyNegotiatedProtocol(
+    private fun applyNativeTransferDetails(
         response: CurlNativeResponse,
         handle: CPointer<out CPointed>?
     ): CurlNativeResponse = response.apply {
         elapse.protocol = GetCurlNegotiatedProtocol(handle)
             ?.toKString()
             ?.takeIf { it != "unknown" }
+        elapse.applyCurlTransferFacts(readCurlTransferFacts(handle))
+    }
+
+    private fun readCurlTransferFacts(
+        handle: CPointer<out CPointed>?
+    ): CurlTransferFactsV1? = memScoped {
+        val native = alloc<CurlTransferInfoV1>()
+        if (NetworkKmmGetCurlTransferInfoV1IfAvailable(
+                handle,
+                native.ptr,
+                sizeOf<CurlTransferInfoV1>().convert(),
+                CURL_TRANSFER_INFO_ABI_VERSION
+            ) == 0) {
+            return@memScoped null
+        }
+        CurlTransferFactsV1(
+            finalHeadersObserved = native.finalHeadersObserved != 0,
+            firstBodyObserved = native.firstBodyObserved != 0,
+            bodyProgressObserved = native.bodyProgressObserved != 0,
+            finalHeadersElapsedMs = native.finalHeadersElapsedMs,
+            firstBodyElapsedMs = native.firstBodyElapsedMs,
+            lastBodyProgressElapsedMs = native.lastBodyProgressElapsedMs,
+            bodyBytes = native.bodyBytes,
+        )
     }
 
     override fun initNativeCurlLog(log: IVBPBLog) {
@@ -414,10 +451,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                 configureCurlRuntime(handle, request)
                 val callback = object : ICurlCallback {
                     override fun onResponse(result: CurlResponse) {
-                        nativeResponse = applyNegotiatedProtocol(
-                            handleCurlNativeResponse(result, logTag),
-                            handle
-                        )
+                        nativeResponse = handleCurlNativeResponse(result, logTag)
                     }
                 }
 
@@ -436,6 +470,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                 } finally {
                     callbackWrapper.release()
                 }
+                nativeResponse = applyNativeTransferDetails(nativeResponse, handle)
                 // Publish the common terminal while the native handle is still
                 // owned. A concurrent common cancel can then only cancel this
                 // handle, never create a tombstone after native release.
@@ -547,6 +582,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                         logE("[$logTag] stream callback failure: ${throwable.message ?: throwable::class.simpleName}")
                     }
                 )
+                var nativeResponse: CurlNativeResponse? = null
                 val handler = object : IStreamHandler {
                     override fun onResponseStart(httpCode: Long, headers: String) {
                         gate.responseStart(httpCode.toInt(), parseCurlHeaders(headers))
@@ -557,15 +593,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                     }
 
                     override fun onComplete(result: CurlResponse) {
-                        val nativeResponse = applyNegotiatedProtocol(
-                            handleCurlNativeResponse(result, logTag),
-                            handle
-                        )
-                        gate.complete(
-                            VBTransportResponse().apply {
-                                updateResponse(request.logTag, nativeResponse, request, this)
-                            }
-                        )
+                        nativeResponse = handleCurlNativeResponse(result, logTag)
                     }
                 }
                 val wrapper = CurlStreamCallbackWrapper(handler)
@@ -582,6 +610,15 @@ object CurlRequestServiceHM : ICurlRequestService {
                 } finally {
                     wrapper.release()
                 }
+                val completedResponse = applyNativeTransferDetails(
+                    checkNotNull(nativeResponse) { "OHOS curl stream returned without completion" },
+                    handle
+                )
+                gate.complete(
+                    VBTransportResponse().apply {
+                        updateResponse(request.logTag, completedResponse, request, this)
+                    }
+                )
             } finally {
                 releaseNativeHandle(request.requestId, handle, logTag)
             }
@@ -647,10 +684,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                     }
                     val callback = object : ICurlCallback {
                         override fun onResponse(result: CurlResponse) {
-                            nativeResponse = applyNegotiatedProtocol(
-                                handleCurlNativeResponse(result, logTag),
-                                handle
-                            )
+                            nativeResponse = handleCurlNativeResponse(result, logTag)
                         }
                     }
                     val callbackWrapper = CurlCallbackWrapper(callback)
@@ -677,6 +711,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                         bridgeRef.dispose()
                         callbackWrapper.release()
                     }
+                    nativeResponse = applyNativeTransferDetails(nativeResponse, handle)
                     // Close common task ownership before native release so a
                     // late common cancel cannot poison a reused request id.
                     responseCallback(

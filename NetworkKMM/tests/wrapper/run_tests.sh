@@ -3,7 +3,7 @@
 # the behavior-contract tests against a local server. Locks down the wrapper's
 # observable contract on every PR — status passthrough (the raft.3 bug class),
 # error bodies, timeouts, redirects, POST bodies, content-encoding decode, and
-# share-handle pooling.
+# share-handle safety.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +21,16 @@ TLS_KEY="${BUILD_DIR}/phase-test-key.pem"
 
 mkdir -p "$BUILD_DIR"
 
+# libcurl does not support sharing one connection cache between concurrent
+# easy_perform calls on different threads. The production wrapper uses one
+# easy handle per request, so keep DNS/SSL-session sharing but fail the gate if
+# unsupported cross-thread connection-cache sharing is reintroduced.
+if grep -q 'CURLSHOPT_SHARE, CURL_LOCK_DATA_CONNECT' \
+  "$CPP_ROOT/wrapper/src/curl_wrapper.cpp"; then
+  echo "unsupported cross-thread CURLSH connection-cache sharing is enabled" >&2
+  exit 1
+fi
+
 echo "==> Building wrapper + tests for host"
 g++ -std=c++17 -O1 -g \
   -I "$CPP_ROOT" \
@@ -33,7 +43,7 @@ g++ -std=c++17 -O1 -g \
   -o "$BUILD_DIR/wrapper_behavior_test"
 
 WRAPPER_SYMBOLS="$(nm "$BUILD_DIR/wrapper_behavior_test")"
-for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27; do
+for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs; do
   grep -Eq " [Tt] ${symbol}$" <<<"$WRAPPER_SYMBOLS"
 done
 for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do
@@ -42,6 +52,13 @@ for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do
     exit 1
   fi
 done
+
+echo "==> Verifying missing additive facts symbol fails closed"
+g++ -std=c++17 \
+  -I "$CPP_ROOT/wrapper/include" \
+  "$SCRIPT_DIR/transfer_facts_missing_symbol_test.cpp" \
+  -o "$BUILD_DIR/transfer_facts_missing_symbol_test"
+"$BUILD_DIR/transfer_facts_missing_symbol_test"
 
 echo "==> Verifying bidirectional ABI skew fails at link time"
 if g++ -std=c++17 \

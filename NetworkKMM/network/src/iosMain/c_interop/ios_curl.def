@@ -1,4 +1,4 @@
-headers = curl_wrapper.h
+headers = networkkmm_curl_facts_compat.h
 package = com.tencent.kmm.network.curl.native
 staticLibraries = libNetworkKMMCurl.a
 linkerOpts = -lc++ -framework Security -framework SystemConfiguration -lz

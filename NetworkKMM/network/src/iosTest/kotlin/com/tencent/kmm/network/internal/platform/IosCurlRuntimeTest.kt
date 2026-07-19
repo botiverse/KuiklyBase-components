@@ -79,6 +79,60 @@ class IosCurlRuntimeTest {
     }
 
     @Test
+    fun productionBridgeMatchesOptionalApiArtifactContract() = runBlocking {
+        val expectation = runtimeEnvironment("NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION")
+            ?: return@runBlocking
+        val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
+        val caPath = runtimeCaPath() ?: return@runBlocking
+        val result = IosCurlCInteropBridge.executeWithOptionalApiDiagnostics(
+            runtimeRequest(900_001, url, caPath)
+        )
+
+        assertEquals(0, result.response.code, result.response.errorMsg)
+        assertTrue(result.response.httpCode in 200..299)
+        assertTrue(result.response.data?.isNotEmpty() == true)
+        when (expectation) {
+            "unavailable" -> assertEquals(
+                IosCurlOptionalApiDiagnostics(
+                    bufferedBodyIdleTimeoutSetterAvailable = false,
+                    maxBufferedResponseBytesSetterAvailable = false,
+                    transferFactsAvailable = false
+                ),
+                result.optionalApi,
+                "old artifact must remain request-capable without additive symbols"
+            )
+            "available" -> {
+                assertEquals(
+                    IosCurlOptionalApiDiagnostics(
+                        bufferedBodyIdleTimeoutSetterAvailable = true,
+                        maxBufferedResponseBytesSetterAvailable = true,
+                        transferFactsAvailable = true
+                    ),
+                    result.optionalApi,
+                    "fresh artifact symbols must survive final executable linking"
+                )
+                assertEquals(true, result.response.elapse.curlFinalHeadersObserved)
+                assertEquals(true, result.response.elapse.curlFirstBodyObserved)
+                assertEquals(true, result.response.elapse.curlBodyProgressObserved)
+                assertTrue(result.response.elapse.curlBodyBytes > 0)
+
+                val capped = IosCurlCInteropBridge.executeWithOptionalApiDiagnostics(
+                    runtimeRequest(
+                        requestId = 900_004,
+                        url = url,
+                        caPath = caPath,
+                        maxBufferedResponseBytes = 1
+                    )
+                )
+                assertTrue(capped.optionalApi.maxBufferedResponseBytesSetterAvailable)
+                assertEquals(63, capped.response.code, capped.response.errorMsg)
+                assertEquals(0, capped.response.data?.size ?: 0)
+            }
+            else -> error("Unknown iOS curl optional API expectation: $expectation")
+        }
+    }
+
+    @Test
     fun productionEngineNegotiatesHttp3AndPreservesFallbackContract() = runBlocking {
         val h3Url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_HTTP3_URL") ?: return@runBlocking
         val fallbackUrl = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_H2_FALLBACK_URL")
@@ -287,13 +341,15 @@ class IosCurlRuntimeTest {
         caPath: String,
         method: String = "GET",
         headers: Map<String, String> = mapOf("Accept" to "text/plain"),
-        uploadContentLength: Long? = null
+        uploadContentLength: Long? = null,
+        maxBufferedResponseBytes: Long = 0
     ) = IosCurlNativeRequest(
         requestId = requestId,
         url = url,
         method = method,
         headers = headers,
         timeoutMillis = 30_000,
+        maxBufferedResponseBytes = maxBufferedResponseBytes,
         uploadContentLength = uploadContentLength,
         caInfoPath = caPath,
         proxyUrl = ""
