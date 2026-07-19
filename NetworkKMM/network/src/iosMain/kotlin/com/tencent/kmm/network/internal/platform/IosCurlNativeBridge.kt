@@ -203,6 +203,7 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
         lateinit var context: IosCurlAsyncContext
         fun cleanupAndResume(response: CurlNativeResponse) {
             if (!terminalOnce.compareAndSet(expect = false, update = true)) return
+            var removed = false
             try {
                 response.elapse.protocol = GetCurlNegotiatedProtocol(handle)
                     ?.toKString()?.takeIf { it != "unknown" }
@@ -211,14 +212,18 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                     response.elapse.curlEnqueueToNativeStartElapsedMs = facts.first.toDouble()
                     response.elapse.curlMultiOwnerThreadObserved = facts.second
                 }
+                IosCurlHandleRegistry.remove(request.requestId, handle)
+                removed = true
                 if (continuation.isActive) continuation.resume(response)
             } catch (throwable: Throwable) {
+                IosCurlHandleRegistry.remove(request.requestId, handle)
+                removed = true
                 if (continuation.isActive) {
                     continuation.resume(unavailable(
                         throwable.message ?: "iOS curl async terminal failed"))
                 }
             } finally {
-                IosCurlHandleRegistry.remove(request.requestId, handle)
+                if (!removed) IosCurlHandleRegistry.remove(request.requestId, handle)
                 context.dispose()
                 DeleteCurlClient(handle)
             }
@@ -262,6 +267,8 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             }
             if (!accepted) {
                 cleanupAndResume(unavailable("iOS curl multi submit rejected"))
+            } else if (!continuation.isActive || request.cancellationSignal.isCancelled()) {
+                IosCurlHandleRegistry.cancel(request.requestId)
             }
         } catch (throwable: Throwable) {
             cleanupAndResume(unavailable(
@@ -506,7 +513,9 @@ private object IosCurlMultiEngines : SynchronizedObject() {
     }
 
     fun engine(http3: Boolean): COpaquePointer? = synchronized(this) {
-        if (!isApiAvailable()) return@synchronized null
+        val available = capability ?: (NetworkKmmCurlMultiApiAvailable() != 0)
+            .also { capability = it }
+        if (!available) return@synchronized null
         if (http3) {
             http3Engine ?: NetworkKmmCreateCurlMultiEngineIfAvailable("NetworkKMM-iOS-h3")
                 ?.also { http3Engine = it }
