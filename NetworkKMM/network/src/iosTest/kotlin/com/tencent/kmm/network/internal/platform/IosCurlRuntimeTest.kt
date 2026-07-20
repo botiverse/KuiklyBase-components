@@ -37,10 +37,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.atomicfu.atomic
 import platform.posix.getenv
+import platform.posix.usleep
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -54,6 +57,7 @@ import kotlin.test.assertTrue
 class IosCurlRuntimeTest {
     @AfterTest
     fun clearCurlRuntime() {
+        IosCurlMultiTestHooks.reset()
         VBTransportCurl.clear()
     }
 
@@ -307,6 +311,103 @@ class IosCurlRuntimeTest {
         withTimeout(10_000) { job.join() }
 
         assertEquals(42, responseCode)
+    }
+
+    @Test
+    fun productionBridgeClosesPublishCheckToNativeSubmitCancellationRace() = runBlocking {
+        val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_CANCEL_URL")
+            ?: return@runBlocking
+        val caPath = runtimeCaPath() ?: return@runBlocking
+        val caSha = runtimeCaSha256() ?: return@runBlocking
+        configureRuntime(caPath, caSha)
+        val requestId = 900_202
+        val enteredPreSubmit = atomic(false)
+        val releaseSubmit = atomic(false)
+        IosCurlMultiTestHooks.beforeNativeSubmit = { observedId ->
+            if (observedId == requestId) {
+                enteredPreSubmit.value = true
+                while (!releaseSubmit.value) usleep(1_000u)
+            }
+        }
+
+        try {
+            val request = runtimeRequest(requestId, url, caPath)
+            val response = async(Dispatchers.Default) {
+                IosCurlCInteropBridge.execute(request)
+            }
+            withTimeout(5_000) {
+                while (!enteredPreSubmit.value) delay(1)
+            }
+
+            // The registry already contains the request, but the native multi
+            // owner has not accepted it yet. This cancel is therefore a no-op
+            // at the native queue and must be repeated by the accepted-submit
+            // post-check below the deterministic pause.
+            request.cancel()
+            IosCurlCInteropBridge.cancel(requestId)
+            releaseSubmit.value = true
+
+            val terminal = withTimeout(10_000) { response.await() }
+            assertEquals(42, terminal.code, terminal.errorMsg)
+        } finally {
+            releaseSubmit.value = true
+            IosCurlMultiTestHooks.reset()
+        }
+    }
+
+    @Test
+    fun productionBridgeRemovesRegistryBeforeTerminalResumeForImmediateSameIdReuse() = runBlocking {
+        val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
+        val caPath = runtimeCaPath() ?: return@runBlocking
+        val caSha = runtimeCaSha256() ?: return@runBlocking
+        configureRuntime(caPath, caSha)
+        val requestId = 900_203
+        val terminalPaused = atomic(false)
+        val observeReusePublication = atomic(false)
+        val reusePublished = atomic(false)
+        val releaseTerminal = atomic(false)
+        IosCurlMultiTestHooks.afterRegistryPublish = { observedId ->
+            if (observedId == requestId && observeReusePublication.value) {
+                reusePublished.value = true
+            }
+        }
+        IosCurlMultiTestHooks.afterRegistryRemovalBeforeResume = { observedId ->
+            if (observedId == requestId && !terminalPaused.value) {
+                terminalPaused.value = true
+                observeReusePublication.value = true
+                while (!releaseTerminal.value) usleep(1_000u)
+            }
+        }
+
+        try {
+            val first = async(Dispatchers.Default) {
+                IosCurlCInteropBridge.execute(runtimeRequest(requestId, url, caPath))
+            }
+            withTimeout(10_000) {
+                while (!terminalPaused.value) delay(1)
+            }
+
+            // Start the replacement while the first native terminal callback
+            // is still paused before coroutine resume. Publication can only
+            // succeed if cleanup removed the old registry entry first.
+            val reused = async(Dispatchers.Default) {
+                IosCurlCInteropBridge.execute(runtimeRequest(requestId, url, caPath))
+            }
+            withTimeout(5_000) {
+                while (!reusePublished.value) delay(1)
+            }
+            releaseTerminal.value = true
+
+            val firstTerminal = withTimeout(10_000) { first.await() }
+            val reusedTerminal = withTimeout(10_000) { reused.await() }
+            assertEquals(0, firstTerminal.code, firstTerminal.errorMsg)
+            assertEquals(0, reusedTerminal.code, reusedTerminal.errorMsg)
+            assertTrue(firstTerminal.httpCode in 200..299)
+            assertTrue(reusedTerminal.httpCode in 200..299)
+        } finally {
+            releaseTerminal.value = true
+            IosCurlMultiTestHooks.reset()
+        }
     }
 
     private suspend fun upload(

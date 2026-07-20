@@ -172,6 +172,18 @@ internal data class IosCurlDiagnosticResponse(
     val optionalApi: IosCurlOptionalApiDiagnostics
 )
 
+internal object IosCurlMultiTestHooks {
+    var afterRegistryPublish: ((Int) -> Unit)? = null
+    var beforeNativeSubmit: ((Int) -> Unit)? = null
+    var afterRegistryRemovalBeforeResume: ((Int) -> Unit)? = null
+
+    fun reset() {
+        afterRegistryPublish = null
+        beforeNativeSubmit = null
+        afterRegistryRemovalBeforeResume = null
+    }
+}
+
 @OptIn(ExperimentalForeignApi::class)
 internal object IosCurlCInteropBridge : IosCurlNativeBridge {
     override val isAvailable: Boolean
@@ -214,6 +226,7 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                 }
                 IosCurlHandleRegistry.remove(request.requestId, handle)
                 removed = true
+                IosCurlMultiTestHooks.afterRegistryRemovalBeforeResume?.invoke(request.requestId)
                 if (continuation.isActive) continuation.resume(response)
             } catch (throwable: Throwable) {
                 IosCurlHandleRegistry.remove(request.requestId, handle)
@@ -250,10 +263,12 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                 cleanupAndResume(unavailable("iOS curl request id already active"))
                 return@suspendCancellableCoroutine
             }
+            IosCurlMultiTestHooks.afterRegistryPublish?.invoke(request.requestId)
             continuation.invokeOnCancellation { IosCurlHandleRegistry.cancel(request.requestId) }
             if (request.cancellationSignal.isCancelled()) {
                 IosCurlHandleRegistry.cancel(request.requestId)
             }
+            IosCurlMultiTestHooks.beforeNativeSubmit?.invoke(request.requestId)
             val accepted = withCurlRequest(request) { nativeRequest ->
                 memScoped {
                     val callback = alloc<CurlCallback> {
