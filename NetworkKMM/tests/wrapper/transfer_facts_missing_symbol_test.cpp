@@ -15,5 +15,24 @@ int main() {
     if (NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable(nullptr, 7000) != 0) {
         return 3;
     }
+    if (NetworkKmmCurlMultiApiAvailable() != 0) {
+        return 4;
+    }
+    if (NetworkKmmCreateCurlMultiEngineIfAvailable("missing") != nullptr) {
+        return 5;
+    }
+    CurlRequest request{};
+    CurlCallback callback{};
+    if (NetworkKmmSubmitBufferedRequestV27IfAvailable(
+            nullptr, 1, nullptr, &request, sizeof(request),
+            CURL_WRAPPER_ABI_VERSION, &callback) != 0) {
+        return 6;
+    }
+    NetworkKmmCancelCurlMultiRequestIfAvailable(nullptr, 1);
+    CurlMultiInfoV1 multi{};
+    if (NetworkKmmGetCurlMultiInfoV1IfAvailable(
+            nullptr, &multi, sizeof(multi), CURL_MULTI_INFO_ABI_VERSION) != 0) {
+        return 7;
+    }
     return 0;
 }

@@ -27,15 +27,22 @@ import com.tencent.kmm.network.curl.native.CurlSupportsHttp3
 import com.tencent.kmm.network.curl.native.CurlWrapperAbiVersion
 import com.tencent.kmm.network.curl.native.CURL_WRAPPER_ABI_VERSION
 import com.tencent.kmm.network.curl.native.CURL_TRANSFER_INFO_ABI_VERSION
+import com.tencent.kmm.network.curl.native.CURL_MULTI_INFO_ABI_VERSION
 import com.tencent.kmm.network.curl.native.CurlCallback
 import com.tencent.kmm.network.curl.native.CurlRequest
 import com.tencent.kmm.network.curl.native.CurlResponse
 import com.tencent.kmm.network.curl.native.CurlStreamCallback
 import com.tencent.kmm.network.curl.native.CurlUploadSource
 import com.tencent.kmm.network.curl.native.CurlTransferInfoV1
+import com.tencent.kmm.network.curl.native.CurlMultiInfoV1
 import com.tencent.kmm.network.curl.native.DeleteCurlClient
 import com.tencent.kmm.network.curl.native.GetCurlNegotiatedProtocol
 import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlTransferInfoV1IfAvailable
+import com.tencent.kmm.network.curl.native.NetworkKmmCurlMultiApiAvailable
+import com.tencent.kmm.network.curl.native.NetworkKmmCreateCurlMultiEngineIfAvailable
+import com.tencent.kmm.network.curl.native.NetworkKmmSubmitBufferedRequestV27IfAvailable
+import com.tencent.kmm.network.curl.native.NetworkKmmCancelCurlMultiRequestIfAvailable
+import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlMultiInfoV1IfAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable
 import com.tencent.kmm.network.curl.native.SetCurlCaInfo
@@ -77,7 +84,9 @@ import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.ObsoleteCoroutinesApi
 import kotlinx.coroutines.newFixedThreadPoolContext
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.resume
 
 private const val IOS_CURL_PERFORM_THREADS = 4
 private const val IOS_CURL_UPLOAD_WRITER_THREADS = 2
@@ -163,6 +172,18 @@ internal data class IosCurlDiagnosticResponse(
     val optionalApi: IosCurlOptionalApiDiagnostics
 )
 
+internal object IosCurlMultiTestHooks {
+    var afterRegistryPublish: ((Int) -> Unit)? = null
+    var beforeNativeSubmit: ((Int) -> Unit)? = null
+    var afterRegistryRemovalBeforeResume: ((Int) -> Unit)? = null
+
+    fun reset() {
+        afterRegistryPublish = null
+        beforeNativeSubmit = null
+        afterRegistryRemovalBeforeResume = null
+    }
+}
+
 @OptIn(ExperimentalForeignApi::class)
 internal object IosCurlCInteropBridge : IosCurlNativeBridge {
     override val isAvailable: Boolean
@@ -170,8 +191,108 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
     override val supportsHttp3: Boolean
         get() = CurlSupportsHttp3() != 0
 
+    internal fun isMultiApiAvailableForTests(): Boolean =
+        IosCurlMultiEngines.isApiAvailable()
+
     override suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse =
-        executeWithOptionalApiDiagnostics(request).response
+        if (IosCurlMultiEngines.isApiAvailable()) {
+            executeBufferedMulti(request)
+        } else {
+            executeWithOptionalApiDiagnostics(request).response
+        }
+
+    private suspend fun executeBufferedMulti(
+        request: IosCurlNativeRequest
+    ): CurlNativeResponse = suspendCancellableCoroutine { continuation ->
+        val engine = IosCurlMultiEngines.engine(request.http3Enabled)
+        if (engine == null) {
+            continuation.resume(unavailable("iOS curl multi engine creation failed"))
+            return@suspendCancellableCoroutine
+        }
+        val handle = CreateCurlClient("NetworkKMM-iOS-multi-${request.requestId}")
+        if (handle == null) {
+            continuation.resume(unavailable("iOS curl failed to create native client"))
+            return@suspendCancellableCoroutine
+        }
+        val terminalOnce = atomic(false)
+        lateinit var context: IosCurlAsyncContext
+        fun cleanupAndResume(response: CurlNativeResponse) {
+            if (!terminalOnce.compareAndSet(expect = false, update = true)) return
+            var removed = false
+            try {
+                response.elapse.protocol = GetCurlNegotiatedProtocol(handle)
+                    ?.toKString()?.takeIf { it != "unknown" }
+                response.elapse.applyCurlTransferFacts(readCurlTransferFacts(handle))
+                readCurlMultiFacts(handle)?.let { facts ->
+                    response.elapse.curlEnqueueToNativeStartElapsedMs = facts.first.toDouble()
+                    response.elapse.curlMultiOwnerThreadObserved = facts.second
+                }
+                IosCurlHandleRegistry.remove(request.requestId, handle)
+                removed = true
+                IosCurlMultiTestHooks.afterRegistryRemovalBeforeResume?.invoke(request.requestId)
+                if (continuation.isActive) continuation.resume(response)
+            } catch (throwable: Throwable) {
+                IosCurlHandleRegistry.remove(request.requestId, handle)
+                removed = true
+                if (continuation.isActive) {
+                    continuation.resume(unavailable(
+                        throwable.message ?: "iOS curl async terminal failed"))
+                }
+            } finally {
+                if (!removed) IosCurlHandleRegistry.remove(request.requestId, handle)
+                context.dispose()
+                DeleteCurlClient(handle)
+            }
+        }
+        context = IosCurlAsyncContext(::cleanupAndResume)
+        try {
+            if (SetCurlHttp3Enabled(handle, if (request.http3Enabled) 1 else 0) == 0) {
+                cleanupAndResume(unavailable("HTTP/3 requested but iOS curl backend is unavailable"))
+                return@suspendCancellableCoroutine
+            }
+            SetCurlCaInfo(handle, request.caInfoPath)
+            SetCurlProxy(handle, request.proxyUrl)
+            NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable(
+                handle, request.bufferedBodyIdleTimeoutMillis)
+            NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable(
+                handle, request.maxBufferedResponseBytes)
+            request.resolveEntry?.let { entry ->
+                if (SetCurlResolve(handle, entry) == 0) {
+                    cleanupAndResume(unavailable("iOS curl failed to apply resolve entry"))
+                    return@suspendCancellableCoroutine
+                }
+            }
+            if (!IosCurlHandleRegistry.publish(request.requestId, handle, engine)) {
+                cleanupAndResume(unavailable("iOS curl request id already active"))
+                return@suspendCancellableCoroutine
+            }
+            IosCurlMultiTestHooks.afterRegistryPublish?.invoke(request.requestId)
+            continuation.invokeOnCancellation { IosCurlHandleRegistry.cancel(request.requestId) }
+            if (request.cancellationSignal.isCancelled()) {
+                IosCurlHandleRegistry.cancel(request.requestId)
+            }
+            IosCurlMultiTestHooks.beforeNativeSubmit?.invoke(request.requestId)
+            val accepted = withCurlRequest(request) { nativeRequest ->
+                memScoped {
+                    val callback = alloc<CurlCallback> {
+                        callbackRef = context.stableRef.asCPointer()
+                        callback = staticCFunction(::iosCurlAsyncComplete)
+                    }
+                    NetworkKmmSubmitBufferedRequestV27IfAvailable(
+                        engine, request.requestId.toLong(), handle, nativeRequest,
+                        sizeOf<CurlRequest>().convert(), CURL_WRAPPER_ABI_VERSION, callback.ptr) != 0
+                }
+            }
+            if (!accepted) {
+                cleanupAndResume(unavailable("iOS curl multi submit rejected"))
+            } else if (!continuation.isActive || request.cancellationSignal.isCancelled()) {
+                IosCurlHandleRegistry.cancel(request.requestId)
+            }
+        } catch (throwable: Throwable) {
+            cleanupAndResume(unavailable(
+                throwable.message ?: "iOS curl multi invocation failed"))
+        }
+    }
 
     internal suspend fun executeWithOptionalApiDiagnostics(
         request: IosCurlNativeRequest
@@ -391,6 +512,52 @@ private fun readCurlTransferFacts(handle: COpaquePointer): CurlTransferFactsV1? 
 }
 
 @OptIn(ExperimentalForeignApi::class)
+private fun readCurlMultiFacts(handle: COpaquePointer): Pair<Long, Boolean>? = memScoped {
+    val native = alloc<CurlMultiInfoV1>()
+    if (NetworkKmmGetCurlMultiInfoV1IfAvailable(
+            handle, native.ptr, sizeOf<CurlMultiInfoV1>().convert(),
+            CURL_MULTI_INFO_ABI_VERSION) == 0) return@memScoped null
+    native.enqueueToNativeStartElapsedMs to (native.ownerThreadObserved != 0)
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private object IosCurlMultiEngines : SynchronizedObject() {
+    private var capability: Boolean? = null
+    private var defaultEngine: COpaquePointer? = null
+    private var http3Engine: COpaquePointer? = null
+
+    fun isApiAvailable(): Boolean = synchronized(this) {
+        capability ?: (NetworkKmmCurlMultiApiAvailable() != 0).also { capability = it }
+    }
+
+    fun engine(http3: Boolean): COpaquePointer? = synchronized(this) {
+        val available = capability ?: (NetworkKmmCurlMultiApiAvailable() != 0)
+            .also { capability = it }
+        if (!available) return@synchronized null
+        if (http3) {
+            http3Engine ?: NetworkKmmCreateCurlMultiEngineIfAvailable("NetworkKMM-iOS-h3")
+                ?.also { http3Engine = it }
+        } else {
+            defaultEngine ?: NetworkKmmCreateCurlMultiEngineIfAvailable("NetworkKMM-iOS-default")
+                ?.also { defaultEngine = it }
+        }
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private class IosCurlAsyncContext(
+    private val terminal: (CurlNativeResponse) -> Unit
+) {
+    val stableRef: StableRef<IosCurlAsyncContext> = StableRef.create(this)
+    fun complete(response: CPointer<CurlResponse>?) {
+        runCatching { response.toCurlNativeResponse() }
+            .fold(terminal, { terminal(CurlNativeResponse(
+                code = -1, errorMsg = it.message ?: "iOS curl callback failed")) })
+    }
+    fun dispose() = stableRef.dispose()
+}
+
+@OptIn(ExperimentalForeignApi::class)
 private class IosCurlCallbackContext(
     val request: IosCurlNativeRequest,
     private val onResponseStart: ((Long, String) -> Unit)?,
@@ -450,26 +617,48 @@ private class IosCurlCallbackContext(
 
 @OptIn(ExperimentalForeignApi::class)
 private object IosCurlHandleRegistry : SynchronizedObject() {
-    private val handles = mutableMapOf<Int, COpaquePointer>()
+    private data class Target(val client: COpaquePointer, val engine: COpaquePointer?)
+    private val handles = mutableMapOf<Int, Target>()
 
-    fun publish(requestId: Int, handle: COpaquePointer): Boolean = synchronized(this) {
+    fun publish(
+        requestId: Int,
+        handle: COpaquePointer,
+        engine: COpaquePointer? = null
+    ): Boolean = synchronized(this) {
         if (handles.containsKey(requestId)) false
         else {
-            handles[requestId] = handle
+            handles[requestId] = Target(handle, engine)
             true
         }
     }
 
     fun remove(requestId: Int, handle: COpaquePointer) {
         synchronized(this) {
-            if (handles[requestId] == handle) handles.remove(requestId)
+            if (handles[requestId]?.client == handle) handles.remove(requestId)
         }
     }
 
     fun cancel(requestId: Int) {
-        synchronized(this) {
-            handles[requestId]?.let(::cancelNative)
+        val target = synchronized(this) { handles[requestId] }
+        target?.let {
+            if (it.engine != null) {
+                NetworkKmmCancelCurlMultiRequestIfAvailable(it.engine, requestId.toLong())
+            } else {
+                cancelNative(it.client)
+            }
         }
+    }
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun iosCurlAsyncComplete(
+    callbackRef: COpaquePointer?,
+    response: CPointer<CurlResponse>?
+) {
+    try {
+        callbackRef?.asStableRef<IosCurlAsyncContext>()?.get()?.complete(response)
+    } catch (_: Throwable) {
+        // Async context owns classified terminal + cleanup; never unwind into C.
     }
 }
 
