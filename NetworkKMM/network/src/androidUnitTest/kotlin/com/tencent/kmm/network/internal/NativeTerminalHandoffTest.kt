@@ -8,6 +8,9 @@
 package com.tencent.kmm.network.internal
 
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
@@ -20,12 +23,13 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 @OptIn(ObsoleteCoroutinesApi::class, ExperimentalCoroutinesApi::class)
 class NativeTerminalHandoffTest {
     @Test
-    fun blockedFirstTerminalDoesNotDelaySecondAndKeyIsReusableBeforeHandoff() = runBlocking {
+    fun sameIdIsReusableBeforeAnyBusinessCallbackStarts() = runBlocking {
         val dispatcher = newFixedThreadPoolContext(2, "native-terminal-test")
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
         try {
@@ -37,8 +41,7 @@ class NativeTerminalHandoffTest {
                     block()
                 }
             }
-            val firstStarted = CompletableDeferred<Unit>()
-            val releaseFirst = CompletableDeferred<Unit>()
+            val firstCompleted = CompletableDeferred<Unit>()
             val secondCompleted = CompletableDeferred<Unit>()
             val cleanupOrder = CopyOnWriteArrayList<String>()
 
@@ -50,8 +53,7 @@ class NativeTerminalHandoffTest {
                 cleanup = { cleanupOrder += "first" }
             ) {
                 assertEquals(listOf("first", "second"), cleanupOrder)
-                firstStarted.complete(Unit)
-                releaseFirst.await()
+                firstCompleted.complete(Unit)
             }
             // Both workers are paused before business callback entry. Removal
             // is synchronous, so the exact same logical ID can publish before
@@ -67,14 +69,58 @@ class NativeTerminalHandoffTest {
             }
             allowCallbacks.complete(Unit)
 
-            // The second worker reaches its callback while the first remains
-            // deliberately blocked. A native owner using this handoff returns
-            // before either business callback completes.
-            withTimeout(2_000) { firstStarted.await() }
+            withTimeout(2_000) { firstCompleted.await() }
             withTimeout(2_000) { secondCompleted.await() }
             assertEquals(listOf("first", "second"), cleanupOrder)
-            releaseFirst.complete(Unit)
         } finally {
+            scope.cancel()
+            dispatcher.close()
+        }
+    }
+
+    @Test
+    fun synchronouslyBlockedFirstTerminalDoesNotDelaySecondWorker() = runBlocking {
+        val dispatcher = newFixedThreadPoolContext(2, "native-terminal-blocking-test")
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        val releaseFirst = CountDownLatch(1)
+        try {
+            val registry = CancellationAwareRegistry<Int, String>()
+            val handoff = NativeTerminalHandoff(registry) { block -> scope.transportLaunch { block() } }
+            val firstStarted = CountDownLatch(1)
+            val secondCompleted = CountDownLatch(1)
+            val firstThread = AtomicReference<String>()
+            val secondThread = AtomicReference<String>()
+
+            assertTrue(registry.begin(1))
+            assertTrue(registry.publish(1, "blocking"))
+            handoff.detachCleanupAndDispatch(1, "blocking", cleanup = {}) {
+                firstThread.set(Thread.currentThread().name)
+                firstStarted.countDown()
+                assertTrue(
+                    releaseFirst.await(5, TimeUnit.SECONDS),
+                    "test must release the synchronously blocked first worker"
+                )
+            }
+            assertTrue(
+                firstStarted.await(5, TimeUnit.SECONDS),
+                "first callback must occupy one terminal worker"
+            )
+
+            assertTrue(registry.begin(2))
+            assertTrue(registry.publish(2, "following"))
+            handoff.detachCleanupAndDispatch(2, "following", cleanup = {}) {
+                secondThread.set(Thread.currentThread().name)
+                secondCompleted.countDown()
+            }
+            assertTrue(
+                secondCompleted.await(5, TimeUnit.SECONDS),
+                "second callback must complete while the first worker is synchronously blocked"
+            )
+            assertNotEquals(firstThread.get(), secondThread.get())
+            assertTrue(firstThread.get().contains("native-terminal-blocking-test"))
+            assertTrue(secondThread.get().contains("native-terminal-blocking-test"))
+        } finally {
+            releaseFirst.countDown()
             scope.cancel()
             dispatcher.close()
         }
