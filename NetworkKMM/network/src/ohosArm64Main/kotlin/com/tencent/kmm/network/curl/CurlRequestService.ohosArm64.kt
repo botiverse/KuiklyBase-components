@@ -551,36 +551,32 @@ object CurlRequestServiceHM : ICurlRequestService {
 
         fun finish(nativeResponse: CurlNativeResponse) {
             if (!terminalOnce.compareAndSet(expect = false, update = true)) return
-            try {
-                val detailed = applyNativeMultiDetails(nativeResponse, handle)
-                removeMultiNativeHandle(request.requestId, target, logTag)
-                try {
-                    buildResponseAndCallback(request, detailed, responseCallback)
-                } catch (throwable: Throwable) {
-                    logI("[$logTag] multi terminal callback failed: " +
-                        (throwable.message ?: throwable::class.simpleName))
-                }
+            val terminalResponse = try {
+                applyNativeMultiDetails(nativeResponse, handle)
             } catch (throwable: Throwable) {
+                CurlNativeResponse(
+                    code = VBTransportResultCode.CODE_NETWORK_ERROR,
+                    errorMsg = throwable.message ?: "OHOS curl multi terminal failed"
+                )
+            }
+            try {
                 removeMultiNativeHandle(request.requestId, target, logTag)
-                try {
-                    buildResponseAndCallback(
-                        request,
-                        CurlNativeResponse(
-                            code = VBTransportResultCode.CODE_NETWORK_ERROR,
-                            errorMsg = throwable.message ?: "OHOS curl multi terminal failed"
-                        ),
-                        responseCallback
-                    )
-                } catch (callbackFailure: Throwable) {
-                    logI("[$logTag] multi failure callback failed: " +
-                        (callbackFailure.message ?: callbackFailure::class.simpleName))
-                }
             } finally {
-                removeMultiNativeHandle(request.requestId, target, logTag)
                 try {
                     callbackContext.release()
                 } finally {
                     DeleteCurlClient(handle)
+                }
+            }
+            // Never execute common/user callbacks on the CURLM owner thread.
+            // A slow, reentrant, or synchronously waiting callback must not
+            // stall native progress for unrelated requests.
+            multiTerminalScope.transportLaunch {
+                try {
+                    buildResponseAndCallback(request, terminalResponse, responseCallback)
+                } catch (throwable: Throwable) {
+                    logI("[$logTag] multi terminal callback failed: " +
+                        (throwable.message ?: throwable::class.simpleName))
                 }
             }
         }
@@ -1304,6 +1300,19 @@ internal fun uploadReadChunk(readRef: COpaquePointer?, buffer: CPointer<ByteVar>
 private val uploadWriterScope = kotlinx.coroutines.CoroutineScope(
     kotlinx.coroutines.SupervisorJob() +
         kotlinx.coroutines.newFixedThreadPoolContext(2, "NetworkKmmUploadWriter")
+)
+
+// Common/business terminal callbacks are isolated from the single CURLM owner
+// thread. Two workers guarantee that one synchronously blocked callback cannot
+// prevent a second completed native request from reaching its business layer;
+// SupervisorJob keeps callback failures request-local.
+@OptIn(
+    kotlinx.coroutines.ObsoleteCoroutinesApi::class,
+    kotlinx.coroutines.ExperimentalCoroutinesApi::class
+)
+private val multiTerminalScope = kotlinx.coroutines.CoroutineScope(
+    kotlinx.coroutines.SupervisorJob() +
+        kotlinx.coroutines.newFixedThreadPoolContext(2, "NetworkKmmMultiTerminal")
 )
 
 actual fun getCurlRequestService(): ICurlRequestService = CurlRequestServiceHM
