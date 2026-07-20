@@ -30,7 +30,13 @@ class NativeTerminalHandoffTest {
         val scope = CoroutineScope(SupervisorJob() + dispatcher)
         try {
             val registry = CancellationAwareRegistry<Int, String>()
-            val handoff = NativeTerminalHandoff(registry) { block -> scope.transportLaunch { block() } }
+            val allowCallbacks = CompletableDeferred<Unit>()
+            val handoff = NativeTerminalHandoff(registry) { block ->
+                scope.transportLaunch {
+                    allowCallbacks.await()
+                    block()
+                }
+            }
             val firstStarted = CompletableDeferred<Unit>()
             val releaseFirst = CompletableDeferred<Unit>()
             val secondCompleted = CompletableDeferred<Unit>()
@@ -43,14 +49,13 @@ class NativeTerminalHandoffTest {
                 value = "first",
                 cleanup = { cleanupOrder += "first" }
             ) {
-                assertEquals(listOf("first"), cleanupOrder)
+                assertEquals(listOf("first", "second"), cleanupOrder)
                 firstStarted.complete(Unit)
                 releaseFirst.await()
             }
-            withTimeout(2_000) { firstStarted.await() }
-
-            // Removal is synchronous and happens before the first business
-            // callback starts, so the exact same logical ID can publish now.
+            // Both workers are paused before business callback entry. Removal
+            // is synchronous, so the exact same logical ID can publish before
+            // the first callback is allowed to start.
             assertTrue(registry.begin(7))
             assertTrue(registry.publish(7, "second"))
             handoff.detachCleanupAndDispatch(
@@ -60,10 +65,12 @@ class NativeTerminalHandoffTest {
             ) {
                 secondCompleted.complete(Unit)
             }
+            allowCallbacks.complete(Unit)
 
             // The second worker reaches its callback while the first remains
             // deliberately blocked. A native owner using this handoff returns
             // before either business callback completes.
+            withTimeout(2_000) { firstStarted.await() }
             withTimeout(2_000) { secondCompleted.await() }
             assertEquals(listOf("first", "second"), cleanupOrder)
             releaseFirst.complete(Unit)
@@ -103,6 +110,39 @@ class NativeTerminalHandoffTest {
                 withTimeout(2_000) { thrown.await() }.message
             )
             withTimeout(2_000) { followingCompleted.await() }
+        } finally {
+            scope.cancel()
+            dispatcher.close()
+        }
+    }
+
+    @Test
+    fun cleanupFailureIsReportedWithoutSuppressingTerminal() = runBlocking {
+        val dispatcher = newFixedThreadPoolContext(1, "native-cleanup-throw-test")
+        val scope = CoroutineScope(SupervisorJob() + dispatcher)
+        try {
+            val registry = CancellationAwareRegistry<Int, String>()
+            val handoff = NativeTerminalHandoff(registry) { block -> scope.transportLaunch { block() } }
+            val cleanupFailure = CompletableDeferred<Throwable>()
+            val terminalCompleted = CompletableDeferred<Unit>()
+
+            assertTrue(registry.begin(3))
+            assertTrue(registry.publish(3, "cleanup-throwing"))
+            handoff.detachCleanupAndDispatch(
+                key = 3,
+                value = "cleanup-throwing",
+                cleanup = { error("native cleanup failed") },
+                onCleanupFailure = { cleanupFailure.complete(it) }
+            ) {
+                terminalCompleted.complete(Unit)
+            }
+
+            assertEquals(
+                "native cleanup failed",
+                withTimeout(2_000) { cleanupFailure.await() }.message
+            )
+            withTimeout(2_000) { terminalCompleted.await() }
+            assertTrue(registry.begin(3), "cleanup failure must not retain the old logical ID")
         } finally {
             scope.cancel()
             dispatcher.close()

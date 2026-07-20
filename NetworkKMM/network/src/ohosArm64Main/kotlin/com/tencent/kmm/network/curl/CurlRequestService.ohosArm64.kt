@@ -566,6 +566,10 @@ object CurlRequestServiceHM : ICurlRequestService {
                     } finally {
                         DeleteCurlClient(handle)
                     }
+                },
+                onCleanupFailure = { throwable ->
+                    logI("[$logTag] multi native cleanup failed: " +
+                        (throwable.message ?: throwable::class.simpleName))
                 }
             ) {
                 // Never execute common/user callbacks on the CURLM owner

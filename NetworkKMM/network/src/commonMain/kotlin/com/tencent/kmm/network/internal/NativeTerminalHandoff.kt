@@ -25,10 +25,15 @@ internal class NativeTerminalHandoff<K, V>(
         key: K,
         value: V,
         cleanup: () -> Unit,
+        onCleanupFailure: (Throwable) -> Unit = {},
         terminal: suspend () -> Unit
     ): Job {
         registry.removeIfSame(key, value)
-        cleanup()
+        try {
+            cleanup()
+        } catch (throwable: Throwable) {
+            runCatching { onCleanupFailure(throwable) }
+        }
         return launch(terminal)
     }
 }
