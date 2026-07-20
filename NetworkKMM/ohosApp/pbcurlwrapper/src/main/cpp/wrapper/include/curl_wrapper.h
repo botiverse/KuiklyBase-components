@@ -25,12 +25,6 @@
 extern "C" {
 #endif
 
-#if defined(__APPLE__) && !defined(NETWORKKMM_BUILDING_WRAPPER)
-#define NETWORKKMM_OPTIONAL_MULTI __attribute__((weak_import))
-#else
-#define NETWORKKMM_OPTIONAL_MULTI
-#endif
-
 // Increment whenever a public by-value struct or exported callback contract
 // changes incompatibly. Kotlin/JNI callers must verify this before passing a
 // CurlRequest so a stale native runtime fails closed instead of interpreting
@@ -230,19 +224,15 @@ int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
 // synchronously waits for their exactly-once callbacks to return. Therefore
 // DeleteCurlMultiEngine must never be called from one of the engine's callbacks;
 // the callback/client context must remain alive until that callback returns.
-CurlMultiEngineHandle CreateCurlMultiEngine(const char *logTag)
-    NETWORKKMM_OPTIONAL_MULTI;
+CurlMultiEngineHandle CreateCurlMultiEngine(const char *logTag);
 void DeleteCurlMultiEngine(CurlMultiEngineHandle engine);
 int SubmitBufferedRequestV27(CurlMultiEngineHandle engine, int64_t requestId,
                              CurClientHandle handle, const CurlRequest *request,
                              size_t requestSize, int abiVersion,
-                             const CurlCallback *callback)
-    NETWORKKMM_OPTIONAL_MULTI;
-void CancelCurlMultiRequest(CurlMultiEngineHandle engine, int64_t requestId)
-    NETWORKKMM_OPTIONAL_MULTI;
+                             const CurlCallback *callback);
+void CancelCurlMultiRequest(CurlMultiEngineHandle engine, int64_t requestId);
 int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
-                       size_t infoSize, int abiVersion)
-    NETWORKKMM_OPTIONAL_MULTI;
+                       size_t infoSize, int abiVersion);
 
 #if defined(NETWORKKMM_WRAPPER_TESTING)
 // Host-test-only seam: 1 fails the next multi perform, 2 the next multi poll.
@@ -266,8 +256,6 @@ int StartStreamRequestV27(CurClientHandle handle, const CurlRequest *request,
 int StartUploadRequestV27(CurClientHandle handle, const CurlRequest *request,
                           size_t requestSize, int abiVersion,
                           CurlUploadSource *source, CurlCallback *callback);
-
-#undef NETWORKKMM_OPTIONAL_MULTI
 
 #ifdef __cplusplus
 }

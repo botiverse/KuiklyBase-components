@@ -46,10 +46,14 @@ static NetworkKmmMultiApiState gNetworkKmmMultiApiState;
 static pthread_once_t gNetworkKmmMultiApiOnce = PTHREAD_ONCE_INIT;
 
 static void NetworkKmmInitMultiApiState(void) {
-    gNetworkKmmMultiApiState.create = CreateCurlMultiEngine;
-    gNetworkKmmMultiApiState.submit = SubmitBufferedRequestV27;
-    gNetworkKmmMultiApiState.cancel = CancelCurlMultiRequest;
-    gNetworkKmmMultiApiState.getInfo = GetCurlMultiInfoV1;
+    gNetworkKmmMultiApiState.create = (NetworkKmmCreateMultiFn)dlsym(
+        RTLD_DEFAULT, "CreateCurlMultiEngine");
+    gNetworkKmmMultiApiState.submit = (NetworkKmmSubmitMultiFn)dlsym(
+        RTLD_DEFAULT, "SubmitBufferedRequestV27");
+    gNetworkKmmMultiApiState.cancel = (NetworkKmmCancelMultiFn)dlsym(
+        RTLD_DEFAULT, "CancelCurlMultiRequest");
+    gNetworkKmmMultiApiState.getInfo = (NetworkKmmGetMultiInfoFn)dlsym(
+        RTLD_DEFAULT, "GetCurlMultiInfoV1");
     gNetworkKmmMultiApiState.available =
         gNetworkKmmMultiApiState.create != 0 &&
         gNetworkKmmMultiApiState.submit != 0 &&

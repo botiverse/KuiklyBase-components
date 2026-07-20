@@ -251,7 +251,6 @@ HTTP_FEATURE_SYMBOLS
     -std=c++17
     -O2
     -fPIC
-    -DNETWORKKMM_BUILDING_WRAPPER=1
     -I "$CPP_ROOT"
     -I "$CPP_ROOT/wrapper/include"
     -I "$curl_source/include"

@@ -1831,6 +1831,28 @@ int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
     }
     return reinterpret_cast<CurlClient *>(handle)->GetTransferInfo(info, infoSize, abiVersion) ? 1 : 0;
 }
+
+#if defined(__APPLE__)
+static void RetainCurlMultiApiForAppleStaticLink() {
+    // The consumer discovers this additive ABI through dlsym so an app may
+    // still link against the previous xcframework. Fresh static archives need
+    // a strong reachability edge from an always-required symbol, otherwise
+    // Apple's dead-strip removes these four functions before dlsym can find
+    // them in the final executable.
+    auto volatile create = &CreateCurlMultiEngine;
+    auto volatile submit = &SubmitBufferedRequestV27;
+    auto volatile cancel = &CancelCurlMultiRequest;
+    auto volatile getInfo = &GetCurlMultiInfoV1;
+    (void)create;
+    (void)submit;
+    (void)cancel;
+    (void)getInfo;
+}
+#endif
+
 int CurlWrapperAbiVersion(void) {
+#if defined(__APPLE__)
+    RetainCurlMultiApiForAppleStaticLink();
+#endif
     return CURL_WRAPPER_ABI_VERSION;
 }
