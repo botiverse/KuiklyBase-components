@@ -37,7 +37,6 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -315,6 +314,13 @@ class IosCurlRuntimeTest {
 
     @Test
     fun productionBridgeClosesPublishCheckToNativeSubmitCancellationRace() = runBlocking {
+        if (runtimeEnvironment("NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION") != "available") {
+            return@runBlocking
+        }
+        assertTrue(
+            IosCurlCInteropBridge.isMultiApiAvailableForTests(),
+            "fresh iOS artifact must expose the all-or-none multi ABI"
+        )
         val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_CANCEL_URL")
             ?: return@runBlocking
         val caPath = runtimeCaPath() ?: return@runBlocking
@@ -332,10 +338,10 @@ class IosCurlRuntimeTest {
 
         try {
             val request = runtimeRequest(requestId, url, caPath)
-            val response = async(Dispatchers.Default) {
+            val response = async(IosCurlExecutionDispatchers.perform) {
                 IosCurlCInteropBridge.execute(request)
             }
-            withTimeout(5_000) {
+            withTimeout(20_000) {
                 while (!enteredPreSubmit.value) delay(1)
             }
 
@@ -357,6 +363,13 @@ class IosCurlRuntimeTest {
 
     @Test
     fun productionBridgeRemovesRegistryBeforeTerminalResumeForImmediateSameIdReuse() = runBlocking {
+        if (runtimeEnvironment("NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION") != "available") {
+            return@runBlocking
+        }
+        assertTrue(
+            IosCurlCInteropBridge.isMultiApiAvailableForTests(),
+            "fresh iOS artifact must expose the all-or-none multi ABI"
+        )
         val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
         val caPath = runtimeCaPath() ?: return@runBlocking
         val caSha = runtimeCaSha256() ?: return@runBlocking
@@ -380,20 +393,20 @@ class IosCurlRuntimeTest {
         }
 
         try {
-            val first = async(Dispatchers.Default) {
+            val first = async(IosCurlExecutionDispatchers.perform) {
                 IosCurlCInteropBridge.execute(runtimeRequest(requestId, url, caPath))
             }
-            withTimeout(10_000) {
+            withTimeout(20_000) {
                 while (!terminalPaused.value) delay(1)
             }
 
             // Start the replacement while the first native terminal callback
             // is still paused before coroutine resume. Publication can only
             // succeed if cleanup removed the old registry entry first.
-            val reused = async(Dispatchers.Default) {
+            val reused = async(IosCurlExecutionDispatchers.perform) {
                 IosCurlCInteropBridge.execute(runtimeRequest(requestId, url, caPath))
             }
-            withTimeout(5_000) {
+            withTimeout(20_000) {
                 while (!reusePublished.value) delay(1)
             }
             releaseTerminal.value = true

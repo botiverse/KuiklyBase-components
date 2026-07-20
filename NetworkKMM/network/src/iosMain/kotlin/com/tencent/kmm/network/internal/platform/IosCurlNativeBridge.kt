@@ -191,6 +191,9 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
     override val supportsHttp3: Boolean
         get() = CurlSupportsHttp3() != 0
 
+    internal fun isMultiApiAvailableForTests(): Boolean =
+        IosCurlMultiEngines.isApiAvailable()
+
     override suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse =
         if (IosCurlMultiEngines.isApiAvailable()) {
             executeBufferedMulti(request)
