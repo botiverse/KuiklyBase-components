@@ -112,6 +112,7 @@ COMMON_CXX_FLAGS=(
   -mios-simulator-version-min="$IOS_DEPLOYMENT_TARGET"
   -std=c++17
   -fPIC
+  -DNETWORKKMM_BUILDING_WRAPPER=1
   -I "$CPP_ROOT"
   -I "$CPP_ROOT/wrapper/include"
   -I "$CURL_SOURCE/include"
