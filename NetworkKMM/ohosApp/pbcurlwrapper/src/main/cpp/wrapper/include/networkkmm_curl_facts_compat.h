@@ -6,20 +6,6 @@
 #if defined(__APPLE__)
 #include <dlfcn.h>
 #include <pthread.h>
-
-// A weak import keeps apps linked against the previous xcframework
-// request-capable, while the direct symbol references keep all four entry
-// points alive when a fresh static archive is linked with dead stripping.
-// dlsym alone cannot provide that retention guarantee for static archives.
-extern CurlMultiEngineHandle CreateCurlMultiEngine(const char *)
-    __attribute__((weak_import));
-extern int SubmitBufferedRequestV27(CurlMultiEngineHandle, int64_t,
-    CurClientHandle, const CurlRequest *, size_t, int, const CurlCallback *)
-    __attribute__((weak_import));
-extern void CancelCurlMultiRequest(CurlMultiEngineHandle, int64_t)
-    __attribute__((weak_import));
-extern int GetCurlMultiInfoV1(CurClientHandle, CurlMultiInfoV1 *, size_t, int)
-    __attribute__((weak_import));
 #endif
 
 // Native apps can be rebuilt before their packaged wrapper artifact is. Keep
