@@ -30,6 +30,7 @@ import com.tencent.qqlive.kmm.native.libcurl.Cancel
 import com.tencent.qqlive.kmm.native.libcurl.CurlWrapperAbiVersion
 import com.tencent.qqlive.kmm.native.libcurl.CURL_WRAPPER_ABI_VERSION
 import com.tencent.qqlive.kmm.native.libcurl.CURL_TRANSFER_INFO_ABI_VERSION
+import com.tencent.qqlive.kmm.native.libcurl.CURL_MULTI_INFO_ABI_VERSION
 import com.tencent.qqlive.kmm.native.libcurl.CreateCurlClient
 import com.tencent.qqlive.kmm.native.libcurl.GetCurlNegotiatedProtocol
 import com.tencent.qqlive.kmm.native.libcurl.CurlCallback
@@ -42,7 +43,13 @@ import com.tencent.qqlive.kmm.native.libcurl.SetCurlProxy
 import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlUploadSource
 import com.tencent.qqlive.kmm.native.libcurl.CurlTransferInfoV1
+import com.tencent.qqlive.kmm.native.libcurl.CurlMultiInfoV1
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmCancelCurlMultiRequestIfAvailable
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmCreateCurlMultiEngineIfAvailable
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmCurlMultiApiAvailable
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmGetCurlMultiInfoV1IfAvailable
 import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmGetCurlTransferInfoV1IfAvailable
+import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmSubmitBufferedRequestV27IfAvailable
 import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable
 import com.tencent.qqlive.kmm.native.libcurl.NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable
 import com.tencent.qqlive.kmm.native.libcurl.StartRequestV27
@@ -90,6 +97,9 @@ import kotlinx.cinterop.staticCFunction
 import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
+import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 import platform.posix.int8_tVar
 import platform.posix.memcpy
 import kotlin.reflect.KFunction1
@@ -104,6 +114,29 @@ private const val CURL_LOG_LEVEL_DEBUG = 0
 private const val CURL_LOG_LEVEL_INFO = 1
 private const val CURL_LOG_LEVEL_WARN = 2
 private const val CURL_LOG_LEVEL_ERROR = 3
+
+private object OhosCurlMultiEngines : SynchronizedObject() {
+    private var capability: Boolean? = null
+    private var defaultEngine: COpaquePointer? = null
+    private var http3Engine: COpaquePointer? = null
+
+    fun isApiAvailable(): Boolean = synchronized(this) {
+        capability ?: (NetworkKmmCurlMultiApiAvailable() != 0).also { capability = it }
+    }
+
+    fun engine(http3: Boolean): COpaquePointer? = synchronized(this) {
+        val available = capability ?: (NetworkKmmCurlMultiApiAvailable() != 0)
+            .also { capability = it }
+        if (!available) return@synchronized null
+        if (http3) {
+            http3Engine ?: NetworkKmmCreateCurlMultiEngineIfAvailable("NetworkKMM-OHOS-h3")
+                ?.also { http3Engine = it }
+        } else {
+            defaultEngine ?: NetworkKmmCreateCurlMultiEngineIfAvailable("NetworkKMM-OHOS-default")
+                ?.also { defaultEngine = it }
+        }
+    }
+}
 
 fun curlLogImpl(level: Int, tag: CPointer<ByteVar>?, content: CPointer<ByteVar>?): Int {
     when (level) {
@@ -132,7 +165,14 @@ private fun toSafeString(content: CPointer<ByteVar>?): String {
 // Curl 鸿蒙平台实现
 object CurlRequestServiceHM : ICurlRequestService {
 
-    private val nativeHandles = CancellationAwareRegistry<Int, CPointer<out CPointed>>()
+    private data class NativeTarget(
+        val client: CPointer<out CPointed>,
+        val engine: COpaquePointer? = null
+    ) {
+        val cancelled = atomic(false)
+    }
+
+    private val nativeHandles = CancellationAwareRegistry<Int, NativeTarget>()
 
     fun prepareRequest(requestId: Int): Boolean = nativeHandles.begin(requestId)
 
@@ -181,6 +221,31 @@ object CurlRequestServiceHM : ICurlRequestService {
             ?.toKString()
             ?.takeIf { it != "unknown" }
         elapse.applyCurlTransferFacts(readCurlTransferFacts(handle))
+    }
+
+    private fun applyNativeMultiDetails(
+        response: CurlNativeResponse,
+        handle: CPointer<out CPointed>?
+    ): CurlNativeResponse = applyNativeTransferDetails(response, handle).apply {
+        readCurlMultiFacts(handle)?.let { facts ->
+            elapse.curlEnqueueToNativeStartElapsedMs = facts.first.toDouble()
+            elapse.curlMultiOwnerThreadObserved = facts.second
+        }
+    }
+
+    private fun readCurlMultiFacts(
+        handle: CPointer<out CPointed>?
+    ): Pair<Long, Boolean>? = memScoped {
+        val native = alloc<CurlMultiInfoV1>()
+        if (NetworkKmmGetCurlMultiInfoV1IfAvailable(
+                handle,
+                native.ptr,
+                sizeOf<CurlMultiInfoV1>().convert(),
+                CURL_MULTI_INFO_ABI_VERSION
+            ) == 0) {
+            return@memScoped null
+        }
+        native.enqueueToNativeStartElapsedMs to (native.ownerThreadObserved != 0)
     }
 
     private fun readCurlTransferFacts(
@@ -236,33 +301,64 @@ object CurlRequestServiceHM : ICurlRequestService {
 
     override fun cancel(requestId: Int) {
         logI("TaskManager remove task, id:${requestId}")
-        nativeHandles.cancelOrRemember(requestId, removePublished = false) { handle ->
-            logI("TaskManager cancel task, id:${requestId} handler:${handle}")
-            Cancel(handle)
+        nativeHandles.cancelOrRemember(requestId, removePublished = false) { target ->
+            logI("TaskManager cancel task, id:${requestId} handler:${target.client}")
+            target.cancelled.value = true
+            if (target.engine != null) {
+                NetworkKmmCancelCurlMultiRequestIfAvailable(target.engine, requestId.toLong())
+            } else {
+                Cancel(target.client)
+            }
         }
     }
 
-    private fun publishNativeHandle(requestId: Int, handle: CPointer<out CPointed>, logTag: String): Boolean {
-        return if (nativeHandles.publish(requestId, handle)) {
+    private fun publishNativeHandle(
+        requestId: Int,
+        handle: CPointer<out CPointed>,
+        logTag: String,
+        engine: COpaquePointer? = null
+    ): Boolean {
+        return publishNativeTarget(requestId, NativeTarget(handle, engine), logTag)
+    }
+
+    private fun publishNativeTarget(
+        requestId: Int,
+        target: NativeTarget,
+        logTag: String
+    ): Boolean {
+        return if (nativeHandles.publish(requestId, target)) {
+            val handle = target.client
             logI("[$logTag] native handle published, id:$requestId, handle:$handle")
             true
         } else {
+            val handle = target.client
             logI("[$logTag] native handle consumed pre-cancel, id:$requestId, handle:$handle")
-            Cancel(handle)
+            if (target.engine == null) Cancel(handle)
             false
         }
     }
 
     private fun releaseNativeHandle(requestId: Int, handle: CPointer<out CPointed>, logTag: String) {
-        val released = nativeHandles.removeIfSame(requestId, handle) { owned ->
-            logI("[$logTag] native handle release, id:$requestId, handle:$owned")
-            DeleteCurlClient(owned)
+        val target = NativeTarget(handle)
+        val released = nativeHandles.removeIfSame(requestId, target) { owned ->
+            logI("[$logTag] native handle release, id:$requestId, handle:${owned.client}")
+            DeleteCurlClient(owned.client)
         }
         if (!released) {
             // The handle may have consumed a pre-publication tombstone and was
             // therefore never inserted. It is still exclusively owned here.
             logI("[$logTag] unpublished native handle release, id:$requestId, handle:$handle")
             DeleteCurlClient(handle)
+        }
+    }
+
+    private fun removeMultiNativeHandle(
+        requestId: Int,
+        target: NativeTarget,
+        logTag: String
+    ) {
+        nativeHandles.removeIfSame(requestId, target) {
+            logI("[$logTag] multi native handle detached, id:$requestId, handle:${target.client}")
         }
     }
 
@@ -286,7 +382,7 @@ object CurlRequestServiceHM : ICurlRequestService {
                 is ByteArray -> {
                     logI("[$logTag] generate native ${request.method} curl params with bytearray data. " +
                             "size: ${data.size}, data: $data")
-                    val buffer = nativeHeap.allocArray<int8_tVar>(data.size)
+                    val buffer = memScope.allocArray<int8_tVar>(data.size)
                     if (data.isNotEmpty()) {
                         data.usePinned { pinnedData ->
                             memcpy(buffer, pinnedData.addressOf(0), data.size.convert())
@@ -421,7 +517,11 @@ object CurlRequestServiceHM : ICurlRequestService {
         // contract is "always exactly one callback" (upstream issue #31 —
         // escaped exceptions crashed the app when the network was down).
         try {
-            startRequestUnsafe(request, responseCallback, logTag)
+            if (OhosCurlMultiEngines.isApiAvailable()) {
+                startRequestMultiUnsafe(request, responseCallback, logTag)
+            } else {
+                startRequestUnsafe(request, responseCallback, logTag)
+            }
         } catch (throwable: Throwable) {
             logI("[$logTag] startRequest failed: ${throwable.message ?: throwable::class.simpleName}")
             val failure = CurlNativeResponse(
@@ -429,6 +529,130 @@ object CurlRequestServiceHM : ICurlRequestService {
                 errorMsg = throwable.message ?: "native request failed"
             )
             buildResponseAndCallback(request, failure, responseCallback)
+        }
+    }
+
+    private fun startRequestMultiUnsafe(
+        request: VBTransportBaseRequest,
+        responseCallback: (response: VBTransportBaseResponse) -> Unit,
+        logTag: String
+    ) {
+        val engine = OhosCurlMultiEngines.engine(request.curlHttp3Enabled) ?: run {
+            nativeHandles.remove(request.requestId)
+            error("OHOS curl multi engine creation failed")
+        }
+        val handle = CreateCurlClient(logTag) ?: run {
+            nativeHandles.remove(request.requestId)
+            error("CreateCurlClient failed")
+        }
+        val target = NativeTarget(handle, engine)
+        val terminalOnce = atomic(false)
+        lateinit var callbackContext: OhosCurlAsyncCallbackContext
+
+        fun finish(nativeResponse: CurlNativeResponse) {
+            if (!terminalOnce.compareAndSet(expect = false, update = true)) return
+            try {
+                val detailed = applyNativeMultiDetails(nativeResponse, handle)
+                removeMultiNativeHandle(request.requestId, target, logTag)
+                try {
+                    buildResponseAndCallback(request, detailed, responseCallback)
+                } catch (throwable: Throwable) {
+                    logI("[$logTag] multi terminal callback failed: " +
+                        (throwable.message ?: throwable::class.simpleName))
+                }
+            } catch (throwable: Throwable) {
+                removeMultiNativeHandle(request.requestId, target, logTag)
+                try {
+                    buildResponseAndCallback(
+                        request,
+                        CurlNativeResponse(
+                            code = VBTransportResultCode.CODE_NETWORK_ERROR,
+                            errorMsg = throwable.message ?: "OHOS curl multi terminal failed"
+                        ),
+                        responseCallback
+                    )
+                } catch (callbackFailure: Throwable) {
+                    logI("[$logTag] multi failure callback failed: " +
+                        (callbackFailure.message ?: callbackFailure::class.simpleName))
+                }
+            } finally {
+                removeMultiNativeHandle(request.requestId, target, logTag)
+                try {
+                    callbackContext.release()
+                } finally {
+                    DeleteCurlClient(handle)
+                }
+            }
+        }
+
+        try {
+            callbackContext = OhosCurlAsyncCallbackContext { response ->
+                val copied = runCatching {
+                    response?.pointed?.let { handleCurlNativeResponse(it, logTag) }
+                        ?: CurlNativeResponse(
+                            code = VBTransportResultCode.CODE_NETWORK_ERROR,
+                            errorMsg = "OHOS curl returned a null response"
+                        )
+                }.getOrElse { throwable ->
+                    CurlNativeResponse(
+                        code = VBTransportResultCode.CODE_NETWORK_ERROR,
+                        errorMsg = throwable.message ?: "OHOS curl callback failed"
+                    )
+                }
+                finish(copied)
+            }
+        } catch (throwable: Throwable) {
+            nativeHandles.remove(request.requestId)
+            DeleteCurlClient(handle)
+            throw throwable
+        }
+
+        try {
+            configureCurlRuntime(handle, request)
+            if (!publishNativeTarget(request.requestId, target, logTag)) {
+                val duplicateActiveId = nativeHandles.get(request.requestId) != null
+                finish(CurlNativeResponse(
+                    code = if (duplicateActiveId) {
+                        VBTransportResultCode.CODE_NETWORK_ERROR
+                    } else {
+                        42
+                    },
+                    errorMsg = if (duplicateActiveId) {
+                        "OHOS curl request id already active"
+                    } else {
+                        "OHOS curl request cancelled"
+                    }
+                ))
+                return
+            }
+            val accepted = memScoped {
+                val headers = toStringDic(buildRequestHeader(request), this)
+                val curlRequest = getCurlRequestParams(
+                    request, headers.pointed, this, logTag)
+                NetworkKmmSubmitBufferedRequestV27IfAvailable(
+                    engine,
+                    request.requestId.toLong(),
+                    handle,
+                    curlRequest,
+                    sizeOf<CurlRequest>().convert(),
+                    CURL_WRAPPER_ABI_VERSION,
+                    callbackContext.nativePtr()
+                ) != 0
+            }
+            if (!accepted) {
+                finish(CurlNativeResponse(
+                    code = VBTransportResultCode.CODE_NETWORK_ERROR,
+                    errorMsg = "OHOS curl multi submit rejected"
+                ))
+            } else if (target.cancelled.value) {
+                NetworkKmmCancelCurlMultiRequestIfAvailable(
+                    engine, request.requestId.toLong())
+            }
+        } catch (throwable: Throwable) {
+            finish(CurlNativeResponse(
+                code = VBTransportResultCode.CODE_NETWORK_ERROR,
+                errorMsg = throwable.message ?: "OHOS curl multi invocation failed"
+            ))
         }
     }
 
@@ -872,6 +1096,41 @@ object CurlRequestServiceHM : ICurlRequestService {
 
     private fun CPointer<ByteVar>?.readBytesOrNull(length: Int): ByteArray? {
         return this?.let { if (length > 0) it.readBytes(length) else ByteArray(0) }
+    }
+}
+
+private class OhosCurlAsyncCallbackContext(
+    private val terminal: (CPointer<CurlResponse>?) -> Unit
+) {
+    private val stableRef = StableRef.create(this)
+    private val native: CurlCallback = nativeHeap.alloc()
+
+    init {
+        native.callbackRef = stableRef.asCPointer()
+        native.callback = staticCFunction(::ohosCurlAsyncComplete)
+    }
+
+    fun nativePtr(): CPointer<CurlCallback> = native.ptr
+
+    fun complete(response: CPointer<CurlResponse>?) {
+        terminal(response)
+    }
+
+    fun release() {
+        stableRef.dispose()
+        nativeHeap.free(native.rawPtr)
+    }
+}
+
+private fun ohosCurlAsyncComplete(
+    callbackRef: COpaquePointer?,
+    response: CPointer<CurlResponse>?
+) {
+    try {
+        callbackRef?.asStableRef<OhosCurlAsyncCallbackContext>()?.get()?.complete(response)
+    } catch (_: Throwable) {
+        // The async context owns classified terminal and cleanup. Never let a
+        // Kotlin exception unwind through the C callback boundary.
     }
 }
 
