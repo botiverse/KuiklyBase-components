@@ -19,6 +19,7 @@ package com.tencent.kmm.network.curl
 import com.tencent.kmm.network.export.IVBPBLog
 import com.tencent.kmm.network.internal.VBPBLog
 import com.tencent.kmm.network.internal.CancellationAwareRegistry
+import com.tencent.kmm.network.internal.NativeTerminalHandoff
 import com.tencent.kmm.network.internal.StreamCallbackGate
 import com.tencent.kmm.network.internal.transportLaunch
 import com.tencent.kmm.network.internal.utils.VBTransportCommonUtils.wrapBytesCallback
@@ -173,6 +174,11 @@ object CurlRequestServiceHM : ICurlRequestService {
     }
 
     private val nativeHandles = CancellationAwareRegistry<Int, NativeTarget>()
+    private val multiTerminalHandoff by lazy {
+        NativeTerminalHandoff(nativeHandles) { block ->
+            multiTerminalScope.transportLaunch { block() }
+        }
+    }
 
     fun prepareRequest(requestId: Int): Boolean = nativeHandles.begin(requestId)
 
@@ -349,16 +355,6 @@ object CurlRequestServiceHM : ICurlRequestService {
             // therefore never inserted. It is still exclusively owned here.
             logI("[$logTag] unpublished native handle release, id:$requestId, handle:$handle")
             DeleteCurlClient(handle)
-        }
-    }
-
-    private fun removeMultiNativeHandle(
-        requestId: Int,
-        target: NativeTarget,
-        logTag: String
-    ) {
-        nativeHandles.removeIfSame(requestId, target) {
-            logI("[$logTag] multi native handle detached, id:$requestId, handle:${target.client}")
         }
     }
 
@@ -559,19 +555,22 @@ object CurlRequestServiceHM : ICurlRequestService {
                     errorMsg = throwable.message ?: "OHOS curl multi terminal failed"
                 )
             }
-            try {
-                removeMultiNativeHandle(request.requestId, target, logTag)
-            } finally {
-                try {
-                    callbackContext.release()
-                } finally {
-                    DeleteCurlClient(handle)
+            multiTerminalHandoff.detachCleanupAndDispatch(
+                key = request.requestId,
+                value = target,
+                cleanup = {
+                    logI("[$logTag] multi native handle detached, " +
+                        "id:${request.requestId}, handle:$handle")
+                    try {
+                        callbackContext.release()
+                    } finally {
+                        DeleteCurlClient(handle)
+                    }
                 }
-            }
-            // Never execute common/user callbacks on the CURLM owner thread.
-            // A slow, reentrant, or synchronously waiting callback must not
-            // stall native progress for unrelated requests.
-            multiTerminalScope.transportLaunch {
+            ) {
+                // Never execute common/user callbacks on the CURLM owner
+                // thread. A slow, reentrant, or synchronously waiting
+                // callback must not stall unrelated native progress.
                 try {
                     buildResponseAndCallback(request, terminalResponse, responseCallback)
                 } catch (throwable: Throwable) {
