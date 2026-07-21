@@ -1,5 +1,14 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.29 / 0.1.0-raft.29-ohos (iOS multipart content type)
+
+- Preserve an explicit `Content-Type` in the iOS Ktor transport instead of
+  overwriting multipart requests with `application/octet-stream`. This keeps
+  the generated multipart boundary visible to server parsers such as Multer,
+  while requests without a content type retain the octet-stream default.
+- Add iOS coverage for multipart headers, case-insensitive header names, and
+  the blank/missing fallback boundary.
+
 ## 0.1.0-raft.28 / 0.1.0-raft.28-ohos (opt-in Android curl runtime)
 
 - Publish `com.tencent.kuiklybase:network-android-curl-runtime` as an opt-in,
