@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   android-unit-tests:
-    name: Android unit tests + common metadata (:datetime)
+    name: Android unit tests + common metadata + normal legal gate (:datetime)
     runs-on: ubuntu-latest
     # The image bakes the Android SDK (platforms;android-36 + build-tools;
     # 36.0.0) so the Android target compiles without a per-run download.
@@ -38,6 +38,21 @@ jobs:
         working-directory: DatetimeKMM
         run: ./gradlew :datetime:compileCommonMainKotlinMetadata --no-daemon --stacktrace
 
+      # Publication legal gate: publish the normal tree to an isolated local
+      # repository and assert LICENSE/NOTICE/PROVENANCE are byte-identical to
+      # the checked-in source in the metadata JAR, root sources JAR, Android
+      # sources JAR, and the Android AAR classes.jar.
+      - name: Verify normal publication legal/provenance bytes
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          # mavenLocal() is the job-local ~/.m2 repository, which is empty at
+          # the start of a fresh CI job, so it serves as the isolated repo.
+          rm -rf "${HOME}/.m2/repository/com/tencent/kuiklybase"
+          ./gradlew :datetime:publishToMavenLocal --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "${HOME}/.m2/repository" normal
+
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -46,7 +61,7 @@ jobs:
           path: DatetimeKMM/datetime/build/reports/tests/
 
   ios-simulator-tests:
-    name: iOS simulator tests (:datetime)
+    name: iOS simulator tests + iOS legal gate (:datetime)
     runs-on: macos-latest
     steps:
       - name: Check out repository
@@ -63,6 +78,17 @@ jobs:
         working-directory: DatetimeKMM
         run: ./gradlew :datetime:iosSimulatorArm64Test --no-daemon --stacktrace
 
+      # Publication legal gate: publish the normal tree (metadata + iOS targets)
+      # to the local repository and assert the three files in the metadata JAR,
+      # root sources JAR, and each iOS target sources JAR.
+      - name: Verify iOS publication legal/provenance bytes
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          ./gradlew :datetime:publishToMavenLocal --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "${HOME}/.m2/repository" ios
+
       - name: Upload iOS test reports
         if: failure()
         uses: actions/upload-artifact@v4
@@ -71,7 +97,7 @@ jobs:
           path: DatetimeKMM/datetime/build/reports/tests/iosSimulatorArm64Test/
 
   ohos-tree:
-    name: OHOS tree compile & publication metadata (:datetime)
+    name: OHOS tree compile + publication metadata + OHOS legal gate (:datetime)
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
@@ -118,3 +144,15 @@ jobs:
           grep -q '"version": "[^"]*-ohos"' "$MODULE_JSON" || {
             echo "ohos tree publication version does not carry the -ohos suffix:"; grep '"version"' "$MODULE_JSON" | head -3; exit 1; }
           echo "OHOS publication metadata: -ohos suffix OK ($MODULE_JSON)"
+
+      # Publication legal gate: publish the OHOS tree to the local repository and
+      # assert the three files in the OHOS metadata JAR, root sources JAR, and
+      # the ohosArm64 sources JAR. (The native KLIB itself does not embed
+      # resources in this toolchain; see legal/META-INF/PROVENANCE.md.)
+      - name: Verify OHOS publication legal/provenance bytes
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          ./gradlew -c settings.ohos.gradle.kts :datetime:publishToMavenLocal --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "${HOME}/.m2/repository" ohos

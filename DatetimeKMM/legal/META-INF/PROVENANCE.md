@@ -49,12 +49,49 @@ No Kotlin/C source file from either reference was copied. If that changes in a
 future patch, the modified file must retain the applicable copyright header,
 carry a prominent modification notice, and this catalog must name it.
 
+## Publication delivery contract
+
+The Apache-2.0 `LICENSE.txt`, `NOTICE.txt`, and this `PROVENANCE.md` are wired
+into the published artifacts explicitly, because in this toolchain KMP resource
+propagation does not place `commonMain` resources into the generated metadata
+JAR, Android AAR, or sources JARs. The DatetimeKMM CI gate republishes to an
+isolated local repository and asserts the exact bytes (SHA-256 below) of all
+three files in every carrying artifact.
+
+Carrying artifacts (each must contain `META-INF/LICENSE.txt`,
+`META-INF/NOTICE.txt`, `META-INF/PROVENANCE.md`):
+
+- normal tree: root metadata JAR (`datetime-<v>.jar`), root sources JAR,
+  Android sources JAR, and the Android AAR `classes.jar`;
+- OHOS tree: root metadata JAR (`datetime-<v>-ohos.jar`), root sources JAR, and
+  the `ohosArm64` sources JAR;
+- iOS tree (macOS CI): root metadata JAR, root sources JAR, and each iOS target
+  sources JAR.
+
+The CI gate computes the SHA-256 of each file from the source-of-truth
+`DatetimeKMM/legal/META-INF/` directory at run time and asserts that the copy
+extracted from every carrying artifact is byte-identical (so the contract cannot
+drift from the checked-in source, and this document does not embed a hash of
+itself).
+
+Native KLIB boundary: a Kotlin/Native library KLIB compiled by KBA
+`2.0.21-KBA-010` (OHOS) or `2.1.21` (iOS) does not embed source-set resources.
+Verified: the `konanc` invocation receives no resource flag and the KLIB's
+`default/resources/` directory is empty even with a conventional
+`src/commonMain/resources/` file. The KLIB binary manifest is therefore left
+unmodified for toolchain compatibility, and the native KLIB's
+license/notice/provenance are delivered by the SAME publication's metadata JAR
+and sources JAR (exact bytes asserted by CI) plus the POM Apache-2.0 license
+metadata. If a future reviewer requires the bytes inside the KLIB binary itself,
+that must be a separate, explicitly authorized change.
+
 ## Verification boundary
 
-Deterministic common tests cover exact epoch forwarding, a local-midnight
-boundary, both sides of a DST transition, a runtime timezone change, same-ID
-rule changes, and invalid platform output. Android exercises a real
-`java.util.TimeZone` DST/change sequence. iOS compares the implementation with
-a freshly reset Foundation timezone. OHOS CI compiles the C interop and checks
-the KBA publication metadata; an OHOS device runtime result must be reported
-separately and must never be inferred from cross-compilation alone.
+Deterministic common tests cover exact epoch forwarding across the full Long
+range (MIN_VALUE and MAX_VALUE), a local-midnight boundary, both sides of a DST
+transition, a runtime timezone change, same-ID rule changes, and invalid
+platform output. Android exercises a real `java.util.TimeZone` DST/change
+sequence. iOS compares the implementation with a freshly reset Foundation
+timezone. OHOS CI compiles the C interop and checks the KBA publication
+metadata; an OHOS device runtime result must be reported separately and must
+never be inferred from cross-compilation alone.

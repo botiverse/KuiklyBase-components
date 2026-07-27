@@ -15,11 +15,12 @@ import kotlin.test.assertTrue
 class DatetimeContractTest {
     @Test
     fun instantKeepsTheExactEpochAcrossTheFullLongRange() {
-        val epochs = listOf(Long.MIN_VALUE, -1L, 0L, 1L, EPOCH_2024_01_01)
+        val epochs = listOf(Long.MIN_VALUE, -1L, 0L, 1L, EPOCH_2024_01_01, Long.MAX_VALUE)
         for (epoch in epochs) {
             assertEquals(epoch, Instant.fromEpochMilliseconds(epoch).toEpochMilliseconds())
         }
         assertTrue(Instant.fromEpochMilliseconds(-1) < Instant.fromEpochMilliseconds(0))
+        assertTrue(Instant.fromEpochMilliseconds(Long.MIN_VALUE) < Instant.fromEpochMilliseconds(Long.MAX_VALUE))
     }
 
     @Test

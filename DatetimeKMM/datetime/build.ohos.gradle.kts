@@ -32,6 +32,26 @@ kotlin {
     }
 }
 
+// --- Legal / provenance packaging (OHOS tree) -----------------------------
+// Mirror the normal tree: commonMain resources embed into the published
+// ohosArm64 KLIB, and the metadata/sources JAR tasks carry the files too. The
+// DatetimeKMM CI OHOS gate republishes to an isolated local repository and
+// asserts these bytes in the KLIB and sources JAR.
+val legalDir = rootProject.file("legal")
+
+tasks.withType<Jar>().configureEach {
+    from(legalDir)
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+afterEvaluate {
+    tasks.matching { it.name.endsWith("SourcesJar", ignoreCase = true) }.configureEach {
+        val jarTask = this as org.gradle.jvm.tasks.Jar
+        jarTask.from(legalDir)
+        jarTask.duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
+}
+
 val githubRepository = System.getenv("GITHUB_REPOSITORY") ?: "bytemain/KuiklyBase-components"
 val githubOwner = githubRepository.substringBefore('/').lowercase(Locale.US)
 val githubRepositoryName = githubRepository.substringAfter('/', "KuiklyBase-components")

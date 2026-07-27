@@ -7,9 +7,12 @@
 
 package com.tencent.kuiklybase.datetime
 
-import platform.Foundation.NSDate
-import platform.Foundation.NSTimeZone
-import platform.Foundation.dateWithTimeIntervalSince1970
+import kotlinx.cinterop.alloc
+import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.ptr
+import platform.Foundation.*
+import platform.posix.gettimeofday
+import platform.posix.timeval
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -17,9 +20,9 @@ import kotlin.test.assertTrue
 class IosPlatformDatetimeTest {
     @Test
     fun systemClockUsesUnixEpochMilliseconds() {
-        val before = (NSDate().timeIntervalSince1970 * 1_000.0).toLong()
+        val before = posixNowMillis()
         val observed = Clock.System.now().toEpochMilliseconds()
-        val after = (NSDate().timeIntervalSince1970 * 1_000.0).toLong()
+        val after = posixNowMillis()
         assertTrue(observed in before..after)
     }
 
@@ -36,4 +39,10 @@ class IosPlatformDatetimeTest {
         assertEquals(foundation.name, snapshot.zoneId)
         assertEquals(foundation.secondsFromGMTForDate(date).toInt(), snapshot.offset.totalSeconds)
     }
+}
+
+private fun posixNowMillis(): Long = memScoped {
+    val now = alloc<timeval>()
+    gettimeofday(now.ptr, null)
+    now.tv_sec.toLong() * 1_000L + now.tv_usec.toLong() / 1_000L
 }

@@ -43,6 +43,42 @@ android {
     }
 }
 
+// --- Legal / provenance packaging -----------------------------------------
+// In this toolchain KMP resource propagation does NOT place commonMain
+// resources into the published metadata JAR, the Android AAR, or the sources
+// JARs, so the Apache-2.0 LICENSE/NOTICE and the provenance catalog are wired
+// into every published artifact explicitly. The DatetimeKMM CI gate republishes
+// to an isolated local repository and asserts these exact bytes in each variant
+// (see .github/workflows/datetimekmm-tests.yml).
+val legalDir = rootProject.file("legal")
+
+// Root metadata binary JAR: carry META-INF/{LICENSE.txt,NOTICE.txt,PROVENANCE.md}.
+tasks.withType<Jar>().configureEach {
+    from(legalDir)
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
+}
+
+// Every platform sources JAR (metadata/android/ios*) carries the same files.
+// The Kotlin sourcesJar copy spec is finalized after the build script body, so
+// these tasks are targeted by name inside afterEvaluate and configured through
+// the stable jvm Jar type (the decorated task defeats a bundling-Jar cast).
+afterEvaluate {
+    tasks.matching { it.name.endsWith("SourcesJar", ignoreCase = true) }.configureEach {
+        val jarTask = this as org.gradle.jvm.tasks.Jar
+        jarTask.from(legalDir)
+        jarTask.duplicatesStrategy = DuplicatesStrategy.INCLUDE
+    }
+}
+
+// Android: place the same files inside the published AAR (classes.jar). AGP
+// strips /META-INF/LICENSE* and /META-INF/NOTICE* by default (leading-slash
+// patterns), so re-allow exactly those four and keep every other exclusion.
+android.packagingOptions.resources.excludes.removeAll {
+    it == "/META-INF/LICENSE" || it == "/META-INF/LICENSE.txt" ||
+        it == "/META-INF/NOTICE" || it == "/META-INF/NOTICE.txt"
+}
+android.sourceSets.getByName("main").resources.srcDir(legalDir)
+
 val githubRepository = System.getenv("GITHUB_REPOSITORY") ?: "bytemain/KuiklyBase-components"
 val githubOwner = githubRepository.substringBefore('/').lowercase(Locale.US)
 val githubRepositoryName = githubRepository.substringAfter('/', "KuiklyBase-components")
