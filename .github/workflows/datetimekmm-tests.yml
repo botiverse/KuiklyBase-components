@@ -1,0 +1,120 @@
+name: DatetimeKMM tests
+
+on:
+  pull_request:
+    paths:
+      - "DatetimeKMM/**"
+      - ".github/workflows/datetimekmm-tests.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android-unit-tests:
+    name: Android unit tests + common metadata (:datetime)
+    runs-on: ubuntu-latest
+    # The image bakes the Android SDK (platforms;android-36 + build-tools;
+    # 36.0.0) so the Android target compiles without a per-run download.
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Trust the checkout dir (container git ownership)
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Run :datetime Android unit tests
+        shell: bash
+        working-directory: DatetimeKMM
+        run: ./gradlew :datetime:testDebugUnitTest --no-daemon --stacktrace
+
+      # Compile common metadata so a dependency-resolution or expect/actual
+      # problem fails the PR instead of surfacing only in a publish job.
+      - name: Compile commonMain metadata
+        shell: bash
+        working-directory: DatetimeKMM
+        run: ./gradlew :datetime:compileCommonMainKotlinMetadata --no-daemon --stacktrace
+
+      - name: Upload test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-test-reports
+          path: DatetimeKMM/datetime/build/reports/tests/
+
+  ios-simulator-tests:
+    name: iOS simulator tests (:datetime)
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Run :datetime iOS simulator tests
+        shell: bash
+        working-directory: DatetimeKMM
+        run: ./gradlew :datetime:iosSimulatorArm64Test --no-daemon --stacktrace
+
+      - name: Upload iOS test reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-ios-test-reports
+          path: DatetimeKMM/datetime/build/reports/tests/iosSimulatorArm64Test/
+
+  ohos-tree:
+    name: OHOS tree compile & publication metadata (:datetime)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Trust the checkout dir (container git ownership)
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Resolve HarmonyOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found at $ohos_sdk_home"; exit 1; }
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          deveco_sdk_home="${DEVECO_SDK_HOME:-$(cd "$ohos_sdk_home/../.." && pwd)}"
+          deveco_studio_home="${DEVECO_STUDIO_HOME:-$(cd "$deveco_sdk_home/.." && pwd)}"
+          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
+          echo "DEVECO_SDK_HOME=$deveco_sdk_home" >> "$GITHUB_ENV"
+          echo "DEVECO_STUDIO_HOME=$deveco_studio_home" >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/toolchains" >> "$GITHUB_PATH"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+
+      # The OHOS tree (settings.ohos.gradle.kts) compiles the same source with
+      # the KBA 2.0.21 toolchain and the time_service cinterop. Assert the
+      # dual-tree contract on the publication metadata: the version carries the
+      # -ohos suffix. Datetime has no KBA coroutines/atomicfu dependency, so no
+      # fork coordinate is asserted here.
+      - name: Compile OHOS tree and verify publication metadata
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          ./gradlew -c settings.ohos.gradle.kts :datetime:compileKotlinOhosArm64 --no-daemon --console=plain --stacktrace
+          ./gradlew -c settings.ohos.gradle.kts :datetime:generateMetadataFileForOhosArm64Publication --no-daemon --console=plain
+          MODULE_JSON=$(find datetime/build/publications -ipath "*ohosarm64*" -name "module.json" | head -1)
+          test -n "$MODULE_JSON" || { echo "ohosArm64 module.json not generated"; exit 1; }
+          grep -q '"version": "[^"]*-ohos"' "$MODULE_JSON" || {
+            echo "ohos tree publication version does not carry the -ohos suffix:"; grep '"version"' "$MODULE_JSON" | head -3; exit 1; }
+          echo "OHOS publication metadata: -ohos suffix OK ($MODULE_JSON)"
