@@ -94,9 +94,14 @@ elif [ "$variant" = "ios" ]; then
     echo "== iOS tree publication legal gate (root=$version) =="
     check_artifact "ios-metadata-jar" "$datetime_dir/$version/datetime-$version.jar" ""
     check_artifact "ios-root-sources" "$datetime_dir/$version/datetime-$version-sources.jar" ""
+    # All three iOS targets are declared and must publish; a missing required
+    # target is a hard fail, never a SKIP (fail-closed against false green).
     for tgt in iosx64 iosarm64 iossimulatorarm64; do
         tgt_dir="$m2_root/com/tencent/kuiklybase/datetime-$tgt"
-        if [ ! -d "$tgt_dir" ]; then echo "  SKIP $tgt (not published)"; continue; fi
+        if [ ! -d "$tgt_dir" ]; then
+            echo "  FAIL $tgt sources JAR missing: required iOS target not published at $tgt_dir" >&2
+            exit 1
+        fi
         tgt_version="$(first_version_dir "$tgt_dir")"
         check_artifact "$tgt-sources" "$tgt_dir/$tgt_version/datetime-$tgt-$tgt_version-sources.jar" ""
     done

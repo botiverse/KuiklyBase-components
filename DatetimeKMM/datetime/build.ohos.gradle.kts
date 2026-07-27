@@ -33,10 +33,18 @@ kotlin {
 }
 
 // --- Legal / provenance packaging (OHOS tree) -----------------------------
-// Mirror the normal tree: commonMain resources embed into the published
-// ohosArm64 KLIB, and the metadata/sources JAR tasks carry the files too. The
-// DatetimeKMM CI OHOS gate republishes to an isolated local repository and
-// asserts these bytes in the KLIB and sources JAR.
+// The ohosArm64 KLIB binary does NOT embed source-set resources in KBA
+// 2.0.21-KBA-010 (konanc receives no resource flag; default/resources/ stays
+// empty), and it is deliberately NOT post-processed, so its manifest stays
+// unmodified for toolchain compatibility. The license/notice/provenance bytes
+// for this publication are carried by the OHOS root metadata JAR and the
+// root/ohosArm64 sources JARs (wired below) plus the POM Apache-2.0 metadata.
+// The DatetimeKMM CI OHOS gate republishes to an isolated local repository and
+// asserts those bytes in the metadata + sources JARs (not the KLIB). See
+// legal/META-INF/PROVENANCE.md, "Publication delivery contract".
+// (commonMain.resources.srcDir(legal) in the source sets above is retained only
+// as forward-compatible intent for a future toolchain that embeds native
+// resources; it contributes nothing to the current KLIB.)
 val legalDir = rootProject.file("legal")
 
 tasks.withType<Jar>().configureEach {
