@@ -47,11 +47,15 @@ jobs:
         working-directory: DatetimeKMM
         run: |
           set -euo pipefail
-          # mavenLocal() is the job-local ~/.m2 repository, which is empty at
-          # the start of a fresh CI job, so it serves as the isolated repo.
-          rm -rf "${HOME}/.m2/repository/com/tencent/kuiklybase"
-          ./gradlew :datetime:publishToMavenLocal --no-daemon --console=plain --stacktrace
-          bash scripts/verify-publication-legal.sh "${HOME}/.m2/repository" normal
+          # Bind publish and verifier to one explicit isolated repo: the Gradle
+          # JVM user.home is not necessarily the runner shell HOME in a container
+          # job, so never assume ~/.m2. -Dmaven.repo.local redirects mavenLocal().
+          verify_repo="$RUNNER_TEMP/datetime-m2"
+          rm -rf "$verify_repo"
+          ./gradlew :datetime:publishToMavenLocal \
+            -Dmaven.repo.local="$verify_repo" \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$verify_repo" normal
 
       - name: Upload test reports
         if: failure()
@@ -86,8 +90,12 @@ jobs:
         working-directory: DatetimeKMM
         run: |
           set -euo pipefail
-          ./gradlew :datetime:publishToMavenLocal --no-daemon --console=plain --stacktrace
-          bash scripts/verify-publication-legal.sh "${HOME}/.m2/repository" ios
+          verify_repo="$RUNNER_TEMP/datetime-m2"
+          rm -rf "$verify_repo"
+          ./gradlew :datetime:publishToMavenLocal \
+            -Dmaven.repo.local="$verify_repo" \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$verify_repo" ios
 
       - name: Upload iOS test reports
         if: failure()
@@ -154,5 +162,9 @@ jobs:
         working-directory: DatetimeKMM
         run: |
           set -euo pipefail
-          ./gradlew -c settings.ohos.gradle.kts :datetime:publishToMavenLocal --no-daemon --console=plain --stacktrace
-          bash scripts/verify-publication-legal.sh "${HOME}/.m2/repository" ohos
+          verify_repo="$RUNNER_TEMP/datetime-m2"
+          rm -rf "$verify_repo"
+          ./gradlew -c settings.ohos.gradle.kts :datetime:publishToMavenLocal \
+            -Dmaven.repo.local="$verify_repo" \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$verify_repo" ohos
