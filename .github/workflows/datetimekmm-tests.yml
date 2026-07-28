@@ -26,6 +26,58 @@ jobs:
         shell: bash
         run: bash DatetimeKMM/scripts/check-gitignore.sh
 
+  publish-selftests:
+    name: Publish admission/classifier self-tests + task existence
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Trust the checkout dir (container git ownership)
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      # Classifier + admission self-tests run against a local mock HTTP server;
+      # they exercise the fail-closed probe (404=ABSENT, 2xx=EXISTS, 401/403/5xx
+      # fail closed), bounded retry, and NONE/COMPLETE/PARTIAL manifest logic
+      # without publishing anything.
+      - name: Run publish-lib classifier self-tests
+        shell: bash
+        working-directory: DatetimeKMM
+        run: bash scripts/test-publish-lib.sh
+
+      - name: Run publish admission self-tests
+        shell: bash
+        working-directory: DatetimeKMM
+        run: bash scripts/test-publish-admission.sh
+
+      # Prove the per-platform Gradle publish tasks really exist (normal
+      # Android + metadata on this tree).
+      - name: Verify normal Android/metadata publish tasks exist
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          bash scripts/check-publish-tasks.sh android
+          bash scripts/check-publish-tasks.sh metadata
+
+      - name: Verify OHOS publish tasks exist
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found at $ohos_sdk_home"; exit 1; }
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          export OHOS_SDK_HOME="$ohos_sdk_home" OHOS_BASE_SDK_HOME="$ohos_sdk_home" OHOS_NDK_HOME="$ohos_sdk_home"
+          export OHOS_LLVM_HOME="$ohos_sdk_home/native/llvm"
+          export DEVECO_SDK_HOME="$(cd "$ohos_sdk_home/../.." && pwd)"
+          export DEVECO_STUDIO_HOME="$(cd "$DEVECO_SDK_HOME/.." && pwd)"
+          export PATH="$ohos_sdk_home/native/llvm/bin:$PATH"
+          bash scripts/check-publish-tasks.sh ohos-tree settings.ohos.gradle.kts
+
   android-unit-tests:
     name: Android unit tests + common metadata + normal legal gate (:datetime)
     runs-on: ubuntu-latest
@@ -96,6 +148,12 @@ jobs:
         shell: bash
         working-directory: DatetimeKMM
         run: ./gradlew :datetime:iosSimulatorArm64Test --no-daemon --stacktrace
+
+      # Prove the three iOS Gradle publish tasks really exist on macOS.
+      - name: Verify iOS publish tasks exist
+        shell: bash
+        working-directory: DatetimeKMM
+        run: bash scripts/check-publish-tasks.sh ios
 
       # Publication legal gate: publish the normal tree (metadata + iOS targets)
       # to the local repository and assert the three files in the metadata JAR,
