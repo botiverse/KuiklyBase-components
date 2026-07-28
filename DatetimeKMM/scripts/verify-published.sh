@@ -58,10 +58,13 @@ download() {
   local want_host eff_host code effective response curl_exit attempt=1
   want_host="$(_host_of "$url")"
   while [ "$attempt" -le "$READBACK_MAX" ]; do
+    # Capture curl status in a conditional context so `set -e` does not abort at
+    # the assignment on a transport failure (refused/DNS/TLS/timeout); the
+    # bounded retry loop below must run instead of exiting immediately.
     response="$(curl -s -L --max-redirs "$MAX_REDIRS" \
       --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-      -w '%{http_code} %{url_effective}' -u "$AUTH" -o "$dest" "$url" 2>/dev/null)"
-    curl_exit=$?
+      -w '%{http_code} %{url_effective}' -u "$AUTH" -o "$dest" "$url" 2>/dev/null)" \
+      && curl_exit=0 || curl_exit=$?
     if [ "$curl_exit" -eq 0 ]; then
       code="${response%% *}"; effective="${response#* }"
       eff_host="$(_host_of "$effective")"
@@ -129,54 +132,17 @@ download_publication "datetime" "$VERSION-ohos" "root-metadata"
 download_publication "datetime-ohosarm64" "$VERSION-ohos" "native-ohos"
 
 echo "== readback: legal byte-equality in carrying artifacts =="
-bash "$SCRIPT_DIR/verify-publication-legal.sh" "$m2" normal
-bash "$SCRIPT_DIR/verify-publication-legal.sh" "$m2" ios
-bash "$SCRIPT_DIR/verify-publication-legal.sh" "$m2" ohos
+# Pin the version explicitly: the readback stages both <v> and <v>-ohos under
+# datetime/, so discovery (ls|head -1) would select the normal root for the OHOS
+# call and false-green the OHOS root legal contract.
+bash "$SCRIPT_DIR/verify-publication-legal.sh" "$m2" normal "$VERSION"
+bash "$SCRIPT_DIR/verify-publication-legal.sh" "$m2" ios "$VERSION"
+bash "$SCRIPT_DIR/verify-publication-legal.sh" "$m2" ohos "$VERSION-ohos"
 
-echo "== readback: root module coordinate / variant references =="
-normal_module="$m2/build/raft/kuiklybase/datetime/$VERSION/datetime-$VERSION.module"
-ohos_module="$m2/build/raft/kuiklybase/datetime/$VERSION-ohos/datetime-$VERSION-ohos.module"
-
-# Validate the root component group/version via JSON parsing (not raw grep).
-python3 - "$normal_module" "build.raft.kuiklybase" "datetime" "$VERSION" <<'PY'
-import json, sys
-path, group, module, version = sys.argv[1:5]
-doc = json.load(open(path))
-comp = doc["component"]
-assert comp["group"] == group, f"normal group {comp['group']} != {group}"
-assert comp["module"] == module, f"normal module {comp['module']} != {module}"
-assert comp["version"] == version, f"normal version {comp['version']} != {version}"
-print(f"  OK   normal root component {group}:{module}:{version}")
-PY
-python3 - "$ohos_module" "build.raft.kuiklybase" "datetime" "$VERSION-ohos" <<'PY'
-import json, sys
-path, group, module, version = sys.argv[1:5]
-doc = json.load(open(path))
-comp = doc["component"]
-assert comp["group"] == group, f"ohos group {comp['group']} != {group}"
-assert comp["module"] == module, f"ohos module {comp['module']} != {module}"
-assert comp["version"] == version, f"ohos version {comp['version']} != {version}"
-print(f"  OK   ohos root component {group}:{module}:{version}")
-PY
-
-# Variant references + negative cross-tree boundary.
-for ref in datetime-android datetime-iosx64 datetime-iosarm64 datetime-iossimulatorarm64; do
-  grep -q "$ref" "$normal_module" || { echo "READBACK FAIL: normal root module missing $ref reference" >&2; exit 1; }
-  echo "  OK   normal root references $ref"
-done
-grep -q "datetime-ohosarm64" "$ohos_module" || { echo "READBACK FAIL: ohos root module missing datetime-ohosarm64 reference" >&2; exit 1; }
-echo "  OK   ohos root references datetime-ohosarm64"
-
-# Negative boundary: normal root must not reference the OHOS variant, and the
-# OHOS root must not reference android/iOS variants.
-if grep -q "datetime-ohosarm64" "$normal_module"; then
-  echo "READBACK FAIL: normal root module illegally references datetime-ohosarm64" >&2; exit 1
-fi
-for ref in datetime-android datetime-iosx64 datetime-iosarm64 datetime-iossimulatorarm64; do
-  if grep -q "$ref" "$ohos_module"; then
-    echo "READBACK FAIL: ohos root module illegally references $ref" >&2; exit 1
-  fi
-done
-echo "  OK   normal/OHOS cross-tree variant boundary clean"
+echo "== readback: exact coordinate / variant-reference validation =="
+# Parses every downloaded module/POM for exact group/artifact/version and the
+# root modules' structured variants[*].available-at for the exact expected
+# target set plus the negative normal-vs-OHOS boundary (no grep).
+python3 "$SCRIPT_DIR/verify-coordinates.py" "$m2" "$VERSION"
 
 echo "READBACK_PASS (version=$VERSION)"

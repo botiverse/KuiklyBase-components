@@ -101,7 +101,7 @@ jobs:
           echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
           echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
           echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)" >> "$GITHUB_ENV"
-          echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../../.." && pwd)" >> "$GITHUB_ENV"
+          echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../.." && pwd)" >> "$GITHUB_ENV"
           echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
       - name: Isolated publication + legal gate (OHOS)
         shell: bash
@@ -177,7 +177,7 @@ jobs:
           echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"; echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
           echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"; echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
           echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)" >> "$GITHUB_ENV"
-          echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../../.." && pwd)" >> "$GITHUB_ENV"
+          echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../.." && pwd)" >> "$GITHUB_ENV"
           echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
       - name: Publish OHOS publications (fail-closed admission)
         id: publish
