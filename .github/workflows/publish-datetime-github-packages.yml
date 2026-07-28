@@ -1,0 +1,338 @@
+name: Publish DatetimeKMM to GitHub Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override Maven version, for example 0.1.0-raft.0"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish-ohos-tree:
+    name: "Publish OHOS tree (ohosArm64 + root, -ohos version)"
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    outputs:
+      skipped: ${{ steps.check_version.outputs.skipped }}
+    env:
+      DATETIME_SETTINGS_FILE: settings.ohos.gradle.kts
+      DATETIME_PUBLISH_TASKS: >-
+        :datetime:publishOhosArm64PublicationToGithubPackagesRepository
+        :datetime:publishKotlinMultiplatformPublicationToGithubPackagesRepository
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Trust the checkout dir (container git ownership)
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Resolve HarmonyOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found at $ohos_sdk_home"; exit 1; }
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          deveco_sdk_home="${DEVECO_SDK_HOME:-$(cd "$ohos_sdk_home/../.." && pwd)}"
+          deveco_studio_home="${DEVECO_STUDIO_HOME:-$(cd "$deveco_sdk_home/.." && pwd)}"
+          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
+          echo "DEVECO_SDK_HOME=$deveco_sdk_home" >> "$GITHUB_ENV"
+          echo "DEVECO_STUDIO_HOME=$deveco_studio_home" >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/toolchains" >> "$GITHUB_PATH"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Resolve publish version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED_VERSION:-}" ]]; then
+            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+          fi
+
+      # Probe an artifact THIS job publishes (the -ohos ohosArm64 klib). The root
+      # maven-metadata.xml listing lags/misses versions on GitHub Packages.
+      - name: Check existing OHOS version
+        id: check_version
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            MAVEN_VERSION="$(grep '^mavenVersion=' DatetimeKMM/gradle.properties | cut -d= -f2)"
+          fi
+          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/build/raft/kuiklybase/datetime-ohosarm64/$MAVEN_VERSION-ohos/datetime-ohosarm64-$MAVEN_VERSION-ohos.klib"
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
+            echo "DatetimeKMM OHOS version $MAVEN_VERSION-ohos (ohosarm64 klib) already exists; skipping publish."
+            echo "DATETIME_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish DatetimeKMM OHOS publications
+        if: env.DATETIME_SKIP_PUBLISH != 'true'
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/publish-github-packages.sh
+
+  publish-android:
+    name: Publish Android (normal tree)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    outputs:
+      skipped: ${{ steps.check_version.outputs.skipped }}
+    env:
+      DATETIME_PUBLISH_TASKS: >-
+        :datetime:publishAndroidReleasePublicationToGithubPackagesRepository
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Trust the checkout dir (container git ownership)
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Resolve publish version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED_VERSION:-}" ]]; then
+            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check existing Android version
+        id: check_version
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            MAVEN_VERSION="$(grep '^mavenVersion=' DatetimeKMM/gradle.properties | cut -d= -f2)"
+          fi
+          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/build/raft/kuiklybase/datetime-android/$MAVEN_VERSION/datetime-android-$MAVEN_VERSION.aar"
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
+            echo "DatetimeKMM Android version $MAVEN_VERSION (aar) already exists; skipping publish."
+            echo "DATETIME_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish DatetimeKMM Android publication
+        if: env.DATETIME_SKIP_PUBLISH != 'true'
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/publish-github-packages.sh
+
+  publish-ios:
+    name: Publish iOS (normal tree)
+    runs-on: macos-latest
+    outputs:
+      skipped: ${{ steps.check_version.outputs.skipped }}
+    env:
+      ANDROID_HOME: /tmp/android-sdk
+      ANDROID_SDK_ROOT: /tmp/android-sdk
+      DATETIME_PUBLISH_TASKS: >-
+        :datetime:publishIosX64PublicationToGithubPackagesRepository
+        :datetime:publishIosArm64PublicationToGithubPackagesRepository
+        :datetime:publishIosSimulatorArm64PublicationToGithubPackagesRepository
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip -o /tmp/android-commandline-tools.zip
+          unzip -q /tmp/android-commandline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Resolve publish version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED_VERSION:-}" ]]; then
+            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check existing iOS version
+        id: check_version
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            MAVEN_VERSION="$(grep '^mavenVersion=' DatetimeKMM/gradle.properties | cut -d= -f2)"
+          fi
+          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/build/raft/kuiklybase/datetime-iosarm64/$MAVEN_VERSION/datetime-iosarm64-$MAVEN_VERSION.klib"
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
+            echo "DatetimeKMM iOS version $MAVEN_VERSION (iosarm64 klib) already exists; skipping publish."
+            echo "DATETIME_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish DatetimeKMM iOS publications
+        if: env.DATETIME_SKIP_PUBLISH != 'true'
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/publish-github-packages.sh
+
+  publish-kmp-metadata:
+    name: "Publish KMP metadata (normal tree root)"
+    needs:
+      - publish-android
+      - publish-ios
+    runs-on: macos-latest
+    outputs:
+      skipped: ${{ steps.check_version.outputs.skipped }}
+    env:
+      ANDROID_HOME: /tmp/android-sdk
+      ANDROID_SDK_ROOT: /tmp/android-sdk
+      DATETIME_PUBLISH_TASKS: >-
+        :datetime:publishKotlinMultiplatformPublicationToGithubPackagesRepository
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip -o /tmp/android-commandline-tools.zip
+          unzip -q /tmp/android-commandline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
+            "platform-tools" \
+            "platforms;android-36" \
+            "build-tools;36.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+      - name: Resolve publish version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${REQUESTED_VERSION:-}" ]]; then
+            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+          fi
+
+      - name: Check existing root metadata version
+        id: check_version
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${MAVEN_VERSION:-}" ]]; then
+            MAVEN_VERSION="$(grep '^mavenVersion=' DatetimeKMM/gradle.properties | cut -d= -f2)"
+          fi
+          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/build/raft/kuiklybase/datetime/$MAVEN_VERSION/datetime-$MAVEN_VERSION.module"
+          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
+            echo "DatetimeKMM root metadata version $MAVEN_VERSION already exists; skipping publish."
+            echo "DATETIME_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish DatetimeKMM metadata publication
+        if: env.DATETIME_SKIP_PUBLISH != 'true'
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/publish-github-packages.sh
+
+  # Guard against a silent no-op: each job skips (not fails) when its artifact
+  # already exists, which is right for a partial retry but means a run where
+  # EVERY job skips publishes nothing yet goes green. Since GitHub Packages
+  # versions are immutable, that would ship stale content under an unchanged
+  # version. Fail a run where all jobs skipped so the version gets bumped.
+  verify-published:
+    name: "Verify something was published (guard stale re-publish)"
+    needs:
+      - publish-ohos-tree
+      - publish-android
+      - publish-ios
+      - publish-kmp-metadata
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail if every artifact was skipped
+        shell: bash
+        env:
+          OHOS_SKIPPED: ${{ needs.publish-ohos-tree.outputs.skipped }}
+          ANDROID_SKIPPED: ${{ needs.publish-android.outputs.skipped }}
+          IOS_SKIPPED: ${{ needs.publish-ios.outputs.skipped }}
+          METADATA_SKIPPED: ${{ needs.publish-kmp-metadata.outputs.skipped }}
+        run: |
+          set -euo pipefail
+          echo "skipped: ohos=${OHOS_SKIPPED:-} android=${ANDROID_SKIPPED:-} ios=${IOS_SKIPPED:-} metadata=${METADATA_SKIPPED:-}"
+          if [[ "${OHOS_SKIPPED:-}" == "true" && "${ANDROID_SKIPPED:-}" == "true" && "${IOS_SKIPPED:-}" == "true" && "${METADATA_SKIPPED:-}" == "true" ]]; then
+            echo "::error::Every DatetimeKMM artifact already exists — this run published nothing. GitHub Packages versions are immutable; to ship new content bump mavenVersion and re-run. The published artifacts were NOT updated."
+            exit 1
+          fi
+          echo "At least one artifact was published (or a partial retry converged)."
