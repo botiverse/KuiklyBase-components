@@ -73,39 +73,49 @@ def check_pom(m2, artifact, version, label):
     ok(f"{label} POM {GROUP}:{artifact}:{version}")
 
 
-def available_at_modules(doc):
-    mods = {}
+def available_at_records(doc):
+    """Return EVERY variants[*].available-at record as a list (no collapsing).
+    Real Gradle root metadata emits multiple records per target (one per variant
+    view), so collapsing module->record would silently drop a bad record behind a
+    good one."""
+    records = []
     for variant in doc.get("variants", []):
         avail = variant.get("available-at")
-        if not avail:
-            continue
-        mods[avail.get("module")] = avail
-    return mods
+        if avail:
+            records.append(avail)
+    return records
 
 
-def check_root_targets(doc, label, expected, forbidden):
-    mods = available_at_modules(doc)
-    for module, avail in mods.items():
-        if avail.get("group") != GROUP:
-            fail(f"{label}: available-at {module} group {avail.get('group')} != {GROUP}")
-        if avail.get("version") is None:
-            fail(f"{label}: available-at {module} missing version")
-    present = set(mods.keys())
-    missing = expected - present
+def check_root_targets(doc, label, root_version, expected):
+    # Validate every available-at record individually (exact group/module/version/
+    # url); a single bad record among duplicates must fail the whole readback.
+    records = available_at_records(doc)
+    seen_modules = set()
+    for avail in records:
+        module = avail.get("module")
+        group = avail.get("group")
+        version = avail.get("version")
+        url = avail.get("url", "")
+        if group != GROUP:
+            fail(f"{label}: available-at {module} group {group} != {GROUP}")
+        if version != root_version:
+            fail(f"{label}: available-at {module} version {version} != {root_version}")
+        expected_url = f"../../{module}/{version}/{module}-{version}.module"
+        if url != expected_url:
+            fail(f"{label}: available-at {module} url {url} != {expected_url}")
+        seen_modules.add(module)
+    # Strict set equality: the unique referenced module set must be exactly the
+    # expected target set — no missing target and no unexpected/foreign target
+    # (e.g. an extra datetime-jvm, or a cross-tree datetime-ohosarm64 in the
+    # normal root).
+    missing = expected - seen_modules
+    unexpected = seen_modules - expected
     if missing:
         fail(f"{label}: missing expected variant references {sorted(missing)}")
-    illegal = present & forbidden
-    if illegal:
-        fail(f"{label}: illegal cross-tree variant references {sorted(illegal)}")
-    # Exact group/version/url for each expected target.
-    for module in expected:
-        avail = mods[module]
-        if avail.get("group") != GROUP:
-            fail(f"{label}: target {module} group {avail.get('group')} != {GROUP}")
-        url = avail.get("url", "")
-        if f"{module}-{avail.get('version')}.module" not in url:
-            fail(f"{label}: target {module} available-at url {url} does not point at its .module")
-    ok(f"{label} variant references exact: {sorted(expected)}; cross-tree clean")
+    if unexpected:
+        fail(f"{label}: unexpected/foreign variant references {sorted(unexpected)}")
+    ok(f"{label} available-at exact: {sorted(expected)} "
+       f"({len(records)} records, unique modules strict-equal)")
 
 
 def main():
@@ -119,8 +129,8 @@ def main():
     check_root_targets(
         normal_root,
         "normal-root",
+        version,
         expected={"datetime-android", "datetime-iosx64", "datetime-iosarm64", "datetime-iossimulatorarm64"},
-        forbidden={"datetime-ohosarm64"},
     )
 
     # OHOS root metadata: component + OHOS arm64 target, no Android/iOS.
@@ -130,8 +140,8 @@ def main():
     check_root_targets(
         ohos_root,
         "ohos-root",
+        ohos_version,
         expected={"datetime-ohosarm64"},
-        forbidden={"datetime-android", "datetime-iosx64", "datetime-iosarm64", "datetime-iossimulatorarm64"},
     )
 
     # Every platform publication: exact module component + POM coordinates.

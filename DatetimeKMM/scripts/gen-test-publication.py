@@ -47,7 +47,11 @@ def write_text(path, content):
         f.write(content)
 
 
-def module_json(artifact, version, available_at=None):
+def module_json(artifact, version, available_at=None, records_per_target=3):
+    """Build a Gradle module metadata document. Real Gradle root metadata emits
+    multiple available-at records per target (one per variant view, e.g.
+    apiElements/runtimeElements/...), so mirror that with records_per_target
+    identical records per target to exercise duplicate handling."""
     doc = {
         "formatVersion": "1.1",
         "component": {"group": GROUP, "module": artifact, "version": version,
@@ -56,14 +60,15 @@ def module_json(artifact, version, available_at=None):
         "variants": [],
     }
     for module, ver in (available_at or []):
-        doc["variants"].append({
-            "name": f"{module}ApiElements",
-            "attributes": {"org.gradle.category": "library"},
-            "available-at": {
-                "url": f"../../{module}/{ver}/{module}-{ver}.module",
-                "group": GROUP, "module": module, "version": ver,
-            },
-        })
+        for i in range(records_per_target):
+            doc["variants"].append({
+                "name": f"{module}Variant{i}",
+                "attributes": {"org.gradle.category": "library"},
+                "available-at": {
+                    "url": f"../../{module}/{ver}/{module}-{ver}.module",
+                    "group": GROUP, "module": module, "version": ver,
+                },
+            })
     return json.dumps(doc, indent=2)
 
 
