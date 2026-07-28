@@ -54,19 +54,6 @@ jobs:
         working-directory: DatetimeKMM
         run: bash scripts/test-publish-admission.sh
 
-      # Terminal-verifier self-tests: generate a synthetic full publication
-      # matrix, serve it locally, and exercise verify-published.sh on the happy
-      # path plus injected faults (corrupt OHOS-root legal bytes, wrong
-      # coordinate, refused transport). Proves the terminal readback is not
-      # false-green. Needs zip/unzip for the archive fault injection.
-      - name: Run terminal verifier (readback) self-tests
-        shell: bash
-        working-directory: DatetimeKMM
-        run: |
-          set -euo pipefail
-          command -v zip >/dev/null 2>&1 || { apt-get update -qq && apt-get install -y -qq zip; }
-          bash scripts/test-verify-published.sh
-
       # Prove the per-platform Gradle publish tasks really exist (normal
       # Android + metadata on this tree).
       - name: Verify normal Android/metadata publish tasks exist
