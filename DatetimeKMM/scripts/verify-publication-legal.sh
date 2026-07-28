@@ -6,7 +6,7 @@
 # contract".
 #
 # Usage:
-#   verify-publication-legal.sh <m2-repo-root> <normal|ohos|ios>
+#   verify-publication-legal.sh <m2-repo-root> <normal|ohos|ios> [explicit-version]
 #
 # <m2-repo-root> is the root of the local Maven repository the publications were
 # written to (the same path passed to Gradle as -Dmaven.repo.local). The source
@@ -14,12 +14,19 @@
 # SHA-256 at run time and compares it with the copy extracted from each carrying
 # artifact, so the contract cannot drift from the checked-in source.
 #
+# [explicit-version] (optional) pins the version directory instead of discovering
+# it with `ls | head -1`. This is REQUIRED when a repository holds more than one
+# version of the same module (e.g. the terminal readback stages both <v> and
+# <v>-ohos under datetime/), where discovery would otherwise select the wrong
+# root and false-green the OHOS root legal contract.
+#
 # Bash 3.2 compatible (macOS system bash): no associative arrays.
 
 set -euo pipefail
 
-m2_root="${1:?usage: verify-publication-legal.sh <m2-repo-root> <normal|ohos|ios>}"
-variant="${2:?usage: verify-publication-legal.sh <m2-repo-root> <normal|ohos|ios>}"
+m2_root="${1:?usage: verify-publication-legal.sh <m2-repo-root> <normal|ohos|ios> [explicit-version]}"
+variant="${2:?usage: verify-publication-legal.sh <m2-repo-root> <normal|ohos|ios> [explicit-version]}"
+explicit_version="${3:-}"
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 legal_src="$script_dir/../legal/META-INF"
@@ -78,19 +85,30 @@ first_version_dir() {
     ls "$1" | grep -v '\.xml$' | head -1
 }
 
+# resolve_version <artifact-dir>: use the explicit version when pinned, else
+# discover. Pinning avoids selecting the wrong root when a module dir holds both
+# <v> and <v>-ohos.
+resolve_version() {
+    if [ -n "$explicit_version" ]; then
+        echo "$explicit_version"
+    else
+        first_version_dir "$1"
+    fi
+}
+
 datetime_dir="$m2_root/build/raft/kuiklybase/datetime"
 
 if [ "$variant" = "normal" ]; then
     android_dir="$m2_root/build/raft/kuiklybase/datetime-android"
-    version="$(first_version_dir "$datetime_dir")"
-    android_version="$(first_version_dir "$android_dir")"
+    version="$(resolve_version "$datetime_dir")"
+    android_version="$(resolve_version "$android_dir")"
     echo "== normal tree publication legal gate (version=$version android=$android_version) =="
     check_artifact "metadata-jar"        "$datetime_dir/$version/datetime-$version.jar" ""
     check_artifact "root-sources"        "$datetime_dir/$version/datetime-$version-sources.jar" ""
     check_artifact "android-sources"     "$android_dir/$android_version/datetime-android-$android_version-sources.jar" ""
     check_artifact "android-aar-classes" "$android_dir/$android_version/datetime-android-$android_version.aar" "classes.jar"
 elif [ "$variant" = "ios" ]; then
-    version="$(first_version_dir "$datetime_dir")"
+    version="$(resolve_version "$datetime_dir")"
     echo "== iOS tree publication legal gate (root=$version) =="
     check_artifact "ios-metadata-jar" "$datetime_dir/$version/datetime-$version.jar" ""
     check_artifact "ios-root-sources" "$datetime_dir/$version/datetime-$version-sources.jar" ""
@@ -102,13 +120,16 @@ elif [ "$variant" = "ios" ]; then
             echo "  FAIL $tgt sources JAR missing: required iOS target not published at $tgt_dir" >&2
             exit 1
         fi
-        tgt_version="$(first_version_dir "$tgt_dir")"
+        tgt_version="$(resolve_version "$tgt_dir")"
         check_artifact "$tgt-sources" "$tgt_dir/$tgt_version/datetime-$tgt-$tgt_version-sources.jar" ""
     done
 elif [ "$variant" = "ohos" ]; then
     ohosarm64_dir="$m2_root/build/raft/kuiklybase/datetime-ohosarm64"
-    version="$(first_version_dir "$datetime_dir")"
-    ohos_version="$(first_version_dir "$ohosarm64_dir")"
+    # The OHOS root metadata lives at datetime/<v>-ohos, NOT datetime/<v>; when
+    # both are staged together the explicit -ohos version must be pinned so the
+    # OHOS root legal bytes are read from the OHOS publication, not the normal one.
+    version="$(resolve_version "$datetime_dir")"
+    ohos_version="$(resolve_version "$ohosarm64_dir")"
     echo "== OHOS tree publication legal gate (root=$version ohosarm64=$ohos_version) =="
     check_artifact "ohos-metadata-jar"      "$datetime_dir/$version/datetime-$version.jar" ""
     check_artifact "ohos-root-sources"      "$datetime_dir/$version/datetime-$version-sources.jar" ""
