@@ -9,8 +9,8 @@ database to a Kuikly application.
 
 The candidate Maven coordinates are:
 
-- normal Android/iOS tree: `com.tencent.kuiklybase:datetime:<version>`;
-- OHOS K/N 2.0.21 tree: `com.tencent.kuiklybase:datetime:<version>-ohos`.
+- normal Android/iOS tree: `build.raft.kuiklybase:datetime:<version>`;
+- OHOS K/N 2.0.21 tree: `build.raft.kuiklybase:datetime:<version>-ohos`.
 
 `0.1.0-raft.0` is reserved in source as the first candidate. Treat it as
 unreleased until an authorized GitHub Packages workflow has verified that the
@@ -19,9 +19,9 @@ immutable coordinate is free and has published all platform variants.
 ## API
 
 ```kotlin
-import com.tencent.kuiklybase.datetime.Clock
-import com.tencent.kuiklybase.datetime.Instant
-import com.tencent.kuiklybase.datetime.SystemTimeZone
+import build.raft.kuiklybase.datetime.Clock
+import build.raft.kuiklybase.datetime.Instant
+import build.raft.kuiklybase.datetime.SystemTimeZone
 
 val now: Instant = Clock.System.now()
 val epochMillis: Long = now.toEpochMilliseconds()

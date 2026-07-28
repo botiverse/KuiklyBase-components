@@ -35,7 +35,7 @@ kotlin {
 }
 
 android {
-    namespace = "com.tencent.kuiklybase.datetime"
+    namespace = "build.raft.kuiklybase.datetime"
     compileSdk = 36
 
     defaultConfig {
