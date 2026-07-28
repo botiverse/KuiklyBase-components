@@ -47,13 +47,19 @@ not_ignored "DatetimeKMM/datetime/src/androidMain/kotlin/build/raft/kuiklybase/d
 not_ignored "DatetimeKMM/datetime/src/iosMain/kotlin/build/raft/kuiklybase/datetime/PlatformDatetime.ios.kt"
 not_ignored "DatetimeKMM/datetime/src/ohosArm64Main/kotlin/build/raft/kuiklybase/datetime/PlatformDatetime.ohos.kt"
 
-# Real Gradle output and local config must remain ignored.
-ignored "DatetimeKMM/build"
+# Real Gradle output and local config must remain ignored. Probe deterministic
+# sentinel CONTENTS under each ignored directory (not the bare directory itself):
+# in a clean CI checkout the bare build/.gradle dirs do not exist, and Git does
+# not match a non-existent trailing-slash-less path against a directory pattern,
+# which would false-fail the gate. A path with content under the ignored dir is
+# matched deterministically regardless of on-disk existence.
 ignored "DatetimeKMM/build/libs/x.jar"
-ignored "DatetimeKMM/datetime/build"
+ignored "DatetimeKMM/build/reports/y.html"
 ignored "DatetimeKMM/datetime/build/classes/kotlin"
-ignored "DatetimeKMM/.gradle"
+ignored "DatetimeKMM/datetime/build/libs/datetime.jar"
+ignored "DatetimeKMM/.gradle/caches/probe"
 ignored "DatetimeKMM/local.properties"
+ignored "DatetimeKMM/github-packages.properties"
 
 if [ "$fail" -ne 0 ]; then
     echo "GITIGNORE_GATE_FAIL" >&2
