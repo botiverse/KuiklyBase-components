@@ -43,28 +43,17 @@ fi
 # DATETIME_REPO_BASE overrides the Maven repository base (self-tests only).
 REPO_BASE="${DATETIME_REPO_BASE:-https://maven.pkg.github.com/${GITHUB_REPOSITORY}/build/raft/kuiklybase}"
 
-# publication_urls <artifact> <version> <main-ext>
-# Prints the full expected-artifact URL set for one Maven publication: the main
-# file, its POM, Gradle module metadata, and sources JAR.
-publication_urls() {
-  local artifact="$1" version="$2" ext="$3"
-  local base="${REPO_BASE}/${artifact}/${version}"
-  echo "${base}/${artifact}-${version}.${ext}"
-  echo "${base}/${artifact}-${version}.pom"
-  echo "${base}/${artifact}-${version}.module"
-  echo "${base}/${artifact}-${version}-sources.jar"
-}
-
-# admit_publication <artifact> <version> <main-ext> <publish-task>
+# admit_publication <artifact> <version> <kind> <publish-task>
 # Classifies the publication and, if NONE, appends its publish task to RUN_TASKS.
 # COMPLETE -> skip. PARTIAL or probe error -> hard fail.
 RUN_TASKS=()
 SKIPPED=()
+PUBLISHED_COUNT=0
 admit_publication() {
-  local artifact="$1" version="$2" ext="$3" task="$4"
+  local artifact="$1" version="$2" kind="$3" task="$4"
   local urls=() line verdict
   # Bash 3.2 compatible (macOS system bash): no mapfile.
-  while IFS= read -r line; do urls+=("$line"); done < <(publication_urls "$artifact" "$version" "$ext")
+  while IFS= read -r line; do urls+=("$line"); done < <(publication_urls "$REPO_BASE" "$artifact" "$version" "$kind")
   verdict="$(classify_manifest "$GITHUB_PACKAGES_USERNAME" "$GITHUB_PACKAGES_TOKEN" "${urls[@]}")" || {
     echo "ADMISSION FAIL: inconclusive probe for $artifact:$version (fail closed)" >&2
     exit 1
@@ -73,6 +62,7 @@ admit_publication() {
     NONE)
       echo "  $artifact:$version -> NONE (will publish)"
       RUN_TASKS+=("$task")
+      PUBLISHED_COUNT=$(( PUBLISHED_COUNT + 1 ))
       ;;
     COMPLETE)
       echo "  $artifact:$version -> COMPLETE (skip)"
@@ -93,25 +83,25 @@ admit_publication() {
 case "$MODE" in
   ohos-tree)
     DATETIME_SETTINGS_FILE="${DATETIME_SETTINGS_FILE:-settings.ohos.gradle.kts}"
-    admit_publication "datetime-ohosarm64" "${VERSION}-ohos" "klib" \
+    admit_publication "datetime-ohosarm64" "${VERSION}-ohos" "native-ohos" \
       ":datetime:publishOhosArm64PublicationToGithubPackagesRepository"
-    admit_publication "datetime" "${VERSION}-ohos" "jar" \
+    admit_publication "datetime" "${VERSION}-ohos" "root-metadata" \
       ":datetime:publishKotlinMultiplatformPublicationToGithubPackagesRepository"
     ;;
   android)
-    admit_publication "datetime-android" "${VERSION}" "aar" \
+    admit_publication "datetime-android" "${VERSION}" "android" \
       ":datetime:publishAndroidReleasePublicationToGithubPackagesRepository"
     ;;
   ios)
-    admit_publication "datetime-iosx64" "${VERSION}" "klib" \
+    admit_publication "datetime-iosx64" "${VERSION}" "native" \
       ":datetime:publishIosX64PublicationToGithubPackagesRepository"
-    admit_publication "datetime-iosarm64" "${VERSION}" "klib" \
+    admit_publication "datetime-iosarm64" "${VERSION}" "native" \
       ":datetime:publishIosArm64PublicationToGithubPackagesRepository"
-    admit_publication "datetime-iossimulatorarm64" "${VERSION}" "klib" \
+    admit_publication "datetime-iossimulatorarm64" "${VERSION}" "native" \
       ":datetime:publishIosSimulatorArm64PublicationToGithubPackagesRepository"
     ;;
   metadata)
-    admit_publication "datetime" "${VERSION}" "jar" \
+    admit_publication "datetime" "${VERSION}" "root-metadata" \
       ":datetime:publishKotlinMultiplatformPublicationToGithubPackagesRepository"
     ;;
   *)
@@ -119,6 +109,12 @@ case "$MODE" in
     exit 2
     ;;
 esac
+
+# Export the newly-admitted publication count for this mode so the terminal job
+# can aggregate across jobs and fail a fully-stale rerun (zero new publications).
+if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
+  echo "published_count=$PUBLISHED_COUNT" >> "$GITHUB_OUTPUT"
+fi
 
 if [[ "${#RUN_TASKS[@]}" -eq 0 ]]; then
   echo "ALL_COMPLETE: every publication in mode '$MODE' already exists; nothing to publish."
