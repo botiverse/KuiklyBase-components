@@ -1,6 +1,10 @@
 .gradle/
-build/
-**/build/
+# Anchor Gradle output to the root and module-root build dirs only. Do NOT use
+# an unanchored `build/` or `**/build/`: the production source package is
+# build.raft.kuiklybase.datetime, so source lives under .../kotlin/build/raft/...
+# and a generic build/ pattern would silently ignore the whole source tree.
+/build/
+/*/build/
 local.properties
 github-packages.properties
 *.hprof
