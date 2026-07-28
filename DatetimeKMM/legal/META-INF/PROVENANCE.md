@@ -38,7 +38,7 @@ system-timezone snapshot/invalidation probe.
 
 | Area | KuiklyBase implementation | Relationship to references |
 |---|---|---|
-| Common API | New `com.tencent.kuiklybase.datetime` types; no dependency on `kotlinx-datetime` | Independently implemented for the Mobile migration boundary |
+| Common API | New `build.raft.kuiklybase.datetime` types; no dependency on `kotlinx-datetime` | Independently implemented for the Mobile migration boundary |
 | Android | `System.currentTimeMillis()` and one fresh `java.util.TimeZone.getDefault()` object per snapshot | Standard JDK/Android APIs; no copied source |
 | iOS | `NSDate` wall clock; `NSTimeZone.resetSystemTimeZone()` before a fresh `systemTimeZone` offset read | Cache-reset requirement was confirmed against JetBrains/CPF Darwin behavior; implementation and API surface are new |
 | OHOS | `OH_TimeService_GetTimeZone` for the current ID; a small POSIX `clock_gettime` / `tzset` / `localtime_r` bridge for wall time and offset | The CPF fork demonstrated the supported TimeService NDK API. KuiklyBase does not copy its `TzdbBionic` or timezone-rule parser |

@@ -78,10 +78,10 @@ first_version_dir() {
     ls "$1" | grep -v '\.xml$' | head -1
 }
 
-datetime_dir="$m2_root/com/tencent/kuiklybase/datetime"
+datetime_dir="$m2_root/build/raft/kuiklybase/datetime"
 
 if [ "$variant" = "normal" ]; then
-    android_dir="$m2_root/com/tencent/kuiklybase/datetime-android"
+    android_dir="$m2_root/build/raft/kuiklybase/datetime-android"
     version="$(first_version_dir "$datetime_dir")"
     android_version="$(first_version_dir "$android_dir")"
     echo "== normal tree publication legal gate (version=$version android=$android_version) =="
@@ -97,7 +97,7 @@ elif [ "$variant" = "ios" ]; then
     # All three iOS targets are declared and must publish; a missing required
     # target is a hard fail, never a SKIP (fail-closed against false green).
     for tgt in iosx64 iosarm64 iossimulatorarm64; do
-        tgt_dir="$m2_root/com/tencent/kuiklybase/datetime-$tgt"
+        tgt_dir="$m2_root/build/raft/kuiklybase/datetime-$tgt"
         if [ ! -d "$tgt_dir" ]; then
             echo "  FAIL $tgt sources JAR missing: required iOS target not published at $tgt_dir" >&2
             exit 1
@@ -106,7 +106,7 @@ elif [ "$variant" = "ios" ]; then
         check_artifact "$tgt-sources" "$tgt_dir/$tgt_version/datetime-$tgt-$tgt_version-sources.jar" ""
     done
 elif [ "$variant" = "ohos" ]; then
-    ohosarm64_dir="$m2_root/com/tencent/kuiklybase/datetime-ohosarm64"
+    ohosarm64_dir="$m2_root/build/raft/kuiklybase/datetime-ohosarm64"
     version="$(first_version_dir "$datetime_dir")"
     ohos_version="$(first_version_dir "$ohosarm64_dir")"
     echo "== OHOS tree publication legal gate (root=$version ohosarm64=$ohos_version) =="

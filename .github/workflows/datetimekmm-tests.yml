@@ -11,6 +11,21 @@ permissions:
   contents: read
 
 jobs:
+  gitignore-gate:
+    name: Gitignore fail-closed gate (build.raft source not ignored)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # The production source package is build.raft.kuiklybase.datetime, so
+      # source lives under .../kotlin/build/raft/... . This gate fails if a
+      # generic build/ ignore pattern would silently hide that source tree,
+      # while real Gradle output must stay ignored.
+      - name: Run gitignore fail-closed gate
+        shell: bash
+        run: bash DatetimeKMM/scripts/check-gitignore.sh
+
   android-unit-tests:
     name: Android unit tests + common metadata + normal legal gate (:datetime)
     runs-on: ubuntu-latest

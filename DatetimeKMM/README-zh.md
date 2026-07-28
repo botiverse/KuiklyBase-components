@@ -8,8 +8,8 @@ KuiklyBase Datetime 是面向 Android、iOS、OHOS 的最小 Kotlin Multiplatfor
 
 候选 Maven 坐标：
 
-- Android/iOS 普通构建树：`com.tencent.kuiklybase:datetime:<version>`；
-- OHOS K/N 2.0.21 构建树：`com.tencent.kuiklybase:datetime:<version>-ohos`。
+- Android/iOS 普通构建树：`build.raft.kuiklybase:datetime:<version>`；
+- OHOS K/N 2.0.21 构建树：`build.raft.kuiklybase:datetime:<version>-ohos`。
 
 源码暂以 `0.1.0-raft.0` 作为首个候选版本。在经授权的 GitHub Packages
 流程确认不可变坐标未占用、并发布完全部平台变体前，请勿把它视为已发布版本。
@@ -17,9 +17,9 @@ KuiklyBase Datetime 是面向 Android、iOS、OHOS 的最小 Kotlin Multiplatfor
 ## API
 
 ```kotlin
-import com.tencent.kuiklybase.datetime.Clock
-import com.tencent.kuiklybase.datetime.Instant
-import com.tencent.kuiklybase.datetime.SystemTimeZone
+import build.raft.kuiklybase.datetime.Clock
+import build.raft.kuiklybase.datetime.Instant
+import build.raft.kuiklybase.datetime.SystemTimeZone
 
 val now: Instant = Clock.System.now()
 val epochMillis: Long = now.toEpochMilliseconds()

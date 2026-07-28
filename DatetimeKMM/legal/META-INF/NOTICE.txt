@@ -14,7 +14,7 @@ Design and platform-compatibility provenance was reviewed against:
    commit cf0c17fec83df813182f8c444ae75760833c67a4.
 
 KuiklyBase Datetime is an independently implemented minimal API in the
-com.tencent.kuiklybase.datetime namespace. It does not incorporate the full
+build.raft.kuiklybase.datetime namespace. It does not incorporate the full
 kotlinx-datetime source tree, timezone database parser, calendar model,
 serialization layer, or kotlinx.datetime ABI. See PROVENANCE.md for the
 audited divergence and per-platform patch catalog.
