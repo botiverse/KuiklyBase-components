@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 #
 # End-to-end self-tests for the terminal verifier scripts/verify-published.sh
-# (and verify-coordinates.py + version-explicit legal gate). Runs in PR CI
-# without publishing or any iOS/OHOS toolchain: a synthetic but structurally-
-# valid publication matrix is generated and served over a local HTTP server,
-# then the verifier is exercised on the happy path and against injected faults
-# (corrupt OHOS-root legal bytes, wrong coordinate, refused transport). This is
-# the gate that proves the terminal verifier itself is not false-green.
+# (verify-coordinates.py + version-explicit legal gate). Runs in PR CI without
+# publishing or any iOS/OHOS toolchain: a synthetic but structurally-valid
+# publication matrix (with multiple available-at records per target, mirroring
+# real Gradle) is generated and served over a local HTTP server, then the
+# verifier is exercised on the happy path and against injected faults. These
+# faults are the deterministic false-greens the verifier must reject:
+#   - corrupt OHOS-root legal bytes (version-explicit legal gate)
+#   - wrong available-at version / wrong url / bad+good duplicate / unexpected
+#     foreign target / wrong component module (strict coordinate validation)
+#   - refused transport (fail-closed retry path)
+# All mutations use python (cross macOS/Linux; no GNU-only sed -i).
 
 set -euo pipefail
 
@@ -23,7 +28,6 @@ fail=0
 note_ok()   { echo "  OK   $1"; pass=$(( pass + 1 )); }
 note_fail() { echo "  FAIL $1" >&2; fail=$(( fail + 1 )); }
 
-# Each case uses its own port to avoid any reuse race between cases.
 serve() {  # serve <dir> <port>
   ( cd "$1" && exec python3 -m http.server "$2" >/dev/null 2>&1 & echo $! > "/tmp/vp-server-$2.pid" )
   for _ in $(seq 1 50); do
@@ -47,8 +51,30 @@ run_verifier() {  # run_verifier <repo-base>
   bash "$SCRIPT_DIR/verify-published.sh" 2>&1
 }
 
-echo "== happy path: full synthetic matrix -> READBACK_PASS =="
-m2="$(mktemp -d)"; P=$BASE_PORT
+# run_coord_fault <mutation> <expect-grep>: generate matrix, mutate the normal
+# root module, serve, run verifier, assert it fails with the expected marker.
+run_coord_fault() {
+  local mutation="$1" expect="$2"
+  local m2 P out rc
+  m2="$(mktemp -d)"; P=$(( BASE_PORT + port_off )); port_off=$(( port_off + 1 ))
+  python3 "$SCRIPT_DIR/gen-test-publication.py" "$m2" "$VERSION" "$LEGAL_DIR" >/dev/null
+  python3 "$SCRIPT_DIR/mutate-module.py" \
+    "$m2/build/raft/kuiklybase/datetime/$VERSION/datetime-$VERSION.module" "$mutation" >/dev/null
+  serve "$m2" "$P"
+  set +e; out="$(run_verifier "http://127.0.0.1:$P/build/raft/kuiklybase")"; rc=$?; set -e
+  stop_serve "$P"
+  if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "$expect"; then
+    note_ok "fault '$mutation' fails closed"
+  else
+    note_fail "fault '$mutation' FALSE-GREEN (rc=$rc, expected /$expect/)"; printf '%s\n' "$out" | tail -5 >&2
+  fi
+  rm -rf "$m2"
+}
+
+port_off=0
+
+echo "== happy path: full synthetic matrix (3 records/target) -> READBACK_PASS =="
+m2="$(mktemp -d)"; P=$BASE_PORT; port_off=1
 python3 "$SCRIPT_DIR/gen-test-publication.py" "$m2" "$VERSION" "$LEGAL_DIR" >/dev/null
 serve "$m2" "$P"
 set +e; out="$(run_verifier "http://127.0.0.1:$P/build/raft/kuiklybase")"; rc=$?; set -e
@@ -61,10 +87,8 @@ fi
 rm -rf "$m2"
 
 echo "== fault: corrupt OHOS-root legal bytes -> must FAIL (not false-green) =="
-m2b="$(mktemp -d)"; P=$(( BASE_PORT + 1 ))
+m2b="$(mktemp -d)"; P=$(( BASE_PORT + port_off )); port_off=$(( port_off + 1 ))
 python3 "$SCRIPT_DIR/gen-test-publication.py" "$m2b" "$VERSION" "$LEGAL_DIR" >/dev/null
-# Corrupt ONLY the OHOS root jar's PROVENANCE (normal root stays valid): the exact
-# false-green the version-explicit legal gate must now catch.
 ohos_root_jar="$m2b/build/raft/kuiklybase/datetime/$VERSION-ohos/datetime-$VERSION-ohos.jar"
 tmp_x="$(mktemp -d)"
 ( cd "$tmp_x" && unzip -o -q "$ohos_root_jar" && echo "CORRUPTED" > META-INF/PROVENANCE.md && rm -f "$ohos_root_jar" && zip -q -r "$ohos_root_jar" META-INF )
@@ -79,20 +103,12 @@ else
 fi
 rm -rf "$m2b"
 
-echo "== fault: wrong coordinate in android module -> COORDINATE FAIL =="
-m2c="$(mktemp -d)"; P=$(( BASE_PORT + 2 ))
-python3 "$SCRIPT_DIR/gen-test-publication.py" "$m2c" "$VERSION" "$LEGAL_DIR" >/dev/null
-android_module="$m2c/build/raft/kuiklybase/datetime-android/$VERSION/datetime-android-$VERSION.module"
-sed -i 's#"module": "datetime-android"#"module": "datetime-WRONG"#' "$android_module"
-serve "$m2c" "$P"
-set +e; out="$(run_verifier "http://127.0.0.1:$P/build/raft/kuiklybase")"; rc=$?; set -e
-stop_serve "$P"
-if [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -qi "COORDINATE FAIL"; then
-  note_ok "wrong coordinate fails closed"
-else
-  note_fail "wrong coordinate not caught (rc=$rc)"; printf '%s\n' "$out" | tail -6 >&2
-fi
-rm -rf "$m2c"
+echo "== coordinate fault teeth (strict available-at / component validation) =="
+run_coord_fault "wrong-version"     "available-at"
+run_coord_fault "wrong-url"         "available-at"
+run_coord_fault "bad-duplicate"     "available-at"
+run_coord_fault "unexpected-target" "unexpected"
+run_coord_fault "wrong-component"   "component"
 
 echo "== fault: refused transport -> fails closed via retry =="
 set +e; out="$(run_verifier "http://127.0.0.1:9/build/raft/kuiklybase")"; rc=$?; set -e
