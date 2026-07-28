@@ -5,6 +5,7 @@ on:
     paths:
       - "DatetimeKMM/**"
       - ".github/workflows/datetimekmm-tests.yml"
+      - ".github/workflows/publish-datetime-github-packages.yml"
   workflow_dispatch:
 
 permissions:
@@ -77,6 +78,25 @@ jobs:
           export DEVECO_STUDIO_HOME="$(cd "$DEVECO_SDK_HOME/.." && pwd)"
           export PATH="$ohos_sdk_home/native/llvm/bin:$PATH"
           bash scripts/check-publish-tasks.sh ohos-tree settings.ohos.gradle.kts
+
+      # Lock the expected-artifact manifest against the real isolated local
+      # publication output for the Android/normal and OHOS trees (the iOS
+      # inventory runs on the macOS job).
+      - name: Verify normal/OHOS publication manifest inventory
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          export OHOS_SDK_HOME="$ohos_sdk_home" OHOS_BASE_SDK_HOME="$ohos_sdk_home" OHOS_NDK_HOME="$ohos_sdk_home"
+          export OHOS_LLVM_HOME="$ohos_sdk_home/native/llvm"
+          export DEVECO_SDK_HOME="$(cd "$ohos_sdk_home/../.." && pwd)"
+          export DEVECO_STUDIO_HOME="$(cd "$DEVECO_SDK_HOME/.." && pwd)"
+          export PATH="$ohos_sdk_home/native/llvm/bin:$PATH"
+          bash scripts/check-manifest-inventory.sh android
+          bash scripts/check-manifest-inventory.sh metadata
+          bash scripts/check-manifest-inventory.sh ohos-tree settings.ohos.gradle.kts
 
   android-unit-tests:
     name: Android unit tests + common metadata + normal legal gate (:datetime)
@@ -154,6 +174,14 @@ jobs:
         shell: bash
         working-directory: DatetimeKMM
         run: bash scripts/check-publish-tasks.sh ios
+
+      # Lock the iOS expected-artifact manifest against the real isolated local
+      # publication output (verifies the native klib + metadata.jar + POM +
+      # module + sources set the publish/readback admission relies on).
+      - name: Verify iOS publication manifest inventory
+        shell: bash
+        working-directory: DatetimeKMM
+        run: bash scripts/check-manifest-inventory.sh ios
 
       # Publication legal gate: publish the normal tree (metadata + iOS targets)
       # to the local repository and assert the three files in the metadata JAR,
