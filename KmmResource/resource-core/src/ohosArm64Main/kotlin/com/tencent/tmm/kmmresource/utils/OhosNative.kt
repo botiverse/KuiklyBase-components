@@ -3,7 +3,6 @@ package com.tencent.tmm.kmmresource.utils
 import com.tencent.tmm.kmmresource.ohos_get_color_by_name
 import com.tencent.tmm.kmmresource.ohos_get_image_base64_by_name
 import com.tencent.tmm.kmmresource.ohos_get_media_by_name
-import com.tencent.tmm.kmmresource.ohos_get_string_by_name
 import com.tencent.tmm.kmmresource.ohos_get_string_plural_by_name
 import kotlinx.cinterop.ByteVar
 import kotlinx.cinterop.CPointerVar
@@ -65,30 +64,6 @@ internal fun getColorByName(name: String): Int {
             resValue.value.toInt()
         } else {
             throw RuntimeException("getColorByName $name failed $resultCode")
-        }
-    }
-}
-
-/**
- * Get normal string by name
- * 测试通过
- * @param name
- * @return
- */
-@OptIn(ExperimentalForeignApi::class)
-internal fun getNormalStringByName(name: String): String? {
-    memScoped {
-        val resValue = alloc<CPointerVar<ByteVar>>()
-        val resultCode = ohos_get_string_by_name(name, resValue.ptr)
-        return if (resultCode == 0) {
-            val res = resValue.value?.toKString()
-            /**
-             * 手动释放native内存
-             */
-            free(resValue.value)
-            res
-        } else {
-            throw RuntimeException("getNormalStringByName $name failed $resultCode")
         }
     }
 }

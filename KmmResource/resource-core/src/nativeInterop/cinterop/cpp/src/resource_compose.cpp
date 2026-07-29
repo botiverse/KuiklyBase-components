@@ -29,12 +29,6 @@ int ohos_get_color_by_name(const char *resName, uint32_t *resValue) {
     return code;
 }
 
-int ohos_get_string_by_name(const char *resName, char **resultValue) {
-    auto code = OH_ResourceManager_GetStringByName(nativeResourceManager, resName, resultValue);
-
-    return code;
-}
-
 int ohos_get_string_plural_by_name(const char *resName, uint32_t num, char **resultValue) {
     auto code = OH_ResourceManager_GetPluralStringByName(nativeResourceManager, resName, num,
                                                          resultValue);
@@ -48,4 +42,3 @@ int ohos_get_image_base64_by_name(const char *resName, char **resultValue, uint6
                                                         resultLen, density);
     return code;
 }
-
