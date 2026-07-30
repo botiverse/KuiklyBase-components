@@ -146,6 +146,16 @@ jobs:
         shell: bash
         run: echo "KmmResource version $MAVEN_VERSION already exists in GitHub Packages."
 
+      - name: Validate string lookup contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd KmmResource
+          ./gradlew --no-daemon --console=plain \
+            -PkmmResourcePublishOnly=true \
+            :resource-core:testDebugUnitTest \
+            :resource-core:compileTestKotlinOhosArm64
+
       - name: Publish KmmResource Android/OHOS/plugin publications
         if: env.KMMRESOURCE_SKIP_PUBLISH != 'true'
         shell: bash
