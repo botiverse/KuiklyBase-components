@@ -30,10 +30,37 @@ function expectCode(call, code) {
   });
 }
 
+function assertBridgeState(target, expectedEnvCall, expectedDebug) {
+  assert.equal(
+    target.__knoi_test_init_env_call,
+    expectedEnvCall,
+    'production init must pass the current env/exports to initEnv',
+  );
+  assert.equal(
+    target.__knoi_test_debug,
+    expectedDebug,
+    'fallback setup must preserve the first debug mode through production init',
+  );
+  assert.equal(typeof target.__knoi_test_get_init_env_calls, 'function');
+  assert.equal(typeof target.__knoi_test_get_init_bridge_calls, 'function');
+  assert.equal(
+    target.__knoi_test_get_init_env_calls(),
+    expectedEnvCall,
+    'initEnv must run once for each initialized environment',
+  );
+  assert.equal(
+    target.__knoi_test_get_init_bridge_calls(),
+    1,
+    'initBridge must run exactly once in the process',
+  );
+}
+
 assert.throws(() => addon.setup(), /Wrong number of arguments/);
 expectCode(() => addon.setup(7, false), 'JSBind: Wrong type of arguments');
-expectCode(() => addon.init(), 'KNOI_NOT_CONFIGURED');
-assert.equal('knoi' in globalThis, false, 'failed init must not leave a partial global');
+if (process.env.KNOI_SKIP_PREINIT_PROBE !== '1') {
+  expectCode(() => addon.init(), 'KNOI_NOT_CONFIGURED');
+  assert.equal('knoi' in globalThis, false, 'failed init must not leave a partial global');
+}
 expectCode(
   () => addon.setup('/definitely/not/a/knoi/library.so', false),
   'KNOI_LIBRARY_OPEN_FAILED',
@@ -49,6 +76,7 @@ assert.equal(addon.setup('', false), undefined);
 assert.equal(addon.init(), undefined);
 assert.equal(typeof globalThis.knoi, 'object');
 assert.notEqual(globalThis.knoi, null);
+assertBridgeState(globalThis.knoi, 1, true);
 
 const waiterId = addon.create_function_waiter();
 assert.equal(Number.isSafeInteger(waiterId), true);
@@ -98,6 +126,12 @@ const worker = new Worker(
       type: 'ready',
       exports: Object.getOwnPropertyNames(addon).sort(),
       hasGlobal: typeof globalThis.knoi === 'object' && globalThis.knoi !== null,
+      bridgeState: {
+        envCall: globalThis.knoi.__knoi_test_init_env_call,
+        debug: globalThis.knoi.__knoi_test_debug,
+        envCalls: globalThis.knoi.__knoi_test_get_init_env_calls(),
+        bridgeCalls: globalThis.knoi.__knoi_test_get_init_bridge_calls(),
+      },
     });
     parentPort.once('message', ({ id, payload }) => {
       addon.notify_function_waiter(id, payload, payload.length);
@@ -114,6 +148,11 @@ worker.on('message', (message) => {
   if (message.type === 'ready') {
     assert.deepEqual(message.exports, expectedExports);
     assert.equal(message.hasGlobal, true, 'worker init must install globalThis.knoi');
+    assert.deepEqual(
+      message.bridgeState,
+      { envCall: 2, debug: true, envCalls: 2, bridgeCalls: 1 },
+      'Worker init must call initEnv for its env while initBridge remains process-once',
+    );
     workerReady = true;
     worker.postMessage({
       id: crossEnvironmentWaiterId,

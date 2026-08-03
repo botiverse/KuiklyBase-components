@@ -19,8 +19,18 @@ if [[ -z "${OHPM}" || -z "${HVIGORW}" ]]; then
 fi
 
 (
+  # The HAR target has only one file: dependency. Install from that module and
+  # poison the registry endpoint so this gate cannot silently resolve the
+  # unrelated sample entry's historical @kuiklybase/knoi@0.0.1 coordinate.
+  cd "${OHOS_APP_ROOT}/knoi"
+  "${OHPM}" install \
+    --no-save \
+    --registry http://127.0.0.1:9 \
+    --strict_ssl true
+)
+
+(
   cd "${OHOS_APP_ROOT}"
-  "${OHPM}" install --all --strict_ssl true
   "${HVIGORW}" \
     --mode module \
     -p module=knoi@default \
