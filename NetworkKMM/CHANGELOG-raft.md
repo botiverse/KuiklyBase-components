@@ -1,5 +1,21 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.30 / 0.1.0-raft.30-ohos (C++ curl Socket.IO v1)
+
+- Add an additive C++ Engine.IO v4 / Socket.IO v4 session on top of libcurl's
+  WebSocket API. The native owner handles the WebSocket upgrade, Socket.IO
+  auth packet, Engine.IO ping/pong, text JSON events, close, and bounded
+  exponential reconnect without a second Kotlin protocol state machine.
+- Expose a thin KMP API (`NetworkSocketIoFactory`) for start/emit/close and
+  serialized state/event callbacks. The OHOS artifact uses the C++ runtime;
+  Android and iOS report unsupported in v1 instead of silently selecting a
+  different transport.
+- Freeze independent WebSocket and Socket.IO C ABI versions, reject mismatched
+  struct sizes/versions before dereference, and add executable protocol tests
+  for URL/query construction plus event JSON escaping/decoding. V1 is default
+  namespace + text JSON only; binary events and acknowledgements remain
+  explicitly unsupported.
+
 ## 0.1.0-raft.29 / 0.1.0-raft.29-ohos (iOS multipart content type)
 
 - Preserve an explicit `Content-Type` in the iOS Ktor transport instead of

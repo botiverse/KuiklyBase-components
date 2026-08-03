@@ -21,6 +21,7 @@
 #include <cctype>
 #include <chrono>
 #include <climits>
+#include <condition_variable>
 #include <deque>
 #include <cstddef>
 #include <cstdio>
@@ -28,6 +29,7 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <poll.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -114,6 +116,479 @@ static const char *CurlProtocolName(long httpVersion) {
     }
     return "unknown";
 }
+
+class CurlWebSocketClient {
+ public:
+    explicit CurlWebSocketClient(std::string logTag) : log_tag_(std::move(logTag)) {
+        if (EnsureCurlGlobalInit()) {
+            curl_ = curl_easy_init();
+        }
+    }
+
+    ~CurlWebSocketClient() {
+        Cleanup();
+    }
+
+    bool Connect(const char *url, const StringDic *headers, const char *caInfoPath,
+                 const char *proxyUrl, int64_t connectTimeoutMs) {
+        if (curl_ == nullptr || url == nullptr || connected_) return false;
+        cancelled_.store(false, std::memory_order_relaxed);
+        header_list_ = nullptr;
+        if (headers != nullptr && headers->stringPairs != nullptr && headers->size > 0) {
+            for (int index = 0; index < headers->size; ++index) {
+                const StringPair &pair = headers->stringPairs[index];
+                if (pair.first == nullptr || pair.second == nullptr) continue;
+                const std::string line = std::string(pair.first) + ": " + pair.second;
+                header_list_ = curl_slist_append(header_list_, line.c_str());
+            }
+        }
+        curl_easy_setopt(curl_, CURLOPT_URL, url);
+        curl_easy_setopt(curl_, CURLOPT_CONNECT_ONLY, 2L);
+        curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, header_list_);
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS,
+                         static_cast<long>(std::max<int64_t>(1, connectTimeoutMs)));
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS,
+                         static_cast<long>(std::max<int64_t>(1, connectTimeoutMs)));
+        curl_easy_setopt(curl_, CURLOPT_NOPROGRESS, 0L);
+        curl_easy_setopt(curl_, CURLOPT_XFERINFOFUNCTION, Progress);
+        curl_easy_setopt(curl_, CURLOPT_XFERINFODATA, this);
+        if (caInfoPath != nullptr && caInfoPath[0] != '\0') {
+            curl_easy_setopt(curl_, CURLOPT_CAINFO, caInfoPath);
+        }
+        if (proxyUrl != nullptr) {
+            curl_easy_setopt(curl_, CURLOPT_PROXY, proxyUrl);
+        }
+        last_error_ = curl_easy_perform(curl_);
+        connected_ = last_error_ == CURLE_OK && !cancelled_.load(std::memory_order_relaxed);
+        return connected_;
+    }
+
+    bool SendText(const char *data, size_t dataLen) {
+        if (!connected_ || data == nullptr) return false;
+        size_t offset = 0;
+        unsigned int flags = CURLWS_TEXT;
+        while (offset < dataLen && !cancelled_.load(std::memory_order_relaxed)) {
+            size_t sent = 0;
+            last_error_ = curl_ws_send(curl_, data + offset, dataLen - offset, &sent,
+                                       static_cast<curl_off_t>(dataLen), flags);
+            if (last_error_ == CURLE_AGAIN) {
+                if (!Wait(POLLOUT, 1000)) return false;
+                continue;
+            }
+            if (last_error_ != CURLE_OK || sent == 0) return false;
+            offset += sent;
+            flags = CURLWS_OFFSET;
+        }
+        return offset == dataLen;
+    }
+
+    int Receive(char *buffer, size_t bufferSize, int64_t timeoutMs,
+                CurlWebSocketReadResultV1 *result) {
+        if (!connected_ || buffer == nullptr || bufferSize == 0 || result == nullptr) return -1;
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(std::max<int64_t>(0, timeoutMs));
+        while (!cancelled_.load(std::memory_order_relaxed)) {
+            size_t received = 0;
+            const curl_ws_frame *meta = nullptr;
+            last_error_ = curl_ws_recv(curl_, buffer, bufferSize, &received, &meta);
+            if (last_error_ == CURLE_OK) {
+                result->flags = meta == nullptr ? 0 : meta->flags;
+                result->dataLen = static_cast<int>(received);
+                result->bytesLeft = meta == nullptr ? 0 : static_cast<int64_t>(meta->bytesleft);
+                if (meta != nullptr && (meta->flags & CURLWS_CLOSE) != 0) connected_ = false;
+                return 1;
+            }
+            if (last_error_ != CURLE_AGAIN) {
+                connected_ = false;
+                return -1;
+            }
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return 0;
+            const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            if (!Wait(POLLIN, static_cast<int>(std::min<int64_t>(remaining, 1000)))) {
+                if (std::chrono::steady_clock::now() >= deadline) return 0;
+            }
+        }
+        return -1;
+    }
+
+    bool Close() {
+        if (!connected_) return true;
+        size_t sent = 0;
+        last_error_ = curl_ws_send(curl_, nullptr, 0, &sent, 0, CURLWS_CLOSE);
+        connected_ = false;
+        return last_error_ == CURLE_OK;
+    }
+
+    void Cancel() {
+        cancelled_.store(true, std::memory_order_relaxed);
+    }
+
+    int LastError() const { return static_cast<int>(last_error_); }
+
+ private:
+    static int Progress(void *client, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+        auto *self = static_cast<CurlWebSocketClient *>(client);
+        return self != nullptr && self->cancelled_.load(std::memory_order_relaxed) ? 1 : 0;
+    }
+
+    bool Wait(short events, int timeoutMs) {
+        curl_socket_t socket = CURL_SOCKET_BAD;
+        if (curl_easy_getinfo(curl_, CURLINFO_ACTIVESOCKET, &socket) != CURLE_OK ||
+            socket == CURL_SOCKET_BAD) {
+            return false;
+        }
+        pollfd descriptor{};
+        descriptor.fd = socket;
+        descriptor.events = events;
+        const int rc = poll(&descriptor, 1, std::max(0, timeoutMs));
+        return rc > 0 && (descriptor.revents & (events | POLLERR | POLLHUP)) != 0;
+    }
+
+    void Cleanup() {
+        if (curl_ != nullptr) {
+            curl_easy_cleanup(curl_);
+            curl_ = nullptr;
+        }
+        if (header_list_ != nullptr) {
+            curl_slist_free_all(header_list_);
+            header_list_ = nullptr;
+        }
+    }
+
+    std::string log_tag_;
+    CURL *curl_ = nullptr;
+    curl_slist *header_list_ = nullptr;
+    std::atomic<bool> cancelled_{false};
+    bool connected_ = false;
+    CURLcode last_error_ = CURLE_OK;
+};
+
+class CurlSocketIoClient {
+ public:
+    CurlSocketIoClient(const CurlSocketIoConfigV1 &config,
+                       const CurlSocketIoCallbackV1 &callback)
+        : server_url_(config.serverUrl == nullptr ? "" : config.serverUrl),
+          auth_json_(config.authJson == nullptr ? "{}" : config.authJson),
+          ca_info_path_(config.caInfoPath == nullptr ? "" : config.caInfoPath),
+          proxy_url_(config.proxyUrl == nullptr ? "" : config.proxyUrl),
+          connect_timeout_ms_(PositiveOr(config.connectTimeoutMs, 10000)),
+          receive_poll_ms_(PositiveOr(config.receivePollMs, 100)),
+          reconnect_initial_delay_ms_(PositiveOr(config.reconnectInitialDelayMs, 500)),
+          reconnect_max_delay_ms_(PositiveOr(config.reconnectMaxDelayMs, 10000)),
+          callback_(callback) {
+        if (config.headers != nullptr && config.headers->stringPairs != nullptr) {
+            for (int index = 0; index < config.headers->size; ++index) {
+                const StringPair &pair = config.headers->stringPairs[index];
+                if (pair.first != nullptr && pair.second != nullptr) {
+                    headers_.emplace_back(pair.first, pair.second);
+                }
+            }
+        }
+    }
+
+    ~CurlSocketIoClient() { Close(); }
+
+    bool Start() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (started_ || server_url_.empty()) return false;
+        started_ = true;
+        stop_.store(false, std::memory_order_relaxed);
+        owner_ = std::thread([this]() { Run(); });
+        return true;
+    }
+
+    bool Emit(const char *eventName, const char *payloadJson) {
+        if (eventName == nullptr || eventName[0] == '\0' || payloadJson == nullptr) return false;
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (!started_ || stop_.load(std::memory_order_relaxed)) return false;
+        commands_.emplace_back(eventName, payloadJson);
+        wake_.notify_all();
+        return true;
+    }
+
+    void Close() {
+        bool calledFromOwner = false;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            if (!started_) {
+                callback_ = {};
+                return;
+            }
+            calledFromOwner = owner_.joinable() && owner_.get_id() == std::this_thread::get_id();
+            stop_.store(true, std::memory_order_relaxed);
+            if (calledFromOwner) callback_ = {};
+            if (wire_ != nullptr) wire_->Cancel();
+            wake_.notify_all();
+        }
+        if (owner_.joinable() && !calledFromOwner) owner_.join();
+        std::lock_guard<std::mutex> guard(mutex_);
+        callback_ = {};
+        started_ = false;
+    }
+
+    void Destroy() {
+        bool deferToOwnerExit = false;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            deferToOwnerExit = owner_.joinable() && owner_.get_id() == std::this_thread::get_id();
+        }
+        if (!deferToOwnerExit) {
+            delete this;
+            return;
+        }
+        Close();
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            delete_on_exit_ = true;
+            owner_.detach();
+        }
+    }
+
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+    static std::string TestWebSocketUrl(const std::string &value) { return WebSocketUrl(value); }
+    static bool TestDecodeEvent(const std::string &frame, std::string *eventName,
+                                std::string *payloadJson) {
+        return DecodeEvent(frame, eventName, payloadJson);
+    }
+    static std::string TestEventFrame(const std::string &eventName,
+                                      const std::string &payloadJson) {
+        const std::string escaped = EscapeJsonString(eventName);
+        return escaped.empty() ? "" : "42[\"" + escaped + "\"," + payloadJson + "]";
+    }
+#endif
+
+ private:
+    static int64_t PositiveOr(int64_t value, int64_t fallback) {
+        return value > 0 ? value : fallback;
+    }
+
+    static std::string WebSocketUrl(std::string base) {
+        while (!base.empty() && base.back() == '/') base.pop_back();
+        if (base.rfind("https://", 0) == 0) base.replace(0, 8, "wss://");
+        else if (base.rfind("http://", 0) == 0) base.replace(0, 7, "ws://");
+        const size_t query = base.find('?');
+        if (base.find("/socket.io/") == std::string::npos) {
+            if (query == std::string::npos) {
+                base += "/socket.io/";
+            } else {
+                base.insert(query, "/socket.io/");
+            }
+        }
+        base += base.find('?') == std::string::npos ? "?" : "&";
+        return base + "EIO=4&transport=websocket";
+    }
+
+    static std::string EscapeJsonString(const std::string &value) {
+        std::string escaped;
+        escaped.reserve(value.size() + 2);
+        for (unsigned char character : value) {
+            switch (character) {
+                case '\\': escaped += "\\\\"; break;
+                case '"': escaped += "\\\""; break;
+                case '\n': escaped += "\\n"; break;
+                case '\r': escaped += "\\r"; break;
+                case '\t': escaped += "\\t"; break;
+                default:
+                    if (character < 0x20) return "";
+                    escaped.push_back(static_cast<char>(character));
+            }
+        }
+        return escaped;
+    }
+
+    static bool DecodeEvent(const std::string &frame, std::string *eventName,
+                            std::string *payloadJson) {
+        if (frame.rfind("42[\"", 0) != 0 || eventName == nullptr || payloadJson == nullptr) return false;
+        std::string name;
+        bool escaped = false;
+        size_t index = 4;
+        for (; index < frame.size(); ++index) {
+            const char character = frame[index];
+            if (escaped) {
+                switch (character) {
+                    case 'n': name.push_back('\n'); break;
+                    case 'r': name.push_back('\r'); break;
+                    case 't': name.push_back('\t'); break;
+                    case '\\': name.push_back('\\'); break;
+                    case '"': name.push_back('"'); break;
+                    default: return false;
+                }
+                escaped = false;
+            } else if (character == '\\') {
+                escaped = true;
+            } else if (character == '"') {
+                break;
+            } else {
+                name.push_back(character);
+            }
+        }
+        if (name.empty() || index + 2 >= frame.size() || frame[index + 1] != ',') return false;
+        const size_t payloadStart = index + 2;
+        if (frame.back() != ']') return false;
+        *eventName = std::move(name);
+        *payloadJson = frame.substr(payloadStart, frame.size() - payloadStart - 1);
+        return !payloadJson->empty();
+    }
+
+    void State(int state, int code = 0, const std::string &detail = "") {
+        CurlSocketIoCallbackV1 callback;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            callback = callback_;
+        }
+        if (callback.onState != nullptr) {
+            callback.onState(callback.callbackRef, state, code, detail.c_str());
+        }
+    }
+
+    void Event(const std::string &eventName, const std::string &payload) {
+        CurlSocketIoCallbackV1 callback;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            callback = callback_;
+        }
+        if (callback.onEvent != nullptr) {
+            callback.onEvent(callback.callbackRef, eventName.c_str(), payload.c_str());
+        }
+    }
+
+    StringDic HeaderDictionary(std::vector<StringPair> *pairs) {
+        pairs->clear();
+        pairs->reserve(headers_.size());
+        for (const auto &header : headers_) {
+            pairs->push_back({header.first.c_str(), header.second.c_str()});
+        }
+        return {pairs->data(), static_cast<int>(pairs->size())};
+    }
+
+    bool DrainCommands(CurlWebSocketClient *wire) {
+        std::deque<std::pair<std::string, std::string>> pending;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            pending.swap(commands_);
+        }
+        for (const auto &command : pending) {
+            const std::string event = EscapeJsonString(command.first);
+            if (event.empty()) return false;
+            const std::string frame = "42[\"" + event + "\"," + command.second + "]";
+            if (!wire->SendText(frame.data(), frame.size())) return false;
+        }
+        return true;
+    }
+
+    bool RunConnection() {
+        auto wire = std::make_unique<CurlWebSocketClient>("NetworkKMM-SocketIO");
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            wire_ = wire.get();
+        }
+        std::vector<StringPair> nativeHeaders;
+        StringDic dictionary = HeaderDictionary(&nativeHeaders);
+        State(CURL_SOCKET_IO_CONNECTING);
+        if (!wire->Connect(WebSocketUrl(server_url_).c_str(), &dictionary,
+                           ca_info_path_.empty() ? nullptr : ca_info_path_.c_str(),
+                           proxy_url_.c_str(), connect_timeout_ms_)) {
+            State(CURL_SOCKET_IO_ERROR, wire->LastError(), "websocket_connect");
+            ClearWire();
+            return false;
+        }
+        bool socketConnected = false;
+        std::string fragments;
+        while (!stop_.load(std::memory_order_relaxed)) {
+            if (socketConnected && !DrainCommands(wire.get())) break;
+            char buffer[16 * 1024];
+            CurlWebSocketReadResultV1 result{};
+            result.abiVersion = CURL_WEBSOCKET_ABI_VERSION;
+            result.structSize = sizeof(result);
+            const int received = wire->Receive(buffer, sizeof(buffer), receive_poll_ms_, &result);
+            if (received == 0) continue;
+            if (received < 0) break;
+            if ((result.flags & CURLWS_BINARY) != 0) {
+                State(CURL_SOCKET_IO_ERROR, 0, "binary_frame_unsupported");
+                break;
+            }
+            fragments.append(buffer, static_cast<size_t>(result.dataLen));
+            if (result.bytesLeft > 0) continue;
+            std::string frame;
+            frame.swap(fragments);
+            if (frame.rfind("0", 0) == 0) {
+                State(CURL_SOCKET_IO_ENGINE_OPEN);
+                const std::string connect = "40" + auth_json_;
+                if (!wire->SendText(connect.data(), connect.size())) break;
+            } else if (frame.rfind("2", 0) == 0) {
+                const std::string pong = "3" + frame.substr(1);
+                if (!wire->SendText(pong.data(), pong.size())) break;
+            } else if (frame.rfind("40", 0) == 0) {
+                socketConnected = true;
+                State(CURL_SOCKET_IO_CONNECTED);
+            } else if (frame.rfind("41", 0) == 0 || frame.rfind("1", 0) == 0) {
+                break;
+            } else if (frame.rfind("44", 0) == 0) {
+                State(CURL_SOCKET_IO_ERROR, 0, frame.substr(2));
+                break;
+            } else {
+                std::string eventName;
+                std::string payload;
+                if (DecodeEvent(frame, &eventName, &payload)) Event(eventName, payload);
+            }
+        }
+        wire->Close();
+        ClearWire();
+        if (socketConnected) State(CURL_SOCKET_IO_DISCONNECTED, wire->LastError(), "transport_closed");
+        return socketConnected;
+    }
+
+    void ClearWire() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        wire_ = nullptr;
+    }
+
+    void Run() {
+        int64_t delayMs = reconnect_initial_delay_ms_;
+        bool first = true;
+        while (!stop_.load(std::memory_order_relaxed)) {
+            if (!first) {
+                State(CURL_SOCKET_IO_RECONNECTING, 0, std::to_string(delayMs));
+                std::unique_lock<std::mutex> lock(mutex_);
+                wake_.wait_for(lock, std::chrono::milliseconds(delayMs), [this]() {
+                    return stop_.load(std::memory_order_relaxed);
+                });
+                if (stop_.load(std::memory_order_relaxed)) break;
+            }
+            first = false;
+            const bool wasConnected = RunConnection();
+            delayMs = wasConnected ? reconnect_initial_delay_ms_ :
+                std::min(reconnect_max_delay_ms_, delayMs * 2);
+        }
+        State(CURL_SOCKET_IO_DISCONNECTED, 0, "closed");
+        bool deleteOnExit = false;
+        {
+            std::lock_guard<std::mutex> guard(mutex_);
+            deleteOnExit = delete_on_exit_;
+        }
+        if (deleteOnExit) delete this;
+    }
+
+    std::string server_url_;
+    std::string auth_json_;
+    std::string ca_info_path_;
+    std::string proxy_url_;
+    int64_t connect_timeout_ms_;
+    int64_t receive_poll_ms_;
+    int64_t reconnect_initial_delay_ms_;
+    int64_t reconnect_max_delay_ms_;
+    CurlSocketIoCallbackV1 callback_{};
+    std::vector<std::pair<std::string, std::string>> headers_;
+    std::mutex mutex_;
+    std::condition_variable wake_;
+    std::deque<std::pair<std::string, std::string>> commands_;
+    std::atomic<bool> stop_{false};
+    bool started_ = false;
+    bool delete_on_exit_ = false;
+    std::thread owner_;
+    CurlWebSocketClient *wire_ = nullptr;
+};
 
 // Share only thread-safe cache classes across the per-request easy handles.
 // libcurl explicitly does not support sharing one connection cache between
@@ -1729,6 +2204,92 @@ int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
     return reinterpret_cast<CurlClient *>(handle)->GetMultiInfo(info, infoSize, abiVersion) ? 1 : 0;
 }
 
+CurlWebSocketHandle CreateCurlWebSocket(const char *logTag) {
+    auto *client = new CurlWebSocketClient(logTag == nullptr ? gDefaultTag : logTag);
+    return client;
+}
+
+void DeleteCurlWebSocket(CurlWebSocketHandle handle) {
+    delete reinterpret_cast<CurlWebSocketClient *>(handle);
+}
+
+void CancelCurlWebSocket(CurlWebSocketHandle handle) {
+    if (handle != nullptr) reinterpret_cast<CurlWebSocketClient *>(handle)->Cancel();
+}
+
+int ConnectCurlWebSocketV1(CurlWebSocketHandle handle, const char *url,
+                           const StringDic *headers, const char *caInfoPath,
+                           const char *proxyUrl, int64_t connectTimeoutMs,
+                           int abiVersion) {
+    if (handle == nullptr || abiVersion != CURL_WEBSOCKET_ABI_VERSION) return 0;
+    return reinterpret_cast<CurlWebSocketClient *>(handle)->Connect(
+        url, headers, caInfoPath, proxyUrl, connectTimeoutMs) ? 1 : 0;
+}
+
+int SendCurlWebSocketTextV1(CurlWebSocketHandle handle, const char *data,
+                            size_t dataLen, int abiVersion) {
+    if (handle == nullptr || abiVersion != CURL_WEBSOCKET_ABI_VERSION) return 0;
+    return reinterpret_cast<CurlWebSocketClient *>(handle)->SendText(data, dataLen) ? 1 : 0;
+}
+
+int ReceiveCurlWebSocketV1(CurlWebSocketHandle handle, char *buffer,
+                           size_t bufferSize, int64_t timeoutMs,
+                           CurlWebSocketReadResultV1 *result,
+                           size_t resultSize, int abiVersion) {
+    if (handle == nullptr || result == nullptr ||
+        abiVersion != CURL_WEBSOCKET_ABI_VERSION ||
+        resultSize != sizeof(CurlWebSocketReadResultV1)) return -1;
+    result->abiVersion = CURL_WEBSOCKET_ABI_VERSION;
+    result->structSize = sizeof(CurlWebSocketReadResultV1);
+    return reinterpret_cast<CurlWebSocketClient *>(handle)->Receive(
+        buffer, bufferSize, timeoutMs, result);
+}
+
+int CloseCurlWebSocketV1(CurlWebSocketHandle handle, int abiVersion) {
+    if (handle == nullptr || abiVersion != CURL_WEBSOCKET_ABI_VERSION) return 0;
+    return reinterpret_cast<CurlWebSocketClient *>(handle)->Close() ? 1 : 0;
+}
+
+int CurlWebSocketLastError(CurlWebSocketHandle handle) {
+    return handle == nullptr ? static_cast<int>(CURLE_BAD_FUNCTION_ARGUMENT) :
+        reinterpret_cast<CurlWebSocketClient *>(handle)->LastError();
+}
+
+CurlSocketIoHandle CreateCurlSocketIoClientV1(
+    const CurlSocketIoConfigV1 *config, size_t configSize, int abiVersion,
+    const CurlSocketIoCallbackV1 *callback) {
+    if (config == nullptr || callback == nullptr ||
+        abiVersion != CURL_SOCKET_IO_ABI_VERSION ||
+        configSize != sizeof(CurlSocketIoConfigV1) ||
+        config->abiVersion != CURL_SOCKET_IO_ABI_VERSION ||
+        config->structSize != sizeof(CurlSocketIoConfigV1) ||
+        config->serverUrl == nullptr) return nullptr;
+    return new CurlSocketIoClient(*config, *callback);
+}
+
+int StartCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion) {
+    if (handle == nullptr || abiVersion != CURL_SOCKET_IO_ABI_VERSION) return 0;
+    return reinterpret_cast<CurlSocketIoClient *>(handle)->Start() ? 1 : 0;
+}
+
+int EmitCurlSocketIoEventV1(CurlSocketIoHandle handle, const char *eventName,
+                            const char *payloadJson, int abiVersion) {
+    if (handle == nullptr || abiVersion != CURL_SOCKET_IO_ABI_VERSION) return 0;
+    return reinterpret_cast<CurlSocketIoClient *>(handle)->Emit(eventName, payloadJson) ? 1 : 0;
+}
+
+void CloseCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion) {
+    if (handle != nullptr && abiVersion == CURL_SOCKET_IO_ABI_VERSION) {
+        reinterpret_cast<CurlSocketIoClient *>(handle)->Close();
+    }
+}
+
+void DeleteCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion) {
+    if (handle != nullptr && abiVersion == CURL_SOCKET_IO_ABI_VERSION) {
+        reinterpret_cast<CurlSocketIoClient *>(handle)->Destroy();
+    }
+}
+
 #if defined(NETWORKKMM_WRAPPER_TESTING)
 void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode) {
     if (engine != nullptr) {
@@ -1740,6 +2301,37 @@ void SetCurlClientTestConfigureFailure(CurClientHandle handle) {
     if (handle != nullptr) {
         reinterpret_cast<CurlClient *>(handle)->SetTestConfigureFailure();
     }
+}
+
+static int CopySocketIoTestString(const std::string &value, char *output, size_t outputSize) {
+    if (output == nullptr || outputSize <= value.size()) return 0;
+    std::memcpy(output, value.data(), value.size());
+    output[value.size()] = '\0';
+    return 1;
+}
+
+int SocketIoTestWebSocketUrl(const char *serverUrl, char *output, size_t outputSize) {
+    if (serverUrl == nullptr) return 0;
+    return CopySocketIoTestString(
+        CurlSocketIoClient::TestWebSocketUrl(serverUrl), output, outputSize);
+}
+
+int SocketIoTestEventFrame(const char *eventName, const char *payloadJson,
+                           char *output, size_t outputSize) {
+    if (eventName == nullptr || payloadJson == nullptr) return 0;
+    return CopySocketIoTestString(
+        CurlSocketIoClient::TestEventFrame(eventName, payloadJson), output, outputSize);
+}
+
+int SocketIoTestDecodeEvent(const char *frame, char *eventName,
+                            size_t eventNameSize, char *payloadJson,
+                            size_t payloadJsonSize) {
+    if (frame == nullptr) return 0;
+    std::string decodedName;
+    std::string decodedPayload;
+    if (!CurlSocketIoClient::TestDecodeEvent(frame, &decodedName, &decodedPayload)) return 0;
+    return CopySocketIoTestString(decodedName, eventName, eventNameSize) &&
+        CopySocketIoTestString(decodedPayload, payloadJson, payloadJsonSize);
 }
 #endif
 
