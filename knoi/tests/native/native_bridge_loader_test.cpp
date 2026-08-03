@@ -67,7 +67,11 @@ int main(int argc, char** argv)
     auto resetCalls = Symbol<void (*)()>(fixtureHandle, "knoi_test_reset_calls");
     auto envCalls = Symbol<int (*)()>(fixtureHandle, "knoi_test_env_calls");
     auto bridgeCalls = Symbol<int (*)()>(fixtureHandle, "knoi_test_bridge_calls");
-    Check(resetCalls != nullptr && envCalls != nullptr && bridgeCalls != nullptr, "fixture probes missing");
+    auto lastDebug = Symbol<int (*)()>(fixtureHandle, "knoi_test_last_debug");
+    Check(
+        resetCalls != nullptr && envCalls != nullptr && bridgeCalls != nullptr &&
+            lastDebug != nullptr,
+        "fixture probes missing");
     resetCalls();
 
     {
@@ -79,11 +83,12 @@ int main(int argc, char** argv)
         Check(loader.Setup(validPath, true).ok(), "valid setup failed");
         Check(loader.Setup(validPath, true).ok(), "same setup must be idempotent");
         Check(
-            loader.Setup(validPath, false).status == knoi::BridgeStatus::kConflictingSetup,
-            "debug-mode conflict must fail");
+            loader.Setup(validPath, false).ok(),
+            "fallback setup with a different debug mode must be a no-op");
         Check(
-            loader.Setup(missingEnvPath, true).status == knoi::BridgeStatus::kConflictingSetup,
-            "library conflict must fail");
+            loader.Setup(missingEnvPath, false).ok(),
+            "fallback setup with a different library must be a no-op");
+        Check(loader.Setup("", false).ok(), "all setup calls after the first success must be no-ops");
         Check(loader.ConfiguredLibrary() == validPath, "configured library identity changed");
 
         constexpr int kThreadCount = 16;
@@ -102,25 +107,33 @@ int main(int argc, char** argv)
         }
         Check(envCalls() == kThreadCount, "initEnv must run once per env initialization");
         Check(bridgeCalls() == 1, "initBridge must run exactly once");
+        Check(lastDebug() == 1, "fallback setup must not replace the first debug mode");
     }
 
     resetCalls();
     {
         knoi::NativeBridgeLoader loader;
+        Check(loader.Setup(validPath, true).ok(), "first setup for mixed concurrency failed");
         constexpr int kThreadCount = 12;
         std::vector<std::thread> threads;
         std::vector<knoi::BridgeStatus> statuses(kThreadCount, knoi::BridgeStatus::kInvalidArgument);
         for (int index = 0; index < kThreadCount; ++index) {
-            threads.emplace_back([&loader, &statuses, &validPath, index]() {
-                statuses[index] = loader.Setup(validPath, false).status;
+            threads.emplace_back([&loader, &statuses, &validPath, &missingEnvPath, index]() {
+                const std::string& fallbackPath = index % 2 == 0 ? validPath : missingEnvPath;
+                statuses[index] = loader.Setup(fallbackPath, false).status;
             });
         }
         for (auto& thread : threads) {
             thread.join();
         }
         for (auto status : statuses) {
-            Check(status == knoi::BridgeStatus::kOk, "concurrent identical setup must be idempotent");
+            Check(status == knoi::BridgeStatus::kOk, "concurrent fallback setup must be a no-op");
         }
+        Check(loader.ConfiguredLibrary() == validPath, "concurrent fallback replaced the first library");
+        Check(
+            loader.Initialize(reinterpret_cast<void*>(1), reinterpret_cast<void*>(2)).ok(),
+            "initialize after concurrent fallback failed");
+        Check(lastDebug() == 1, "concurrent fallback replaced the first debug mode");
     }
 
     dlclose(fixtureHandle);

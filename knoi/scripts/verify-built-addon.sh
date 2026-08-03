@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 library=""
 mode=""
 while [[ $# -gt 0 ]]; do
@@ -39,6 +40,12 @@ if [[ -z "${STRINGS}" ]]; then
   echo "strings or llvm-strings is required" >&2
   exit 1
 fi
+
+python3 "${SCRIPT_DIR}/verify-built-addon-elf.py" \
+  --library "${library}" \
+  --mode "${mode}" \
+  --readelf "${READELF}" \
+  --self-test
 
 dynamic="$(${READELF} -d "${library}")"
 printf '%s\n' "${dynamic}" | grep -F '(SONAME)' | grep -F '[libknoi.so]' >/dev/null

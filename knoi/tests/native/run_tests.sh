@@ -87,6 +87,21 @@ if [[ "${KNOI_RUN_MUTATIONS:-1}" == "1" ]]; then
     echo "UTF-8 truncation mutation survived" >&2
     exit 1
   fi
+
+  cp "${CPP_ROOT}/native_bridge_loader.cpp" "${mutation_root}/native_bridge_loader.cpp"
+  cp "${CPP_ROOT}/function_waiter_registry.cpp" "${mutation_root}/function_waiter_registry.cpp"
+  perl -0pi -e \
+    's/if \(libraryHandle_ != nullptr\) \{\n        return \{\};\n    \}/if (libraryHandle_ != nullptr \&\& libraryName_ == libraryName \&\& debug_ == debug) {\n        return {};\n    }/' \
+    "${mutation_root}/native_bridge_loader.cpp"
+  compile_tests "${mutation_root}" "_fallback_setup_mutant"
+  set +e
+  run_tests "_fallback_setup_mutant" >/dev/null 2>&1
+  mutation_status=$?
+  set -e
+  if [[ ${mutation_status} -eq 0 ]]; then
+    echo "fallback-setup mutation survived" >&2
+    exit 1
+  fi
   echo "native contract mutations killed"
 fi
 

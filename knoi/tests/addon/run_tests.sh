@@ -6,7 +6,13 @@ KNOI_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 CPP_ROOT="${KNOI_ROOT}/ohosApp/knoi/src/main/cpp"
 AKI_ROOT="${KNOI_ROOT}/third_party/aki"
 BUILD_ROOT="${KNOI_ADDON_HOST_BUILD_ROOT:-${KNOI_ROOT}/build/addon-host-probe}"
-CXX="${CXX:-c++}"
+if [[ -z "${CXX:-}" ]]; then
+  if command -v clang++ >/dev/null 2>&1; then
+    CXX="$(command -v clang++)"
+  else
+    CXX="c++"
+  fi
+fi
 NODE="${NODE:-$(command -v node || true)}"
 
 if [[ -z "${NODE}" ]]; then
@@ -39,6 +45,7 @@ common_flags=(
   -DAKI_BUILDING_SHARED=0
   -DKNOI_AKI_VERSION=\"1.3.1\"
   -DKNOI_WAITER_TIMEOUT_MS=250
+  -include "${SCRIPT_DIR}/host_include/aki_host_compat.h"
   -I"${node_include}"
   -I"${SCRIPT_DIR}/host_include"
   -isystem "${AKI_ROOT}/include"
@@ -79,19 +86,53 @@ aki_sources=(
   "${AKI_ROOT}/src/napi/napi_init.cpp"
   "${AKI_ROOT}/src/overloader/napi/napi_overloader.cpp"
 )
-knoi_sources=(
+knoi_common_sources=(
   "${CPP_ROOT}/knoi_aki.cpp"
-  "${CPP_ROOT}/async_invoker_aki.cpp"
   "${CPP_ROOT}/native_bridge_loader.cpp"
   "${CPP_ROOT}/function_waiter_registry.cpp"
 )
 
-"${CXX}" "${common_flags[@]}" "${shared_flags[@]}" \
-  "${aki_sources[@]}" "${knoi_sources[@]}" \
-  -o "${BUILD_ROOT}/knoi.node"
+build_addon() {
+  local async_source="$1"
+  local output="$2"
+  "${CXX}" "${common_flags[@]}" "${shared_flags[@]}" \
+    "${aki_sources[@]}" "${knoi_common_sources[@]}" "${async_source}" \
+    -o "${output}"
+}
 
-"${NODE}" "${SCRIPT_DIR}/addon_contract_test.js" \
-  "${BUILD_ROOT}/knoi.node" \
-  "${BUILD_ROOT}/libbridge_valid.so" \
-  "${BUILD_ROOT}/libbridge_missing_env.so" \
-  "${BUILD_ROOT}/libbridge_missing_bridge.so"
+run_addon_contract() {
+  local addon="$1"
+  "${NODE}" "${SCRIPT_DIR}/addon_contract_test.js" \
+    "${addon}" \
+    "${BUILD_ROOT}/libbridge_valid.so" \
+    "${BUILD_ROOT}/libbridge_missing_env.so" \
+    "${BUILD_ROOT}/libbridge_missing_bridge.so"
+}
+
+build_addon "${CPP_ROOT}/async_invoker_aki.cpp" "${BUILD_ROOT}/knoi.node"
+run_addon_contract "${BUILD_ROOT}/knoi.node"
+
+if [[ "${KNOI_RUN_MUTATIONS:-1}" == "1" ]]; then
+  thread_local_source="${BUILD_ROOT}/async_invoker_thread_local.cpp"
+  cp "${CPP_ROOT}/async_invoker_aki.cpp" "${thread_local_source}"
+  perl -0pi -e \
+    's/knoi::FunctionWaiterRegistry gWaiters;/thread_local knoi::FunctionWaiterRegistry gWaiters;/' \
+    "${thread_local_source}"
+  build_addon "${thread_local_source}" "${BUILD_ROOT}/knoi-thread-local.node"
+
+  set +e
+  run_addon_contract "${BUILD_ROOT}/knoi-thread-local.node" \
+    >"${BUILD_ROOT}/thread-local-mutation.log" 2>&1
+  mutation_status=$?
+  set -e
+  if [[ ${mutation_status} -eq 0 ]]; then
+    echo "cross-environment waiter mutation survived" >&2
+    exit 1
+  fi
+  if ! grep -Eq 'KNOI_WAITER_(NOT_FOUND|TIMED_OUT)' \
+    "${BUILD_ROOT}/thread-local-mutation.log"; then
+    echo "cross-environment waiter mutation failed for an unexpected reason" >&2
+    exit 1
+  fi
+  echo "addon cross-environment mutation killed"
+fi

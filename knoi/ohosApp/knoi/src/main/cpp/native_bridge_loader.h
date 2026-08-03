@@ -12,7 +12,6 @@ enum class BridgeStatus {
     kLibraryOpenFailed,
     kMissingInitEnv,
     kMissingInitBridge,
-    kConflictingSetup,
     kNotConfigured,
 };
 

@@ -27,18 +27,17 @@ NativeBridgeLoader::~NativeBridgeLoader()
 
 BridgeResult NativeBridgeLoader::Setup(const std::string& libraryName, bool debug)
 {
-    if (libraryName.empty()) {
-        return Failure(BridgeStatus::kInvalidArgument, "KNOI library name must not be empty");
+    std::lock_guard<std::mutex> lock(mutex_);
+    // Preserve KNOI's first-successful-owner contract. Environment creation
+    // unconditionally calls setup("libkn.so", false) as a fallback, even when
+    // the application already selected a custom library/debug mode. Once a
+    // setup succeeds, every later setup is therefore an intentional no-op.
+    if (libraryHandle_ != nullptr) {
+        return {};
     }
 
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (libraryHandle_ != nullptr) {
-        if (libraryName_ == libraryName && debug_ == debug) {
-            return {};
-        }
-        return Failure(
-            BridgeStatus::kConflictingSetup,
-            "KNOI is already configured for a different library or debug mode");
+    if (libraryName.empty()) {
+        return Failure(BridgeStatus::kInvalidArgument, "KNOI library name must not be empty");
     }
 
     dlerror();
@@ -124,8 +123,6 @@ const char* BridgeStatusCode(BridgeStatus status)
             return "KNOI_MISSING_INIT_ENV";
         case BridgeStatus::kMissingInitBridge:
             return "KNOI_MISSING_INIT_BRIDGE";
-        case BridgeStatus::kConflictingSetup:
-            return "KNOI_CONFLICTING_SETUP";
         case BridgeStatus::kNotConfigured:
             return "KNOI_NOT_CONFIGURED";
     }
