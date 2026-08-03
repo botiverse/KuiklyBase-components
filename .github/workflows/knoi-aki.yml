@@ -73,6 +73,10 @@ jobs:
         with:
           ref: ${{ env.KNOI_EXPECTED_HEAD }}
 
+      - name: Trust the container checkout
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
       - name: Verify exact source identity
         shell: bash
         run: |
@@ -84,10 +88,6 @@ jobs:
           test "$actual_tree" = "$expected_tree"
           test -z "$(git status --porcelain)"
           echo "KNOI_EXACT_IDENTITY_PASS head=$actual_head tree=$actual_tree"
-
-      - name: Trust the container checkout
-        shell: bash
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
       - name: Resolve the fixed HarmonyOS toolchain
         shell: bash
