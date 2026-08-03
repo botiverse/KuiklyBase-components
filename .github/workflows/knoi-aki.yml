@@ -1,0 +1,131 @@
+name: KNOI Aki migration gates
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - "knoi/**"
+      - ".github/workflows/knoi-aki.yml"
+  pull_request:
+    paths:
+      - "knoi/**"
+      - ".github/workflows/knoi-aki.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: knoi-aki-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  host-contract:
+    name: Provenance and host runtime contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Verify pinned Aki provenance
+        run: python3 knoi/scripts/verify-aki-provenance.py
+
+      - name: Verify published KNOI 0.0.4 byte and ELF baseline
+        run: python3 knoi/scripts/verify-registry-baseline.py --require-elf
+
+      - name: Verify the frozen JS and bootstrap surface
+        run: python3 knoi/scripts/verify-knoi-surface.py --self-test
+
+      - name: Run loader and waiter behavior plus mutation gates
+        run: bash knoi/tests/native/run_tests.sh
+
+      - name: Load the Aki adapter in a Node-API runtime
+        run: bash knoi/tests/addon/run_tests.sh
+
+  ohos-arm64:
+    name: OHOS arm64 addon, Kotlin consumer, and HAR
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Trust the container checkout
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Resolve the fixed HarmonyOS toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -f "$ohos_sdk_home/native/build/cmake/ohos.toolchain.cmake"
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          {
+            echo "OHOS_SDK_HOME=$ohos_sdk_home"
+            echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home"
+            echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)"
+          } >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure CMake is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v cmake >/dev/null 2>&1; then
+            cmake --version | head -1
+            exit 0
+          fi
+          sdk_cmake_bin="$OHOS_SDK_HOME/native/build-tools/cmake/bin"
+          test -x "$sdk_cmake_bin/cmake"
+          echo "$sdk_cmake_bin" >> "$GITHUB_PATH"
+
+      - name: Cross-compile Aki and legacy rollback addons
+        shell: bash
+        run: bash knoi/scripts/build-ohos-addon.sh
+
+      - name: Compile KNOI and link the real Kotlin/Native consumer
+        shell: bash
+        working-directory: knoi
+        run: |
+          set -euo pipefail
+          ./gradlew \
+            :knoi:compileKotlinOhosArm64 \
+            :example:empty:linkDebugSharedOhosArm64 \
+            --no-daemon --console=plain --stacktrace
+
+      - name: Verify consumer bootstrap definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer="knoi/example/empty/build/bin/ohosArm64/debugShared/libkn.so"
+          test -s "$consumer"
+          symbols="$(readelf --dyn-syms --wide "$consumer")"
+          for symbol in com_tencent_tmm_knoi_initEnv com_tencent_tmm_knoi_initBridge; do
+            printf '%s\n' "$symbols" |
+              awk -v expected="$symbol" \
+                '$5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" && $8 == expected { found = 1 } END { exit !found }'
+          done
+          echo "KNOI_CONSUMER_BOOTSTRAP_PASS symbols=2"
+
+      - name: Build and verify the distributable HAR
+        shell: bash
+        run: bash knoi/scripts/build-ohos-har.sh
+
+      - name: Upload exact build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: knoi-aki-ohos-arm64
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            knoi/build/ohos-addon/aki/Debug/libknoi.so
+            knoi/build/ohos-addon/aki/Release/libknoi.so
+            knoi/build/ohos-addon/legacy/Debug/libknoi.so
+            knoi/build/ohos-addon/legacy/Release/libknoi.so
+            knoi/example/empty/build/bin/ohosArm64/debugShared/libkn.so
+            knoi/ohosApp/knoi/build/default/outputs/default/knoi.har

@@ -1,0 +1,135 @@
+#include "native_bridge_loader.h"
+
+#include <dlfcn.h>
+#include <utility>
+
+namespace knoi {
+namespace {
+
+constexpr const char* kInitEnvSymbol = "com_tencent_tmm_knoi_initEnv";
+constexpr const char* kInitBridgeSymbol = "com_tencent_tmm_knoi_initBridge";
+
+BridgeResult Failure(BridgeStatus status, std::string detail)
+{
+    return BridgeResult{status, std::move(detail)};
+}
+
+} // namespace
+
+NativeBridgeLoader::~NativeBridgeLoader()
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (libraryHandle_ != nullptr) {
+        dlclose(libraryHandle_);
+        libraryHandle_ = nullptr;
+    }
+}
+
+BridgeResult NativeBridgeLoader::Setup(const std::string& libraryName, bool debug)
+{
+    if (libraryName.empty()) {
+        return Failure(BridgeStatus::kInvalidArgument, "KNOI library name must not be empty");
+    }
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (libraryHandle_ != nullptr) {
+        if (libraryName_ == libraryName && debug_ == debug) {
+            return {};
+        }
+        return Failure(
+            BridgeStatus::kConflictingSetup,
+            "KNOI is already configured for a different library or debug mode");
+    }
+
+    dlerror();
+    void* candidateHandle = dlopen(libraryName.c_str(), RTLD_NOW | RTLD_LOCAL);
+    if (candidateHandle == nullptr) {
+        const char* error = dlerror();
+        return Failure(
+            BridgeStatus::kLibraryOpenFailed,
+            error == nullptr ? "dlopen failed without a diagnostic" : error);
+    }
+
+    dlerror();
+    auto candidateInitEnv = reinterpret_cast<InitEnvFunction>(dlsym(candidateHandle, kInitEnvSymbol));
+    const char* initEnvError = dlerror();
+    if (candidateInitEnv == nullptr || initEnvError != nullptr) {
+        dlclose(candidateHandle);
+        return Failure(BridgeStatus::kMissingInitEnv, kInitEnvSymbol);
+    }
+
+    dlerror();
+    auto candidateInitBridge =
+        reinterpret_cast<InitBridgeFunction>(dlsym(candidateHandle, kInitBridgeSymbol));
+    const char* initBridgeError = dlerror();
+    if (candidateInitBridge == nullptr || initBridgeError != nullptr) {
+        dlclose(candidateHandle);
+        return Failure(BridgeStatus::kMissingInitBridge, kInitBridgeSymbol);
+    }
+
+    libraryHandle_ = candidateHandle;
+    libraryName_ = libraryName;
+    debug_ = debug;
+    initEnv_ = candidateInitEnv;
+    initBridge_ = candidateInitBridge;
+    return {};
+}
+
+BridgeResult NativeBridgeLoader::Initialize(void* env, void* exports)
+{
+    if (env == nullptr || exports == nullptr) {
+        return Failure(BridgeStatus::kInvalidArgument, "KNOI init requires non-null env and exports");
+    }
+
+    InitEnvFunction initEnv = nullptr;
+    InitBridgeFunction initBridge = nullptr;
+    bool debug = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (libraryHandle_ == nullptr || initEnv_ == nullptr || initBridge_ == nullptr) {
+            return Failure(BridgeStatus::kNotConfigured, "call setup before init");
+        }
+        initEnv = initEnv_;
+        initBridge = initBridge_;
+        debug = debug_;
+    }
+
+    initEnv(env, exports, debug);
+    std::call_once(initBridgeOnce_, [initBridge]() { initBridge(); });
+    return {};
+}
+
+bool NativeBridgeLoader::IsConfigured() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return libraryHandle_ != nullptr;
+}
+
+std::string NativeBridgeLoader::ConfiguredLibrary() const
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    return libraryName_;
+}
+
+const char* BridgeStatusCode(BridgeStatus status)
+{
+    switch (status) {
+        case BridgeStatus::kOk:
+            return "KNOI_OK";
+        case BridgeStatus::kInvalidArgument:
+            return "KNOI_INVALID_ARGUMENT";
+        case BridgeStatus::kLibraryOpenFailed:
+            return "KNOI_LIBRARY_OPEN_FAILED";
+        case BridgeStatus::kMissingInitEnv:
+            return "KNOI_MISSING_INIT_ENV";
+        case BridgeStatus::kMissingInitBridge:
+            return "KNOI_MISSING_INIT_BRIDGE";
+        case BridgeStatus::kConflictingSetup:
+            return "KNOI_CONFLICTING_SETUP";
+        case BridgeStatus::kNotConfigured:
+            return "KNOI_NOT_CONFIGURED";
+    }
+    return "KNOI_UNKNOWN_ERROR";
+}
+
+} // namespace knoi
