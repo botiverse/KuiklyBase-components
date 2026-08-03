@@ -1,64 +1,139 @@
 <?xml version="1.0" encoding="utf-8"?>
-<RelativeLayout xmlns:android="http://schemas.android.com/apk/res/android"
+<!--
+  ~ Tencent is pleased to support the open source community by making KuiklyBase available.
+  ~ Copyright (C) 2025 Tencent. All rights reserved.
+  ~
+  ~ Licensed under the Apache License, Version 2.0 (the "License");
+  ~ you may not use this file except in compliance with the License.
+  ~ You may obtain a copy of the License at
+  ~
+  ~      http://www.apache.org/licenses/LICENSE-2.0
+  ~
+  ~ Unless required by applicable law or agreed to in writing, software
+  ~ distributed under the License is distributed on an "AS IS" BASIS,
+  ~ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  ~ See the License for the specific language governing permissions and
+  ~ limitations under the License.
+  -->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
-    android:background="@android:color/white">
+    android:background="@android:color/white"
+    android:orientation="vertical"
+    android:padding="16dp">
 
     <TextView
-        android:id="@+id/title"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
-        android:layout_centerHorizontal="true"
-        android:layout_marginTop="20dp"
-        android:text="Android 网络接口测试"
-        android:textColor="@android:color/black"
-        android:textSize="20dp" />
-
-    <ScrollView
         android:layout_width="match_parent"
-        android:layout_height="match_parent"
-        android:layout_above="@+id/btnContainer"
-        android:layout_below="@id/title">
+        android:layout_height="wrap_content"
+        android:text="NetworkKMM Demo — NetworkClient"
+        android:textColor="@android:color/black"
+        android:textSize="18sp"
+        android:textStyle="bold" />
 
-        <TextView
-            android:id="@+id/result"
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:text="传输引擎 Transport engine"
+        android:textColor="@android:color/black" />
+
+    <RadioGroup
+        android:id="@+id/engineGroup"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <RadioButton
+            android:id="@+id/engineKtor"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:textSize="16dp" />
-    </ScrollView>
+            android:checked="true"
+            android:text="Ktor (默认)"
+            android:textColor="@android:color/black" />
 
-    <LinearLayout
-        android:id="@+id/btnContainer"
+        <RadioButton
+            android:id="@+id/engineCurl"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="24dp"
+            android:text="curl"
+            android:textColor="@android:color/black" />
+    </RadioGroup>
+
+    <EditText
+        android:id="@+id/baseUrl"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_alignParentBottom="true"
-        android:layout_centerHorizontal="true"
-        android:layout_marginBottom="20dp"
-        android:orientation="vertical">
+        android:hint="Base URL"
+        android:inputType="textUri"
+        android:singleLine="true"
+        android:text="https://httpbin.org"
+        android:textColor="@android:color/black" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
 
         <Button
-            android:id="@+id/requestWithGet"
-            android:layout_width="match_parent"
+            android:id="@+id/btnBuffered"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="[Get] 请求" />
+            android:layout_weight="1"
+            android:text="Buffered GET" />
 
         <Button
-            android:id="@+id/requestWithPost"
-            android:layout_width="match_parent"
+            android:id="@+id/btnStreaming"
+            android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="[Post] 请求" />
-
-        <Button
-            android:id="@+id/requestWithBytes"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="[Bytes] 请求" />
-
-        <Button
-            android:id="@+id/requestWithString"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="[String] 请求" />
-
+            android:layout_weight="1"
+            android:text="流式 Stream" />
     </LinearLayout>
-</RelativeLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal">
+
+        <Button
+            android:id="@+id/btnUpload"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="上传 Upload" />
+
+        <Button
+            android:id="@+id/btnCancel"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:text="取消 Cancel" />
+    </LinearLayout>
+
+    <Button
+        android:id="@+id/btnClear"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="清空日志 Clear log" />
+
+    <ScrollView
+        android:id="@+id/logScroll"
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_marginTop="8dp"
+        android:layout_weight="1"
+        android:background="#11000000">
+
+        <TextView
+            android:id="@+id/logView"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:fontFamily="monospace"
+            android:padding="8dp"
+            android:textColor="@android:color/black"
+            android:textIsSelectable="true"
+            android:textSize="12sp" />
+    </ScrollView>
+
+</LinearLayout>
