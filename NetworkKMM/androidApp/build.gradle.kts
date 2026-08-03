@@ -44,11 +44,6 @@ kotlin {
 }
 dependencies {
     implementation(project(":network"))
-    // NetworkClient's constructor exposes a `scope: CoroutineScope` parameter,
-    // so the coroutines type must be on the app's compile classpath even though
-    // the demo itself uses the callback API and never touches coroutines
-    // directly (it's an `implementation` dep of `:network`, not re-exported).
-    implementation(libs.kotlinx.coroutines.core)
 //    implementation("com.tencent.kuiklybase:network:0.0.3")
 }
 
