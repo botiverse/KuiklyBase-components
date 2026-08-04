@@ -192,15 +192,32 @@ class NetworkGenerationManagerTest {
 
         val networkChange = async(Dispatchers.Default) { manager.retireIfCurrent(0L) }
         firstEntry.await()
-        val quorum = async(Dispatchers.Default) { manager.retireIfCurrent(0L) }
-        delay(25)
+        val secondStarted = CompletableDeferred<Unit>()
+        val quorum = async(Dispatchers.Default) {
+            secondStarted.complete(Unit)
+            manager.retireIfCurrent(0L)
+        }
 
-        // Held by the same CAS the first trigger is inside: it has neither
-        // completed nor reached the controller.
-        assertFalse(quorum.isCompleted)
-        assertFalse(secondEntry.isCompleted)
+        try {
+            // Wait for the second trigger to be scheduled and standing at the
+            // call. Without this the negative assertions below could pass merely
+            // because a loaded runner had not started the coroutine yet.
+            secondStarted.await()
+            delay(25)
 
-        release.complete(Unit)
+            // Held by the same CAS the first trigger is inside: it has neither
+            // completed nor reached the controller.
+            assertFalse(quorum.isCompleted)
+            assertFalse(secondEntry.isCompleted)
+        } finally {
+            // Release unconditionally. The controller parks in a nested,
+            // non-cancellable `runBlocking`, so if an assertion above throws
+            // before this runs, both invocations stay parked forever: the
+            // mutation would hang the worker with no failure report instead of
+            // going red. A red arm that cannot terminate is not a red arm.
+            release.complete(Unit)
+        }
+
         val results = listOf(networkChange.await(), quorum.await())
 
         assertEquals(1, results.count { it is GenerationRetirementResult.Advanced })
