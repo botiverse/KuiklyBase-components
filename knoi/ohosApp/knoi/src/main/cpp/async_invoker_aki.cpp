@@ -7,7 +7,6 @@
  */
 
 #include "function_waiter_registry.h"
-#include "knoi_aki_scope.h"
 
 #include <aki/jsbind.h>
 #include <node_api.h>
@@ -75,8 +74,11 @@ napi_value wait_on_function_waiter(int64_t id)
     return value;
 }
 
-JSBIND_SCOPED_FUNCTION(kKnoiAkiModuleScope, create_function_waiter);
-JSBIND_SCOPED_FUNCTION(kKnoiAkiModuleScope, wait_on_function_waiter);
-JSBIND_SCOPED_FUNCTION(kKnoiAkiModuleScope, notify_function_waiter);
-
 } // namespace
+
+JSBIND_GLOBAL()
+{
+    JSBIND_FUNCTION(create_function_waiter);
+    JSBIND_FUNCTION(wait_on_function_waiter);
+    JSBIND_FUNCTION(notify_function_waiter);
+}

@@ -37,7 +37,7 @@ def verify(root: Path) -> None:
     combined = "\n".join(path.read_text() for path in sources)
     actual_exports = set(
         re.findall(
-            r"JSBIND_SCOPED_FUNCTION\(kKnoiAkiModuleScope,\s*([A-Za-z0-9_]+)\s*\)",
+            r"JSBIND_FUNCTION\(\s*([A-Za-z0-9_]+)\s*\)",
             combined,
         )
     )
@@ -46,8 +46,12 @@ def verify(root: Path) -> None:
             f"native export drift: expected={sorted(EXPECTED_NATIVE_EXPORTS)}, "
             f"actual={sorted(actual_exports)}"
         )
-    if "JSBIND_ADDON(" in combined or "JSBIND_GLOBAL(" in combined:
-        raise ContractFailure("unscoped Aki binding would expose an extra runtime surface")
+    if "JSBIND_SCOPED_FUNCTION(" in combined or "BindSymbols(kKnoiAkiModuleScope)" in combined:
+        raise ContractFailure("undocumented scoped Aki binding must not be used")
+    if "aki::JSBind::BindSymbols(env, exports)" not in combined:
+        raise ContractFailure("documented Aki hybrid binding is missing")
+    if 'napi_delete_property(env, exports, key, &deleted)' not in combined:
+        raise ContractFailure("Aki's internal JSBind class is not removed from the public surface")
 
     declarations = (
         root / "ohosApp" / "knoi" / "src" / "main" / "types" / "libknoi" / "index.d.ts"
@@ -83,7 +87,7 @@ def self_test(root: Path) -> None:
 
         adapter = copy / "ohosApp" / "knoi" / "src" / "main" / "cpp" / "knoi_aki.cpp"
         adapter.write_text(adapter.read_text().replace(
-            "JSBIND_SCOPED_FUNCTION(kKnoiAkiModuleScope, setup);", ""
+            "JSBIND_FUNCTION(setup);", ""
         ))
         try:
             verify(copy)
@@ -119,7 +123,7 @@ def main() -> None:
     verify(args.root)
     if args.self_test:
         self_test(args.root)
-    print("KNOI_SURFACE_PASS native_exports=5 bootstrap_symbols=2 scoped_aki=true")
+    print("KNOI_SURFACE_PASS native_exports=5 bootstrap_symbols=2 documented_aki=true")
 
 
 if __name__ == "__main__":

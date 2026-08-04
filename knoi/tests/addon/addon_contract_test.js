@@ -8,7 +8,15 @@ if (process.argv.length !== 6) {
 }
 
 const [addonPath, validPath, missingEnvPath, missingBridgePath] = process.argv.slice(2);
-const addon = require(addonPath);
+const moduleRecord = { exports: {} };
+const initialExports = moduleRecord.exports;
+process.dlopen(moduleRecord, addonPath);
+assert.equal(
+  moduleRecord.exports,
+  initialExports,
+  'production initializer must bind into the exports object supplied by the host',
+);
+const addon = moduleRecord.exports;
 const expectedExports = [
   'create_function_waiter',
   'init',

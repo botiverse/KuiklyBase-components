@@ -62,7 +62,7 @@ int main(int argc, char** argv)
         Check(!loader.IsConfigured(), "missing initBridge must leave loader unconfigured");
     }
 
-    void* fixtureHandle = dlopen(validPath.c_str(), RTLD_NOW | RTLD_LOCAL);
+    void* fixtureHandle = dlopen(validPath.c_str(), RTLD_LAZY | RTLD_LOCAL);
     Check(fixtureHandle != nullptr, "valid fixture must load");
     auto resetCalls = Symbol<void (*)()>(fixtureHandle, "knoi_test_reset_calls");
     auto envCalls = Symbol<int (*)()>(fixtureHandle, "knoi_test_env_calls");

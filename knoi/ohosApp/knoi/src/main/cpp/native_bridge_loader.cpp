@@ -41,7 +41,11 @@ BridgeResult NativeBridgeLoader::Setup(const std::string& libraryName, bool debu
     }
 
     dlerror();
-    void* candidateHandle = dlopen(libraryName.c_str(), RTLD_NOW | RTLD_LOCAL);
+    // Kotlin/Native OHOS shared libraries intentionally retain lazy-only
+    // runtime references such as `main`. The legacy KNOI loader used
+    // RTLD_LAZY; resolving every function relocation up front rejects valid
+    // production consumers before their bootstrap symbols can be called.
+    void* candidateHandle = dlopen(libraryName.c_str(), RTLD_LAZY | RTLD_LOCAL);
     if (candidateHandle == nullptr) {
         const char* error = dlerror();
         return Failure(

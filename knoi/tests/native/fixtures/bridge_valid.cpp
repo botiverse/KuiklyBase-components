@@ -4,6 +4,16 @@
 #include <node_api.h>
 #endif
 
+// Kotlin/Native OHOS shared libraries contain lazy-only unresolved runtime
+// references (notably `main`). Keep an equivalent never-called relocation in
+// the valid fixture so RTLD_NOW is proven incompatible while RTLD_LAZY can
+// still validate and invoke the two KNOI bootstrap symbols.
+extern "C" void knoi_fixture_lazy_only_dependency();
+extern "C" __attribute__((visibility("default"), used)) void knoi_fixture_never_called()
+{
+    knoi_fixture_lazy_only_dependency();
+}
+
 namespace {
 std::atomic<int> gEnvCalls{0};
 std::atomic<int> gBridgeCalls{0};

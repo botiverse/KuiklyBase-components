@@ -154,6 +154,38 @@ build_addon \
 run_addon_contract "${BUILD_ROOT}/knoi.node"
 
 if [[ "${KNOI_RUN_MUTATIONS:-1}" == "1" ]]; then
+  replacement_exports_adapter="${BUILD_ROOT}/knoi_aki_replacement_exports.cpp"
+  cp "${CPP_ROOT}/knoi_aki.cpp" "${replacement_exports_adapter}"
+  perl -0pi -e \
+    's@return aki::JSBind::BindSymbols\(env, exports\);@napi_value replacementExports = nullptr;\n    napi_create_object(env, \&replacementExports);\n    return aki::JSBind::BindSymbols(env, replacementExports);@' \
+    "${replacement_exports_adapter}"
+  build_addon \
+    "${replacement_exports_adapter}" \
+    "${CPP_ROOT}/async_invoker_aki.cpp" \
+    "${CPP_ROOT}/native_bridge_loader.cpp" \
+    "${BUILD_ROOT}/knoi-replacement-exports.node"
+  expect_addon_mutation_red \
+    "${BUILD_ROOT}/knoi-replacement-exports.node" \
+    "${BUILD_ROOT}/replacement-exports-mutation.log" \
+    'production initializer must bind into the exports object supplied by the host' \
+    'addon in-place exports'
+
+  eager_loader_source="${BUILD_ROOT}/native_bridge_loader_eager.cpp"
+  cp "${CPP_ROOT}/native_bridge_loader.cpp" "${eager_loader_source}"
+  perl -0pi -e \
+    's/RTLD_LAZY \| RTLD_LOCAL/RTLD_NOW | RTLD_LOCAL/' \
+    "${eager_loader_source}"
+  build_addon \
+    "${CPP_ROOT}/knoi_aki.cpp" \
+    "${CPP_ROOT}/async_invoker_aki.cpp" \
+    "${eager_loader_source}" \
+    "${BUILD_ROOT}/knoi-eager-loader.node"
+  expect_addon_mutation_red \
+    "${BUILD_ROOT}/knoi-eager-loader.node" \
+    "${BUILD_ROOT}/eager-loader-mutation.log" \
+    'KNOI_LIBRARY_OPEN_FAILED' \
+    'addon eager loader'
+
   thread_local_source="${BUILD_ROOT}/async_invoker_thread_local.cpp"
   cp "${CPP_ROOT}/async_invoker_aki.cpp" "${thread_local_source}"
   perl -0pi -e \

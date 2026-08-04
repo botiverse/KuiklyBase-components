@@ -5,15 +5,12 @@
  * Kotlin/Native bootstrap symbols remain the KNOI compatibility contract.
  */
 
-#include "knoi_aki_scope.h"
 #include "native_bridge_loader.h"
 
 #include <aki/jsbind.h>
 #include <node_api.h>
 
 #include <string>
-
-const char kKnoiAkiModuleScope[] = "kuiklybase.knoi";
 
 namespace {
 
@@ -95,15 +92,45 @@ napi_value init()
     return Undefined(env);
 }
 
-JSBIND_SCOPED_FUNCTION(kKnoiAkiModuleScope, setup);
-JSBIND_SCOPED_FUNCTION(kKnoiAkiModuleScope, init);
+napi_value BindDocumentedAkiSurface(napi_env env, napi_value exports)
+{
+    // Aki's hybrid Node-API contract binds its registered global functions
+    // into the host-supplied exports object. Do not use the undocumented
+    // scoped registry: it constructs a replacement object and is not the
+    // addon integration path described by Aki 1.3.1.
+    return aki::JSBind::BindSymbols(env, exports);
+}
+
+bool HideAkiInternalClass(napi_env env, napi_value exports)
+{
+    napi_value key = nullptr;
+    bool deleted = false;
+    return napi_create_string_utf8(env, "JSBind", NAPI_AUTO_LENGTH, &key) == napi_ok &&
+        napi_delete_property(env, exports, key, &deleted) == napi_ok && deleted;
+}
 
 } // namespace
 
-extern "C" napi_value InitKnoiAkiModule(napi_env env, napi_value)
+JSBIND_GLOBAL()
 {
-    aki::JSBind::SetScopedEnv(env);
-    return aki::JSBind::BindSymbols(kKnoiAkiModuleScope);
+    JSBIND_FUNCTION(setup);
+    JSBIND_FUNCTION(init);
+}
+
+extern "C" napi_value InitKnoiAkiModule(napi_env env, napi_value exports)
+{
+    napi_value boundExports = BindDocumentedAkiSurface(env, exports);
+    if (boundExports == nullptr) {
+        return nullptr;
+    }
+    if (!HideAkiInternalClass(env, boundExports)) {
+        napi_throw_error(
+            env,
+            "KNOI_HIDE_AKI_INTERNAL_FAILED",
+            "failed to remove Aki's internal JSBind class from the KNOI addon surface");
+        return nullptr;
+    }
+    return boundExports;
 }
 
 static napi_module knoiModule = {
