@@ -1,0 +1,242 @@
+name: KNOI Aki migration gates
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+    paths:
+      - "knoi/**"
+      - ".github/workflows/knoi-aki.yml"
+  pull_request:
+    paths:
+      - "knoi/**"
+      - ".github/workflows/knoi-aki.yml"
+
+permissions:
+  contents: read
+
+env:
+  KNOI_EXPECTED_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+
+concurrency:
+  group: knoi-aki-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  host-contract:
+    name: Provenance and host runtime contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KNOI_EXPECTED_HEAD }}
+
+      - name: Verify exact source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          actual_tree="$(git rev-parse 'HEAD^{tree}')"
+          expected_tree="$(git rev-parse "${KNOI_EXPECTED_HEAD}^{tree}")"
+          test "$actual_head" = "$KNOI_EXPECTED_HEAD"
+          test "$actual_tree" = "$expected_tree"
+          test -z "$(git status --porcelain)"
+          echo "KNOI_EXACT_IDENTITY_PASS head=$actual_head tree=$actual_tree"
+
+      - name: Verify pinned Aki provenance
+        run: python3 knoi/scripts/verify-aki-provenance.py
+
+      - name: Verify published KNOI 0.0.4 byte and ELF baseline
+        run: python3 knoi/scripts/verify-registry-baseline.py --require-elf
+
+      - name: Verify the frozen JS and bootstrap surface
+        run: python3 knoi/scripts/verify-knoi-surface.py --self-test
+
+      - name: Run loader and waiter behavior plus mutation gates
+        run: bash knoi/tests/native/run_tests.sh
+
+      - name: Load the Aki adapter in a Node-API runtime
+        run: bash knoi/tests/addon/run_tests.sh
+
+  ohos-arm64:
+    name: OHOS arm64 addon and HAR
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KNOI_EXPECTED_HEAD }}
+
+      - name: Trust the container checkout
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Verify exact source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          actual_tree="$(git rev-parse 'HEAD^{tree}')"
+          expected_tree="$(git rev-parse "${KNOI_EXPECTED_HEAD}^{tree}")"
+          test "$actual_head" = "$KNOI_EXPECTED_HEAD"
+          test "$actual_tree" = "$expected_tree"
+          test -z "$(git status --porcelain)"
+          echo "KNOI_EXACT_IDENTITY_PASS head=$actual_head tree=$actual_tree"
+
+      - name: Resolve the fixed HarmonyOS toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -f "$ohos_sdk_home/native/build/cmake/ohos.toolchain.cmake"
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          {
+            echo "OHOS_SDK_HOME=$ohos_sdk_home"
+            echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home"
+            echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)"
+          } >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Ensure CMake is available
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v cmake >/dev/null 2>&1; then
+            cmake --version | head -1
+            exit 0
+          fi
+          sdk_cmake_bin="$OHOS_SDK_HOME/native/build-tools/cmake/bin"
+          test -x "$sdk_cmake_bin/cmake"
+          echo "$sdk_cmake_bin" >> "$GITHUB_PATH"
+
+      - name: Cross-compile Aki and legacy rollback addons
+        shell: bash
+        run: bash knoi/scripts/build-ohos-addon.sh
+
+      - name: Build and verify the distributable HAR
+        shell: bash
+        run: bash knoi/scripts/build-ohos-har.sh
+
+      - name: Upload exact build evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: knoi-aki-ohos-arm64
+          if-no-files-found: error
+          retention-days: 14
+          path: |
+            knoi/build/ohos-addon/aki/Debug/libknoi.so
+            knoi/build/ohos-addon/aki/Release/libknoi.so
+            knoi/build/ohos-addon/legacy/Debug/libknoi.so
+            knoi/build/ohos-addon/legacy/Release/libknoi.so
+            knoi/ohosApp/knoi/build/default/outputs/default/knoi.har
+
+  kotlin-consumer:
+    name: OHOS Kotlin/Native consumer ABI
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      COMMAND_LINE_TOOLS_URL: https://cdn.cat.ms/commandline-tools-mac-arm64-6.1.1.280.zip
+      COMMAND_LINE_TOOLS_SHA256: 47d0e558b8285e1452f4d3611863027ec0d1135642761bef23402434e22382d4
+      OHOS_SDK_CACHE_ROOT: ${{ github.workspace }}/.toolcache/ohos-sdk-6.1.1.280
+      OHOS_SDK_HOME: ${{ github.workspace }}/.toolcache/ohos-sdk-6.1.1.280/sdk/default/openharmony
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.KNOI_EXPECTED_HEAD }}
+
+      - name: Verify exact source identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual_head="$(git rev-parse HEAD)"
+          actual_tree="$(git rev-parse 'HEAD^{tree}')"
+          expected_tree="$(git rev-parse "${KNOI_EXPECTED_HEAD}^{tree}")"
+          test "$actual_head" = "$KNOI_EXPECTED_HEAD"
+          test "$actual_tree" = "$expected_tree"
+          test -z "$(git status --porcelain)"
+          echo "KNOI_EXACT_IDENTITY_PASS head=$actual_head tree=$actual_tree"
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Restore the pinned HarmonyOS SDK
+        id: ohos-sdk-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.OHOS_SDK_CACHE_ROOT }}
+          key: knoi-ohos-sdk-mac-arm64-${{ env.COMMAND_LINE_TOOLS_SHA256 }}
+
+      - name: Install the pinned HarmonyOS SDK
+        if: steps.ohos-sdk-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          archive="$RUNNER_TEMP/command-line-tools-mac-arm64-6.1.1.280.zip"
+          tools_parent="$RUNNER_TEMP/harmonyos-tools"
+          mkdir -p "$tools_parent"
+          curl --fail --location --retry 3 \
+            --output "$archive" \
+            "$COMMAND_LINE_TOOLS_URL"
+          printf '%s  %s\n' "$COMMAND_LINE_TOOLS_SHA256" "$archive" |
+            shasum -a 256 --check -
+          ditto -x -k "$archive" "$tools_parent"
+          mkdir -p "$(dirname "$OHOS_SDK_HOME")"
+          ditto \
+            "$tools_parent/command-line-tools/sdk/default/openharmony" \
+            "$OHOS_SDK_HOME"
+
+      - name: Resolve the consumer toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "$OHOS_SDK_HOME/native/build/cmake/ohos.toolchain.cmake"
+          xattr -dr com.apple.quarantine "$OHOS_SDK_CACHE_ROOT" || true
+          {
+            echo "OHOS_SDK_HOME=$OHOS_SDK_HOME"
+            echo "OHOS_BASE_SDK_HOME=$OHOS_SDK_HOME"
+            echo "DEVECO_SDK_HOME=$(cd "$OHOS_SDK_HOME/../.." && pwd)"
+          } >> "$GITHUB_ENV"
+          echo "$OHOS_SDK_HOME/native/llvm/bin" >> "$GITHUB_PATH"
+
+      - name: Compile KNOI and link the real Kotlin/Native consumer
+        shell: bash
+        working-directory: knoi
+        run: |
+          set -euo pipefail
+          ./gradlew \
+            :knoi:compileKotlinOhosArm64 \
+            :example:empty:linkDebugSharedOhosArm64 \
+            --no-daemon --console=plain --stacktrace
+
+      - name: Verify consumer bootstrap definitions
+        shell: bash
+        run: |
+          set -euo pipefail
+          consumer="knoi/example/empty/build/bin/ohosArm64/debugShared/libkn.so"
+          test -s "$consumer"
+          symbols="$(llvm-readelf --dyn-syms --wide "$consumer")"
+          for symbol in com_tencent_tmm_knoi_initEnv com_tencent_tmm_knoi_initBridge; do
+            printf '%s\n' "$symbols" |
+              awk -v expected="$symbol" \
+                '$5 == "GLOBAL" && $6 == "DEFAULT" && $7 != "UND" && $8 == expected { found = 1 } END { exit !found }'
+          done
+          echo "KNOI_CONSUMER_BOOTSTRAP_PASS symbols=2"
+
+      - name: Upload consumer evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: knoi-aki-ohos-consumer
+          if-no-files-found: error
+          retention-days: 14
+          path: knoi/example/empty/build/bin/ohosArm64/debugShared/libkn.so
