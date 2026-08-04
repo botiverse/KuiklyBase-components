@@ -28,6 +28,99 @@ internal data class CurlTransferFactsV1(
     val bodyBytes: Long,
 )
 
+internal enum class CurlTlsTimingState(val diagnosticValue: String) {
+    UNKNOWN("unknown"),
+    NOT_APPLICABLE("not_applicable"),
+    OBSERVED("observed"),
+    REUSED_CONNECTION("reused_connection"),
+    NOT_REACHED("not_reached"),
+}
+
+internal data class CurlCompletionFactsV1(
+    val schemaVersion: Int,
+    val connectionIdAvailable: Boolean,
+    val nameLookupTimingAvailable: Boolean,
+    val connectTimingAvailable: Boolean,
+    val preTransferTimingAvailable: Boolean,
+    val startTransferTimingAvailable: Boolean,
+    val totalTimingAvailable: Boolean,
+    val tlsTimingState: CurlTlsTimingState,
+    val connectionCacheId: Long,
+    val connectionId: Long,
+    val nameLookupTimeUs: Long,
+    val connectTimeUs: Long,
+    val tlsTimeUs: Long,
+    val preTransferTimeUs: Long,
+    val startTransferTimeUs: Long,
+    val totalTimeUs: Long,
+)
+
+private const val UNKNOWN_CURL_CONNECTION_IDENTITY = "unknown"
+
+internal fun VBTransportElapseStatistics.applyCurlCompletionFacts(facts: CurlCompletionFactsV1?) {
+    // The legacy CurlResponse.elapse values are a frozen ABI. In particular,
+    // an old native artifact may report a meaningful zero, so an absent V1
+    // snapshot must not reinterpret or overwrite any legacy numeric field.
+    if (facts == null) {
+        connectionIdentity = UNKNOWN_CURL_CONNECTION_IDENTITY
+        curlCompletionInfoVersion = null
+        curlNameLookupTimingAvailable = null
+        curlConnectTimingAvailable = null
+        curlPreTransferTimingAvailable = null
+        curlStartTransferTimingAvailable = null
+        curlTotalTimingAvailable = null
+        curlTlsTimingState = CurlTlsTimingState.UNKNOWN.diagnosticValue
+        return
+    }
+    connectionIdentity =
+        if (facts.connectionIdAvailable && facts.connectionCacheId > 0L && facts.connectionId >= 0L) {
+            "curl:${facts.connectionCacheId}:${facts.connectionId}"
+        } else {
+            UNKNOWN_CURL_CONNECTION_IDENTITY
+        }
+    curlCompletionInfoVersion = facts.schemaVersion
+    curlNameLookupTimingAvailable = facts.validTiming(facts.nameLookupTimingAvailable, facts.nameLookupTimeUs)
+    curlConnectTimingAvailable = facts.validTiming(facts.connectTimingAvailable, facts.connectTimeUs)
+    curlPreTransferTimingAvailable = facts.validTiming(facts.preTransferTimingAvailable, facts.preTransferTimeUs)
+    curlStartTransferTimingAvailable = facts.validTiming(facts.startTransferTimingAvailable, facts.startTransferTimeUs)
+    curlTotalTimingAvailable = facts.validTiming(facts.totalTimingAvailable, facts.totalTimeUs)
+    curlTlsTimingState = facts.tlsTimingState.diagnosticValue
+
+    if (curlNameLookupTimingAvailable == true) {
+        nameLookupTimeMs = facts.nameLookupTimeUs.toMilliseconds()
+    }
+    if (curlConnectTimingAvailable == true) {
+        connectTimeMs = facts.connectTimeUs.toMilliseconds()
+    }
+    when (facts.tlsTimingState) {
+        CurlTlsTimingState.OBSERVED -> {
+            if (facts.tlsTimeUs >= 0L) {
+                sslCostTimeMs = facts.tlsTimeUs.toMilliseconds()
+            }
+        }
+        CurlTlsTimingState.NOT_APPLICABLE,
+        CurlTlsTimingState.REUSED_CONNECTION -> sslCostTimeMs = 0.0
+        CurlTlsTimingState.UNKNOWN,
+        CurlTlsTimingState.NOT_REACHED -> Unit
+    }
+    if (curlPreTransferTimingAvailable == true) {
+        preTransferTime = facts.preTransferTimeUs.toMilliseconds()
+    }
+    if (curlStartTransferTimingAvailable == true) {
+        val responseWait = facts.startTransferTimeUs.toMilliseconds()
+        startTransferTimeMs = responseWait
+        responseWaitTimeMs = responseWait
+    }
+    if (curlTotalTimingAvailable == true) {
+        totalTimeMs = facts.totalTimeUs.toMilliseconds()
+    }
+}
+
+private fun CurlCompletionFactsV1.validTiming(available: Boolean, microseconds: Long): Boolean =
+    available && microseconds >= 0L
+
+private fun Long.toMilliseconds(): Double = toDouble() / 1_000.0
+
 internal fun VBTransportElapseStatistics.applyCurlTransferFacts(facts: CurlTransferFactsV1?) {
     if (facts == null) return
     curlFinalHeadersObserved = facts.finalHeadersObserved

@@ -449,6 +449,224 @@ int main(int argc, char **argv) {
         DeleteCurlClient(cancelHandle);
     }
 
+    // CURLINFO_CONN_ID is unique only within one connection cache. Prove the
+    // exported physical identity preserves reuse, changes for a new physical
+    // connection, and remains collision-free across engine/cache instances.
+    {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-connection-identity");
+        CHECK(engine != nullptr, "connection-identity multi engine starts");
+        StringDic headers{};
+        const size_t portSeparator = base.rfind(':');
+        CHECK(portSeparator != std::string::npos,
+              "connection-identity test server base has a port");
+        const std::string alternateOrigin =
+            "http://localhost" + base.substr(portSeparator) + "/ok";
+        const std::string primaryUrl = base + "/ok";
+
+        auto performOne = [&](CurlMultiEngineHandle targetEngine,
+                              int64_t requestId,
+                              const std::string &url,
+                              const char *caInfoPath,
+                              CurClientHandle *outHandle) {
+            MultiCaptured captured;
+            captured.expected = 1;
+            captured.callbackCounts.assign(1, 0);
+            captured.codes.assign(1, -1);
+            captured.httpCodes.assign(1, -1);
+            MultiCallbackRef ref{&captured, 0};
+            CurClientHandle handle = CreateCurlClient("wrapper-connection-identity-request");
+            SetCurlCaInfo(handle, caInfoPath);
+            CurlRequest request{};
+            request.url = url.c_str();
+            request.method = "GET";
+            request.headers = &headers;
+            request.timeout = 5000;
+            CurlCallback callback{&ref, OnMultiResponse};
+            CHECK(SubmitBufferedRequestV27(
+                      targetEngine, requestId, handle, &request, sizeof(request),
+                      CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+                  "connection-identity request is accepted");
+            CHECK(AwaitMulti(captured, 5000),
+                  "connection-identity request reaches terminal");
+            CHECK(captured.codes[0] == 0 && captured.httpCodes[0] == 200,
+                  "connection-identity request succeeds");
+            CurlCompletionInfoV1 info{};
+            CHECK(GetCurlCompletionInfoV1(
+                      handle, &info, sizeof(info), CURL_COMPLETION_INFO_ABI_VERSION) == 1,
+                  "completion diagnostics snapshot succeeds");
+            CHECK(info.abiVersion == CURL_COMPLETION_INFO_ABI_VERSION &&
+                      info.structSize == sizeof(CurlCompletionInfoV1),
+                  "completion diagnostics report the exact V1 ABI shape");
+            CHECK(info.connectionIdAvailable == 1 && info.connectionCacheId > 0 &&
+                      info.connectionId >= 0,
+                  "successful request exposes a cache-scoped connection id");
+            CHECK(info.nameLookupTimingAvailable == 1 &&
+                      info.connectTimingAvailable == 1 &&
+                      info.preTransferTimingAvailable == 1 &&
+                      info.startTransferTimingAvailable == 1 &&
+                      info.totalTimingAvailable == 1,
+                  "successful request exposes all completed phase timings");
+            CHECK(info.nameLookupTimeUs >= 0 && info.connectTimeUs >= 0 &&
+                      info.tlsTimeUs >= 0 && info.preTransferTimeUs >= 0 &&
+                      info.startTransferTimeUs >= 0 && info.totalTimeUs >= 0,
+                  "normalized completion phase durations are non-negative");
+            const int64_t normalizedToFirstByteUs =
+                info.nameLookupTimeUs + info.connectTimeUs + info.tlsTimeUs +
+                info.preTransferTimeUs + info.startTransferTimeUs;
+            CHECK(normalizedToFirstByteUs <= info.totalTimeUs,
+                  "normalized phase durations fit inside total transfer time");
+            *outHandle = handle;
+            return info;
+        };
+
+        CurClientHandle firstHandle = nullptr;
+        CurClientHandle reusedHandle = nullptr;
+        CurClientHandle newConnectionHandle = nullptr;
+        const CurlCompletionInfoV1 first =
+            performOne(engine, 30'000, primaryUrl, "", &firstHandle);
+        const CurlCompletionInfoV1 reused =
+            performOne(engine, 30'001, primaryUrl, "", &reusedHandle);
+        const CurlCompletionInfoV1 newConnection =
+            performOne(engine, 30'002, alternateOrigin, "", &newConnectionHandle);
+        CHECK(first.connectionCacheId == reused.connectionCacheId &&
+                  first.connectionId == reused.connectionId,
+              "same keep-alive connection keeps the same physical identity");
+        CHECK(first.connectionCacheId == newConnection.connectionCacheId &&
+                  first.connectionId != newConnection.connectionId,
+              "new connection in one cache receives a different connection id");
+        CHECK(first.tlsTimingState == CURL_TLS_TIMING_STATE_NOT_APPLICABLE &&
+                  reused.tlsTimingState == CURL_TLS_TIMING_STATE_NOT_APPLICABLE &&
+                  newConnection.tlsTimingState == CURL_TLS_TIMING_STATE_NOT_APPLICABLE &&
+                  first.tlsTimeUs == 0 && reused.tlsTimeUs == 0 &&
+                  newConnection.tlsTimeUs == 0,
+              "plain HTTP completion exposes a known zero TLS phase");
+
+        CurlMultiEngineHandle otherEngine =
+            CreateCurlMultiEngine("wrapper-connection-identity-other-cache");
+        CHECK(otherEngine != nullptr, "second connection cache starts");
+        CurClientHandle otherHandle = nullptr;
+        const CurlCompletionInfoV1 other =
+            performOne(otherEngine, 30'003, primaryUrl, "", &otherHandle);
+        CHECK(first.connectionCacheId != other.connectionCacheId,
+              "different connection caches receive different process namespaces");
+
+        if (!phaseHttpsBase.empty() && !phaseCaPath.empty()) {
+            CurClientHandle tlsFreshHandle = nullptr;
+            CurClientHandle tlsReusedHandle = nullptr;
+            const CurlCompletionInfoV1 tlsFresh = performOne(
+                engine, 30'004, phaseHttpsBase + "/", phaseCaPath.c_str(), &tlsFreshHandle);
+            const CurlCompletionInfoV1 tlsReused = performOne(
+                engine, 30'005, phaseHttpsBase + "/", phaseCaPath.c_str(), &tlsReusedHandle);
+            CHECK(tlsFresh.connectionCacheId == tlsReused.connectionCacheId &&
+                      tlsFresh.connectionId == tlsReused.connectionId,
+                  "HTTPS keep-alive requests share one physical identity");
+            CHECK(tlsFresh.tlsTimingState == CURL_TLS_TIMING_STATE_OBSERVED,
+                  "fresh HTTPS connection reports an observed TLS phase");
+            CHECK(tlsReused.tlsTimingState == CURL_TLS_TIMING_STATE_REUSED_CONNECTION &&
+                      tlsReused.tlsTimeUs == 0,
+                  "reused HTTPS connection reports an explicit known-zero TLS phase");
+            DeleteCurlClient(tlsFreshHandle);
+            DeleteCurlClient(tlsReusedHandle);
+        }
+
+        CurlCompletionInfoV1 untouched;
+        std::memset(&untouched, 0xA5, sizeof(untouched));
+        const CurlCompletionInfoV1 beforeMismatch = untouched;
+        CHECK(GetCurlCompletionInfoV1(
+                  firstHandle, &untouched, sizeof(untouched) - 1,
+                  CURL_COMPLETION_INFO_ABI_VERSION) == 0,
+              "completion diagnostics reject mismatched struct size");
+        CHECK(std::memcmp(&untouched, &beforeMismatch, sizeof(untouched)) == 0,
+              "completion diagnostics mismatch does not write caller memory");
+        CHECK(GetCurlCompletionInfoV1(firstHandle, &untouched, sizeof(untouched), 99) == 0,
+              "completion diagnostics reject mismatched ABI version");
+        CHECK(std::memcmp(&untouched, &beforeMismatch, sizeof(untouched)) == 0,
+              "completion diagnostics ABI mismatch remains fail-closed");
+        CHECK(GetCurlCompletionInfoV1(
+                  nullptr, &untouched, sizeof(untouched), CURL_COMPLETION_INFO_ABI_VERSION) == 0,
+              "completion diagnostics reject a null client");
+        CHECK(std::memcmp(&untouched, &beforeMismatch, sizeof(untouched)) == 0,
+              "completion diagnostics null-client rejection writes no caller memory");
+
+        DeleteCurlMultiEngine(engine);
+        DeleteCurlMultiEngine(otherEngine);
+        DeleteCurlClient(firstHandle);
+        DeleteCurlClient(reusedHandle);
+        DeleteCurlClient(newConnectionHandle);
+        DeleteCurlClient(otherHandle);
+    }
+
+    // A real non-TLS completion is a known 0us TLS phase, while an HTTPS
+    // transfer that never reaches TLS carries the explicit not-reached state.
+    {
+        auto fetchWithCompletion = [&](const std::string &url, int64_t timeoutMs,
+                                       Captured *captured) {
+            StringDic headers{};
+            CurlRequest request{};
+            request.url = url.c_str();
+            request.method = "GET";
+            request.headers = &headers;
+            request.timeout = timeoutMs;
+            CurlCallback callback{captured, OnResponse};
+            CurClientHandle handle = CreateCurlClient("wrapper-timing-state");
+            SetCurlProxy(handle, "");
+            StartRequestV27(
+                handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+            CurlCompletionInfoV1 info{};
+            CHECK(GetCurlCompletionInfoV1(
+                      handle, &info, sizeof(info), CURL_COMPLETION_INFO_ABI_VERSION) == 1,
+                  "timing-state completion diagnostics snapshot succeeds");
+            DeleteCurlClient(handle);
+            return info;
+        };
+
+        Captured plain;
+        const CurlCompletionInfoV1 plainInfo =
+            fetchWithCompletion(base + "/ok", 5000, &plain);
+        CHECK(plain.code == 0 && plainInfo.tlsTimingState == CURL_TLS_TIMING_STATE_NOT_APPLICABLE,
+              "plain HTTP reports TLS not-applicable instead of failure");
+        CHECK(plainInfo.abiVersion == CURL_COMPLETION_INFO_ABI_VERSION &&
+                  plainInfo.structSize == sizeof(CurlCompletionInfoV1),
+              "standalone completion reports the exact V1 ABI shape");
+        CHECK(plainInfo.nameLookupTimingAvailable == 1 &&
+                  plainInfo.connectTimingAvailable == 1 &&
+                  plainInfo.startTransferTimingAvailable == 1,
+              "successful plain HTTP exposes completed phase availability");
+
+        Captured otherPlain;
+        const CurlCompletionInfoV1 otherPlainInfo =
+            fetchWithCompletion(base + "/ok", 5000, &otherPlain);
+        CHECK(otherPlain.code == 0 && plainInfo.connectionIdAvailable == 1 &&
+                  otherPlainInfo.connectionIdAvailable == 1 &&
+                  plainInfo.connectionCacheId != otherPlainInfo.connectionCacheId,
+              "standalone clients receive distinct process-local cache namespaces");
+
+        Captured tlsNotReached;
+        const CurlCompletionInfoV1 tlsNotReachedInfo =
+            fetchWithCompletion("https://127.0.0.1:1/", 500, &tlsNotReached);
+        CHECK(tlsNotReached.code != 0 &&
+                  tlsNotReachedInfo.tlsTimingState == CURL_TLS_TIMING_STATE_NOT_REACHED,
+              "HTTPS failure before handshake is distinct from non-TLS");
+        CHECK(tlsNotReachedInfo.connectionIdAvailable == 1 &&
+                  tlsNotReachedInfo.connectionCacheId > 0 &&
+                  tlsNotReachedInfo.connectionId >= 0,
+              "pre-connect failure retains libcurl's physical connection identity");
+        CHECK(tlsNotReachedInfo.nameLookupTimingAvailable ==
+                      (tlsNotReachedInfo.nameLookupTimeUs > 0 ? 1 : 0),
+              "pre-connect failure exposes name lookup only when libcurl measured it");
+        CHECK(tlsNotReachedInfo.connectTimingAvailable == 0 &&
+                  tlsNotReachedInfo.preTransferTimingAvailable == 0 &&
+                  tlsNotReachedInfo.startTransferTimingAvailable == 0 &&
+                  tlsNotReachedInfo.connectTimeUs == 0 &&
+                  tlsNotReachedInfo.tlsTimeUs == 0 &&
+                  tlsNotReachedInfo.preTransferTimeUs == 0 &&
+                  tlsNotReachedInfo.startTransferTimeUs == 0,
+              "physical identity never fabricates uncompleted phase timing");
+        CHECK(tlsNotReachedInfo.totalTimingAvailable == 1 &&
+                  tlsNotReachedInfo.totalTimeUs >= 0,
+              "failed completion still exposes its measured total duration");
+    }
+
     {
         CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-config-failure");
         CHECK(engine != nullptr, "configure-failure multi engine starts");

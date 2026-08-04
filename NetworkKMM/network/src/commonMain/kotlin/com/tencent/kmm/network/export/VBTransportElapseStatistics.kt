@@ -83,7 +83,11 @@ data class VBTransportElapseStatistics(
     var connectionGeneration: Long? = null,
     /** Zero-based independent Android OkHttp client/pool slot. */
     var connectionShard: Int? = null,
-    /** Process-local diagnostic identity for the acquired OkHttp connection. */
+    /**
+     * Process-local physical connection identity. Curl emits `curl:<cache>:<connection>`;
+     * `unknown` means the native artifact or completed transfer cannot provide a true
+     * connection id. This is never a URL, pointer, request id, or easy-handle id.
+     */
     var connectionIdentity: String? = null,
     /** The observed generation was retired for new requests. */
     var connectionDraining: Boolean = false,
@@ -99,6 +103,20 @@ data class VBTransportElapseStatistics(
     var staleH2ConcurrentRequestCount: Int = 0,
     /** null when the native curl artifact does not expose transfer facts V1. */
     var curlFinalHeadersObserved: Boolean? = null,
+    /** null means the native artifact has no completion schema; 1 means V1 was read. */
+    var curlCompletionInfoVersion: Int? = null,
+    /** null when the completion diagnostics ABI is unavailable. */
+    var curlNameLookupTimingAvailable: Boolean? = null,
+    /** null when the completion diagnostics ABI is unavailable. */
+    var curlConnectTimingAvailable: Boolean? = null,
+    /** null when the completion diagnostics ABI is unavailable. */
+    var curlPreTransferTimingAvailable: Boolean? = null,
+    /** null when the completion diagnostics ABI is unavailable. */
+    var curlStartTransferTimingAvailable: Boolean? = null,
+    /** null when the completion diagnostics ABI is unavailable. */
+    var curlTotalTimingAvailable: Boolean? = null,
+    /** `not_applicable`, `observed`, `reused_connection`, `not_reached`, or `unknown`. */
+    var curlTlsTimingState: String? = null,
     /** null when unavailable; false means the transfer ended before any body byte. */
     var curlFirstBodyObserved: Boolean? = null,
     /** null when unavailable; false means no positive-length body callback occurred. */

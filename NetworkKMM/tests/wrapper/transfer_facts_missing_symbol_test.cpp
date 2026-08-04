@@ -9,6 +9,14 @@ int main() {
             CURL_TRANSFER_INFO_ABI_VERSION) != 0) {
         return 1;
     }
+    CurlCompletionInfoV1 completion{};
+    if (NetworkKmmGetCurlCompletionInfoV1IfAvailable(
+            nullptr,
+            &completion,
+            sizeof(completion),
+            CURL_COMPLETION_INFO_ABI_VERSION) != 0) {
+        return 8;
+    }
     if (NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable(nullptr, 1024) != 0) {
         return 2;
     }

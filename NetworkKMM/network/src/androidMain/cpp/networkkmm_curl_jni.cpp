@@ -76,6 +76,7 @@ struct CallbackContext {
     jmethodID buffered_body_idle_timeout_millis = nullptr;
     jmethodID max_buffered_response_bytes = nullptr;
     jmethodID on_complete = nullptr;
+    jmethodID on_completion_facts = nullptr;
     jmethodID on_transfer_facts = nullptr;
     jmethodID on_multi_facts = nullptr;
     CurlResponse *pending_response = nullptr;
@@ -238,6 +239,7 @@ void OnComplete(void *callback_ref, CurlResponse *response) {
 }
 
 void DeliverTransferFacts(CallbackContext *context);
+void DeliverCompletionFacts(CallbackContext *context);
 void DeliverMultiFacts(CallbackContext *context);
 
 void RemovePublishedClient(int request_id, CurClientHandle client) {
@@ -278,6 +280,7 @@ void OnAsyncComplete(void *callback_ref, CurlResponse *response) {
     // Multi terminal callbacks run after the easy handle is finished, so facts
     // are valid now. Publish facts before the Kotlin terminal response.
     DeliverMultiFacts(context);
+    DeliverCompletionFacts(context);
     DeliverTransferFacts(context);
     RemovePublishedClient(context->request_id, context->client);
     DeliverComplete(context, response);
@@ -315,6 +318,40 @@ void DeliverTransferFacts(CallbackContext *context) {
         static_cast<jlong>(facts.firstBodyElapsedMs),
         static_cast<jlong>(facts.lastBodyProgressElapsedMs),
         static_cast<jlong>(facts.bodyBytes)
+    );
+    CancelAfterCallbackException(context);
+}
+
+void DeliverCompletionFacts(CallbackContext *context) {
+    if (context->on_completion_facts == nullptr || context->client == nullptr) {
+        return;
+    }
+    CurlCompletionInfoV1 facts{};
+    if (GetCurlCompletionInfoV1(
+            context->client,
+            &facts,
+            sizeof(facts),
+            CURL_COMPLETION_INFO_ABI_VERSION) == 0) {
+        return;
+    }
+    context->env->CallVoidMethod(
+        context->callback,
+        context->on_completion_facts,
+        facts.connectionIdAvailable != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.nameLookupTimingAvailable != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.connectTimingAvailable != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.preTransferTimingAvailable != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.startTransferTimingAvailable != 0 ? JNI_TRUE : JNI_FALSE,
+        facts.totalTimingAvailable != 0 ? JNI_TRUE : JNI_FALSE,
+        static_cast<jint>(facts.tlsTimingState),
+        static_cast<jlong>(facts.connectionCacheId),
+        static_cast<jlong>(facts.connectionId),
+        static_cast<jlong>(facts.nameLookupTimeUs),
+        static_cast<jlong>(facts.connectTimeUs),
+        static_cast<jlong>(facts.tlsTimeUs),
+        static_cast<jlong>(facts.preTransferTimeUs),
+        static_cast<jlong>(facts.startTransferTimeUs),
+        static_cast<jlong>(facts.totalTimeUs)
     );
     CancelAfterCallbackException(context);
 }
@@ -365,6 +402,13 @@ bool PopulateCallbackMethods(JNIEnv *env, jobject callback, CallbackContext *con
     if (context->on_transfer_facts == nullptr && env->ExceptionCheck()) {
         // Additive bridge method: an older Kotlin callback remains request-
         // compatible and simply receives no V1 facts.
+        env->ExceptionClear();
+    }
+    context->on_completion_facts = env->GetMethodID(
+        callback_class,
+        "onCompletionFacts",
+        "(ZZZZZZIJJJJJJJJ)V");
+    if (context->on_completion_facts == nullptr && env->ExceptionCheck()) {
         env->ExceptionClear();
     }
     context->on_multi_facts = env->GetMethodID(callback_class, "onMultiFacts", "(JZ)V");
@@ -706,6 +750,7 @@ void NativePerform(
     // The V1 native contract permits reads only after Start* has completed its
     // terminal callback and returned, while the handle is still alive.
     if (transfer_completed) {
+        DeliverCompletionFacts(&context);
         DeliverTransferFacts(&context);
         DeliverComplete(&context, context.pending_response);
     }

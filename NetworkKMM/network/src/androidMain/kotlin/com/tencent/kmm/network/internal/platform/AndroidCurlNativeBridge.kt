@@ -16,10 +16,13 @@
  */
 package com.tencent.kmm.network.internal.platform
 
+import com.tencent.kmm.network.curl.CurlCompletionFactsV1
 import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.CurlResponseCodec
 import com.tencent.kmm.network.curl.CurlResponseFields
+import com.tencent.kmm.network.curl.CurlTlsTimingState
 import com.tencent.kmm.network.curl.CurlTransferFactsV1
+import com.tencent.kmm.network.curl.applyCurlCompletionFacts
 import com.tencent.kmm.network.curl.applyCurlTransferFacts
 import com.tencent.kmm.network.export.VBTransportElapseStatistics
 import kotlinx.coroutines.Dispatchers
@@ -302,6 +305,7 @@ internal class AndroidCurlJniCallback(
     private val onCompleteBlock: (CurlNativeResponse) -> Unit
 ) {
     private val callbackFailure = AtomicReference<Throwable?>(null)
+    private var pendingCompletionFacts: CurlCompletionFactsV1? = null
     private var pendingTransferFacts: CurlTransferFactsV1? = null
     private var pendingMultiQueueDelayMs: Long = 0
     private var pendingMultiOwnerObserved: Boolean? = null
@@ -360,6 +364,51 @@ internal class AndroidCurlJniCallback(
         )
     }
 
+    @Suppress("LongParameterList")
+    @JvmName("onCompletionFacts")
+    fun onCompletionFacts(
+        connectionIdAvailable: Boolean,
+        nameLookupTimingAvailable: Boolean,
+        connectTimingAvailable: Boolean,
+        preTransferTimingAvailable: Boolean,
+        startTransferTimingAvailable: Boolean,
+        totalTimingAvailable: Boolean,
+        tlsTimingState: Int,
+        connectionCacheId: Long,
+        connectionId: Long,
+        nameLookupTimeUs: Long,
+        connectTimeUs: Long,
+        tlsTimeUs: Long,
+        preTransferTimeUs: Long,
+        startTransferTimeUs: Long,
+        totalTimeUs: Long,
+    ) {
+        pendingCompletionFacts = CurlCompletionFactsV1(
+            schemaVersion = 1,
+            connectionIdAvailable = connectionIdAvailable,
+            nameLookupTimingAvailable = nameLookupTimingAvailable,
+            connectTimingAvailable = connectTimingAvailable,
+            preTransferTimingAvailable = preTransferTimingAvailable,
+            startTransferTimingAvailable = startTransferTimingAvailable,
+            totalTimingAvailable = totalTimingAvailable,
+            tlsTimingState = when (tlsTimingState) {
+                1 -> CurlTlsTimingState.NOT_APPLICABLE
+                2 -> CurlTlsTimingState.OBSERVED
+                3 -> CurlTlsTimingState.REUSED_CONNECTION
+                4 -> CurlTlsTimingState.NOT_REACHED
+                else -> CurlTlsTimingState.UNKNOWN
+            },
+            connectionCacheId = connectionCacheId,
+            connectionId = connectionId,
+            nameLookupTimeUs = nameLookupTimeUs,
+            connectTimeUs = connectTimeUs,
+            tlsTimeUs = tlsTimeUs,
+            preTransferTimeUs = preTransferTimeUs,
+            startTransferTimeUs = startTransferTimeUs,
+            totalTimeUs = totalTimeUs,
+        )
+    }
+
     @JvmName("onMultiFacts")
     fun onMultiFacts(enqueueToNativeStartElapsedMs: Long, ownerThreadObserved: Boolean) {
         pendingMultiQueueDelayMs = enqueueToNativeStartElapsedMs
@@ -415,6 +464,7 @@ internal class AndroidCurlJniCallback(
                     )
                 )
             )
+        response.elapse.applyCurlCompletionFacts(pendingCompletionFacts)
         response.elapse.applyCurlTransferFacts(pendingTransferFacts)
         response.elapse.curlEnqueueToNativeStartElapsedMs = pendingMultiQueueDelayMs.toDouble()
         response.elapse.curlMultiOwnerThreadObserved = pendingMultiOwnerObserved

@@ -95,21 +95,31 @@ class IosCurlRuntimeTest {
         assertTrue(result.response.httpCode in 200..299)
         assertTrue(result.response.data?.isNotEmpty() == true)
         when (expectation) {
-            "unavailable" -> assertEquals(
-                IosCurlOptionalApiDiagnostics(
-                    bufferedBodyIdleTimeoutSetterAvailable = false,
-                    maxBufferedResponseBytesSetterAvailable = false,
-                    transferFactsAvailable = false
-                ),
-                result.optionalApi,
-                "old artifact must remain request-capable without additive symbols"
-            )
+            "unavailable" -> {
+                assertEquals(
+                    IosCurlOptionalApiDiagnostics(
+                        bufferedBodyIdleTimeoutSetterAvailable = false,
+                        maxBufferedResponseBytesSetterAvailable = false,
+                        transferFactsAvailable = false,
+                        completionFactsAvailable = false,
+                    ),
+                    result.optionalApi,
+                    "old artifact must remain request-capable without additive symbols"
+                )
+                assertNull(result.response.elapse.curlCompletionInfoVersion)
+                assertEquals("unknown", result.response.elapse.connectionIdentity)
+                assertNull(result.response.elapse.curlNameLookupTimingAvailable)
+                assertEquals("unknown", result.response.elapse.curlTlsTimingState)
+                assertEquals(0.0, result.response.elapse.responseWaitTimeMs)
+                assertTrue(result.response.elapse.totalTimeMs > 0.0)
+            }
             "available" -> {
                 assertEquals(
                     IosCurlOptionalApiDiagnostics(
                         bufferedBodyIdleTimeoutSetterAvailable = true,
                         maxBufferedResponseBytesSetterAvailable = true,
-                        transferFactsAvailable = true
+                        transferFactsAvailable = true,
+                        completionFactsAvailable = true,
                     ),
                     result.optionalApi,
                     "fresh artifact symbols must survive final executable linking"
@@ -118,6 +128,19 @@ class IosCurlRuntimeTest {
                 assertEquals(true, result.response.elapse.curlFirstBodyObserved)
                 assertEquals(true, result.response.elapse.curlBodyProgressObserved)
                 assertTrue(result.response.elapse.curlBodyBytes > 0)
+                assertEquals(1, result.response.elapse.curlCompletionInfoVersion)
+                assertTrue(result.response.elapse.connectionIdentity.orEmpty().startsWith("curl:"))
+                assertEquals(true, result.response.elapse.curlNameLookupTimingAvailable)
+                assertEquals(true, result.response.elapse.curlConnectTimingAvailable)
+                assertEquals(true, result.response.elapse.curlPreTransferTimingAvailable)
+                assertEquals(true, result.response.elapse.curlStartTransferTimingAvailable)
+                assertEquals(true, result.response.elapse.curlTotalTimingAvailable)
+                assertEquals("observed", result.response.elapse.curlTlsTimingState)
+                assertEquals(
+                    result.response.elapse.startTransferTimeMs,
+                    result.response.elapse.responseWaitTimeMs,
+                )
+                assertTrue(result.response.elapse.totalTimeMs > 0.0)
 
                 val capped = IosCurlCInteropBridge.executeWithOptionalApiDiagnostics(
                     runtimeRequest(

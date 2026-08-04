@@ -16,19 +16,24 @@
  */
 package com.tencent.kmm.network.internal.platform
 
+import com.tencent.kmm.network.curl.CurlCompletionFactsV1
 import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.CurlResponseCodec
 import com.tencent.kmm.network.curl.CurlResponseFields
+import com.tencent.kmm.network.curl.CurlTlsTimingState
 import com.tencent.kmm.network.curl.CurlTransferFactsV1
+import com.tencent.kmm.network.curl.applyCurlCompletionFacts
 import com.tencent.kmm.network.curl.applyCurlTransferFacts
 import com.tencent.kmm.network.curl.native.Cancel as cancelNative
 import com.tencent.kmm.network.curl.native.CreateCurlClient
 import com.tencent.kmm.network.curl.native.CurlSupportsHttp3
 import com.tencent.kmm.network.curl.native.CurlWrapperAbiVersion
 import com.tencent.kmm.network.curl.native.CURL_WRAPPER_ABI_VERSION
+import com.tencent.kmm.network.curl.native.CURL_COMPLETION_INFO_ABI_VERSION
 import com.tencent.kmm.network.curl.native.CURL_TRANSFER_INFO_ABI_VERSION
 import com.tencent.kmm.network.curl.native.CURL_MULTI_INFO_ABI_VERSION
 import com.tencent.kmm.network.curl.native.CurlCallback
+import com.tencent.kmm.network.curl.native.CurlCompletionInfoV1
 import com.tencent.kmm.network.curl.native.CurlRequest
 import com.tencent.kmm.network.curl.native.CurlResponse
 import com.tencent.kmm.network.curl.native.CurlStreamCallback
@@ -38,6 +43,7 @@ import com.tencent.kmm.network.curl.native.CurlMultiInfoV1
 import com.tencent.kmm.network.curl.native.DeleteCurlClient
 import com.tencent.kmm.network.curl.native.GetCurlNegotiatedProtocol
 import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlTransferInfoV1IfAvailable
+import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlCompletionInfoV1IfAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmCurlMultiApiAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmCreateCurlMultiEngineIfAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmSubmitBufferedRequestV27IfAvailable
@@ -164,7 +170,8 @@ internal interface IosCurlNativeBridge {
 internal data class IosCurlOptionalApiDiagnostics(
     val bufferedBodyIdleTimeoutSetterAvailable: Boolean,
     val maxBufferedResponseBytesSetterAvailable: Boolean,
-    val transferFactsAvailable: Boolean
+    val transferFactsAvailable: Boolean,
+    val completionFactsAvailable: Boolean,
 )
 
 internal data class IosCurlDiagnosticResponse(
@@ -222,6 +229,7 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             try {
                 response.elapse.protocol = GetCurlNegotiatedProtocol(handle)
                     ?.toKString()?.takeIf { it != "unknown" }
+                response.elapse.applyCurlCompletionFacts(readCurlCompletionFacts(handle))
                 response.elapse.applyCurlTransferFacts(readCurlTransferFacts(handle))
                 readCurlMultiFacts(handle)?.let { facts ->
                     response.elapse.curlEnqueueToNativeStartElapsedMs = facts.first.toDouble()
@@ -404,7 +412,8 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             optionalApi = IosCurlOptionalApiDiagnostics(
                 bufferedBodyIdleTimeoutSetterAvailable = false,
                 maxBufferedResponseBytesSetterAvailable = false,
-                transferFactsAvailable = false
+                transferFactsAvailable = false,
+                completionFactsAvailable = false,
             )
         )
         if (!isAvailable) {
@@ -467,6 +476,8 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
             response.elapse.protocol = GetCurlNegotiatedProtocol(handle)
                 ?.toKString()
                 ?.takeIf { it != "unknown" }
+            val completionFacts = readCurlCompletionFacts(handle)
+            response.elapse.applyCurlCompletionFacts(completionFacts)
             val transferFacts = readCurlTransferFacts(handle)
             response.elapse.applyCurlTransferFacts(transferFacts)
             IosCurlDiagnosticResponse(
@@ -476,7 +487,8 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                         bufferedBodyIdleTimeoutSetterAvailable,
                     maxBufferedResponseBytesSetterAvailable =
                         maxBufferedResponseBytesSetterAvailable,
-                    transferFactsAvailable = transferFacts != null
+                    transferFactsAvailable = transferFacts != null,
+                    completionFactsAvailable = completionFacts != null,
                 )
             )
         } finally {
@@ -487,6 +499,48 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
     }
 
     private fun unavailable(message: String) = CurlNativeResponse(code = -1, errorMsg = message)
+}
+
+@OptIn(ExperimentalForeignApi::class)
+private fun readCurlCompletionFacts(handle: COpaquePointer): CurlCompletionFactsV1? = memScoped {
+    val native = alloc<CurlCompletionInfoV1>()
+    val expectedSize = sizeOf<CurlCompletionInfoV1>()
+    if (NetworkKmmGetCurlCompletionInfoV1IfAvailable(
+            handle,
+            native.ptr,
+            expectedSize.convert(),
+            CURL_COMPLETION_INFO_ABI_VERSION
+        ) == 0) {
+        return@memScoped null
+    }
+    if (native.abiVersion != CURL_COMPLETION_INFO_ABI_VERSION ||
+        native.structSize.toLong() != expectedSize) {
+        return@memScoped null
+    }
+    CurlCompletionFactsV1(
+        schemaVersion = native.abiVersion,
+        connectionIdAvailable = native.connectionIdAvailable != 0,
+        nameLookupTimingAvailable = native.nameLookupTimingAvailable != 0,
+        connectTimingAvailable = native.connectTimingAvailable != 0,
+        preTransferTimingAvailable = native.preTransferTimingAvailable != 0,
+        startTransferTimingAvailable = native.startTransferTimingAvailable != 0,
+        totalTimingAvailable = native.totalTimingAvailable != 0,
+        tlsTimingState = when (native.tlsTimingState) {
+            1 -> CurlTlsTimingState.NOT_APPLICABLE
+            2 -> CurlTlsTimingState.OBSERVED
+            3 -> CurlTlsTimingState.REUSED_CONNECTION
+            4 -> CurlTlsTimingState.NOT_REACHED
+            else -> CurlTlsTimingState.UNKNOWN
+        },
+        connectionCacheId = native.connectionCacheId,
+        connectionId = native.connectionId,
+        nameLookupTimeUs = native.nameLookupTimeUs,
+        connectTimeUs = native.connectTimeUs,
+        tlsTimeUs = native.tlsTimeUs,
+        preTransferTimeUs = native.preTransferTimeUs,
+        startTransferTimeUs = native.startTransferTimeUs,
+        totalTimeUs = native.totalTimeUs,
+    )
 }
 
 @OptIn(ExperimentalForeignApi::class)
