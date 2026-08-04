@@ -278,7 +278,7 @@ HTTP_FEATURE_SYMBOLS
   local wrapper_symbols
   wrapper_symbols="$(xcrun nm "$merged" 2>/dev/null || true)"
   for symbol in CurlWrapperAbiVersion StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 \
-                GetCurlTransferInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs \
+                GetCurlTransferInfoV1 GetCurlCompletionInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs \
                 CreateCurlMultiEngine SubmitBufferedRequestV27 CancelCurlMultiRequest \
                 GetCurlMultiInfoV1; do
     if ! grep -q "${symbol}$" <<<"$wrapper_symbols"; then
@@ -336,7 +336,7 @@ for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
   syms="$(xcrun nm -g --defined-only -arch arm64 "$lib" 2>/dev/null || true)"
   for sym in _CreateCurlClient _DeleteCurlClient _Cancel _SetCurlCaInfo _SetCurlProxy _SetCurlResolve \
              _CurlWrapperAbiVersion _CurlSupportsHttp3 _SetCurlHttp3Enabled _GetCurlNegotiatedProtocol \
-             _GetCurlTransferInfoV1 _SetCurlMaxBufferedResponseBytes _SetCurlBufferedBodyIdleTimeoutMs \
+             _GetCurlTransferInfoV1 _GetCurlCompletionInfoV1 _SetCurlMaxBufferedResponseBytes _SetCurlBufferedBodyIdleTimeoutMs \
              _CreateCurlMultiEngine _SubmitBufferedRequestV27 _CancelCurlMultiRequest _GetCurlMultiInfoV1 \
              _StartRequestV27 _StartStreamRequestV27 _StartUploadRequestV27; do
     # herestring, not a pipe: grep -q exits on first match and pipefail

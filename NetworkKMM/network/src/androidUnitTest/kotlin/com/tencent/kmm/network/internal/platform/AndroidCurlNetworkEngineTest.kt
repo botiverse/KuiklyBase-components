@@ -883,7 +883,7 @@ class AndroidCurlNetworkEngineTest {
     }
 
     @Test
-    fun jniCallbackPublishesTerminalOnlyAfterApplyingTransferFacts() {
+    fun jniCallbackPublishesTerminalOnlyAfterApplyingCompletionAndTransferFacts() {
         var terminalInvoked = false
         val callback = AndroidCurlJniCallback(
             onResponseStartBlock = null,
@@ -901,7 +901,39 @@ class AndroidCurlNetworkEngineTest {
                 assertEquals(0L, timing.curlBodyBytes)
                 assertEquals(4.0, timing.curlEnqueueToNativeStartElapsedMs)
                 assertEquals(true, timing.curlMultiOwnerThreadObserved)
+                assertEquals(1, timing.curlCompletionInfoVersion)
+                assertEquals("curl:17:4", timing.connectionIdentity)
+                assertEquals(1.25, timing.nameLookupTimeMs)
+                assertEquals(2.5, timing.connectTimeMs)
+                assertEquals(0.0, timing.sslCostTimeMs)
+                assertEquals(3.75, timing.preTransferTime)
+                assertEquals(23.5, timing.startTransferTimeMs)
+                assertEquals(23.5, timing.responseWaitTimeMs)
+                assertEquals(42.125, timing.totalTimeMs)
+                assertEquals(true, timing.curlNameLookupTimingAvailable)
+                assertEquals(true, timing.curlConnectTimingAvailable)
+                assertEquals(true, timing.curlPreTransferTimingAvailable)
+                assertEquals(true, timing.curlStartTransferTimingAvailable)
+                assertEquals(true, timing.curlTotalTimingAvailable)
+                assertEquals("reused_connection", timing.curlTlsTimingState)
             }
+        )
+        callback.onCompletionFacts(
+            connectionIdAvailable = true,
+            nameLookupTimingAvailable = true,
+            connectTimingAvailable = true,
+            preTransferTimingAvailable = true,
+            startTransferTimingAvailable = true,
+            totalTimingAvailable = true,
+            tlsTimingState = 3,
+            connectionCacheId = 17,
+            connectionId = 4,
+            nameLookupTimeUs = 1_250,
+            connectTimeUs = 2_500,
+            tlsTimeUs = 99_000,
+            preTransferTimeUs = 3_750,
+            startTransferTimeUs = 23_500,
+            totalTimeUs = 42_125,
         )
         callback.onTransferFacts(
             finalHeadersObserved = true,
@@ -934,6 +966,56 @@ class AndroidCurlNetworkEngineTest {
             receiveTimeMs = 0.0,
             totalTimeMs = 510.0,
         )
+        assertTrue(terminalInvoked)
+    }
+
+    @Test
+    fun jniCallbackWithoutCompletionFactsPreservesLegacyTimingAndMarksSchemaAbsent() {
+        var terminalInvoked = false
+        val callback = AndroidCurlJniCallback(
+            onResponseStartBlock = null,
+            onChunkBlock = null,
+            uploadSource = null,
+            cancellationSignal = AndroidCurlCancellationSignal(),
+            onCompleteBlock = { response ->
+                terminalInvoked = true
+                val timing = response.elapse
+                assertEquals(1.0, timing.nameLookupTimeMs)
+                assertEquals(2.0, timing.connectTimeMs)
+                assertEquals(3.0, timing.sslCostTimeMs)
+                assertEquals(4.0, timing.preTransferTime)
+                assertEquals(5.0, timing.startTransferTimeMs)
+                assertEquals(0.0, timing.responseWaitTimeMs)
+                assertEquals(510.0, timing.totalTimeMs)
+                assertEquals("unknown", timing.connectionIdentity)
+                assertNull(timing.curlCompletionInfoVersion)
+                assertNull(timing.curlNameLookupTimingAvailable)
+                assertNull(timing.curlConnectTimingAvailable)
+                assertNull(timing.curlPreTransferTimingAvailable)
+                assertNull(timing.curlStartTransferTimingAvailable)
+                assertNull(timing.curlTotalTimingAvailable)
+                assertEquals("unknown", timing.curlTlsTimingState)
+            }
+        )
+
+        callback.onComplete(
+            code = 0,
+            httpCode = 200,
+            errorMessage = "",
+            headers = "HTTP/1.1 200 OK\r\n",
+            redirectUrl = "",
+            data = "ok".encodeToByteArray(),
+            protocol = "h2",
+            nameLookupTimeMs = 1.0,
+            connectTimeMs = 2.0,
+            sslCostTimeMs = 3.0,
+            preTransferTimeMs = 4.0,
+            startTransferTimeMs = 5.0,
+            redirectTimeMs = 0.0,
+            receiveTimeMs = 500.0,
+            totalTimeMs = 510.0,
+        )
+
         assertTrue(terminalInvoked)
     }
 

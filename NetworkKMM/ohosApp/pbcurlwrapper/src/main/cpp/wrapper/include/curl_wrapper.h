@@ -145,6 +145,41 @@ typedef struct {
     int64_t bodyBytes;
 } CurlTransferInfoV1;
 
+// Additive completion diagnostics ABI. Connection ids reported by libcurl
+// are unique only inside one connection cache, so callers must use the
+// (connectionCacheId, connectionId) pair as the physical identity. The cache
+// id is a process-local monotonic namespace, never a pointer or request/easy
+// handle id. A false connectionIdAvailable means the pair is invalid.
+#define CURL_COMPLETION_INFO_ABI_VERSION 1
+#define CURL_TLS_TIMING_STATE_UNKNOWN 0
+#define CURL_TLS_TIMING_STATE_NOT_APPLICABLE 1
+#define CURL_TLS_TIMING_STATE_OBSERVED 2
+#define CURL_TLS_TIMING_STATE_REUSED_CONNECTION 3
+#define CURL_TLS_TIMING_STATE_NOT_REACHED 4
+typedef struct {
+    int abiVersion;
+    uint32_t structSize;
+    int connectionIdAvailable;
+    int nameLookupTimingAvailable;
+    int connectTimingAvailable;
+    int preTransferTimingAvailable;
+    int startTransferTimingAvailable;
+    int totalTimingAvailable;
+    int tlsTimingState;
+    int reserved;
+    int64_t connectionCacheId;
+    int64_t connectionId;
+    // Normalized phase durations in microseconds. Availability flags and
+    // tlsTimingState are authoritative; a numeric zero may be a real
+    // sub-microsecond/skipped phase and must not be treated as unavailable.
+    int64_t nameLookupTimeUs;
+    int64_t connectTimeUs;
+    int64_t tlsTimeUs;
+    int64_t preTransferTimeUs;
+    int64_t startTransferTimeUs;
+    int64_t totalTimeUs;
+} CurlCompletionInfoV1;
+
 // CurClient 对象指针
 typedef void* CurClientHandle;
 typedef void* CurlMultiEngineHandle;
@@ -288,6 +323,12 @@ const char *GetCurlNegotiatedProtocol(CurClientHandle handle);
 // Returns 0 on a null/mismatched ABI without writing to the output buffer.
 int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
                           size_t infoSize, int abiVersion);
+
+// Snapshot completion-only phase availability and physical connection
+// identity. Read under the same lifetime contract as GetCurlTransferInfoV1.
+// Returns 0 on a null/mismatched ABI without writing to the output buffer.
+int GetCurlCompletionInfoV1(CurClientHandle handle, CurlCompletionInfoV1 *info,
+                            size_t infoSize, int abiVersion);
 
 // Single-owner multi engine for buffered requests. Submit is non-blocking:
 // one native owner thread drives every accepted easy handle through CURLM and

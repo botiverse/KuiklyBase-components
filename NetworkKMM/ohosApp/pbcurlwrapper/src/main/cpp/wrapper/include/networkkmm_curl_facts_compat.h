@@ -13,6 +13,7 @@
 // callers receive unavailable facts instead of a load/link failure.
 #if !defined(__APPLE__) && defined(__GNUC__)
 #pragma weak GetCurlTransferInfoV1
+#pragma weak GetCurlCompletionInfoV1
 #endif
 
 #if !defined(__APPLE__) && defined(__GNUC__)
@@ -158,6 +159,33 @@ static inline int NetworkKmmGetCurlTransferInfoV1IfAvailable(
         return 0;
     }
     return GetCurlTransferInfoV1(handle, info, infoSize, abiVersion);
+#endif
+}
+
+static inline int NetworkKmmGetCurlCompletionInfoV1IfAvailable(
+    CurClientHandle handle,
+    CurlCompletionInfoV1 *info,
+    size_t infoSize,
+    int abiVersion
+) {
+#if defined(__APPLE__)
+    typedef int (*GetCompletionInfoFn)(
+        CurClientHandle,
+        CurlCompletionInfoV1 *,
+        size_t,
+        int);
+    GetCompletionInfoFn function = (GetCompletionInfoFn)dlsym(
+        RTLD_DEFAULT,
+        "GetCurlCompletionInfoV1");
+    if (function == 0) {
+        return 0;
+    }
+    return function(handle, info, infoSize, abiVersion);
+#else
+    if (GetCurlCompletionInfoV1 == 0) {
+        return 0;
+    }
+    return GetCurlCompletionInfoV1(handle, info, infoSize, abiVersion);
 #endif
 }
 

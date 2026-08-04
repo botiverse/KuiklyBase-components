@@ -77,6 +77,12 @@ static_assert(sizeof(CurlTransferInfoV1) == 56,
               "CurlTransferInfoV1 ABI size drift");
 static_assert(offsetof(CurlTransferInfoV1, finalHeadersElapsedMs) == 24,
               "CurlTransferInfoV1 timing offset drift");
+static_assert(sizeof(CurlCompletionInfoV1) == 104,
+              "CurlCompletionInfoV1 ABI size drift");
+static_assert(offsetof(CurlCompletionInfoV1, connectionCacheId) == 40,
+              "CurlCompletionInfoV1 connection namespace offset drift");
+static_assert(offsetof(CurlCompletionInfoV1, nameLookupTimeUs) == 56,
+              "CurlCompletionInfoV1 timing offset drift");
 static_assert(offsetof(CurlRequest, streamWholeTimeoutMs) == 56,
               "CurlRequest.streamWholeTimeoutMs ABI offset drift");
 static_assert(offsetof(CurlRequest, postBodyLen) == 64, "CurlRequest.postBodyLen ABI offset drift");
@@ -85,6 +91,14 @@ static_assert(offsetof(CurlRequest, postBody) == 72, "CurlRequest.postBody ABI o
 
 static std::once_flag gCurlGlobalInitFlag;
 static CURLcode gCurlGlobalInitResult = CURLE_FAILED_INIT;
+static std::atomic<int64_t> gNextConnectionCacheId{1};
+
+static int64_t NextConnectionCacheId() {
+    // A process cannot realistically exhaust the positive int64 range. Still
+    // fail closed on wrap instead of ever emitting namespace zero.
+    const int64_t value = gNextConnectionCacheId.fetch_add(1, std::memory_order_relaxed);
+    return value > 0 ? value : 0;
+}
 
 static bool EnsureCurlGlobalInit() {
     std::call_once(gCurlGlobalInitFlag, []() {
@@ -590,6 +604,21 @@ class CurlSocketIoClient {
     CurlWebSocketClient *wire_ = nullptr;
 };
 
+static std::string CurlUrlScheme(const char *url) {
+    if (url == nullptr) {
+        return "";
+    }
+    const char *separator = std::strchr(url, ':');
+    if (separator == nullptr || separator == url) {
+        return "";
+    }
+    std::string scheme(url, static_cast<size_t>(separator - url));
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), [](unsigned char value) {
+        return static_cast<char>(std::tolower(value));
+    });
+    return scheme;
+}
+
 // Share only thread-safe cache classes across the per-request easy handles.
 // libcurl explicitly does not support sharing one connection cache between
 // concurrent easy_perform calls on different threads: lock callbacks prevent
@@ -630,7 +659,9 @@ static CURLSH *GetCurlShare(bool http3Enabled) {
 }
 class CurlClient {
  public:
-    explicit CurlClient(std::string logTag) {
+    explicit CurlClient(std::string logTag)
+        : connection_cache_id_(NextConnectionCacheId()) {
+        ResetCompletionInfo();
         log_tag_ = logTag;
         logI(log_tag_, "CurlClient() execute.");
         if (!EnsureCurlGlobalInit()) {
@@ -1066,6 +1097,9 @@ class CurlClient {
     // (fork #8). Everything except the write callback + perform is configured
     // here; the caller sets its own CURLOPT_WRITEFUNCTION and performs.
     bool ConfigureRequest(CurlRequest &request, std::string &method) {
+        completion_capture_eligible_ = false;
+        ResetCompletionInfo();
+        request_scheme_.clear();
 #if defined(NETWORKKMM_WRAPPER_TESTING)
         if (test_configure_failure_.exchange(false, std::memory_order_relaxed)) {
             logE(log_tag_, "injected ConfigureRequest failure");
@@ -1089,6 +1123,7 @@ class CurlClient {
             curlVer = ver;
         }
         const char *url = request.url;
+        request_scheme_ = CurlUrlScheme(url);
         int64_t timeout = request.timeout;
         StringDic *headers = request.headers;
         int size = headers->size;
@@ -1296,6 +1331,7 @@ class CurlClient {
         // on body-idle, while the routing layer may later replay only explicit
         // idempotent/replay-safe requests.
         last_buffered_body_activity_ = request_started_;
+        completion_capture_eligible_ = true;
         return true;
     }
 
@@ -1632,6 +1668,147 @@ class CurlClient {
     }
 
 
+    void ResetCompletionInfo() {
+        completion_info_ = {};
+        completion_info_.abiVersion = CURL_COMPLETION_INFO_ABI_VERSION;
+        completion_info_.structSize = static_cast<uint32_t>(sizeof(CurlCompletionInfoV1));
+        completion_info_.tlsTimingState = CURL_TLS_TIMING_STATE_UNKNOWN;
+        completion_info_.connectionId = -1;
+    }
+
+    void CaptureCompletionInfo() {
+        ResetCompletionInfo();
+        if (curl_ == nullptr || !completion_capture_eligible_) {
+            return;
+        }
+
+        // TIME_T variants are cumulative microseconds from transfer start.
+        // Keep these normalized diagnostics out of frozen CurlResponse so the
+        // legacy/OHOS response ABI and its historical zero semantics do not
+        // change. Availability/state fields distinguish a real zero from a
+        // phase the transfer never reached.
+        curl_off_t nameLookupUs = 0;
+        curl_off_t connectUs = 0;
+        curl_off_t appConnectUs = 0;
+        curl_off_t preTransferUs = 0;
+        curl_off_t startTransferUs = 0;
+        curl_off_t totalUs = 0;
+        const bool nameLookupRead =
+            curl_easy_getinfo(curl_, CURLINFO_NAMELOOKUP_TIME_T, &nameLookupUs) == CURLE_OK;
+        const bool connectRead =
+            curl_easy_getinfo(curl_, CURLINFO_CONNECT_TIME_T, &connectUs) == CURLE_OK;
+        const bool appConnectRead =
+            curl_easy_getinfo(curl_, CURLINFO_APPCONNECT_TIME_T, &appConnectUs) == CURLE_OK;
+        const bool preTransferRead =
+            curl_easy_getinfo(curl_, CURLINFO_PRETRANSFER_TIME_T, &preTransferUs) == CURLE_OK;
+        const bool startTransferRead =
+            curl_easy_getinfo(curl_, CURLINFO_STARTTRANSFER_TIME_T, &startTransferUs) == CURLE_OK;
+        const bool totalRead =
+            curl_easy_getinfo(curl_, CURLINFO_TOTAL_TIME_T, &totalUs) == CURLE_OK;
+
+        curl_off_t connectionId = -1;
+#if LIBCURL_VERSION_NUM >= 0x080200
+        const bool connectionIdAvailable =
+            curl_easy_getinfo(curl_, CURLINFO_CONN_ID, &connectionId) == CURLE_OK &&
+            connectionId >= 0 && connection_cache_id_ > 0;
+#else
+        const bool connectionIdAvailable = false;
+#endif
+        long newConnections = 0;
+        const bool newConnectionsRead =
+            curl_easy_getinfo(curl_, CURLINFO_NUM_CONNECTS, &newConnections) == CURLE_OK;
+
+        // CURLINFO_EFFECTIVE_URL follows redirects. Prefer it over the
+        // originally requested scheme so an HTTP -> HTTPS transfer is
+        // classified as TLS-applicable.
+        char *effectiveUrl = nullptr;
+        std::string effectiveScheme;
+        if (curl_easy_getinfo(curl_, CURLINFO_EFFECTIVE_URL, &effectiveUrl) == CURLE_OK &&
+            effectiveUrl != nullptr) {
+            effectiveScheme = CurlUrlScheme(effectiveUrl);
+        }
+        if (effectiveScheme.empty()) {
+            char *scheme = nullptr;
+            if (curl_easy_getinfo(curl_, CURLINFO_SCHEME, &scheme) == CURLE_OK &&
+                scheme != nullptr) {
+                effectiveScheme = scheme;
+            }
+        }
+        if (effectiveScheme.empty()) {
+            effectiveScheme = request_scheme_;
+        }
+        std::transform(
+            effectiveScheme.begin(), effectiveScheme.end(), effectiveScheme.begin(),
+            [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+        const bool schemeKnown = !effectiveScheme.empty();
+        const bool tlsApplicable =
+            effectiveScheme == "https" || effectiveScheme == "wss" ||
+            effectiveScheme == "ftps" || effectiveScheme == "imaps" ||
+            effectiveScheme == "pop3s" || effectiveScheme == "smtps" ||
+            effectiveScheme == "ldaps";
+
+        const bool finalHeadersObserved = final_headers_elapsed_ms_ >= 0;
+        const bool preTransferReached =
+            preTransferUs > 0 || startTransferUs > 0 || finalHeadersObserved;
+        const bool startTransferReached = startTransferUs > 0 || finalHeadersObserved;
+        // A libcurl connection object (and therefore CURLINFO_CONN_ID) may
+        // exist even when the socket connection never completed. Keep that
+        // physical identity independent from phase completion: only a
+        // positive CONNECT timestamp or a later completed phase proves that
+        // connect timing is meaningful. Likewise, a zero name-lookup value is
+        // a known completed phase only once connect or a later phase completed
+        // (cached/literal-host lookups can legitimately take zero microseconds).
+        const bool connectReached = connectUs > 0 || preTransferReached;
+        const bool nameLookupReached = nameLookupUs > 0 || connectReached;
+
+        completion_info_.connectionIdAvailable = connectionIdAvailable ? 1 : 0;
+        completion_info_.connectionCacheId = connectionIdAvailable ? connection_cache_id_ : 0;
+        completion_info_.connectionId = connectionIdAvailable
+            ? static_cast<int64_t>(connectionId)
+            : -1;
+        completion_info_.nameLookupTimingAvailable =
+            nameLookupRead && nameLookupReached ? 1 : 0;
+        completion_info_.connectTimingAvailable =
+            connectRead && connectReached ? 1 : 0;
+        completion_info_.preTransferTimingAvailable =
+            preTransferRead && preTransferReached ? 1 : 0;
+        completion_info_.startTransferTimingAvailable =
+            startTransferRead && startTransferReached ? 1 : 0;
+        completion_info_.totalTimingAvailable = totalRead ? 1 : 0;
+        if (!schemeKnown) {
+            completion_info_.tlsTimingState = CURL_TLS_TIMING_STATE_UNKNOWN;
+        } else if (!tlsApplicable) {
+            completion_info_.tlsTimingState = CURL_TLS_TIMING_STATE_NOT_APPLICABLE;
+        } else if (appConnectRead && appConnectUs > 0) {
+            completion_info_.tlsTimingState = CURL_TLS_TIMING_STATE_OBSERVED;
+        } else if (connectionIdAvailable && newConnectionsRead && newConnections == 0 &&
+                   preTransferReached) {
+            completion_info_.tlsTimingState = CURL_TLS_TIMING_STATE_REUSED_CONNECTION;
+        } else if (connectionIdAvailable && finalHeadersObserved) {
+            // A completed secure response proves TLS even when the timer is a
+            // real zero or redirect aggregation cannot identify final-cache
+            // reuse precisely.
+            completion_info_.tlsTimingState = CURL_TLS_TIMING_STATE_OBSERVED;
+        } else {
+            completion_info_.tlsTimingState = CURL_TLS_TIMING_STATE_NOT_REACHED;
+        }
+
+        completion_info_.nameLookupTimeUs = std::max<curl_off_t>(0, nameLookupUs);
+        completion_info_.connectTimeUs =
+            std::max<curl_off_t>(0, connectUs - nameLookupUs);
+        completion_info_.tlsTimeUs =
+            completion_info_.tlsTimingState == CURL_TLS_TIMING_STATE_OBSERVED
+                ? std::max<curl_off_t>(0, appConnectUs - connectUs)
+                : 0;
+        const curl_off_t preTransferBaseUs = std::max(
+            nameLookupUs, std::max(connectUs, appConnectUs));
+        completion_info_.preTransferTimeUs =
+            std::max<curl_off_t>(0, preTransferUs - preTransferBaseUs);
+        completion_info_.startTransferTimeUs =
+            std::max<curl_off_t>(0, startTransferUs - preTransferUs);
+        completion_info_.totalTimeUs = std::max<curl_off_t>(0, totalUs);
+    }
+
     void HandleElapseStatisticsInfo(CurlResponse *curlResponse) {
         if (curl_ == nullptr || curlResponse == nullptr) {
             return;
@@ -1680,6 +1857,7 @@ class CurlClient {
         curlResponse->elapse.redirectTime = redirectTime;
         curlResponse->elapse.recvTime = recvTime;
         curlResponse->elapse.totalTimeMs = totalTime;
+        CaptureCompletionInfo();
     }
 
  public:
@@ -1752,6 +1930,19 @@ class CurlClient {
         return true;
     }
 
+    bool GetCompletionInfo(CurlCompletionInfoV1 *info, size_t infoSize, int abiVersion) const {
+        if (info == nullptr || infoSize != sizeof(CurlCompletionInfoV1) ||
+            abiVersion != CURL_COMPLETION_INFO_ABI_VERSION) {
+            return false;
+        }
+        *info = completion_info_;
+        return true;
+    }
+
+    void SetConnectionCacheId(int64_t connectionCacheId) {
+        connection_cache_id_ = connectionCacheId > 0 ? connectionCacheId : 0;
+    }
+
  private:
     std::string log_tag_;
     CURL *curl_ = nullptr;
@@ -1774,6 +1965,9 @@ class CurlClient {
     bool first_body_seen_ = false;
     std::string buffered_timeout_reason_;
     int64_t max_buffered_response_bytes_ = 0;
+    int64_t connection_cache_id_ = 0;
+    CurlCompletionInfoV1 completion_info_{};
+    bool completion_capture_eligible_ = false;
     std::string buffered_response_limit_reason_;
     CurlResponse *curl_response_ = nullptr;  // destructor deletes it — must not start wild
     // Caller-pinned Accept-Encoding (from the request header); empty = advertise
@@ -1782,6 +1976,7 @@ class CurlClient {
     std::string ca_info_path_;
     std::string proxy_url_;
     std::string resolve_entry_;
+    std::string request_scheme_;
     // fork #8 streaming: set for the lifetime of a StartStreamRequest call.
     CurlStreamCallback *stream_callback_ = nullptr;
     // issue #8 slice 3: set for the lifetime of a StartUploadRequest call.
@@ -1867,7 +2062,9 @@ struct OwnedMultiBufferedRequest {
 
 class CurlMultiEngine {
  public:
-    explicit CurlMultiEngine(std::string logTag) : log_tag_(std::move(logTag)) {
+    explicit CurlMultiEngine(std::string logTag)
+        : log_tag_(std::move(logTag)),
+          connection_cache_id_(NextConnectionCacheId()) {
         if (!EnsureCurlGlobalInit()) {
             return;
         }
@@ -1916,6 +2113,7 @@ class CurlMultiEngine {
             } else if (http3_cohort_ != job->client->Http3Enabled()) {
                 return false;
             }
+            job->client->SetConnectionCacheId(connection_cache_id_);
             jobs_by_id_[job->request_id] = job.get();
             pending_.push_back(std::move(job));
         }
@@ -2117,6 +2315,7 @@ class CurlMultiEngine {
     bool stopping_ = false;
     bool cohort_initialized_ = false;
     bool http3_cohort_ = false;
+    int64_t connection_cache_id_ = 0;
     std::deque<std::unique_ptr<OwnedMultiBufferedRequest>> pending_;
     std::unordered_map<int64_t, OwnedMultiBufferedRequest *> jobs_by_id_;
     std::unordered_map<CURL *, std::unique_ptr<OwnedMultiBufferedRequest>> active_by_easy_;
@@ -2422,6 +2621,16 @@ int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
         return 0;
     }
     return reinterpret_cast<CurlClient *>(handle)->GetTransferInfo(info, infoSize, abiVersion) ? 1 : 0;
+}
+
+NETWORKKMM_OPTIONAL_API
+int GetCurlCompletionInfoV1(CurClientHandle handle, CurlCompletionInfoV1 *info,
+                            size_t infoSize, int abiVersion) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    return reinterpret_cast<CurlClient *>(handle)->GetCompletionInfo(
+        info, infoSize, abiVersion) ? 1 : 0;
 }
 
 #if defined(__APPLE__)

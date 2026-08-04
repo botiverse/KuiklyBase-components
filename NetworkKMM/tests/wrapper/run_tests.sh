@@ -44,7 +44,7 @@ g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
   -o "$BUILD_DIR/wrapper_behavior_test"
 
 WRAPPER_SYMBOLS="$(nm "$BUILD_DIR/wrapper_behavior_test")"
-for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs CreateCurlMultiEngine SubmitBufferedRequestV27 CancelCurlMultiRequest GetCurlMultiInfoV1 CreateCurlWebSocket ConnectCurlWebSocketV1 SendCurlWebSocketTextV1 ReceiveCurlWebSocketV1 CreateCurlSocketIoClientV1 StartCurlSocketIoClientV1 EmitCurlSocketIoEventV1; do
+for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1 GetCurlCompletionInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs CreateCurlMultiEngine SubmitBufferedRequestV27 CancelCurlMultiRequest GetCurlMultiInfoV1 CreateCurlWebSocket ConnectCurlWebSocketV1 SendCurlWebSocketTextV1 ReceiveCurlWebSocketV1 CreateCurlSocketIoClientV1 StartCurlSocketIoClientV1 EmitCurlSocketIoEventV1; do
   grep -Eq " [Tt] _?${symbol}$" <<<"$WRAPPER_SYMBOLS"
 done
 
