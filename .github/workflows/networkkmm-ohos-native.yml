@@ -175,6 +175,9 @@ jobs:
           printf '%s\n' "$symbols" | grep ' UND StartRequestV27$' >/dev/null
           printf '%s\n' "$symbols" | grep ' UND StartStreamRequestV27$' >/dev/null
           printf '%s\n' "$symbols" | grep ' UND StartUploadRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND CreateCurlSocketIoClientV1$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartCurlSocketIoClientV1$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND EmitCurlSocketIoEventV1$' >/dev/null
           legacy_matches="$(printf '%s\n' "$symbols" | grep -E ' UND Start(Request|StreamRequest|UploadRequest)$' || true)"
           if [[ -n "$legacy_matches" ]]; then
             echo "OHOS Kotlin/Native consumer still imports legacy Start* symbols" >&2
@@ -182,7 +185,7 @@ jobs:
             exit 1
           fi
           echo "OHOS Kotlin/Native consumer ABI/V27 dynamic imports:"
-          printf '%s\n' "$symbols" | grep -E ' UND (CurlWrapperAbiVersion|Start(Request|StreamRequest|UploadRequest)V27)$'
+          printf '%s\n' "$symbols" | grep -E ' UND (CurlWrapperAbiVersion|Start(Request|StreamRequest|UploadRequest)V27|CreateCurlSocketIoClientV1|StartCurlSocketIoClientV1|EmitCurlSocketIoEventV1)$'
 
       - name: Upload native artifacts
         uses: actions/upload-artifact@v4
@@ -256,6 +259,9 @@ jobs:
           printf '%s\n' "$symbols" | grep ' UND StartRequestV27$' >/dev/null
           printf '%s\n' "$symbols" | grep ' UND StartStreamRequestV27$' >/dev/null
           printf '%s\n' "$symbols" | grep ' UND StartUploadRequestV27$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND CreateCurlSocketIoClientV1$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND StartCurlSocketIoClientV1$' >/dev/null
+          printf '%s\n' "$symbols" | grep ' UND EmitCurlSocketIoEventV1$' >/dev/null
           legacy_matches="$(printf '%s\n' "$symbols" | grep -E ' UND Start(Request|StreamRequest|UploadRequest)$' || true)"
           test -z "$legacy_matches" || { printf '%s\n' "$legacy_matches" >&2; exit 1; }
 

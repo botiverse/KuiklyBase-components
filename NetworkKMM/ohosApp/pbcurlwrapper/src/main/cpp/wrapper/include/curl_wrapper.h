@@ -148,6 +148,7 @@ typedef struct {
 // CurClient 对象指针
 typedef void* CurClientHandle;
 typedef void* CurlMultiEngineHandle;
+typedef void* CurlWebSocketHandle;
 
 #define CURL_MULTI_INFO_ABI_VERSION 1
 
@@ -158,6 +159,81 @@ typedef struct CurlMultiInfoV1 {
     int ownerThreadObserved;
     int reserved;
 } CurlMultiInfoV1;
+
+// Additive WebSocket ABI. It deliberately owns a separate easy handle and is
+// driven by one caller thread. Return values are 1 = success/frame, 0 =
+// timeout/no frame, -1 = terminal error. The last libcurl error is available
+// through CurlWebSocketLastError.
+#define CURL_WEBSOCKET_ABI_VERSION 1
+typedef struct CurlWebSocketReadResultV1 {
+    int abiVersion;
+    uint32_t structSize;
+    int flags;
+    int dataLen;
+    int64_t bytesLeft;
+} CurlWebSocketReadResultV1;
+
+CurlWebSocketHandle CreateCurlWebSocket(const char *logTag);
+void DeleteCurlWebSocket(CurlWebSocketHandle handle);
+void CancelCurlWebSocket(CurlWebSocketHandle handle);
+int ConnectCurlWebSocketV1(CurlWebSocketHandle handle, const char *url,
+                           const StringDic *headers, const char *caInfoPath,
+                           const char *proxyUrl, int64_t connectTimeoutMs,
+                           int abiVersion);
+int SendCurlWebSocketTextV1(CurlWebSocketHandle handle, const char *data,
+                            size_t dataLen, int abiVersion);
+int ReceiveCurlWebSocketV1(CurlWebSocketHandle handle, char *buffer,
+                           size_t bufferSize, int64_t timeoutMs,
+                           CurlWebSocketReadResultV1 *result,
+                           size_t resultSize, int abiVersion);
+int CloseCurlWebSocketV1(CurlWebSocketHandle handle, int abiVersion);
+int CurlWebSocketLastError(CurlWebSocketHandle handle);
+
+// C++ Engine.IO v4 / Socket.IO v4 session built on the curl WebSocket ABI.
+// The session copies every config string/header before Start returns. All
+// callbacks are serialized on its owner thread; Delete must not be called
+// from a callback. V1 supports the default namespace and text JSON events.
+typedef void* CurlSocketIoHandle;
+#define CURL_SOCKET_IO_ABI_VERSION 1
+
+enum CurlSocketIoStateV1 {
+    CURL_SOCKET_IO_CONNECTING = 1,
+    CURL_SOCKET_IO_ENGINE_OPEN = 2,
+    CURL_SOCKET_IO_CONNECTED = 3,
+    CURL_SOCKET_IO_DISCONNECTED = 4,
+    CURL_SOCKET_IO_RECONNECTING = 5,
+    CURL_SOCKET_IO_ERROR = 6,
+};
+
+typedef struct CurlSocketIoConfigV1 {
+    int abiVersion;
+    uint32_t structSize;
+    const char *serverUrl;
+    const char *authJson;
+    const StringDic *headers;
+    const char *caInfoPath;
+    const char *proxyUrl;
+    int64_t connectTimeoutMs;
+    int64_t receivePollMs;
+    int64_t reconnectInitialDelayMs;
+    int64_t reconnectMaxDelayMs;
+} CurlSocketIoConfigV1;
+
+typedef struct CurlSocketIoCallbackV1 {
+    void *callbackRef;
+    void (*onState)(void *callbackRef, int state, int code, const char *detail);
+    void (*onEvent)(void *callbackRef, const char *eventName,
+                    const char *payloadJson);
+} CurlSocketIoCallbackV1;
+
+CurlSocketIoHandle CreateCurlSocketIoClientV1(
+    const CurlSocketIoConfigV1 *config, size_t configSize, int abiVersion,
+    const CurlSocketIoCallbackV1 *callback);
+int StartCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion);
+int EmitCurlSocketIoEventV1(CurlSocketIoHandle handle, const char *eventName,
+                            const char *payloadJson, int abiVersion);
+void CloseCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion);
+void DeleteCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion);
 
 // 创建 CurClient 对象
 CurClientHandle CreateCurlClient(const char *logTag);
@@ -238,6 +314,12 @@ int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
 // Host-test-only seam: 1 fails the next multi perform, 2 the next multi poll.
 void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode);
 void SetCurlClientTestConfigureFailure(CurClientHandle handle);
+int SocketIoTestWebSocketUrl(const char *serverUrl, char *output, size_t outputSize);
+int SocketIoTestEventFrame(const char *eventName, const char *payloadJson,
+                           char *output, size_t outputSize);
+int SocketIoTestDecodeEvent(const char *frame, char *eventName,
+                            size_t eventNameSize, char *payloadJson,
+                            size_t payloadJsonSize);
 #endif
 
 // Curl 发送请求

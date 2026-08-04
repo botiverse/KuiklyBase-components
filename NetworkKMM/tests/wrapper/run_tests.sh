@@ -14,6 +14,7 @@ PROXY_PORT="$((PORT + 1))"
 HTTPS_PORT="$((PORT + 2))"
 DELAYED_PROXY_PORT="$((PORT + 3))"
 CROSS_ORIGIN_PORT="$((PORT + 4))"
+SOCKET_IO_PORT="$((PORT + 5))"
 PROXY_MARKER="${BUILD_DIR}/stalled-connect-proxy.marker"
 DELAYED_PROXY_MARKER="${BUILD_DIR}/delayed-connect-proxy.marker"
 TLS_CERT="${BUILD_DIR}/phase-test-cert.pem"
@@ -43,11 +44,49 @@ g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
   -o "$BUILD_DIR/wrapper_behavior_test"
 
 WRAPPER_SYMBOLS="$(nm "$BUILD_DIR/wrapper_behavior_test")"
-for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs CreateCurlMultiEngine SubmitBufferedRequestV27 CancelCurlMultiRequest GetCurlMultiInfoV1; do
-  grep -Eq " [Tt] ${symbol}$" <<<"$WRAPPER_SYMBOLS"
+for symbol in StartRequestV27 StartStreamRequestV27 StartUploadRequestV27 GetCurlTransferInfoV1 SetCurlMaxBufferedResponseBytes SetCurlBufferedBodyIdleTimeoutMs CreateCurlMultiEngine SubmitBufferedRequestV27 CancelCurlMultiRequest GetCurlMultiInfoV1 CreateCurlWebSocket ConnectCurlWebSocketV1 SendCurlWebSocketTextV1 ReceiveCurlWebSocketV1 CreateCurlSocketIoClientV1 StartCurlSocketIoClientV1 EmitCurlSocketIoEventV1; do
+  grep -Eq " [Tt] _?${symbol}$" <<<"$WRAPPER_SYMBOLS"
 done
+
+echo "==> Verifying C++ Socket.IO protocol surface"
+g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
+  -I "$CPP_ROOT" \
+  -I "$CPP_ROOT/wrapper/include" \
+  "$CPP_ROOT/wrapper/src/curl_wrapper.cpp" \
+  "$CPP_ROOT/wrapper/src/log/curl_log.cpp" \
+  "$CPP_ROOT/wrapper/src/utils/curl_utils.cpp" \
+  "$SCRIPT_DIR/socketio_protocol_test.cpp" \
+  -lcurl -lz -pthread \
+  -o "$BUILD_DIR/socketio_protocol_test"
+"$BUILD_DIR/socketio_protocol_test"
+
+g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
+  -I "$CPP_ROOT" \
+  -I "$CPP_ROOT/wrapper/include" \
+  "$CPP_ROOT/wrapper/src/curl_wrapper.cpp" \
+  "$CPP_ROOT/wrapper/src/log/curl_log.cpp" \
+  "$CPP_ROOT/wrapper/src/utils/curl_utils.cpp" \
+  "$SCRIPT_DIR/socketio_integration_test.cpp" \
+  -lcurl -lz -pthread \
+  -o "$BUILD_DIR/socketio_integration_test"
+python3 "$SCRIPT_DIR/socketio_test_server.py" "$SOCKET_IO_PORT" &
+SOCKET_IO_PID=$!
+trap 'kill "$SOCKET_IO_PID" 2>/dev/null || true' EXIT
+sleep 0.2
+set +e
+"$BUILD_DIR/socketio_integration_test" "http://127.0.0.1:$SOCKET_IO_PORT"
+socket_io_result=$?
+set -e
+if [[ "$socket_io_result" -eq 77 ]]; then
+  echo "skip: Socket.IO live loop requires a host libcurl built with ws"
+  kill "$SOCKET_IO_PID" 2>/dev/null || true
+elif [[ "$socket_io_result" -eq 0 ]]; then
+  wait "$SOCKET_IO_PID"
+else
+  exit "$socket_io_result"
+fi
 for legacy_symbol in StartRequest StartStreamRequest StartUploadRequest; do
-  if grep -Eq " [Tt] ${legacy_symbol}$" <<<"$WRAPPER_SYMBOLS"; then
+  if grep -Eq " [Tt] _?${legacy_symbol}$" <<<"$WRAPPER_SYMBOLS"; then
     echo "legacy wrapper ABI symbol is still exported: ${legacy_symbol}" >&2
     exit 1
   fi
