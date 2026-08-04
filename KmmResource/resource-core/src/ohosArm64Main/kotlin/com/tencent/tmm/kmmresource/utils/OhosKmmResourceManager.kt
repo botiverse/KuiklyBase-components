@@ -1,27 +1,26 @@
 package com.tencent.tmm.kmmresource.utils
 
+import com.tencent.tmm.kmmresource.internal.StringLookupDispatcher
 import com.tencent.tmm.kmmresource.utils.cache.ColorCache
 import com.tencent.tmm.kmmresource.utils.cache.FontCache
-import com.tencent.tmm.kmmresource.utils.cache.StringCache
 import com.tencent.tmm.knoi.type.ArrayBuffer
 
 object OhosKmmResourceManager {
 
     private val fontCache = FontCache()
     private val colorCache = ColorCache()
-    private val stringCache = StringCache()
-
     internal val resourceService = getOhosResourceServiceApi()
+    private val stringLookup = StringLookupDispatcher(
+        rawLookup = { resourceName -> resourceService.getString(resourceName) },
+        formattedLookup = { resourceName, arguments ->
+            resourceService.getString(resourceName, arguments)
+        }
+    )
 
-    fun getString(resName: String): String? {
-        val resResult = stringCache.getResourceByCache(resName)
-        return resResult
-    }
+    fun getString(resName: String): String? = stringLookup.getString(resName)
 
-    fun getString(resName: String, vararg args: Any): String? {
-        val resResult = resourceService.getString(resName, args)
-        return resResult
-    }
+    fun getString(resName: String, vararg args: Any): String? =
+        stringLookup.getString(resName, *args)
 
 
     fun getPlural(resName: String, args: Int): String? {

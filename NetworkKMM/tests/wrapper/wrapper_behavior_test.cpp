@@ -6,9 +6,13 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <algorithm>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <curl/curl.h>
@@ -34,6 +38,64 @@ struct Captured {
     long long connectTimeMs = -1;
     bool invoked = false;
 };
+
+struct MultiCaptured {
+    std::mutex mutex;
+    std::condition_variable condition;
+    int expected = 0;
+    int completed = 0;
+    std::vector<int> callbackCounts;
+    std::vector<int> codes;
+    std::vector<long> httpCodes;
+    std::thread::id ownerThread;
+    bool ownerThreadSet = false;
+    bool ownerThreadMismatch = false;
+};
+
+struct MultiCallbackRef {
+    MultiCaptured *batch = nullptr;
+    int index = 0;
+};
+
+static void OnMultiResponse(void *ref, CurlResponse *response) {
+    auto *item = static_cast<MultiCallbackRef *>(ref);
+    std::lock_guard<std::mutex> lock(item->batch->mutex);
+    item->batch->callbackCounts[item->index]++;
+    item->batch->codes[item->index] = response->code;
+    item->batch->httpCodes[item->index] = response->httpCode;
+    if (!item->batch->ownerThreadSet) {
+        item->batch->ownerThread = std::this_thread::get_id();
+        item->batch->ownerThreadSet = true;
+    } else if (item->batch->ownerThread != std::this_thread::get_id()) {
+        item->batch->ownerThreadMismatch = true;
+    }
+    item->batch->completed++;
+    item->batch->condition.notify_all();
+}
+
+static bool AwaitMulti(MultiCaptured &batch, int timeoutMs) {
+    std::unique_lock<std::mutex> lock(batch.mutex);
+    return batch.condition.wait_for(
+        lock,
+        std::chrono::milliseconds(timeoutMs),
+        [&batch]() { return batch.completed >= batch.expected; });
+}
+
+struct UploadBuffer {
+    std::string data;
+    size_t offset = 0;
+};
+
+static int ReadUploadBuffer(void *ref, char *buffer, int maxLen) {
+    auto *source = static_cast<UploadBuffer *>(ref);
+    if (source == nullptr || buffer == nullptr || maxLen <= 0) return -1;
+    const size_t remaining = source->data.size() - source->offset;
+    if (remaining == 0) return 0;
+    const size_t count = std::min(remaining, static_cast<size_t>(maxLen));
+    std::memcpy(buffer, source->data.data() + source->offset, count);
+    source->offset += count;
+    return static_cast<int>(count);
+}
 
 struct StreamCaptured {
     int starts = 0;
@@ -127,7 +189,8 @@ static void OnResponse(void *ref, CurlResponse *response) {
 }
 
 static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
-                      const char *method = "GET", const char *body = nullptr) {
+                      const char *method = "GET", const char *body = nullptr,
+                      int64_t bufferedBodyIdleTimeoutMs = 0) {
     Captured captured;
     StringDic headers{};
     headers.size = 0;
@@ -146,6 +209,24 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     // semantics crashed exactly this pattern.
     CurlCallback callback{&captured, OnResponse};
     CurClientHandle handle = CreateCurlClient("wrapper-test");
+    SetCurlBufferedBodyIdleTimeoutMs(handle, bufferedBodyIdleTimeoutMs);
+    StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+    DeleteCurlClient(handle);
+    return captured;
+}
+
+static Captured FetchCapped(const std::string &url, int64_t maxBytes) {
+    Captured captured;
+    StringDic headers{};
+    CurlRequest request{};
+    request.url = url.c_str();
+    request.method = "GET";
+    request.headers = &headers;
+    request.timeout = 5000;
+
+    CurlCallback callback{&captured, OnResponse};
+    CurClientHandle handle = CreateCurlClient("wrapper-response-cap-test");
+    SetCurlMaxBufferedResponseBytes(handle, maxBytes);
     StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
     DeleteCurlClient(handle);
     return captured;
@@ -267,6 +348,239 @@ int main(int argc, char **argv) {
         DeleteCurlClient(handle);
     }
 
+    {
+        constexpr int requestCount = 4;
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-owner");
+        CHECK(engine != nullptr, "single-owner multi engine starts");
+
+        MultiCaptured batch;
+        batch.expected = requestCount;
+        batch.callbackCounts.assign(requestCount, 0);
+        batch.codes.assign(requestCount, -1);
+        batch.httpCodes.assign(requestCount, -1);
+        std::vector<MultiCallbackRef> refs(requestCount);
+        std::vector<CurClientHandle> handles(requestCount, nullptr);
+        const std::string multiUrl = base + "/multi-delay";
+        StringDic headers{};
+        const auto started = std::chrono::steady_clock::now();
+        for (int index = 0; index < requestCount; ++index) {
+            refs[index] = MultiCallbackRef{&batch, index};
+            handles[index] = CreateCurlClient("wrapper-multi-request");
+            CurlRequest request{};
+            request.url = multiUrl.c_str();
+            request.method = "GET";
+            request.headers = &headers;
+            request.timeout = 5000;
+            CurlCallback callback{&refs[index], OnMultiResponse};
+            CHECK(
+                SubmitBufferedRequestV27(
+                    engine,
+                    10'000 + index,
+                    handles[index],
+                    &request,
+                    sizeof(request),
+                    CURL_WRAPPER_ABI_VERSION,
+                    &callback) == 1,
+                "multi engine accepts buffered request");
+        }
+        CHECK(AwaitMulti(batch, 5000), "multi owner completes every concurrent request");
+        CHECK(batch.ownerThreadSet && !batch.ownerThreadMismatch,
+              "every multi terminal callback runs on one owner thread");
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        CHECK(elapsed < 2200, "single owner advances four delayed requests concurrently");
+        for (int index = 0; index < requestCount; ++index) {
+            CHECK(batch.callbackCounts[index] == 1, "multi request completes exactly once");
+            CHECK(batch.codes[index] == 0, "multi request CURLcode is 0");
+            CHECK(batch.httpCodes[index] == 200, "multi request preserves HTTP 200");
+            CurlMultiInfoV1 info{};
+            CHECK(
+                GetCurlMultiInfoV1(
+                    handles[index],
+                    &info,
+                    sizeof(info),
+                    CURL_MULTI_INFO_ABI_VERSION) == 1,
+                "multi request exposes queue-delay facts");
+            CHECK(info.ownerThreadObserved == 1, "multi request ran on owner thread");
+            CHECK(info.enqueueToNativeStartElapsedMs >= 0, "multi queue delay is non-negative");
+            CurlMultiInfoV1 untouched{};
+            untouched.reserved = 77;
+            CHECK(
+                GetCurlMultiInfoV1(handles[index], &untouched, sizeof(untouched) - 1,
+                                   CURL_MULTI_INFO_ABI_VERSION) == 0,
+                "multi facts reject mismatched struct size");
+            CHECK(untouched.reserved == 77, "multi facts mismatch does not write caller memory");
+        }
+
+        MultiCaptured cancelled;
+        cancelled.expected = 1;
+        cancelled.callbackCounts.assign(1, 0);
+        cancelled.codes.assign(1, -1);
+        cancelled.httpCodes.assign(1, -1);
+        MultiCallbackRef cancelRef{&cancelled, 0};
+        CurClientHandle cancelHandle = CreateCurlClient("wrapper-multi-cancel");
+        const std::string slowUrl = base + "/slow";
+        CurlRequest cancelRequest{};
+        cancelRequest.url = slowUrl.c_str();
+        cancelRequest.method = "GET";
+        cancelRequest.headers = &headers;
+        cancelRequest.timeout = 30'000;
+        CurlCallback cancelCallback{&cancelRef, OnMultiResponse};
+        CHECK(
+            SubmitBufferedRequestV27(
+                engine,
+                20'000,
+                cancelHandle,
+                &cancelRequest,
+                sizeof(cancelRequest),
+                CURL_WRAPPER_ABI_VERSION,
+                &cancelCallback) == 1,
+            "multi engine accepts cancellable request");
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        CancelCurlMultiRequest(engine, 20'000);
+        CHECK(AwaitMulti(cancelled, 3000), "multi cancel wakes owner without worker starvation");
+        CHECK(cancelled.callbackCounts[0] == 1, "multi cancel completes exactly once");
+        CHECK(cancelled.codes[0] == 42, "multi cancel preserves CURLE_ABORTED_BY_CALLBACK");
+
+        DeleteCurlMultiEngine(engine);
+        for (CurClientHandle handle : handles) {
+            DeleteCurlClient(handle);
+        }
+        DeleteCurlClient(cancelHandle);
+    }
+
+    {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-config-failure");
+        CHECK(engine != nullptr, "configure-failure multi engine starts");
+        MultiCaptured captured;
+        captured.expected = 1;
+        captured.callbackCounts.assign(1, 0);
+        captured.codes.assign(1, -1);
+        captured.httpCodes.assign(1, -1);
+        MultiCallbackRef ref{&captured, 0};
+        CurClientHandle handle = CreateCurlClient("wrapper-multi-config-failure-request");
+        SetCurlClientTestConfigureFailure(handle);
+        StringDic headers{};
+        const std::string url = base + "/ok";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+        CurlCallback callback{&ref, OnMultiResponse};
+        CHECK(SubmitBufferedRequestV27(engine, 21'000, handle, &request, sizeof(request),
+                                       CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "multi accepts request before configure failure is observed");
+        CHECK(AwaitMulti(captured, 3000),
+              "accepted configure failure reaches a terminal callback");
+        CHECK(captured.callbackCounts[0] == 1,
+              "accepted configure failure completes exactly once");
+        CHECK(captured.codes[0] == CURLE_FAILED_INIT,
+              "accepted configure failure is classified as failed init");
+        DeleteCurlMultiEngine(engine);
+        DeleteCurlClient(handle);
+    }
+
+    {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-pre-cancel");
+        CHECK(engine != nullptr, "pre-cancel multi engine starts");
+        MultiCaptured captured;
+        captured.expected = 1;
+        captured.callbackCounts.assign(1, 0);
+        captured.codes.assign(1, -1);
+        captured.httpCodes.assign(1, -1);
+        MultiCallbackRef ref{&captured, 0};
+        CurClientHandle handle = CreateCurlClient("wrapper-multi-pre-cancel-request");
+        SetCurlClientTestConfigureFailure(handle);
+        StringDic headers{};
+        const std::string url = base + "/slow";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 30'000;
+        CurlCallback callback{&ref, OnMultiResponse};
+        CHECK(SubmitBufferedRequestV27(engine, 21'001, handle, &request, sizeof(request),
+                                       CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "multi accepts request before configure/pre-cancel race");
+        CancelCurlMultiRequest(engine, 21'001);
+        CHECK(AwaitMulti(captured, 3000),
+              "configure/pre-cancel race reaches one terminal callback");
+        CHECK(captured.callbackCounts[0] == 1,
+              "configure/pre-cancel race never double-completes");
+        CHECK(captured.codes[0] == CURLE_FAILED_INIT ||
+                  captured.codes[0] == CURLE_ABORTED_BY_CALLBACK,
+              "configure/pre-cancel race preserves the winning terminal cause");
+        DeleteCurlMultiEngine(engine);
+        DeleteCurlClient(handle);
+    }
+
+    for (int failureMode : {1, 2}) {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-owner-fatal");
+        CHECK(engine != nullptr, "owner-fatal multi engine starts");
+        MultiCaptured captured;
+        captured.expected = 1;
+        captured.callbackCounts.assign(1, 0);
+        captured.codes.assign(1, -1);
+        captured.httpCodes.assign(1, -1);
+        MultiCallbackRef ref{&captured, 0};
+        CurClientHandle handle = CreateCurlClient("wrapper-multi-owner-fatal-request");
+        StringDic headers{};
+        const std::string url = base + "/slow";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 30'000;
+        CurlCallback callback{&ref, OnMultiResponse};
+        CHECK(SubmitBufferedRequestV27(engine, 22'000 + failureMode, handle, &request,
+                                       sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "multi accepts request before owner API failure");
+        SetCurlMultiTestFailureMode(engine, failureMode);
+        CHECK(AwaitMulti(captured, 3000),
+              "multi API failure drains accepted request without an infinite loop");
+        CHECK(captured.callbackCounts[0] == 1,
+              "multi API failure completes accepted request exactly once");
+        CHECK(captured.codes[0] == CURLE_FAILED_INIT,
+              "multi API failure has a stable failed-init terminal");
+        DeleteCurlMultiEngine(engine);
+        DeleteCurlClient(handle);
+    }
+
+    for (int deleteDelayMs : {0, 100}) {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-delete");
+        CHECK(engine != nullptr, "delete-lifecycle multi engine starts");
+        MultiCaptured captured;
+        captured.expected = 1;
+        captured.callbackCounts.assign(1, 0);
+        captured.codes.assign(1, -1);
+        captured.httpCodes.assign(1, -1);
+        MultiCallbackRef ref{&captured, 0};
+        CurClientHandle handle = CreateCurlClient("wrapper-multi-delete-request");
+        StringDic headers{};
+        const std::string url = base + "/slow";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 30'000;
+        CurlCallback callback{&ref, OnMultiResponse};
+        CHECK(SubmitBufferedRequestV27(engine, 23'000 + deleteDelayMs, handle, &request,
+                                       sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "multi accepts request before engine deletion");
+        if (deleteDelayMs > 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(deleteDelayMs));
+        }
+        DeleteCurlMultiEngine(engine);
+        CHECK(AwaitMulti(captured, 100),
+              "engine deletion synchronously drains pending or active request");
+        CHECK(captured.callbackCounts[0] == 1,
+              "engine deletion completes request exactly once");
+        CHECK(captured.codes[0] == CURLE_ABORTED_BY_CALLBACK,
+              "engine deletion classifies pending and active requests as cancelled");
+        DeleteCurlClient(handle);
+    }
+
     // CURLOPT_RESOLVE keeps the URL hostname while bypassing the process DNS
     // resolver. Use the reserved .invalid TLD so success proves the override.
     {
@@ -306,6 +620,231 @@ int main(int argc, char **argv) {
     Captured slow = Fetch(base + "/slow", 1500);
     CHECK(slow.code == 28, "/slow times out with CURLE_OPERATION_TIMEDOUT");
 
+    Captured declaredOversize = FetchCapped(base + "/ok", 5);
+    CHECK(declaredOversize.code == 63,
+          "declared oversized buffered response fails as CURLE_FILESIZE_EXCEEDED");
+    CHECK(declaredOversize.errorMsg.find("buffered response exceeded 5 bytes") != std::string::npos,
+          "declared response cap carries a stable reason");
+    CHECK(declaredOversize.data.empty(),
+          "declared response cap exposes no body");
+
+    Captured exactCap = FetchCapped(base + "/ok", 11);
+    CHECK(exactCap.code == 0 && exactCap.data == "{\"ok\":true}",
+          "buffered response exactly equal to the cap succeeds");
+
+    Captured disabledCap = FetchCapped(base + "/gzip-large", 0);
+    CHECK(disabledCap.code == 0 && disabledCap.data.size() == 4096,
+          "zero buffered response cap remains disabled after decoding");
+
+    Captured receivedOversize = FetchCapped(base + "/chunked-stream", 5);
+    CHECK(receivedOversize.code == 63,
+          "unknown-length received-byte cap fails as CURLE_FILESIZE_EXCEEDED");
+    CHECK(receivedOversize.errorMsg.find("buffered response exceeded 5 bytes") != std::string::npos,
+          "received-byte cap carries a stable reason");
+    CHECK(receivedOversize.data.empty(),
+          "received-byte cap fences the native partial body");
+
+    Captured decodedOversize = FetchCapped(base + "/gzip-large", 100);
+    CHECK(decodedOversize.code == 63,
+          "decoded buffered response cap rejects compressed expansion");
+    CHECK(decodedOversize.errorMsg.find("buffered response exceeded 100 bytes") != std::string::npos,
+          "decoded response cap carries a stable reason");
+    CHECK(decodedOversize.data.empty(),
+          "decoded response cap fences expanded partial data");
+
+    // Buffered GETs keep partial response bytes inside native until terminal
+    // success. A body-progress stall must therefore abort as timeout and
+    // expose no prefix to Kotlin/callers, preserving safe retry eligibility.
+    Captured bufferedIdle = Fetch(base + "/idle-stream", 5000, "GET", nullptr, 500);
+    CHECK(bufferedIdle.code == 28,
+          "buffered inter-chunk idle completes as CURLE_OPERATION_TIMEDOUT");
+    CHECK(bufferedIdle.errorMsg.find("buffered body idle timeout") != std::string::npos,
+          "buffered idle timeout reason crosses the wrapper response ABI");
+    CHECK(bufferedIdle.data.empty(),
+          "buffered idle timeout fences native partial body from the caller");
+
+    {
+        Captured factsResponse;
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/idle-stream";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        CurlCallback callback{&factsResponse, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-transfer-facts-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 500);
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+
+        CurlTransferInfoV1 untouched{};
+        untouched.abiVersion = 77;
+        CHECK(GetCurlTransferInfoV1(
+                  handle, &untouched, sizeof(untouched) - 1, CURL_TRANSFER_INFO_ABI_VERSION) == 0,
+              "transfer facts reject mismatched struct size");
+        CHECK(untouched.abiVersion == 77,
+              "transfer facts size mismatch does not write caller memory");
+        CHECK(GetCurlTransferInfoV1(handle, &untouched, sizeof(untouched), 99) == 0,
+              "transfer facts reject mismatched ABI version");
+        CHECK(untouched.abiVersion == 77,
+              "transfer facts version mismatch does not write caller memory");
+
+        CurlTransferInfoV1 facts{};
+        CHECK(GetCurlTransferInfoV1(
+                  handle, &facts, sizeof(facts), CURL_TRANSFER_INFO_ABI_VERSION) == 1,
+              "transfer facts V1 snapshot succeeds");
+        CHECK(facts.abiVersion == CURL_TRANSFER_INFO_ABI_VERSION &&
+                  facts.structSize == sizeof(CurlTransferInfoV1),
+              "transfer facts report their exact size and version");
+        CHECK(facts.finalHeadersObserved == 1 && facts.firstBodyObserved == 1 &&
+                  facts.bodyProgressObserved == 1,
+              "buffered callback facts observe headers and partial body progress");
+        CHECK(facts.finalHeadersElapsedMs >= 0 &&
+                  facts.firstBodyElapsedMs >= facts.finalHeadersElapsedMs &&
+                  facts.lastBodyProgressElapsedMs >= facts.firstBodyElapsedMs,
+              "buffered callback facts are non-negative and monotonic");
+        CHECK(facts.bodyBytes == 3,
+              "buffered callback facts retain received byte count after partial-body timeout");
+        DeleteCurlClient(handle);
+    }
+
+    {
+        Captured bufferedFirstBody;
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/headers-only-stall";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        CurlCallback callback{&bufferedFirstBody, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-headers-only-facts-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 500);
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+
+        CHECK(bufferedFirstBody.code == 28,
+              "buffered final-headers-to-first-body stall times out");
+        CHECK(bufferedFirstBody.errorMsg.find("buffered body idle timeout") != std::string::npos,
+              "first-body stall carries the buffered timeout reason");
+        CHECK(bufferedFirstBody.data.empty(),
+              "first-body stall exposes no body to the caller");
+
+        CurlTransferInfoV1 facts{};
+        CHECK(GetCurlTransferInfoV1(
+                  handle, &facts, sizeof(facts), CURL_TRANSFER_INFO_ABI_VERSION) == 1,
+              "headers-only timeout transfer facts snapshot succeeds");
+        CHECK(facts.finalHeadersObserved == 1 && facts.firstBodyObserved == 0 &&
+                  facts.bodyProgressObserved == 0,
+              "headers-only timeout observes headers without fabricating body facts");
+        CHECK(facts.firstBodyElapsedMs == 0 && facts.lastBodyProgressElapsedMs == 0 &&
+                  facts.bodyBytes == 0,
+              "headers-only timeout keeps absent body facts at zero");
+        DeleteCurlClient(handle);
+    }
+
+    Captured postIdle =
+        Fetch(base + "/post-idle-response", 5000, "POST", "request-body", 500);
+    CHECK(postIdle.code == 28,
+          "buffered write-request response still receives body-idle protection");
+    CHECK(postIdle.data.empty(),
+          "write-request response timeout exposes no partial response body");
+
+    // Exercise the real streaming-upload entrypoint, whose response is still
+    // buffered. It must share the same timeout normalization as StartRequest.
+    {
+        Captured uploadIdle;
+        UploadBuffer uploadBuffer{"stream-upload-body"};
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/post-idle-response";
+        request.url = url.c_str();
+        request.method = "POST";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        CurlUploadSource source{&uploadBuffer, ReadUploadBuffer,
+                                static_cast<int64_t>(uploadBuffer.data.size())};
+        CurlCallback callback{&uploadIdle, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-upload-idle-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 500);
+        StartUploadRequestV27(
+            handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &source, &callback);
+        DeleteCurlClient(handle);
+
+        CHECK(uploadIdle.code == 28,
+              "stream-upload buffered response idle normalizes to timeout");
+        CHECK(uploadIdle.errorMsg.find("buffered body idle timeout") != std::string::npos,
+              "stream-upload response idle carries stable timeout reason");
+        CHECK(uploadIdle.data.empty(),
+              "stream-upload response idle fences partial response body");
+    }
+
+    {
+        Captured uploadCancelled;
+        UploadBuffer uploadBuffer{"stream-upload-body"};
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/post-idle-response";
+        request.url = url.c_str();
+        request.method = "POST";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        CurlUploadSource source{&uploadBuffer, ReadUploadBuffer,
+                                static_cast<int64_t>(uploadBuffer.data.size())};
+        CurlCallback callback{&uploadCancelled, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-upload-cancel-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 5000);
+        std::thread performThread([&] {
+            StartUploadRequestV27(
+                handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &source, &callback);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        Cancel(handle);
+        performThread.join();
+        DeleteCurlClient(handle);
+
+        CHECK(uploadCancelled.invoked, "stream-upload response cancel completes");
+        CHECK(uploadCancelled.code == 42,
+              "stream-upload response cancel normalizes to CURLE_ABORTED_BY_CALLBACK");
+        CHECK(uploadCancelled.data.empty(),
+              "stream-upload response cancel fences partial response body");
+    }
+
+    // Cancellation may be first observed inside DataWriteCallback, where
+    // libcurl reports a short write as CURLE_WRITE_ERROR. The wrapper must
+    // normalize that terminal result back to the public cancel code and keep
+    // its partial native buffer private.
+    {
+        Captured cancelled;
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/idle-stream";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        CurlCallback callback{&cancelled, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-buffered-cancel-test");
+        SetCurlBufferedBodyIdleTimeoutMs(handle, 5000);
+        std::thread performThread([&] {
+            StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+        });
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        Cancel(handle);
+        performThread.join();
+        DeleteCurlClient(handle);
+
+        CHECK(cancelled.invoked, "buffered mid-body cancel completes");
+        CHECK(cancelled.code == 42,
+              "buffered mid-body cancel preserves CURLE_ABORTED_BY_CALLBACK");
+        CHECK(cancelled.data.empty(),
+              "buffered mid-body cancel fences partial body from the caller");
+    }
+
     // 5. Redirect is followed to /ok.
     Captured redir = Fetch(base + "/redirect");
     CHECK(redir.httpCode == 200, "/redirect followed to 200");
@@ -317,14 +856,17 @@ int main(int argc, char **argv) {
     CHECK(post.data.find("\"echoLen\":13") != std::string::npos,
           "POST body length echoed");
 
-    // 7. Connection pooling: a second request to the same host should reuse
-    //    the pooled connection via the process-wide share handle, reporting
-    //    (near-)zero connect time.
+    // 7. Independent per-request clients remain functional. Connection-cache
+    //    sharing across these clients is intentionally forbidden: libcurl
+    //    does not support one shared connection cache across concurrent
+    //    easy_perform threads. DNS/TLS-session sharing is not observable via
+    //    connectTimeMs, so this behavior test only guards request continuity;
+    //    run_tests.sh has the structural CONNECT-share prohibition.
     Captured first = Fetch(base + "/ok");
     Captured second = Fetch(base + "/ok");
-    CHECK(first.invoked && second.invoked, "pooling probes ran");
-    CHECK(second.connectTimeMs == 0,
-          "second request reuses pooled connection (connectTimeMs == 0)");
+    CHECK(first.invoked && second.invoked, "independent per-request clients complete");
+    CHECK(first.httpCode == 200 && second.httpCode == 200,
+          "independent per-request clients preserve HTTP success");
 
     // 8b. task #24 (RFC D-5): a cancel that lands BEFORE perform starts must
     //     fail deterministically with CURLE_ABORTED_BY_CALLBACK and exactly
@@ -397,6 +939,51 @@ int main(int argc, char **argv) {
         CHECK(stream.chunks >= 2, "known-length response is delivered in multiple chunks");
         CHECK(stream.data == "alphabetagamma", "stream chunks preserve complete byte order");
         CHECK(stream.completes == 1 && stream.code == 0, "stream completes successfully exactly once");
+    }
+
+    // Native transfer facts are transport observations, not consumer callback
+    // observations. A caller may omit onChunk and still inspect the completed
+    // stream's byte/progress facts after the terminal callback returns.
+    {
+        StreamCaptured stream;
+        StringDic headers{};
+        CurlRequest request{};
+        std::string url = base + "/stream";
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.streamConnectTimeoutMs = 1000;
+        request.streamResponseHeadersTimeoutMs = 1000;
+        request.streamIdleTimeoutMs = 1000;
+
+        CurlStreamCallback callback{};
+        callback.callbackRef = &stream;
+        callback.onResponseStart = OnStreamStart;
+        callback.onChunk = nullptr;
+        callback.onComplete = OnStreamComplete;
+
+        CurClientHandle handle = CreateCurlClient("wrapper-stream-facts-no-chunk-test");
+        StartStreamRequestV27(
+            handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+
+        CHECK(stream.starts == 1 && stream.completes == 1 && stream.code == 0,
+              "stream without onChunk reaches one successful terminal callback");
+        CHECK(stream.chunks == 0 && stream.data.empty(),
+              "stream without onChunk does not invoke a consumer chunk callback");
+        CurlTransferInfoV1 facts{};
+        CHECK(GetCurlTransferInfoV1(
+                  handle, &facts, sizeof(facts), CURL_TRANSFER_INFO_ABI_VERSION) == 1,
+              "completed stream transfer facts snapshot succeeds");
+        CHECK(facts.finalHeadersObserved == 1 && facts.firstBodyObserved == 1 &&
+                  facts.bodyProgressObserved == 1,
+              "stream without onChunk still records native header and body progress");
+        CHECK(facts.finalHeadersElapsedMs >= 0 &&
+                  facts.firstBodyElapsedMs >= facts.finalHeadersElapsedMs &&
+                  facts.lastBodyProgressElapsedMs >= facts.firstBodyElapsedMs,
+              "completed stream transfer facts are non-negative and monotonic");
+        CHECK(facts.bodyBytes == 14,
+              "stream without onChunk records the complete native byte count");
+        DeleteCurlClient(handle);
     }
 
     // 8e. Redirect intermediates never escape as response-start; only the

@@ -91,10 +91,38 @@ data class VBTransportElapseStatistics(
     var connectionRolloverRateLimited: Boolean = false,
     /** This logical request made its one allowed fresh-generation retry. */
     var freshRetry: Boolean = false,
-    /** `success`, `failure`, or null when no fresh retry occurred. */
+    /** Retry transport terminal: `success` means CURLcode 0, independent of HTTP status. */
     var freshRetryResult: String? = null,
     /** Duration observed when the stale-h2 watchdog fired. */
     var noResponseHeadersDurationMs: Double = 0.0,
     /** Concurrent no-headers calls observed on the same reused h2 connection. */
     var staleH2ConcurrentRequestCount: Int = 0,
+    /** null when the native curl artifact does not expose transfer facts V1. */
+    var curlFinalHeadersObserved: Boolean? = null,
+    /** null when unavailable; false means the transfer ended before any body byte. */
+    var curlFirstBodyObserved: Boolean? = null,
+    /** null when unavailable; false means no positive-length body callback occurred. */
+    var curlBodyProgressObserved: Boolean? = null,
+    /** Meaningful only when [curlFinalHeadersObserved] is true. */
+    var curlFinalHeadersElapsedMs: Double = 0.0,
+    /** Meaningful only when [curlFirstBodyObserved] is true. */
+    var curlFirstBodyElapsedMs: Double = 0.0,
+    /** Meaningful only when [curlBodyProgressObserved] is true. */
+    var curlLastBodyProgressElapsedMs: Double = 0.0,
+    /** Native response bytes observed before the terminal result; 0 when unavailable/absent. */
+    var curlBodyBytes: Long = 0,
+    /** curl multi submit accepted -> native owner began configuring the easy handle. */
+    var curlEnqueueToNativeStartElapsedMs: Double = 0.0,
+    /** null for legacy/blocking artifacts; true when a CURLM owner advanced this request. */
+    var curlMultiOwnerThreadObserved: Boolean? = null,
+    /** Buffered curl response body-progress watchdog fired on the first attempt. */
+    var curlBodyStallDetected: Boolean = false,
+    /** First (stalled) attempt facts retained when a fresh retry is made. */
+    var curlFirstAttemptFinalHeadersObserved: Boolean? = null,
+    var curlFirstAttemptFirstBodyObserved: Boolean? = null,
+    var curlFirstAttemptBodyProgressObserved: Boolean? = null,
+    var curlFirstAttemptFinalHeadersElapsedMs: Double = 0.0,
+    var curlFirstAttemptFirstBodyElapsedMs: Double = 0.0,
+    var curlFirstAttemptLastBodyProgressElapsedMs: Double = 0.0,
+    var curlFirstAttemptBodyBytes: Long = 0,
 )

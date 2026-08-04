@@ -70,6 +70,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
@@ -112,23 +113,36 @@ class AndroidCurlRuntimeInstrumentedTest {
             assertTrue("instrumentation APK must load the committed curl artifact", VBTransportAndroidCurl.nativeAvailable)
             val engine = requireNotNull(AndroidCurlEngineProvider.resolve())
 
-            bufferedSelectorRequestUsesCurl()
-            streamingDownloadPreservesCallbackThread()
-            streamingUploadUsesNativePullAndProgress()
-            externalCancelStopsBodyCallbacks(engine)
-            highLevelPreCancelNeverStartsNative(engine)
-            nativePreStartCancelCoversAllThreeEntrypoints()
-            callbackFailureAbortsAndSuppressesLaterChunks(engine)
-            concurrentUploadsDoNotStarveDispatcher()
-            certificateAcceptanceMatrixAndManualProxy()
-            publicHttp3NegotiationContract()
+            runtimeGate("buffered") { bufferedSelectorRequestUsesCurl() }
+            runtimeGate("buffered-multi") { concurrentBufferedRequestsShareOneNativeOwner() }
+            runtimeGate("buffered-cancel") { bufferedCoroutineCancellationWakesNativeOwner() }
+            runtimeGate("download") { streamingDownloadPreservesCallbackThread() }
+            runtimeGate("upload") { streamingUploadUsesNativePullAndProgress() }
+            runtimeGate("external-cancel") { externalCancelStopsBodyCallbacks(engine) }
+            runtimeGate("pre-cancel") { highLevelPreCancelNeverStartsNative(engine) }
+            runtimeGate("native-pre-start") { nativePreStartCancelCoversAllThreeEntrypoints() }
+            runtimeGate("callback-failure") { callbackFailureAbortsAndSuppressesLaterChunks(engine) }
+            runtimeGate("concurrent-upload") { concurrentUploadsDoNotStarveDispatcher() }
+            runtimeGate("cert-proxy") { certificateAcceptanceMatrixAndManualProxy() }
+            runtimeGate("http3") { publicHttp3NegotiationContract() }
 
             Log.i(
                 TAG,
-                "completed passed=true gates=buffered,download,upload,external-cancel," +
+                "completed passed=true gates=buffered,buffered-multi,buffered-cancel,download,upload,external-cancel," +
                     "pre-start,cross-thread,callback-failure,concurrent-upload,cert-matrix," +
                     "manual-proxy,android-system-pac-proxy,h3,h3-default-isolation,h3-h2-fallback," +
                     "h3-total-failure"
+            )
+        }
+    }
+
+    private suspend fun runtimeGate(name: String, block: suspend () -> Unit) {
+        try {
+            block()
+        } catch (throwable: Throwable) {
+            throw AssertionError(
+                "Android curl runtime gate '$name' failed: ${throwable.message ?: throwable}",
+                throwable
             )
         }
     }
@@ -140,7 +154,7 @@ class AndroidCurlRuntimeInstrumentedTest {
 
         val response = client.execute(request)
 
-        assertTrue(response.isSuccess)
+        assertTrue("buffered selector response failed: ${response.error}", response.isSuccess)
         assertEquals(200, response.statusCode)
         assertEquals("buffer-ok", response.body.text())
         val selection = selections.single()
@@ -148,6 +162,53 @@ class AndroidCurlRuntimeInstrumentedTest {
         assertTrue(selection.capabilities.requestBodyStreaming)
         assertTrue(selection.capabilities.responseBodyStreaming)
         assertEquals(1, server.requestCount("/buffer"))
+    }
+
+    private suspend fun concurrentBufferedRequestsShareOneNativeOwner() = coroutineScope {
+        val startedAt = System.nanoTime()
+        val responses = withTimeout(CONCURRENT_TIMEOUT_MS) {
+            (0 until CONCURRENT_BUFFERED_REQUESTS).map { index ->
+                async(Dispatchers.Default) {
+                    AndroidCurlJniBridge.execute(nativeRequest("/buffer-delay/$index"))
+                }
+            }.awaitAll()
+        }
+        val elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
+
+        assertTrue(responses.all { it.code == 0 && it.httpCode == 200 })
+        assertTrue(responses.all { it.data?.decodeToString() == "buffer-delay-ok" })
+        if (responses.all { it.elapse.curlMultiOwnerThreadObserved == null }) {
+            // Rollout compatibility: the committed older .so has no async JNI
+            // entry, so Kotlin deliberately falls back to blocking V27. The
+            // fresh-artifact run below must take the strict multi branch.
+            return@coroutineScope
+        }
+        assertTrue(responses.all { it.elapse.curlMultiOwnerThreadObserved == true })
+        assertTrue(responses.all { it.elapse.curlEnqueueToNativeStartElapsedMs >= 0.0 })
+        assertEquals(CONCURRENT_BUFFERED_REQUESTS, server.maxConcurrentBuffered.get())
+        assertTrue(
+            "four 800ms buffered requests must advance concurrently, elapsed=$elapsedMillis",
+            elapsedMillis < 2_200
+        )
+    }
+
+    private suspend fun bufferedCoroutineCancellationWakesNativeOwner() = coroutineScope {
+        val request = nativeRequest("/slow-buffer")
+        val result = async(Dispatchers.Default) { AndroidCurlJniBridge.execute(request) }
+        withTimeout(TIMEOUT_MS) {
+            while (server.requestCount("/slow-buffer") == 0) {
+                delay(10)
+            }
+        }
+
+        result.cancelAndJoin()
+
+        assertTrue("coroutine cancellation must abort the native buffered transfer",
+            server.awaitBufferedSlowDisconnect())
+        delay(100)
+        val reusedIdResponse = AndroidCurlJniBridge.execute(nativeRequest("/slow-buffer"))
+        assertEquals("cancel terminal must release the request-id mapping", 0, reusedIdResponse.code)
+        assertEquals("slow-buffer-reused", reusedIdResponse.data?.decodeToString())
     }
 
     private suspend fun streamingDownloadPreservesCallbackThread() {
@@ -695,8 +756,11 @@ class AndroidCurlRuntimeInstrumentedTest {
         private val counts = ConcurrentHashMap<String, AtomicInteger>()
         private val uploadBarrier = CountDownLatch(concurrentUploadCount)
         private val slowDisconnected = CountDownLatch(1)
+        private val bufferedSlowDisconnected = CountDownLatch(1)
         private val activeUploads = AtomicInteger(0)
+        private val activeBuffered = AtomicInteger(0)
         val maxConcurrentUploads = AtomicInteger(0)
+        val maxConcurrentBuffered = AtomicInteger(0)
         val concurrentUploadsCompleted = AtomicInteger(0)
 
         init {
@@ -717,6 +781,9 @@ class AndroidCurlRuntimeInstrumentedTest {
         fun requestCount(path: String): Int = counts[path]?.get() ?: 0
 
         fun awaitSlowDisconnect(): Boolean = slowDisconnected.await(5, TimeUnit.SECONDS)
+
+        fun awaitBufferedSlowDisconnect(): Boolean =
+            bufferedSlowDisconnected.await(5, TimeUnit.SECONDS)
 
         override fun close() {
             running.set(false)
@@ -746,9 +813,17 @@ class AndroidCurlRuntimeInstrumentedTest {
                 val body = readBody(input, headers)
                 when {
                     path == "/buffer" -> respond(output, "buffer-ok".encodeToByteArray())
+                    path.startsWith("/buffer-delay/") -> delayedBuffered(output)
                     path == "/stream" -> stream(output, listOf("stream-one", "stream-two"))
                     path == "/upload" -> respond(output, "upload:${body.decodeToString()}".encodeToByteArray())
                     path == "/slow" -> slow(output)
+                    path == "/slow-buffer" -> {
+                        if (requestCount(path) == 1) {
+                            slow(output, bufferedSlowDisconnected)
+                        } else {
+                            respond(output, "slow-buffer-reused".encodeToByteArray())
+                        }
+                    }
                     path == "/callback-failure" -> stream(output, listOf("first", "second", "third"))
                     path.startsWith("/upload-delay/") -> delayedUpload(output, body)
                     else -> respond(output, "not-found".encodeToByteArray(), status = "404 Not Found")
@@ -770,7 +845,21 @@ class AndroidCurlRuntimeInstrumentedTest {
             activeUploads.decrementAndGet()
         }
 
-        private fun slow(output: BufferedOutputStream) {
+        private fun delayedBuffered(output: BufferedOutputStream) {
+            val active = activeBuffered.incrementAndGet()
+            maxConcurrentBuffered.updateAndGet { current -> maxOf(current, active) }
+            try {
+                Thread.sleep(800)
+                respond(output, "buffer-delay-ok".encodeToByteArray())
+            } finally {
+                activeBuffered.decrementAndGet()
+            }
+        }
+
+        private fun slow(
+            output: BufferedOutputStream,
+            disconnected: CountDownLatch = slowDisconnected
+        ) {
             writeHeaders(output, contentLength = 100_000)
             try {
                 repeat(1_000) {
@@ -779,7 +868,7 @@ class AndroidCurlRuntimeInstrumentedTest {
                     Thread.sleep(10)
                 }
             } catch (_: Throwable) {
-                slowDisconnected.countDown()
+                disconnected.countDown()
             }
         }
 
@@ -872,6 +961,7 @@ class AndroidCurlRuntimeInstrumentedTest {
         private const val TIMEOUT_MS = 10_000L
         private const val PUBLIC_TIMEOUT_MS = 30_000L
         private const val CONCURRENT_TIMEOUT_MS = 30_000L
+        private const val CONCURRENT_BUFFERED_REQUESTS = 4
         private const val CONCURRENT_UPLOADS = 8
         private const val PUBLIC_CA_ASSET = "networkkmm-cacert.pem"
         private const val PUBLIC_HTTP3_URL = "https://cloudflare-quic.com/"

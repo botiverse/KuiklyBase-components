@@ -16,7 +16,10 @@
  */
 package com.tencent.kmm.network.service
 
+import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
+import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.export.NetworkBody
+import com.tencent.kmm.network.export.NetworkBodyBytes
 import com.tencent.kmm.network.export.streamingUploadStreamOrNull
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkByteStreamSink
@@ -658,6 +661,14 @@ class NetworkClient(
         attempt: Int,
         body: NetworkBody
     ): Boolean {
+        // Curl body-stall recovery is already bounded to one physical fresh
+        // attempt inside the selected engine. Never stack the generic policy
+        // retry on top, and never replay a write-method stall here.
+        if (response.error?.rawCode == 63 ||
+            response.timing.curlBodyStallDetected || response.timing.freshRetry
+        ) {
+            return false
+        }
         if (attempt >= policy.retry.maxRetries || !body.repeatable) {
             return false
         }
@@ -751,7 +762,49 @@ object VBTransportNetworkEngine : NetworkEngine {
             )
         }
 
-        return suspendCancellableCoroutine { continuation ->
+        val startedAt = TimeSource.Monotonic.markNow()
+        val first = executeBufferedPlatformAttempt(
+            request = request,
+            call = call,
+            bodyBytes = bodyBytes,
+            timeoutMillis = request.policy.timeoutMillis,
+        )
+        if (!usesCurlPlatformDefault || !first.isCurlBufferedBodyIdleTimeout()) {
+            return first
+        }
+        first.timing.curlBodyStallDetected = true
+        val remainingTimeout = remainingPlatformCurlTimeoutMillis(
+            request.policy.timeoutMillis,
+            startedAt
+        )
+        if (!shouldFreshRetryCurlBufferedStall(
+                method = request.method,
+                bodyRepeatable = request.body.repeatable,
+                policy = request.policy.curlBufferedResponse,
+                cancelled = call.isCancelled,
+                remainingTimeoutMillis = remainingTimeout,
+            )) {
+            return first
+        }
+        val retried = executeBufferedPlatformAttempt(
+            request = request,
+            call = call,
+            bodyBytes = bodyBytes,
+            timeoutMillis = remainingTimeout ?: 0L,
+        )
+        retried.timing.curlBodyStallDetected = true
+        retried.timing.retainFirstAttemptCurlFacts(first.timing)
+        retried.timing.freshRetry = true
+        retried.timing.freshRetryResult = if (retried.statusCode != null) "success" else "failure"
+        return retried
+    }
+
+    private suspend fun executeBufferedPlatformAttempt(
+        request: NetworkRequest,
+        call: NetworkCall,
+        bodyBytes: NetworkBodyBytes,
+        timeoutMillis: Long,
+    ): NetworkResponse = suspendCancellableCoroutine { continuation ->
             val vbRequest = VBTransportRequest().apply {
                 method = request.method
                 url = request.resolvedUrl()
@@ -761,7 +814,10 @@ object VBTransportNetworkEngine : NetworkEngine {
                         header["Content-Type"] = it
                     }
                 }
-                totalTimeout = request.policy.timeoutMillis
+                totalTimeout = timeoutMillis
+                curlBufferedBodyIdleTimeoutMillis =
+                    request.policy.curlBufferedResponse.bodyIdleTimeoutMillis
+                curlMaxBufferedResponseBytes = request.policy.curlBufferedResponse.maxDecodedBytes
                 curlCaInfoPath = preparedCurlCaInfoPath(request)
                 curlProxyUrl = preparedCurlProxyUrl(request)
                 curlHttp3Enabled = preparedCurlHttp3Enabled(request)
@@ -780,7 +836,6 @@ object VBTransportNetworkEngine : NetworkEngine {
                 VBTransportService.cancel(vbRequest.requestId)
             }
         }
-    }
 
     override suspend fun downloadStream(
         request: NetworkRequest,
@@ -853,6 +908,9 @@ object VBTransportNetworkEngine : NetworkEngine {
                     }
                 }
                 totalTimeout = request.policy.timeoutMillis
+                curlBufferedBodyIdleTimeoutMillis =
+                    request.policy.curlBufferedResponse.bodyIdleTimeoutMillis
+                curlMaxBufferedResponseBytes = request.policy.curlBufferedResponse.maxDecodedBytes
                 curlCaInfoPath = preparedCurlCaInfoPath(request)
                 curlProxyUrl = preparedCurlProxyUrl(request)
                 curlHttp3Enabled = preparedCurlHttp3Enabled(request)
@@ -885,6 +943,9 @@ object VBTransportNetworkEngine : NetworkEngine {
                     cancellationOwners.disarmTransport()
                     if (continuation.isActive) {
                         val mapped = response.toNetworkResponse(request)
+                        if (usesCurlPlatformDefault && mapped.isCurlBufferedBodyIdleTimeout()) {
+                            mapped.timing.curlBodyStallDetected = true
+                        }
                         if (mapped.error != null) cancellationOwners.releaseAttemptSourceOnFailure()
                         continuation.resume(mapped)
                     }
@@ -901,6 +962,14 @@ object VBTransportNetworkEngine : NetworkEngine {
     private val usesCurlPlatformDefault: Boolean
         get() = com.tencent.kmm.network.internal.platform.platformDefaultNetworkTransportEngine ==
             NetworkTransportEngine.CURL
+}
+
+private fun NetworkResponse.isCurlBufferedBodyIdleTimeout(): Boolean =
+    error?.rawCode == 28 && error.message.contains("buffered body idle timeout")
+
+private fun remainingPlatformCurlTimeoutMillis(totalTimeoutMillis: Long, startedAt: TimeMark): Long? {
+    if (totalTimeoutMillis <= 0) return null
+    return (totalTimeoutMillis - startedAt.elapsedNow().inWholeMilliseconds).coerceAtLeast(0)
 }
 
 internal class NetworkUploadStreamSource(

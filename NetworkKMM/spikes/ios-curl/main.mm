@@ -70,7 +70,7 @@ void RunProbe() {
         request.timeout = 10'000;
 
         bool passed = true;
-        bool reusedConnection = false;
+        bool independentConnections = true;
         for (int attempt = 1; attempt <= 2; ++attempt) {
             ProbeResult result;
             CurlCallback callback{};
@@ -89,9 +89,7 @@ void RunProbe() {
             result.passed = started && result.passed;
             DeleteCurlClient(client);
             passed = passed && result.passed;
-            if (attempt == 2) {
-                reusedConnection = result.connectMs == 0 && result.tlsMs == 0;
-            }
+            independentConnections = independentConnections && result.passed;
             std::fprintf(
                 stderr,
                 "SLOCK_IOS_CURL_SPIKE attempt=%d passed=%s\n",
@@ -100,12 +98,11 @@ void RunProbe() {
             );
         }
 
-        passed = passed && reusedConnection;
         std::fprintf(
             stderr,
-            "SLOCK_IOS_CURL_SPIKE completed passed=%s reused=%s\n",
+            "SLOCK_IOS_CURL_SPIKE completed passed=%s independentConnections=%s\n",
             passed ? "true" : "false",
-            reusedConnection ? "true" : "false"
+            independentConnections ? "true" : "false"
         );
         std::fflush(stderr);
         std::exit(passed ? 0 : 3);

@@ -30,7 +30,7 @@ kotlin {
         val sliceRoot = iosCurlFrameworkRoot.resolve(slice)
         compilations.getByName("main").cinterops.create("iosCurl") {
             definitionFile.set(iosCurlDefinition)
-            includeDirs(sliceRoot.resolve("Headers"))
+            includeDirs(project.file("../ohosApp/pbcurlwrapper/src/main/cpp/wrapper/include"))
             extraOpts("-libraryPath", sliceRoot.absolutePath)
         }
     }

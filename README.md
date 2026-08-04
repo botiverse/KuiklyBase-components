@@ -11,6 +11,7 @@ KuiklyBase is developed and open - sourced by the Oteam of Tencent's large front
 | knoi | Provides mutual invocation capability between Kotlin Native and ArkTS without writing C/C++ bridging code | HarmonyOS | Open sourced | [Details](knoi/README.md) |
 | KmmResource | Cross-platform native resource management solution, offering developers an Android R-like resource access experience | Android / iOS / HarmonyOS | Open sourced | [Details](KmmResource/README.md) |
 | Network | Delivers cross-platform network request capabilities without requiring attention to platform differences | Android / iOS / HarmonyOS | Open sourced | [Details](NetworkKMM/README.md) |
+| Datetime | Minimal wall-clock, instant, and fresh system-timezone/offset primitives | Android / iOS / HarmonyOS | Preview | [Details](DatetimeKMM/README.md) |
 | Image | Image display capability based on Compose, supporting network image loading | Android / iOS / HarmonyOS | September release | / |
 
 # License

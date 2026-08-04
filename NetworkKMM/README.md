@@ -60,6 +60,19 @@ For new KMP call sites, prefer `NetworkClient` as the typed request boundary ins
 
 Keep using `VBTransportService` only for legacy integration points or low-level engine code.
 
+#### Socket.IO (raft.30, OHOS v1)
+
+raft.30 adds an Engine.IO v4 / Socket.IO v4 client implemented in C++ on
+libcurl WebSocket. The native single owner handles upgrade, auth, ping/pong,
+text JSON events, close, and reconnect; KMP exposes only
+`NetworkSocketIoFactory` with `start`, `emit`, `close`, and serialized
+state/event callbacks.
+
+V1 supports the default namespace and text JSON events only. Binary events and
+acknowledgements are unsupported. `NetworkSocketIoFactory.isSupported` is
+currently `true` only on OHOS; Android and iOS fail closed instead of silently
+using a different Socket.IO stack.
+
 #### Network Permission Declaration
 ##### Android
 ```kotlin

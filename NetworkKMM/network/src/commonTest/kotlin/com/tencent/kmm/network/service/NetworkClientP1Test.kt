@@ -904,6 +904,86 @@ class NetworkClientP1Test {
     }
 
     @Test
+    fun genericRetryNeverStacksOnCurlRecoveryOrResponseCap() = runBlocking {
+        suspend fun attemptsFor(response: (NetworkRequest) -> NetworkResponse): Int {
+            var attempts = 0
+            val client = NetworkClient(
+                config = NetworkClientConfig(
+                    defaultPolicy = com.tencent.kmm.network.export.NetworkRequestPolicy(
+                        retry = com.tencent.kmm.network.export.NetworkRetryPolicy(
+                            maxRetries = 2,
+                            backoff = com.tencent.kmm.network.export.NetworkBackoffPolicy(
+                                initialDelayMillis = 0,
+                                maxDelayMillis = 0,
+                            ),
+                        )
+                    )
+                ),
+                engine = object : NetworkEngine {
+                    override suspend fun execute(
+                        request: NetworkRequest,
+                        call: NetworkCall
+                    ): NetworkResponse {
+                        attempts++
+                        return response(request)
+                    }
+                },
+                scope = CoroutineScope(coroutineContext + SupervisorJob()),
+            )
+            client.execute(NetworkRequest())
+            return attempts
+        }
+        fun failure(
+            request: NetworkRequest,
+            rawCode: Int,
+            timing: com.tencent.kmm.network.export.VBTransportElapseStatistics,
+        ) = NetworkResponse(
+            request = request,
+            statusCode = null,
+            headers = emptyMap(),
+            body = NetworkResponseBody(),
+            error = com.tencent.kmm.network.export.NetworkError(
+                kind = NetworkErrorKind.TIMEOUT,
+                message = "retryable transport failure",
+                rawCode = rawCode,
+            ),
+            timing = timing,
+        )
+
+        assertEquals(
+            1,
+            attemptsFor { request ->
+                failure(
+                    request,
+                    28,
+                    com.tencent.kmm.network.export.VBTransportElapseStatistics(
+                        curlBodyStallDetected = true
+                    ),
+                )
+            }
+        )
+        assertEquals(
+            1,
+            attemptsFor { request ->
+                failure(
+                    request,
+                    28,
+                    com.tencent.kmm.network.export.VBTransportElapseStatistics(
+                        freshRetry = true,
+                        freshRetryResult = "failure",
+                    ),
+                )
+            }
+        )
+        assertEquals(
+            1,
+            attemptsFor { request ->
+                failure(request, 63, com.tencent.kmm.network.export.VBTransportElapseStatistics())
+            }
+        )
+    }
+
+    @Test
     fun laterAttemptShortCircuitBindsItsOwnBodyInsteadOfPreviousEngineBody() = runBlocking {
         var interceptorAttempts = 0
         var engineAttempts = 0

@@ -107,6 +107,13 @@ jobs:
             -Pandroid.testInstrumentationRunnerArguments.class=com.tencent.kmm.network.internal.platform.AndroidCurlRuntimeInstrumentedTest
             --no-daemon --stacktrace
 
+      - name: Upload Android curl runtime report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-android-curl-runtime-report
+          path: NetworkKMM/network/build/reports/androidTests/connected/
+
   darwin-behavior-tests:
     name: Darwin engine behavior tests (macosArm64)
     runs-on: macos-latest
@@ -196,6 +203,8 @@ jobs:
 
       - name: Run production iOS curl runtime tests
         shell: bash
+        env:
+          NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION: unavailable
         run: NetworkKMM/scripts/run-ios-curl-runtime-tests.sh
 
       - name: Upload iOS curl test reports

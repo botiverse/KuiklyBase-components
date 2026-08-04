@@ -229,7 +229,7 @@ if [[ "$RUN_SPIKE" -eq 1 ]]; then
     exit 3
   fi
   cat "$LOG_PATH"
-  if [[ "$result" != *"passed=true reused=true"* ]]; then
+  if [[ "$result" != *"passed=true independentConnections=true"* ]]; then
     exit 3
   fi
 fi

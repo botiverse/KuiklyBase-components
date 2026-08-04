@@ -60,6 +60,32 @@ bytemain fork 会把 Android、iOS、HarmonyOS 三端 KMP artifacts 发布到 Gi
 
 `VBTransportService` 只建议继续用于历史接入点或底层 engine 封装。
 
+#### Socket.IO（raft.30，OHOS v1）
+
+raft.30 提供基于 C++ / libcurl WebSocket 的 Engine.IO v4 + Socket.IO v4
+客户端。协议、ping/pong、auth、事件和重连都由 C++ 单 owner 管理，KMP 只暴露
+薄 API：
+
+```kotlin
+val client = NetworkSocketIoFactory.create(
+    NetworkSocketIoConfig(
+        serverUrl = "https://example.com",
+        authJson = """{"token":"..."}""",
+    ),
+    object : NetworkSocketIoListener {
+        override fun onState(state: NetworkSocketIoState, code: Int, detail: String) = Unit
+        override fun onEvent(eventName: String, payloadJson: String) = Unit
+    },
+)
+client.start()
+client.emit("room:join", """{"roomId":"room-1"}""")
+client.close()
+```
+
+V1 只支持 default namespace 与 text JSON event，不支持 binary event/ack。
+`NetworkSocketIoFactory.isSupported` 当前只在 OHOS 为 `true`；Android/iOS 会
+显式 fail-closed，不能把它当成已完成的三端迁移。
+
 #### 网络权限声明
 ##### Android
 ```kotlin

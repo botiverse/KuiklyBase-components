@@ -40,7 +40,9 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import kotlinx.atomicfu.atomic
 import platform.posix.getenv
+import platform.posix.usleep
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
@@ -54,6 +56,7 @@ import kotlin.test.assertTrue
 class IosCurlRuntimeTest {
     @AfterTest
     fun clearCurlRuntime() {
+        IosCurlMultiTestHooks.reset()
         VBTransportCurl.clear()
     }
 
@@ -75,6 +78,60 @@ class IosCurlRuntimeTest {
             assertNull(response.error)
         } finally {
             VBTransportCurl.clear()
+        }
+    }
+
+    @Test
+    fun productionBridgeMatchesOptionalApiArtifactContract() = runBlocking {
+        val expectation = runtimeEnvironment("NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION")
+            ?: return@runBlocking
+        val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
+        val caPath = runtimeCaPath() ?: return@runBlocking
+        val result = IosCurlCInteropBridge.executeWithOptionalApiDiagnostics(
+            runtimeRequest(900_001, url, caPath)
+        )
+
+        assertEquals(0, result.response.code, result.response.errorMsg)
+        assertTrue(result.response.httpCode in 200..299)
+        assertTrue(result.response.data?.isNotEmpty() == true)
+        when (expectation) {
+            "unavailable" -> assertEquals(
+                IosCurlOptionalApiDiagnostics(
+                    bufferedBodyIdleTimeoutSetterAvailable = false,
+                    maxBufferedResponseBytesSetterAvailable = false,
+                    transferFactsAvailable = false
+                ),
+                result.optionalApi,
+                "old artifact must remain request-capable without additive symbols"
+            )
+            "available" -> {
+                assertEquals(
+                    IosCurlOptionalApiDiagnostics(
+                        bufferedBodyIdleTimeoutSetterAvailable = true,
+                        maxBufferedResponseBytesSetterAvailable = true,
+                        transferFactsAvailable = true
+                    ),
+                    result.optionalApi,
+                    "fresh artifact symbols must survive final executable linking"
+                )
+                assertEquals(true, result.response.elapse.curlFinalHeadersObserved)
+                assertEquals(true, result.response.elapse.curlFirstBodyObserved)
+                assertEquals(true, result.response.elapse.curlBodyProgressObserved)
+                assertTrue(result.response.elapse.curlBodyBytes > 0)
+
+                val capped = IosCurlCInteropBridge.executeWithOptionalApiDiagnostics(
+                    runtimeRequest(
+                        requestId = 900_004,
+                        url = url,
+                        caPath = caPath,
+                        maxBufferedResponseBytes = 1
+                    )
+                )
+                assertTrue(capped.optionalApi.maxBufferedResponseBytesSetterAvailable)
+                assertEquals(63, capped.response.code, capped.response.errorMsg)
+                assertEquals(0, capped.response.data?.size ?: 0)
+            }
+            else -> error("Unknown iOS curl optional API expectation: $expectation")
         }
     }
 
@@ -255,6 +312,117 @@ class IosCurlRuntimeTest {
         assertEquals(42, responseCode)
     }
 
+    @Test
+    fun productionBridgeClosesPublishCheckToNativeSubmitCancellationRace() = runBlocking {
+        if (runtimeEnvironment("NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION") != "available") {
+            return@runBlocking
+        }
+        assertTrue(
+            IosCurlCInteropBridge.isMultiApiAvailableForTests(),
+            "fresh iOS artifact must expose the all-or-none multi ABI"
+        )
+        val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_CANCEL_URL")
+            ?: return@runBlocking
+        val caPath = runtimeCaPath() ?: return@runBlocking
+        val caSha = runtimeCaSha256() ?: return@runBlocking
+        configureRuntime(caPath, caSha)
+        val requestId = 900_202
+        val enteredPreSubmit = atomic(false)
+        val releaseSubmit = atomic(false)
+        IosCurlMultiTestHooks.beforeNativeSubmit = { observedId ->
+            if (observedId == requestId) {
+                enteredPreSubmit.value = true
+                while (!releaseSubmit.value) usleep(1_000u)
+            }
+        }
+
+        try {
+            val request = runtimeRequest(requestId, url, caPath)
+            val response = async(IosCurlExecutionDispatchers.perform) {
+                IosCurlCInteropBridge.execute(request)
+            }
+            withTimeout(20_000) {
+                while (!enteredPreSubmit.value) delay(1)
+            }
+
+            // The registry already contains the request, but the native multi
+            // owner has not accepted it yet. This cancel is therefore a no-op
+            // at the native queue and must be repeated by the accepted-submit
+            // post-check below the deterministic pause.
+            request.cancel()
+            IosCurlCInteropBridge.cancel(requestId)
+            releaseSubmit.value = true
+
+            val terminal = withTimeout(10_000) { response.await() }
+            assertEquals(42, terminal.code, terminal.errorMsg)
+        } finally {
+            releaseSubmit.value = true
+            IosCurlMultiTestHooks.reset()
+        }
+    }
+
+    @Test
+    fun productionBridgeRemovesRegistryBeforeTerminalResumeForImmediateSameIdReuse() = runBlocking {
+        if (runtimeEnvironment("NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION") != "available") {
+            return@runBlocking
+        }
+        assertTrue(
+            IosCurlCInteropBridge.isMultiApiAvailableForTests(),
+            "fresh iOS artifact must expose the all-or-none multi ABI"
+        )
+        val url = runtimeEnvironment("NETWORKKMM_IOS_CURL_RUNTIME_URL") ?: return@runBlocking
+        val caPath = runtimeCaPath() ?: return@runBlocking
+        val caSha = runtimeCaSha256() ?: return@runBlocking
+        configureRuntime(caPath, caSha)
+        val requestId = 900_203
+        val terminalPaused = atomic(false)
+        val observeReusePublication = atomic(false)
+        val reusePublished = atomic(false)
+        val releaseTerminal = atomic(false)
+        IosCurlMultiTestHooks.afterRegistryPublish = { observedId ->
+            if (observedId == requestId && observeReusePublication.value) {
+                reusePublished.value = true
+            }
+        }
+        IosCurlMultiTestHooks.afterRegistryRemovalBeforeResume = { observedId ->
+            if (observedId == requestId && !terminalPaused.value) {
+                terminalPaused.value = true
+                observeReusePublication.value = true
+                while (!releaseTerminal.value) usleep(1_000u)
+            }
+        }
+
+        try {
+            val first = async(IosCurlExecutionDispatchers.perform) {
+                IosCurlCInteropBridge.execute(runtimeRequest(requestId, url, caPath))
+            }
+            withTimeout(20_000) {
+                while (!terminalPaused.value) delay(1)
+            }
+
+            // Start the replacement while the first native terminal callback
+            // is still paused before coroutine resume. Publication can only
+            // succeed if cleanup removed the old registry entry first.
+            val reused = async(IosCurlExecutionDispatchers.perform) {
+                IosCurlCInteropBridge.execute(runtimeRequest(requestId, url, caPath))
+            }
+            withTimeout(20_000) {
+                while (!reusePublished.value) delay(1)
+            }
+            releaseTerminal.value = true
+
+            val firstTerminal = withTimeout(10_000) { first.await() }
+            val reusedTerminal = withTimeout(10_000) { reused.await() }
+            assertEquals(0, firstTerminal.code, firstTerminal.errorMsg)
+            assertEquals(0, reusedTerminal.code, reusedTerminal.errorMsg)
+            assertTrue(firstTerminal.httpCode in 200..299)
+            assertTrue(reusedTerminal.httpCode in 200..299)
+        } finally {
+            releaseTerminal.value = true
+            IosCurlMultiTestHooks.reset()
+        }
+    }
+
     private suspend fun upload(
         url: String,
         caPath: String,
@@ -287,13 +455,15 @@ class IosCurlRuntimeTest {
         caPath: String,
         method: String = "GET",
         headers: Map<String, String> = mapOf("Accept" to "text/plain"),
-        uploadContentLength: Long? = null
+        uploadContentLength: Long? = null,
+        maxBufferedResponseBytes: Long = 0
     ) = IosCurlNativeRequest(
         requestId = requestId,
         url = url,
         method = method,
         headers = headers,
         timeoutMillis = 30_000,
+        maxBufferedResponseBytes = maxBufferedResponseBytes,
         uploadContentLength = uploadContentLength,
         caInfoPath = caPath,
         proxyUrl = ""

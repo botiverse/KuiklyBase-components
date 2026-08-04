@@ -11,6 +11,18 @@
     {
       "name": "TestAbility_label",
       "value": "test label"
+    },
+    {
+      "name": "kmm_raw_positional_template",
+      "value": "Failed to save tab order: %1$s"
+    },
+    {
+      "name": "kmm_ordinary_string",
+      "value": "Status OK"
+    },
+    {
+      "name": "kmm_multi_and_escaped_percent",
+      "value": "Pair %1$s/%2$d/100%%"
     }
   ]
 }

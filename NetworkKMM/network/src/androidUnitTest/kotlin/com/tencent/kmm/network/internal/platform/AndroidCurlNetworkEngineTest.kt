@@ -25,12 +25,14 @@ import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkProgressCallbacks
 import com.tencent.kmm.network.export.NetworkRequest
 import com.tencent.kmm.network.export.NetworkRequestPolicy
+import com.tencent.kmm.network.export.NetworkRetryPolicy
 import com.tencent.kmm.network.export.NetworkStreamTimeoutPolicy
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
 import com.tencent.kmm.network.export.NetworkCurlTrustStore
 import com.tencent.kmm.network.export.NetworkCurlConfigurationFailureReason
+import com.tencent.kmm.network.export.NetworkCurlBufferedResponsePolicy
 import com.tencent.kmm.network.export.VBTransportElapseStatistics
 import com.tencent.kmm.network.export.VBTransportCurl
 import com.tencent.kmm.network.export.VBTransportMethod
@@ -53,6 +55,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
@@ -142,6 +145,157 @@ class AndroidCurlNetworkEngineTest {
         assertContentEquals("{\"ok\":true}".encodeToByteArray(), nativeRequest.body)
         assertEquals(trustStoreFile.absolutePath, nativeRequest.caInfoPath)
         assertEquals("", nativeRequest.proxyUrl)
+        assertEquals(7_000L, nativeRequest.bufferedBodyIdleTimeoutMillis)
+        assertEquals(16L * 1024L * 1024L, nativeRequest.maxBufferedResponseBytes)
+    }
+
+    @Test
+    fun bufferedBodyStallRetriesGetOnceOnFreshRequestWithinBudget() = runBlocking {
+        val bridge = FakeBridge().apply {
+            executeResponses += CurlNativeResponse(
+                code = 28,
+                errorMsg = "buffered body idle timeout after 7000ms",
+                elapse = VBTransportElapseStatistics(
+                    curlFinalHeadersObserved = true,
+                    curlFirstBodyObserved = true,
+                    curlBodyProgressObserved = true,
+                    curlFinalHeadersElapsedMs = 5.0,
+                    curlFirstBodyElapsedMs = 8.0,
+                    curlLastBodyProgressElapsedMs = 9.0,
+                    curlBodyBytes = 3,
+                )
+            )
+            executeResponses += CurlNativeResponse(code = 0, httpCode = 200, data = "ok".encodeToByteArray())
+        }
+        val request = NetworkRequest(
+            method = VBTransportMethod.GET,
+            url = "https://example.test",
+            policy = NetworkRequestPolicy(timeoutMillis = 20_000)
+        )
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals("ok", response.body.text())
+        assertEquals(2, bridge.executeRequests.size)
+        assertTrue(bridge.executeRequests[0].requestId != bridge.executeRequests[1].requestId)
+        assertTrue(bridge.executeRequests[1].timeoutMillis in 1..20_000)
+        assertTrue(response.timing.curlBodyStallDetected)
+        assertTrue(response.timing.freshRetry)
+        assertEquals("success", response.timing.freshRetryResult)
+        assertEquals(true, response.timing.curlFirstAttemptFinalHeadersObserved)
+        assertEquals(true, response.timing.curlFirstAttemptFirstBodyObserved)
+        assertEquals(9.0, response.timing.curlFirstAttemptLastBodyProgressElapsedMs)
+        assertEquals(3L, response.timing.curlFirstAttemptBodyBytes)
+    }
+
+    @Test
+    fun bufferedBodyStallNeverReplaysWriteAndPolicyCanDisableGetRetry() = runBlocking {
+        val stall = CurlNativeResponse(
+            code = 28,
+            errorMsg = "buffered body idle timeout after 7000ms"
+        )
+        val writeBridge = FakeBridge().apply { executeResponses += stall }
+        val post = NetworkRequest(
+            method = VBTransportMethod.POST,
+            url = "https://example.test",
+            body = NetworkBody.Text("write")
+        )
+
+        val writeResponse = AndroidCurlNetworkEngine(writeBridge).execute(post, NetworkCall(post))
+
+        assertEquals(1, writeBridge.executeRequests.size)
+        assertTrue(writeResponse.timing.curlBodyStallDetected)
+        assertFalse(writeResponse.timing.freshRetry)
+
+        val disabledBridge = FakeBridge().apply { executeResponses += stall.copy() }
+        val disabledGet = NetworkRequest(
+            method = VBTransportMethod.GET,
+            url = "https://example.test",
+            policy = NetworkRequestPolicy(
+                curlBufferedResponse = NetworkCurlBufferedResponsePolicy(freshRetryEnabled = false)
+            )
+        )
+        AndroidCurlNetworkEngine(disabledBridge).execute(disabledGet, NetworkCall(disabledGet))
+        assertEquals(1, disabledBridge.executeRequests.size)
+
+        val uploadBridge = FakeBridge().apply { uploadResponse = stall.copy() }
+        val upload = NetworkRequest(
+            method = VBTransportMethod.POST,
+            url = "https://example.test",
+            body = NetworkBody.Stream(
+                stream = NetworkByteStream.fromChunks(contentLength = 3) { sink ->
+                    sink.write("abc".encodeToByteArray())
+                }
+            )
+        )
+        val uploadResponse = AndroidCurlNetworkEngine(uploadBridge).execute(upload, NetworkCall(upload))
+        assertEquals(1, uploadBridge.uploadRequests)
+        assertFalse(uploadResponse.timing.freshRetry)
+    }
+
+    @Test
+    fun freshRetryIsBoundedAndSuppressedByCancelOrExhaustedTotalBudget() = runBlocking {
+        fun stall() = CurlNativeResponse(
+            code = 28,
+            errorMsg = "buffered body idle timeout after 7000ms"
+        )
+        val twiceStalled = FakeBridge().apply {
+            executeResponses += stall()
+            executeResponses += stall()
+            executeResponses += CurlNativeResponse(code = 0, httpCode = 200)
+        }
+        val retryingGet = NetworkRequest(
+            method = VBTransportMethod.GET,
+            url = "https://example.test",
+            policy = NetworkRequestPolicy(
+                retry = NetworkRetryPolicy(maxRetries = 1),
+                timeoutMillis = 20_000,
+            )
+        )
+        val client = NetworkClient(engine = AndroidCurlNetworkEngine(twiceStalled))
+
+        val failed = client.execute(retryingGet)
+
+        assertEquals(2, twiceStalled.executeRequests.size)
+        assertTrue(failed.timing.freshRetry)
+        assertEquals("failure", failed.timing.freshRetryResult)
+
+        lateinit var cancelledCall: NetworkCall
+        val cancelledBridge = FakeBridge().apply {
+            executeResponses += stall()
+            onExecute = { _, attempt -> if (attempt == 1) cancelledCall.cancel() }
+        }
+        cancelledCall = NetworkCall(retryingGet)
+        AndroidCurlNetworkEngine(cancelledBridge).execute(retryingGet, cancelledCall)
+        assertEquals(1, cancelledBridge.executeRequests.size)
+
+        val exhaustedBridge = FakeBridge().apply {
+            executeResponses += stall()
+            executeDelayMillis = 5
+        }
+        val exhausted = retryingGet.copyMutable().apply {
+            policy = NetworkRequestPolicy(timeoutMillis = 1)
+        }
+        AndroidCurlNetworkEngine(exhaustedBridge).execute(exhausted, NetworkCall(exhausted))
+        assertEquals(1, exhaustedBridge.executeRequests.size)
+    }
+
+    @Test
+    fun freshRetryResultDescribesTransportTerminalNotHttpSuccess() = runBlocking {
+        val bridge = FakeBridge().apply {
+            executeResponses += CurlNativeResponse(
+                code = 28,
+                errorMsg = "buffered body idle timeout after 7000ms"
+            )
+            executeResponses += CurlNativeResponse(code = 0, httpCode = 503)
+        }
+        val request = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals(503, response.statusCode)
+        assertEquals(NetworkErrorKind.HTTP_STATUS, response.error?.kind)
+        assertEquals("success", response.timing.freshRetryResult)
     }
 
     @Test
@@ -728,11 +882,68 @@ class AndroidCurlNetworkEngineTest {
         )
     }
 
+    @Test
+    fun jniCallbackPublishesTerminalOnlyAfterApplyingTransferFacts() {
+        var terminalInvoked = false
+        val callback = AndroidCurlJniCallback(
+            onResponseStartBlock = null,
+            onChunkBlock = null,
+            uploadSource = null,
+            cancellationSignal = AndroidCurlCancellationSignal(),
+            onCompleteBlock = { response ->
+                terminalInvoked = true
+                val timing = response.elapse
+                assertEquals(true, timing.curlFinalHeadersObserved)
+                assertEquals(false, timing.curlFirstBodyObserved)
+                assertEquals(false, timing.curlBodyProgressObserved)
+                assertEquals(9.0, timing.curlFinalHeadersElapsedMs)
+                assertEquals(0.0, timing.curlFirstBodyElapsedMs)
+                assertEquals(0L, timing.curlBodyBytes)
+                assertEquals(4.0, timing.curlEnqueueToNativeStartElapsedMs)
+                assertEquals(true, timing.curlMultiOwnerThreadObserved)
+            }
+        )
+        callback.onTransferFacts(
+            finalHeadersObserved = true,
+            firstBodyObserved = false,
+            bodyProgressObserved = false,
+            finalHeadersElapsedMs = 9,
+            firstBodyElapsedMs = 0,
+            lastBodyProgressElapsedMs = 0,
+            bodyBytes = 0,
+        )
+        callback.onMultiFacts(
+            enqueueToNativeStartElapsedMs = 4,
+            ownerThreadObserved = true,
+        )
+        assertFalse(terminalInvoked)
+        callback.onComplete(
+            code = 28,
+            httpCode = 200,
+            errorMessage = "buffered body idle timeout",
+            headers = "HTTP/1.1 200 OK\r\n",
+            redirectUrl = "",
+            data = null,
+            protocol = "h2",
+            nameLookupTimeMs = 1.0,
+            connectTimeMs = 2.0,
+            sslCostTimeMs = 3.0,
+            preTransferTimeMs = 4.0,
+            startTransferTimeMs = 5.0,
+            redirectTimeMs = 0.0,
+            receiveTimeMs = 0.0,
+            totalTimeMs = 510.0,
+        )
+        assertTrue(terminalInvoked)
+    }
+
     private open class FakeBridge(
         override val isAvailable: Boolean = true,
         override val supportsHttp3: Boolean = false
     ) : AndroidCurlNativeBridge {
         var executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val executeResponses = mutableListOf<CurlNativeResponse>()
+        val executeRequests = mutableListOf<AndroidCurlNativeRequest>()
         var streamResponse = CurlNativeResponse(code = 0, httpCode = 200)
         var uploadResponse = CurlNativeResponse(code = 0, httpCode = 200)
         var streamStatus = 200L
@@ -742,11 +953,17 @@ class AndroidCurlNetworkEngineTest {
         var lastRequest: AndroidCurlNativeRequest? = null
         var uploadedBytes = ByteArray(0)
         val uploadChunkSizes = mutableListOf<Int>()
+        var uploadRequests = 0
         val cancelledIds = mutableListOf<Int>()
+        var executeDelayMillis: Long = 0
+        var onExecute: ((AndroidCurlNativeRequest, Int) -> Unit)? = null
 
         override suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse {
             lastRequest = request
-            return executeResponse
+            executeRequests += request
+            onExecute?.invoke(request, executeRequests.size)
+            if (executeDelayMillis > 0) delay(executeDelayMillis)
+            return if (executeResponses.isEmpty()) executeResponse else executeResponses.removeAt(0)
         }
 
         override suspend fun downloadStream(
@@ -765,6 +982,7 @@ class AndroidCurlNetworkEngineTest {
             source: AndroidCurlUploadSource
         ): CurlNativeResponse {
             lastRequest = request
+            uploadRequests += 1
             val chunks = mutableListOf<ByteArray>()
             while (true) {
                 val chunk = source.read(uploadReadSize) ?: error("Upload source aborted")

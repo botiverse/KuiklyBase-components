@@ -50,6 +50,9 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/slow":
             time.sleep(10)
             self._send(200, b'{"slow":true}')
+        elif self.path == "/multi-delay":
+            time.sleep(0.8)
+            self._send(200, b'{"multi":true}')
         elif self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/ok")
@@ -146,6 +149,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.flush()
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        elif self.path == "/headers-only-stall":
+            self.send_response(200)
+            self.send_header("Content-Length", "3")
+            self.end_headers()
+            self.wfile.flush()
+            time.sleep(1.5)
         elif self.path == "/echo-headers":
             # Echo every received header name:value pair, one per line, so the
             # test can assert each request header arrives exactly once
@@ -154,6 +163,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, lines.encode())
         elif self.path == "/gzip":
             body = gzip.compress(ENCODED_BODY)
+            self._send(200, body, {"Content-Encoding": "gzip"})
+        elif self.path == "/gzip-large":
+            body = gzip.compress(b"x" * 4096)
             self._send(200, body, {"Content-Encoding": "gzip"})
         elif self.path == "/br":
             body = compress_with("brotli", ENCODED_BODY)
@@ -167,6 +179,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        if self.path == "/post-idle-response":
+            self.send_response(200)
+            self.send_header("Content-Length", "6")
+            self.end_headers()
+            try:
+                self.wfile.write(b"abc")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                return
+            time.sleep(1.5)
+            try:
+                self.wfile.write(b"def")
+                self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            return
         self._send(200, b'{"echoLen":%d}' % len(body))
 
     def do_HEAD(self):

@@ -10,5 +10,5 @@ cd "$NETWORK_ROOT"
 
 ANDROID_ABI=x86_64 ./scripts/build-android-curl-spike.sh --run 2>&1 \
   | tee "$LOG_DIR/ci-output.log"
-grep -q "SLOCK_ANDROID_CURL_SPIKE completed passed=true reused=true" \
+grep -q "SLOCK_ANDROID_CURL_SPIKE completed passed=true independentConnections=true" \
   "$LOG_DIR/android-curl-spike.log"

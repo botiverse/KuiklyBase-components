@@ -76,7 +76,7 @@ jobs:
           set -euo pipefail
           mkdir -p build/ios-curl-spike
           ./scripts/build-ios-curl-spike.sh --run 2>&1 | tee build/ios-curl-spike/ios-curl-spike.log
-          grep -q "SLOCK_IOS_CURL_SPIKE completed passed=true reused=true" build/ios-curl-spike/ios-curl-spike.log
+          grep -q "SLOCK_IOS_CURL_SPIKE completed passed=true independentConnections=true" build/ios-curl-spike/ios-curl-spike.log
 
       - name: Compile Kotlin/Native cinterop probe
         shell: bash

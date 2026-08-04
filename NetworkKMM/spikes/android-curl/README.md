@@ -17,7 +17,7 @@ Run from `NetworkKMM` with an arm64 Android device or emulator connected:
 The expected marker is:
 
 ```text
-SLOCK_ANDROID_CURL_SPIKE completed passed=true reused=true
+SLOCK_ANDROID_CURL_SPIKE completed passed=true independentConnections=true
 ```
 
 The `NetworkKMM Android curl spike` GitHub Actions workflow runs the same
@@ -44,8 +44,8 @@ arm64-v8a Android emulator with 16 KB pages.
 - Minimal debug APK: 7.6 MB after a clean package.
 - First HTTPS request: HTTP 200, 559 bytes, about 886 ms total in the clean
   recorded run (about 101 ms connect and 378 ms TLS).
-- Second HTTPS request: HTTP 200, 559 bytes, about 101 ms total, with connect
-  and TLS both 0 because the process-wide shared connection was reused.
+- Second HTTPS request: HTTP 200, 559 bytes. It uses a separately created
+  client/easy connection; DNS and TLS-session metadata may still be shared.
 - ELF load segments use 16 KB alignment (`p_align = 0x4000`) and the APK ran
   on a 16 KB-page emulator.
 
@@ -54,7 +54,7 @@ arm64-v8a Android emulator with 16 KB pages.
 - The same wrapper C++ source can be built for Android and reached through a
   small JNI boundary.
 - Static OpenSSL/curl packaging, 16 KB compatibility, HTTPS verification, and
-  cross-client pooling are feasible on Android.
+  repeated independent-client requests are feasible on Android.
 - Android does not have Kotlin/Native cinterop. A production migration still
   needs a real JVM-facing JNI API for buffered requests, streaming download,
   streaming upload, cancellation, callback threading, and memory ownership.

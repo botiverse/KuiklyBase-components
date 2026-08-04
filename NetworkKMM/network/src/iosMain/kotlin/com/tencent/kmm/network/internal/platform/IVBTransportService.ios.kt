@@ -20,7 +20,6 @@ import com.tencent.kmm.network.export.VBTransportBaseRequest
 import com.tencent.kmm.network.export.VBTransportBaseResponse
 import com.tencent.kmm.network.export.VBTransportBytesRequest
 import com.tencent.kmm.network.export.VBTransportBytesResponse
-import com.tencent.kmm.network.export.VBTransportContentType
 import com.tencent.kmm.network.export.VBTransportGetRequest
 import com.tencent.kmm.network.export.VBTransportGetResponse
 import com.tencent.kmm.network.export.VBTransportPostRequest
@@ -411,6 +410,8 @@ class IOSTransportImpl : IVBTransportService {
     }
 
     private fun HttpRequestBuilder.constructRequest(kmmRequest: VBTransportBaseRequest) {
+        val hasContentType = hasExplicitContentType(kmmRequest.header)
+
         // 设置 post body
         kmmRequest.bodyData()?.let {
             setBody(it)
@@ -421,15 +422,9 @@ class IOSTransportImpl : IVBTransportService {
                 header(it.key, it.value)
             }
         }
-        val requestContentType = when {
-            kmmRequest.header["Content-Type"]?.contains(
-                VBTransportContentType.JSON.toString(),
-                ignoreCase = true
-            ) == true -> ContentType.Application.Json
-
-            else -> ContentType.Application.OctetStream
+        if (!hasContentType) {
+            contentType(ContentType.Application.OctetStream)
         }
-        contentType(requestContentType)
     }
 
     // issue #8: true streaming upload via ktor WriteChannelContent — the
@@ -556,6 +551,11 @@ internal class IosTransportTaskRegistry : SynchronizedObject() {
         }
     }
 }
+
+internal fun hasExplicitContentType(headers: Map<String, String>): Boolean =
+    headers.any { (key, value) ->
+        key.equals("Content-Type", ignoreCase = true) && value.isNotBlank()
+    }
 
 actual fun getIVBTransportService(): IVBTransportService = iOSTransportImpl
 

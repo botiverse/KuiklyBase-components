@@ -18,6 +18,9 @@ package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.contentLength
+import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
+import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
+import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
@@ -48,6 +51,8 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlin.coroutines.cancellation.CancellationException
+import kotlin.time.TimeMark
+import kotlin.time.TimeSource
 
 internal object IosCurlEngineProvider {
     internal var testBridge: IosCurlNativeBridge? = null
@@ -102,31 +107,41 @@ internal class IosCurlNetworkEngine(
                 error = error
             )
         }
-        val owner = Any()
-        val requestId = iosCurlRequestOwners.reserve(owner)
-        val nativeRequest = try {
-            request.toNativeRequest(
-                requestId = requestId,
-                body = body.bytes,
-                contentType = body.contentType
-            )
-        } catch (throwable: Throwable) {
-            iosCurlRequestOwners.release(requestId, owner)
-            throw throwable
+        val startedAt = TimeSource.Monotonic.markNow()
+        val first = executeBufferedAttempt(
+            request = request,
+            call = call,
+            body = body.bytes,
+            contentType = body.contentType,
+            timeoutMillis = request.policy.timeoutMillis,
+        )
+        if (!first.isBufferedBodyIdleTimeout()) {
+            return first.toNetworkResponse(request)
         }
-        call.addCancelHandler {
-            nativeRequest.cancel()
-            iosCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
+        first.elapse.curlBodyStallDetected = true
+        val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
+        if (!shouldFreshRetryCurlBufferedStall(
+                method = request.method,
+                bodyRepeatable = request.body.repeatable,
+                policy = request.policy.curlBufferedResponse,
+                cancelled = call.isCancelled,
+                remainingTimeoutMillis = remainingTimeout,
+            )) {
+            return first.toNetworkResponse(request)
         }
-        if (call.isCancelled) {
-            iosCurlRequestOwners.release(requestId, owner)
-            return cancelledResponse(request)
-        }
-        return try {
-            bridge.execute(nativeRequest).toNetworkResponse(request)
-        } finally {
-            iosCurlRequestOwners.release(requestId, owner)
-        }
+
+        val retried = executeBufferedAttempt(
+            request = request,
+            call = call,
+            body = body.bytes,
+            contentType = body.contentType,
+            timeoutMillis = remainingTimeout ?: 0L,
+        )
+        retried.elapse.curlBodyStallDetected = true
+        retried.elapse.retainFirstAttemptCurlFacts(first.elapse)
+        retried.elapse.freshRetry = true
+        retried.elapse.freshRetryResult = if (retried.code == 0) "success" else "failure"
+        return retried.toNetworkResponse(request)
     }
 
     override suspend fun downloadStream(
@@ -248,7 +263,11 @@ internal class IosCurlNetworkEngine(
                     }
                 }
             }
-            val response = bridge.uploadStream(nativeRequest, uploadSource).toNetworkResponse(request)
+            val nativeResponse = bridge.uploadStream(nativeRequest, uploadSource)
+            if (nativeResponse.isBufferedBodyIdleTimeout()) {
+                nativeResponse.elapse.curlBodyStallDetected = true
+            }
+            val response = nativeResponse.toNetworkResponse(request)
             if (response.error != null) cancellationOwners.releaseAttemptSourceOnFailure()
             response
         } catch (throwable: Throwable) {
@@ -261,11 +280,47 @@ internal class IosCurlNetworkEngine(
         }
     }
 
+    private suspend fun executeBufferedAttempt(
+        request: NetworkRequest,
+        call: NetworkCall,
+        body: ByteArray?,
+        contentType: String?,
+        timeoutMillis: Long,
+    ): CurlNativeResponse {
+        val owner = Any()
+        val requestId = iosCurlRequestOwners.reserve(owner)
+        val nativeRequest = try {
+            request.toNativeRequest(
+                requestId = requestId,
+                body = body,
+                contentType = contentType,
+                timeoutMillis = timeoutMillis,
+            )
+        } catch (throwable: Throwable) {
+            iosCurlRequestOwners.release(requestId, owner)
+            throw throwable
+        }
+        call.addCancelHandler {
+            nativeRequest.cancel()
+            iosCurlRequestOwners.cancelIfOwner(requestId, owner) { bridge.cancel(requestId) }
+        }
+        if (call.isCancelled) {
+            iosCurlRequestOwners.release(requestId, owner)
+            return CurlNativeResponse(code = 42, errorMsg = "cancelled before iOS curl native start")
+        }
+        return try {
+            bridge.execute(nativeRequest)
+        } finally {
+            iosCurlRequestOwners.release(requestId, owner)
+        }
+    }
+
     private fun NetworkRequest.toNativeRequest(
         requestId: Int,
         body: ByteArray? = null,
         contentType: String? = null,
-        uploadContentLength: Long? = null
+        uploadContentLength: Long? = null,
+        timeoutMillis: Long = policy.timeoutMillis,
     ): IosCurlNativeRequest {
         val nativeHeaders = headers.toMutableMap()
         contentType?.let { type ->
@@ -278,11 +333,13 @@ internal class IosCurlNetworkEngine(
             url = resolvedUrl(),
             method = method.name,
             headers = nativeHeaders,
-            timeoutMillis = policy.timeoutMillis,
+            timeoutMillis = timeoutMillis,
             streamConnectTimeoutMillis = policy.streamTimeouts.connectTimeoutMillis,
             streamResponseHeadersTimeoutMillis = policy.streamTimeouts.responseHeadersTimeoutMillis,
             streamIdleTimeoutMillis = policy.streamTimeouts.interChunkIdleTimeoutMillis,
             streamWholeTimeoutMillis = policy.streamTimeouts.wholeTransferTimeoutMillis,
+            bufferedBodyIdleTimeoutMillis = policy.curlBufferedResponse.bodyIdleTimeoutMillis,
+            maxBufferedResponseBytes = policy.curlBufferedResponse.maxDecodedBytes,
             body = body,
             uploadContentLength = uploadContentLength,
             caInfoPath = checkNotNull(preparedCurlCaInfoPath(this)) {
@@ -301,6 +358,11 @@ internal class IosCurlNetworkEngine(
             errorMsg = "cancelled before iOS curl native start"
         ).toNetworkResponse(request)
 
+}
+
+private fun remainingCurlTimeoutMillis(totalTimeoutMillis: Long, startedAt: TimeMark): Long? {
+    if (totalTimeoutMillis <= 0) return null
+    return (totalTimeoutMillis - startedAt.elapsedNow().inWholeMilliseconds).coerceAtLeast(0)
 }
 
 private val iosCurlRequestOwners = RequestIdOwnerRegistry()

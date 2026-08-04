@@ -28,6 +28,9 @@ data class CurlNativeResponse(
     var elapse: VBTransportElapseStatistics = VBTransportElapseStatistics()
 )
 
+internal fun CurlNativeResponse.isBufferedBodyIdleTimeout(): Boolean =
+    code == 28 && errorMsg.contains("buffered body idle timeout")
+
 internal data class CurlResponseFields(
     val code: Int = 0,
     val httpCode: Int = 0,

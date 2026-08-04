@@ -128,8 +128,112 @@ typedef struct {
     int64_t totalLength;  // -1 = unknown
 } CurlUploadSource;
 
+// Additive transfer facts ABI. This is intentionally separate from
+// CurlResponse so existing callers keep their frozen response layout. Callers
+// pass both size and version; the runtime rejects mismatches before writing.
+#define CURL_TRANSFER_INFO_ABI_VERSION 1
+typedef struct {
+    int abiVersion;
+    uint32_t structSize;
+    int finalHeadersObserved;
+    int firstBodyObserved;
+    int bodyProgressObserved;
+    int reserved;
+    int64_t finalHeadersElapsedMs;
+    int64_t firstBodyElapsedMs;
+    int64_t lastBodyProgressElapsedMs;
+    int64_t bodyBytes;
+} CurlTransferInfoV1;
+
 // CurClient 对象指针
 typedef void* CurClientHandle;
+typedef void* CurlMultiEngineHandle;
+typedef void* CurlWebSocketHandle;
+
+#define CURL_MULTI_INFO_ABI_VERSION 1
+
+typedef struct CurlMultiInfoV1 {
+    int abiVersion;
+    int structSize;
+    int64_t enqueueToNativeStartElapsedMs;
+    int ownerThreadObserved;
+    int reserved;
+} CurlMultiInfoV1;
+
+// Additive WebSocket ABI. It deliberately owns a separate easy handle and is
+// driven by one caller thread. Return values are 1 = success/frame, 0 =
+// timeout/no frame, -1 = terminal error. The last libcurl error is available
+// through CurlWebSocketLastError.
+#define CURL_WEBSOCKET_ABI_VERSION 1
+typedef struct CurlWebSocketReadResultV1 {
+    int abiVersion;
+    uint32_t structSize;
+    int flags;
+    int dataLen;
+    int64_t bytesLeft;
+} CurlWebSocketReadResultV1;
+
+CurlWebSocketHandle CreateCurlWebSocket(const char *logTag);
+void DeleteCurlWebSocket(CurlWebSocketHandle handle);
+void CancelCurlWebSocket(CurlWebSocketHandle handle);
+int ConnectCurlWebSocketV1(CurlWebSocketHandle handle, const char *url,
+                           const StringDic *headers, const char *caInfoPath,
+                           const char *proxyUrl, int64_t connectTimeoutMs,
+                           int abiVersion);
+int SendCurlWebSocketTextV1(CurlWebSocketHandle handle, const char *data,
+                            size_t dataLen, int abiVersion);
+int ReceiveCurlWebSocketV1(CurlWebSocketHandle handle, char *buffer,
+                           size_t bufferSize, int64_t timeoutMs,
+                           CurlWebSocketReadResultV1 *result,
+                           size_t resultSize, int abiVersion);
+int CloseCurlWebSocketV1(CurlWebSocketHandle handle, int abiVersion);
+int CurlWebSocketLastError(CurlWebSocketHandle handle);
+
+// C++ Engine.IO v4 / Socket.IO v4 session built on the curl WebSocket ABI.
+// The session copies every config string/header before Start returns. All
+// callbacks are serialized on its owner thread; Delete must not be called
+// from a callback. V1 supports the default namespace and text JSON events.
+typedef void* CurlSocketIoHandle;
+#define CURL_SOCKET_IO_ABI_VERSION 1
+
+enum CurlSocketIoStateV1 {
+    CURL_SOCKET_IO_CONNECTING = 1,
+    CURL_SOCKET_IO_ENGINE_OPEN = 2,
+    CURL_SOCKET_IO_CONNECTED = 3,
+    CURL_SOCKET_IO_DISCONNECTED = 4,
+    CURL_SOCKET_IO_RECONNECTING = 5,
+    CURL_SOCKET_IO_ERROR = 6,
+};
+
+typedef struct CurlSocketIoConfigV1 {
+    int abiVersion;
+    uint32_t structSize;
+    const char *serverUrl;
+    const char *authJson;
+    const StringDic *headers;
+    const char *caInfoPath;
+    const char *proxyUrl;
+    int64_t connectTimeoutMs;
+    int64_t receivePollMs;
+    int64_t reconnectInitialDelayMs;
+    int64_t reconnectMaxDelayMs;
+} CurlSocketIoConfigV1;
+
+typedef struct CurlSocketIoCallbackV1 {
+    void *callbackRef;
+    void (*onState)(void *callbackRef, int state, int code, const char *detail);
+    void (*onEvent)(void *callbackRef, const char *eventName,
+                    const char *payloadJson);
+} CurlSocketIoCallbackV1;
+
+CurlSocketIoHandle CreateCurlSocketIoClientV1(
+    const CurlSocketIoConfigV1 *config, size_t configSize, int abiVersion,
+    const CurlSocketIoCallbackV1 *callback);
+int StartCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion);
+int EmitCurlSocketIoEventV1(CurlSocketIoHandle handle, const char *eventName,
+                            const char *payloadJson, int abiVersion);
+void CloseCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion);
+void DeleteCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion);
 
 // 创建 CurClient 对象
 CurClientHandle CreateCurlClient(const char *logTag);
@@ -148,6 +252,14 @@ void SetCurlCaInfo(CurClientHandle handle, const char *caInfoPath);
 // disables environment/system proxy discovery for direct mode.
 void SetCurlProxy(CurClientHandle handle, const char *proxyUrl);
 
+// Cap decoded bytes retained by buffered responses. Zero disables the cap.
+// Streaming downloads are not buffered and ignore this setting.
+void SetCurlMaxBufferedResponseBytes(CurClientHandle handle, int64_t maxBytes);
+
+// Set the body-progress idle deadline for buffered responses only. Zero
+// disables it. This is intentionally separate from streaming phase timeouts.
+void SetCurlBufferedBodyIdleTimeoutMs(CurClientHandle handle, int64_t timeoutMs);
+
 // Add one libcurl CURLOPT_RESOLVE entry for this client. The entry is copied
 // and follows libcurl's "host:port:address[,address]" format. This preserves
 // the URL hostname for TLS SNI/verification while allowing a caller to supply
@@ -159,15 +271,56 @@ int SetCurlResolve(CurClientHandle handle, const char *resolveEntry);
 int CurlSupportsHttp3(void);
 
 // Select explicit HTTP/3-with-fallback for this client. Disabled clients are
-// pinned to HTTP/2-over-TLS with HTTP/1.1 fallback and use a separate shared
-// connection pool, so an earlier gray request cannot upgrade default traffic
-// through connection reuse. Returns 0 only when HTTP/3 was requested but the
-// linked artifact lacks the backend.
+// pinned to HTTP/2-over-TLS with HTTP/1.1 fallback. Default and H3 clients use
+// separate DNS/TLS-session shares; connection caches are intentionally not
+// shared across concurrent per-request easy handles because libcurl does not
+// support that cross-thread topology. Returns 0 only when HTTP/3 was requested
+// but the linked artifact lacks the backend.
 int SetCurlHttp3Enabled(CurClientHandle handle, int enabled);
 
 // Actual protocol negotiated by the completed request. The returned pointer
 // is a process-lifetime string literal ("h3", "h2", "http/1.1", etc.).
 const char *GetCurlNegotiatedProtocol(CurClientHandle handle);
+
+// Snapshot callback-owned monotonic transfer facts for this client. Read only
+// after Start*Request has completed its terminal callback and returned, and
+// before DeleteCurlClient; concurrent during-transfer reads are not supported.
+// Returns 0 on a null/mismatched ABI without writing to the output buffer.
+int GetCurlTransferInfoV1(CurClientHandle handle, CurlTransferInfoV1 *info,
+                          size_t infoSize, int abiVersion);
+
+// Single-owner multi engine for buffered requests. Submit is non-blocking:
+// one native owner thread drives every accepted easy handle through CURLM and
+// invokes the copied callback exactly once at transport terminal. The caller
+// keeps `handle` alive through that callback and may read transfer/multi facts
+// before deleting it. Request strings/headers/body are copied at submission.
+// One engine accepts exactly one HTTP-version cohort (default h2/h1 or H3);
+// create a separate engine for the other cohort so a default request can never
+// silently acquire an H3 connection. Delete cancels all accepted requests and
+// synchronously waits for their exactly-once callbacks to return. Therefore
+// DeleteCurlMultiEngine must never be called from one of the engine's callbacks;
+// the callback/client context must remain alive until that callback returns.
+CurlMultiEngineHandle CreateCurlMultiEngine(const char *logTag);
+void DeleteCurlMultiEngine(CurlMultiEngineHandle engine);
+int SubmitBufferedRequestV27(CurlMultiEngineHandle engine, int64_t requestId,
+                             CurClientHandle handle, const CurlRequest *request,
+                             size_t requestSize, int abiVersion,
+                             const CurlCallback *callback);
+void CancelCurlMultiRequest(CurlMultiEngineHandle engine, int64_t requestId);
+int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
+                       size_t infoSize, int abiVersion);
+
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+// Host-test-only seam: 1 fails the next multi perform, 2 the next multi poll.
+void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode);
+void SetCurlClientTestConfigureFailure(CurClientHandle handle);
+int SocketIoTestWebSocketUrl(const char *serverUrl, char *output, size_t outputSize);
+int SocketIoTestEventFrame(const char *eventName, const char *payloadJson,
+                           char *output, size_t outputSize);
+int SocketIoTestDecodeEvent(const char *frame, char *eventName,
+                            size_t eventNameSize, char *payloadJson,
+                            size_t payloadJsonSize);
+#endif
 
 // Curl 发送请求
 int StartRequestV27(CurClientHandle handle, const CurlRequest *request,

@@ -7,8 +7,8 @@ production transport implementation.
 The harness cross-compiles OpenSSL, curl, and the existing `pbcurlwrapper`
 sources for an arm64 or x86_64 iOS Simulator, bundles Mozilla CA roots for the
 spike, then installs a minimal app that performs a real HTTPS GET through
-`StartRequest`. The harness performs the request twice to exercise connection
-sharing across two separately created wrapper clients.
+`StartRequest`. The harness performs the request twice through separately
+created wrapper clients and requires both independent requests to succeed.
 
 Run from `NetworkKMM` on an Apple Silicon Mac with a booted iOS Simulator:
 
@@ -19,7 +19,7 @@ Run from `NetworkKMM` on an Apple Silicon Mac with a booted iOS Simulator:
 The expected success marker is:
 
 ```text
-SLOCK_IOS_CURL_SPIKE completed passed=true reused=true
+SLOCK_IOS_CURL_SPIKE completed passed=true independentConnections=true
 ```
 
 The Kotlin/Native binding probe is opt-in so normal publications and source
@@ -52,15 +52,16 @@ deployment target, OpenSSL 3.5.4, curl 8.16.0.
 - Dead-stripped simulator executable: 6.5 MB.
 - First HTTPS request: HTTP 200, 559 bytes, about 503 ms total in the recorded
   run (about 399 ms TLS).
-- Second HTTPS request: HTTP 200, 559 bytes, about 96 ms total, with DNS,
-  connect, and TLS all reported as 0 because the shared connection was reused.
+- Second HTTPS request: HTTP 200, 559 bytes through a separately created
+  client/easy connection. DNS and TLS-session sharing are not used as a
+  connection-reuse oracle.
 - Kotlin/Native cinterop plus `iosSimulatorArm64` Kotlin compile: successful.
 - Existing host wrapper behavior suite: all checks passed.
 
 ## Findings
 
 - Native compilation, static linking, app signing, simulator launch, wrapper
-  callbacks, HTTPS, and connection reuse are feasible without rewriting the
+  callbacks, HTTPS, and independent-client requests are feasible without rewriting the
   wrapper C++ implementation for iOS.
 - curl 8.16.0 no longer contains the Secure Transport backend. The iOS SDK also
   does not expose a system libcurl development surface. A curl migration must
@@ -75,9 +76,9 @@ deployment target, OpenSSL 3.5.4, curl 8.16.0.
 - The wrapper source previously selected a vendored `7.64.0-DEV` curl header
   through a quoted include while linking curl 8.16.0. The spike selects the
   current header explicitly; this is build hygiene, not iOS transport logic.
-- A suspected process-global cleanup/share-handle lifetime risk did not
-  reproduce in this two-client run. The second client successfully reused the
-  first client's connection even after the first client was destroyed.
+- Both separately created clients complete after the first client is
+  destroyed. Cross-thread/cross-client connection-cache sharing is
+  intentionally not part of this feasibility claim.
 
 ## Production boundary
 

@@ -1,0 +1,20 @@
+KuiklyBase Datetime
+Copyright (C) 2026 Tencent. All rights reserved.
+
+Licensed under the Apache License, Version 2.0. See LICENSE.txt in this
+directory.
+
+Design and platform-compatibility provenance was reviewed against:
+
+1. Kotlin/kotlinx-datetime, copyright JetBrains s.r.o. and contributors,
+   Apache License 2.0, tag v0.7.1 peeled commit
+   1ee0daac9fc4c22a7da33b830c7cc60e625c49bb.
+
+2. CPF-KMP-CMP/kotlinx-datetime, Apache License 2.0, tag v0.7.1-0.3.0,
+   commit cf0c17fec83df813182f8c444ae75760833c67a4.
+
+KuiklyBase Datetime is an independently implemented minimal API in the
+build.raft.kuiklybase.datetime namespace. It does not incorporate the full
+kotlinx-datetime source tree, timezone database parser, calendar model,
+serialization layer, or kotlinx.datetime ABI. See PROVENANCE.md for the
+audited divergence and per-platform patch catalog.
