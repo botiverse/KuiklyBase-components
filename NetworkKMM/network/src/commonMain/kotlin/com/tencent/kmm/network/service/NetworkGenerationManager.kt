@@ -41,6 +41,17 @@ import kotlinx.atomicfu.locks.synchronized
  * All generation state is guarded by one [SynchronizedObject]; the manager
  * commits its generation only after a successful ([true]) transaction, and that
  * commit is an infallible in-memory assignment.
+ *
+ * Scope, stated narrowly on purpose: the participants of a generation are today
+ * exactly the paired default and H3 `CURLSH` cohorts. The long-lived C++ curl
+ * Socket.IO session added in `raft.30` is **not** a participant — this control
+ * plane neither leases nor rotates it. Phase-2 wiring must decide that
+ * relationship explicitly rather than inherit it: retiring a generation must not
+ * silently sever an active realtime session, and because a network change is
+ * positive evidence that reconnecting will now succeed, a session must not treat
+ * a rotation-driven disconnect as another failure to back off from. Until that
+ * is defined, read "shared control plane" as *for the curl request cohorts*, not
+ * for every consumer of the curl lane.
  */
 internal class NetworkGenerationManager(
     private val cohortController: CurlCohortController,

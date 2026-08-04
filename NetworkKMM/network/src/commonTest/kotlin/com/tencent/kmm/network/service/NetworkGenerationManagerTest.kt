@@ -18,7 +18,13 @@ package com.tencent.kmm.network.service
 
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
 
 /**
  * task #52 Phase 2 step 1: deterministic proofs of the shared generation-swap
@@ -154,6 +160,53 @@ class NetworkGenerationManagerTest {
         assertEquals(1L, manager.currentGeneration())
         assertEquals(listOf(1L to 0L), controller.calls)
         assertEquals(1, controller.committedRotations)
+    }
+
+    /**
+     * The sequential proofs above cannot distinguish one shared compare-and-swap
+     * from a fresh lock taken per call: without contention both shapes serialize
+     * and produce the same transcript. Only genuine overlap separates them — with
+     * a per-call lock the second trigger walks into the controller while the first
+     * is still inside its transaction, double-rotating a single generation.
+     *
+     * So hold the first trigger *inside* `rotateToGeneration` and let the second
+     * arrive while it is held. `CompletableDeferred.complete` is the entry counter:
+     * it is atomic and answers `false` once already completed, so a second entrant
+     * is recorded without needing atomics in common test code.
+     */
+    @Test
+    fun contendingTriggersEnterTheControllerOnceUnderOneSharedCas() = runBlocking {
+        val firstEntry = CompletableDeferred<Unit>()
+        val secondEntry = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val controller = object : CurlCohortController {
+            override fun rotateToGeneration(newGeneration: Long, retiredGeneration: Long): Boolean {
+                if (!firstEntry.complete(Unit)) {
+                    secondEntry.complete(Unit)
+                }
+                runBlocking { release.await() }
+                return true
+            }
+        }
+        val manager = NetworkGenerationManager(controller)
+
+        val networkChange = async(Dispatchers.Default) { manager.retireIfCurrent(0L) }
+        firstEntry.await()
+        val quorum = async(Dispatchers.Default) { manager.retireIfCurrent(0L) }
+        delay(25)
+
+        // Held by the same CAS the first trigger is inside: it has neither
+        // completed nor reached the controller.
+        assertFalse(quorum.isCompleted)
+        assertFalse(secondEntry.isCompleted)
+
+        release.complete(Unit)
+        val results = listOf(networkChange.await(), quorum.await())
+
+        assertEquals(1, results.count { it is GenerationRetirementResult.Advanced })
+        assertEquals(1, results.count { it is GenerationRetirementResult.AlreadyAdvanced })
+        assertFalse(secondEntry.isCompleted)
+        assertEquals(1L, manager.currentGeneration())
     }
 
     @Test
