@@ -5,6 +5,9 @@ on:
     paths:
       - "NetworkKMM/**"
       - "knoi/**"
+      - ".github/workflows/networkkmm-android-native.yml"
+      - ".github/workflows/networkkmm-ios-native.yml"
+      - ".github/workflows/networkkmm-ohos-native.yml"
       - ".github/workflows/networkkmm-tests.yml"
       - ".github/workflows/publish-network-github-packages.yml"
   workflow_dispatch:
@@ -37,6 +40,10 @@ jobs:
       - name: Run dual-publication static contract and mutation teeth
         shell: bash
         run: python3 NetworkKMM/scripts/verify-network-dual-publication-contract.py
+
+      - name: Verify native source-date workflow dependency graph
+        shell: bash
+        run: python3 NetworkKMM/scripts/verify-native-source-date-workflow-contract.py
 
       - name: Discover and dry-run both normal-tree repositories
         shell: bash
@@ -371,7 +378,7 @@ jobs:
       - name: Run production iOS curl runtime tests
         shell: bash
         env:
-          NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION: unavailable
+          NETWORKKMM_IOS_CURL_OPTIONAL_API_EXPECTATION: available
         run: NetworkKMM/scripts/run-ios-curl-runtime-tests.sh
 
       - name: Upload iOS curl test reports

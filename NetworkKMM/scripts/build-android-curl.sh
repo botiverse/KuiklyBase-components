@@ -34,6 +34,26 @@ ANDROID_NDK_ROOT="${ANDROID_NDK_ROOT:-${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NETWORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# OpenSSL otherwise embeds the wall clock in OPENSSL_FULL_VERSION_STR, which
+# also perturbs mergeable rodata placement and makes release carriers differ
+# across identical builds. The epoch is one audited repository constant shared
+# by Android, iOS and OHOS; an ambient override must never change release bits.
+SOURCE_DATE_EPOCH_FILE="${SCRIPT_DIR}/native-source-date-epoch.txt"
+if [[ ! -f "$SOURCE_DATE_EPOCH_FILE" ]]; then
+  echo "Native source-date epoch is missing: $SOURCE_DATE_EPOCH_FILE" >&2
+  exit 2
+fi
+REPOSITORY_SOURCE_DATE_EPOCH="$(tr -d '\r\n' < "$SOURCE_DATE_EPOCH_FILE")"
+if [[ ! "$REPOSITORY_SOURCE_DATE_EPOCH" =~ ^[0-9]{10}$ ]]; then
+  echo "Native source-date epoch must be one 10-digit repository value" >&2
+  exit 2
+fi
+if [[ -n "${SOURCE_DATE_EPOCH:-}" && "$SOURCE_DATE_EPOCH" != "$REPOSITORY_SOURCE_DATE_EPOCH" ]]; then
+  echo "Ambient SOURCE_DATE_EPOCH disagrees with the repository value" >&2
+  exit 2
+fi
+SOURCE_DATE_EPOCH="$REPOSITORY_SOURCE_DATE_EPOCH"
+export SOURCE_DATE_EPOCH
 CPP_ROOT="${NETWORK_ROOT}/ohosApp/pbcurlwrapper/src/main/cpp"
 SHIM_SOURCE="${NETWORK_ROOT}/network/src/androidMain/cpp/networkkmm_curl_jni.cpp"
 OUT_ROOT="${NETWORK_ROOT}/network/libs/android"
@@ -53,7 +73,7 @@ NGHTTP3_STAMP="${NGHTTP3_PREFIX}/.android-build-config"
 CURL_SOURCE="${BUILD_ROOT}/curl-${CURL_VERSION}"
 CURL_BUILD="${BUILD_ROOT}/curl-build"
 CURL_STAMP="${CURL_BUILD}/.android-build-config"
-BUILD_CONFIG="${NDK_VERSION}:${ANDROID_API}:${ANDROID_ABI}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}"
+BUILD_CONFIG="${NDK_VERSION}:${ANDROID_API}:${ANDROID_ABI}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}:source-date=${SOURCE_DATE_EPOCH}"
 
 if [[ ! -f "$SHIM_SOURCE" ]]; then
   echo "JNI shim not found: $SHIM_SOURCE" >&2

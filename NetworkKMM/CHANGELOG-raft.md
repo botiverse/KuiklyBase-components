@@ -1,5 +1,22 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.31 / 0.1.0-raft.31-ohos (curl completion diagnostics)
+
+- Add completion-only curl transfer facts for Android and iOS: normalized
+  DNS/connect/TLS/pre-transfer/first-byte/total timings, independent
+  availability flags, and an explicit final TLS timing state.
+- Expose a process-stable physical connection identity only when libcurl
+  provides a real connection ID. The identity is namespaced by the
+  process-monotonic connection-cache generation; unavailable facts remain
+  explicit `unknown` instead of falling back to request IDs, pointers, IPs,
+  ports, or URLs.
+- Version the additive native facts ABI and fail closed against older iOS
+  artifacts. Completion facts are observational only: this release adds no
+  stale-connection detection, retry, or recovery behavior.
+- `0.1.0-raft.30` was reserved by the Socket.IO source change but was never
+  published. Consume `.31`; it contains that preceding source plus these
+  completion diagnostics under one fresh immutable coordinate.
+
 ## 0.1.0-raft.30 / 0.1.0-raft.30-ohos (C++ curl Socket.IO v1)
 
 - Add an additive C++ Engine.IO v4 / Socket.IO v4 session on top of libcurl's
