@@ -36,6 +36,25 @@ OHOS_TRIPLE="aarch64-linux-ohos"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NETWORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# OpenSSL otherwise embeds the runner wall clock and changes libopenssl.so on
+# every rebuild. Consume the same audited repository epoch as Android/iOS and
+# reject ambient overrides so producer/writeback/replay cannot drift.
+SOURCE_DATE_EPOCH_FILE="${SCRIPT_DIR}/native-source-date-epoch.txt"
+if [[ ! -f "$SOURCE_DATE_EPOCH_FILE" ]]; then
+  echo "Native source-date epoch is missing: $SOURCE_DATE_EPOCH_FILE" >&2
+  exit 1
+fi
+REPOSITORY_SOURCE_DATE_EPOCH="$(tr -d '\r\n' < "$SOURCE_DATE_EPOCH_FILE")"
+if [[ ! "$REPOSITORY_SOURCE_DATE_EPOCH" =~ ^[0-9]{10}$ ]]; then
+  echo "Native source-date epoch must be one 10-digit repository value" >&2
+  exit 1
+fi
+if [[ -n "${SOURCE_DATE_EPOCH:-}" && "$SOURCE_DATE_EPOCH" != "$REPOSITORY_SOURCE_DATE_EPOCH" ]]; then
+  echo "Ambient SOURCE_DATE_EPOCH disagrees with the repository value" >&2
+  exit 1
+fi
+SOURCE_DATE_EPOCH="$REPOSITORY_SOURCE_DATE_EPOCH"
+export SOURCE_DATE_EPOCH
 BUILD_ROOT="${NETWORK_BUILD_ROOT:-${NETWORK_ROOT}/build/ohos-native}"
 WRAPPER_LIBS_DIR="${NETWORK_ROOT}/ohosApp/pbcurlwrapper/libs/${OHOS_ARCH}"
 ENTRY_LIBS_DIR="${NETWORK_ROOT}/ohosApp/entry/libs/${OHOS_ARCH}"
@@ -91,10 +110,12 @@ fetch_and_verify \
   "openssl-${OPENSSL_VERSION}.tar.gz" \
   "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz.sha256"
 OPENSSL_PREFIX="$BUILD_ROOT/openssl-out"
-if [[ -f "$OPENSSL_PREFIX/lib/libssl.a" && -f "$OPENSSL_PREFIX/lib/libcrypto.a" ]]; then
+OPENSSL_STAMP="$OPENSSL_PREFIX/.ohos-build-config"
+OPENSSL_BUILD_CONFIG="${OPENSSL_VERSION}:${OHOS_TRIPLE}:source-date=${SOURCE_DATE_EPOCH}"
+if [[ -f "$OPENSSL_PREFIX/lib/libssl.a" && -f "$OPENSSL_PREFIX/lib/libcrypto.a" && "$(cat "$OPENSSL_STAMP" 2>/dev/null)" == "$OPENSSL_BUILD_CONFIG" ]]; then
   echo "==> OpenSSL already built, reusing $OPENSSL_PREFIX"
 else
-rm -rf "openssl-${OPENSSL_VERSION}"
+rm -rf "openssl-${OPENSSL_VERSION}" "$OPENSSL_PREFIX"
 tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
 
 echo "==> Building OpenSSL (static libs)"
@@ -114,6 +135,7 @@ echo "==> Building OpenSSL (static libs)"
   make -j"$(nproc)" build_libs
   make install_dev >/dev/null
 )
+printf '%s' "$OPENSSL_BUILD_CONFIG" > "$OPENSSL_STAMP"
 fi
 
 echo "==> Linking combined libopenssl.so (libssl + libcrypto)"

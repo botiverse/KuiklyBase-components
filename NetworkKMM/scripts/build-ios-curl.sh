@@ -33,6 +33,27 @@ JOBS="$(sysctl -n hw.ncpu)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NETWORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+# Keep the OpenSSL build identity and every static-archive member header
+# independent of the runner clock. SOURCE_DATE_EPOCH is one audited repository
+# value shared by all native lanes; ZERO_AR_DATE is the documented Apple
+# archive switch used by libtool/ar for deterministic member dates.
+SOURCE_DATE_EPOCH_FILE="${SCRIPT_DIR}/native-source-date-epoch.txt"
+if [[ ! -f "$SOURCE_DATE_EPOCH_FILE" ]]; then
+  echo "Native source-date epoch is missing: $SOURCE_DATE_EPOCH_FILE" >&2
+  exit 2
+fi
+REPOSITORY_SOURCE_DATE_EPOCH="$(tr -d '\r\n' < "$SOURCE_DATE_EPOCH_FILE")"
+if [[ ! "$REPOSITORY_SOURCE_DATE_EPOCH" =~ ^[0-9]{10}$ ]]; then
+  echo "Native source-date epoch must be one 10-digit repository value" >&2
+  exit 2
+fi
+if [[ -n "${SOURCE_DATE_EPOCH:-}" && "$SOURCE_DATE_EPOCH" != "$REPOSITORY_SOURCE_DATE_EPOCH" ]]; then
+  echo "Ambient SOURCE_DATE_EPOCH disagrees with the repository value" >&2
+  exit 2
+fi
+SOURCE_DATE_EPOCH="$REPOSITORY_SOURCE_DATE_EPOCH"
+ZERO_AR_DATE=1
+export SOURCE_DATE_EPOCH ZERO_AR_DATE
 CPP_ROOT="${NETWORK_ROOT}/ohosApp/pbcurlwrapper/src/main/cpp"
 WRAPPER_HEADER="${CPP_ROOT}/wrapper/include/curl_wrapper.h"
 OUT_DIR="${NETWORK_ROOT}/network/libs/ios"
@@ -99,7 +120,7 @@ build_slice_arch() {
   local nghttp3_stamp="${nghttp3_prefix}/.build-config"
   local wrapper_build="${slice_root}/wrapper-build"
   local merged="${slice_root}/libNetworkKMMCurl.a"
-  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}"
+  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}:source-date=${SOURCE_DATE_EPOCH}:zero-ar-date=${ZERO_AR_DATE}"
   local sdk_path
   sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
 
