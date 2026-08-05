@@ -100,14 +100,63 @@ def validate(files: Mapping[str, str]) -> None:
 
     publisher = files["publisher"]
     require(
-        "git status --porcelain=v1 --untracked-files=all" in publisher,
+        "publication_git status --porcelain=v1 --untracked-files=all" in publisher,
         "clean-checkout",
         "publisher must reject dirty tracked and untracked state",
     )
     require(
-        'resolved_source_sha="$(git rev-parse HEAD)"' in publisher,
+        'resolved_source_sha="$(publication_git rev-parse HEAD)"' in publisher,
         "source-sha-resolution",
         "source SHA must come from the publication checkout",
+    )
+    require(
+        'HOME="$git_config_home" git config --global --add safe.directory "$REPOSITORY_DIR"' in publisher
+        and 'HOME="$git_config_home" git "$@"' in publisher,
+        "isolated-safe-directory",
+        "container-safe Git provenance must not mutate the real global config",
+    )
+    state = files["state"]
+    empty_array_expansions = {
+        "publisher": (
+            "validated_required_tasks",
+            "github_publish_tasks",
+            "raft_base_tasks",
+            "selected_publish_tasks",
+        ),
+        "state": (
+            "validated_required_tasks",
+            "auth_args",
+            "github_missing",
+            "raft_missing",
+            "requested_lane_tasks",
+            "missing_union",
+        ),
+    }
+    guarded_empty_arrays = True
+    for file_name, array_names in empty_array_expansions.items():
+        script = files[file_name]
+        for array_name in array_names:
+            direct = f'"${{{array_name}[@]}}"'
+            guarded = f'${{{array_name}[@]+"${{{array_name}[@]}}"}}'
+            guarded_empty_arrays = (
+                guarded_empty_arrays
+                and script.count(guarded) > 0
+                and script.count(direct) == script.count(guarded)
+            )
+    guarded_empty_arrays = (
+        guarded_empty_arrays
+        and 'github_missing_text=""\nraft_missing_text=""' in state
+        and state.count('github_missing_text="${github_missing[*]}"') == 1
+        and state.count('raft_missing_text="${raft_missing[*]}"') == 1
+    )
+    require(
+        "declare -A" not in publisher
+        and "[[ -v" not in publisher
+        and "declare -A" not in state
+        and "[[ -v" not in state
+        and guarded_empty_arrays,
+        "bash32-portability",
+        "macOS scripts must avoid Bash 4 features and nounset-unsafe empty-array expansion",
     )
     require(
         "GITHUB_SHA" not in publisher and "github.sha" not in publisher,
@@ -135,7 +184,6 @@ def validate(files: Mapping[str, str]) -> None:
         "repository tokens must remain environment credentials, not process arguments",
     )
 
-    state = files["state"]
     require(
         "GitHub Packages positive control failed" in state
         and "Raft Artifacts scope positive control failed" in state,
@@ -212,6 +260,13 @@ def validate(files: Mapping[str, str]) -> None:
         "hosted-contract",
         "Hosted CI must execute the static and mutation contract",
     )
+    require(
+        "publishIosX64PublicationToMavenLocal" in test_workflow
+        and "network_required_paths_for" in test_workflow
+        and "dev.raft.sourceSha" in test_workflow,
+        "hosted-ios-artifacts",
+        "macOS Hosted must publish and inspect the real isolated iOS Maven files and provenance",
+    )
 
 
 def mutate_once(files: Mapping[str, str], key: str, old: str, new: str = "") -> dict[str, str]:
@@ -227,7 +282,18 @@ def run_mutations(files: Mapping[str, str]) -> None:
         ("drop-environment", mutate_once(files, "workflow", "    environment: raft-artifacts-production\n"), "environment-count"),
         ("drop-raft-secret", mutate_once(files, "workflow", "          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}\n"), "secret-count"),
         ("drop-required-task", mutate_once(files, "workflow", f"        {first_task}\n"), f"task-count:{first_task}"),
-        ("event-sha", mutate_once(files, "publisher", 'resolved_source_sha="$(git rev-parse HEAD)"', 'resolved_source_sha="${GITHUB_SHA}"'), "source-sha-resolution"),
+        ("event-sha", mutate_once(files, "publisher", 'resolved_source_sha="$(publication_git rev-parse HEAD)"', 'resolved_source_sha="${GITHUB_SHA}"'), "source-sha-resolution"),
+        ("bash4-only", mutate_once(files, "publisher", "#!/usr/bin/env bash\n", "#!/usr/bin/env bash\ndeclare -A bash4_only=()\n"), "bash32-portability"),
+        (
+            "bash32-empty-array",
+            mutate_once(
+                files,
+                "publisher",
+                '${validated_required_tasks[@]+"${validated_required_tasks[@]}"}',
+                '"${validated_required_tasks[@]}"',
+            ),
+            "bash32-portability",
+        ),
         ("drop-task-pair", mutate_once(files, "publisher", 'selected_publish_tasks+=("$(network_raft_task_for "$task")")'), "paired-task-derivation"),
         ("drop-normal-convention", mutate_once(files, "normal_root", '        apply(from = rootProject.file("gradle/raft-artifacts-publishing.gradle.kts"))\n'), "normal-convention"),
         ("drop-android-sources", mutate_once(files, "android_runtime", "            withSourcesJar()\n"), "android-sources"),

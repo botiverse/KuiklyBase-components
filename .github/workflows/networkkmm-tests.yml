@@ -111,6 +111,74 @@ jobs:
             :network:publishIosSimulatorArm64PublicationToGithubPackagesRepository
         run: NetworkKMM/scripts/publish-github-packages.sh
 
+      - name: Publish and verify isolated iOS Maven artifacts
+        shell: bash
+        working-directory: NetworkKMM
+        env:
+          GITHUB_PACKAGES_USERNAME: contract-user
+          GITHUB_PACKAGES_TOKEN: contract-token
+        run: |
+          set -euo pipefail
+          source scripts/network-publication-manifest.sh
+          source_sha="$(git rev-parse HEAD)"
+          version="0.0.0-hosted-ios-contract"
+          repository_dir="$(mktemp -d "$RUNNER_TEMP/networkkmm-ios-maven.XXXXXX")"
+
+          ./gradlew --no-daemon --console=plain \
+            -PnetworkSourceSha="$source_sha" \
+            -PmavenVersion="$version" \
+            -Dmaven.repo.local="$repository_dir" \
+            :network:publishIosX64PublicationToMavenLocal \
+            :network:publishIosArm64PublicationToMavenLocal \
+            :network:publishIosSimulatorArm64PublicationToMavenLocal
+
+          publication_tasks=(
+            :network:publishIosX64PublicationToGithubPackagesRepository
+            :network:publishIosArm64PublicationToGithubPackagesRepository
+            :network:publishIosSimulatorArm64PublicationToGithubPackagesRepository
+          )
+          missing=0
+          for task in "${publication_tasks[@]}"; do
+            while IFS= read -r relative_path; do
+              [[ -n "$relative_path" ]] || continue
+              if [[ ! -f "$repository_dir/$relative_path" ]]; then
+                echo "::error::Missing isolated iOS Maven file: $relative_path"
+                missing=1
+              fi
+            done < <(network_required_paths_for "$task" "$version")
+          done
+
+          if [[ "$missing" -ne 0 ]]; then
+            REPOSITORY_DIR="$repository_dir" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["REPOSITORY_DIR"])
+          print("Actual isolated Maven files:")
+          for path in sorted(item.relative_to(root) for item in root.rglob("*") if item.is_file()):
+              print(path)
+          PY
+            exit 1
+          fi
+
+          REPOSITORY_DIR="$repository_dir" SOURCE_SHA="$source_sha" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["REPOSITORY_DIR"])
+          source_sha = os.environ["SOURCE_SHA"]
+          poms = sorted(root.rglob("*.pom"))
+          if len(poms) != 3:
+              raise SystemExit(f"expected 3 iOS POMs, found {len(poms)}")
+          for pom in poms:
+              text = pom.read_text()
+              if f"<dev.raft.sourceSha>{source_sha}</dev.raft.sourceSha>" not in text:
+                  raise SystemExit(f"source SHA property missing from {pom.relative_to(root)}")
+              if f"<tag>{source_sha}</tag>" not in text:
+                  raise SystemExit(f"SCM tag missing from {pom.relative_to(root)}")
+          print("isolated iOS Maven files and source-SHA POM provenance: PASS")
+          PY
+
   ca-bundle-contract:
     name: App-owned CA bundle pin
     runs-on: ubuntu-latest

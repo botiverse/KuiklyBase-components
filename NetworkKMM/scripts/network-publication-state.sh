@@ -18,15 +18,30 @@ if [[ -z "$required_task_text" ]]; then
 fi
 IFS=' ' read -r -a required_tasks <<< "$required_task_text"
 
-declare -A required_set=()
+array_contains() {
+  local needle="$1"
+  shift
+  local candidate
+  for candidate in "$@"; do
+    if [[ "$candidate" == "$needle" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+validated_required_tasks=()
 for task in "${required_tasks[@]}"; do
   network_assert_known_publication_task "$task"
-  if [[ -n "${required_set[$task]:-}" ]]; then
+  # Bash 3.2 treats an empty array as unset under `set -u`; the guarded
+  # expansion keeps the first iteration portable to the macOS system Bash.
+  if array_contains "$task" ${validated_required_tasks[@]+"${validated_required_tasks[@]}"}; then
     echo "Duplicate required publication task: $task" >&2
     exit 1
   fi
-  required_set[$task]=true
+  validated_required_tasks+=("$task")
 done
+required_tasks=(${validated_required_tasks[@]+"${validated_required_tasks[@]}"})
 
 base_version="${MAVEN_VERSION:-}"
 if [[ -z "$base_version" ]]; then
@@ -84,7 +99,7 @@ curl_code() {
   esac
   curl --silent --show-error --head --output /dev/null --write-out '%{http_code}' \
     --connect-timeout 15 --max-time 60 --retry 2 --retry-all-errors \
-    "${auth_args[@]}" "$base_url/$relative_path"
+    ${auth_args[@]+"${auth_args[@]}"} "$base_url/$relative_path"
 }
 
 assert_positive_controls() {
@@ -164,38 +179,51 @@ if [[ "$mode" == "verify" ]]; then
   exit 0
 fi
 
-declare -A missing_union=()
-for task in "${github_missing[@]}" "${raft_missing[@]}"; do
-  [[ -n "$task" ]] && missing_union[$task]=true
+missing_union=()
+for task in "${required_tasks[@]}"; do
+  if array_contains "$task" ${github_missing[@]+"${github_missing[@]}"} \
+    || array_contains "$task" ${raft_missing[@]+"${raft_missing[@]}"}; then
+    missing_union+=("$task")
+  fi
 done
 
 # The legacy workflow inputs remain available for a deliberate partial retry,
 # but they are an exact allowlist, not a way to omit a missing publication.
 if [[ -n "${NETWORK_PUBLISH_TASKS:-}" ]]; then
   IFS=' ' read -r -a requested_tasks <<< "$NETWORK_PUBLISH_TASKS"
-  declare -A requested_set=()
+  requested_lane_tasks=()
   for task in "${requested_tasks[@]}"; do
     network_assert_known_publication_task "$task"
     # android_ohos_publish_tasks is shared by two jobs. Each job validates
     # only the entries belonging to its own required lane.
-    if [[ -n "${required_set[$task]:-}" ]]; then
-      requested_set[$task]=true
+    if array_contains "$task" "${required_tasks[@]}"; then
+      if array_contains "$task" ${requested_lane_tasks[@]+"${requested_lane_tasks[@]}"}; then
+        echo "Requested retry contains a duplicate publication task: $task" >&2
+        exit 1
+      fi
+      requested_lane_tasks+=("$task")
     fi
   done
-  if (( ${#requested_set[@]} != ${#missing_union[@]} )); then
+  if (( ${#requested_lane_tasks[@]} != ${#missing_union[@]} )); then
     echo "Requested retry tasks must exactly match all missing publications in this lane." >&2
     exit 1
   fi
-  for task in "${!missing_union[@]}"; do
-    if [[ -z "${requested_set[$task]:-}" ]]; then
+  for task in ${missing_union[@]+"${missing_union[@]}"}; do
+    if ! array_contains "$task" ${requested_lane_tasks[@]+"${requested_lane_tasks[@]}"}; then
       echo "Requested retry omits missing publication task: $task" >&2
       exit 1
     fi
   done
 fi
 
-github_missing_text="${github_missing[*]}"
-raft_missing_text="${raft_missing[*]}"
+github_missing_text=""
+raft_missing_text=""
+if (( ${#github_missing[@]} > 0 )); then
+  github_missing_text="${github_missing[*]}"
+fi
+if (( ${#raft_missing[@]} > 0 )); then
+  raft_missing_text="${raft_missing[*]}"
+fi
 skip_publish=false
 if (( ${#missing_union[@]} == 0 )); then
   skip_publish=true
