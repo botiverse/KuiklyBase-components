@@ -47,7 +47,11 @@ Key points:
 2. If any `.cpp`/header changed, dispatch `networkkmm-ohos-native.yml` with
    `commit_binaries=true` first (rebuilds + commits the `.so`).
 3. Dispatch `publish-network-github-packages.yml` with `version=0.1.0-raft.N`
-   (builds all targets incl. iOS on mac → validates iOS before publishing).
+   (builds all targets incl. iOS on mac, then publishes the original GAVs to
+   both GitHub Packages and Raft Artifacts). The jobs require the protected
+   `raft-artifacts-production` environment and its scope-limited
+   `RAFT_ARTIFACTS_PUBLISH_TOKEN`; do not bypass the clean-checkout,
+   source-SHA, immutable-state, or two-repository convergence gates.
 4. To consume locally (the dev box cannot read GitHub Packages — 401 without
    `read:packages`), publish to mavenLocal from source:
    `./gradlew :network:publishKotlinMultiplatformPublicationToMavenLocal :network:publishAndroidPublicationToMavenLocal`

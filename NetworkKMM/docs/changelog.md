@@ -2,6 +2,10 @@
 
 ##### Unreleased
 
+- build: dual-publish every existing NetworkKMM GAV to GitHub Packages and Raft Artifacts
+- build: bind remote Maven POMs to a clean-checkout source SHA and reject SNAPSHOT or partial immutable retries
+- build: attach sources to the Android curl and HarmonyOS runtime publications and add publication mutation gates
+
 ##### 0.1.0-raft.0
 
 - docs: point consumer setup to the bytemain GitHub Packages Maven repository

@@ -46,7 +46,7 @@ implementation("com.tencent.kuiklybase:network:0.1.0-raft.0")
 ```
 
 #### GitHub Packages
-bytemain fork 会把 Android、iOS、HarmonyOS 三端 KMP artifacts 发布到 GitHub Packages。GitHub Packages Maven 即使是 public 包也需要 credentials。本地构建时，把 [`docs/github-packages.properties.example`](./docs/github-packages.properties.example) 复制到消费仓库根目录的 `github-packages.properties`，填入带 `read:packages` 权限的 classic PAT；文件不存在时，Gradle 会回退读取 `GITHUB_ACTOR`、`GITHUB_PACKAGES_TOKEN` 或 `GITHUB_TOKEN`。手动发布、CI 发布和消费端仓库配置见 [GitHub Packages 发布文档](./docs/github-packages-publishing.md)。
+bytemain fork 会把 Android、iOS、HarmonyOS 三端同一组 Maven 坐标同时发布到 GitHub Packages 和公开的 Raft Maven 仓库 `https://maven.artifacts.botiverse.dev`。GitHub Packages 即使是 public 包也需要凭据，Raft 的公开读取不需要。本地使用 GitHub Packages 时，把 [`docs/github-packages.properties.example`](./docs/github-packages.properties.example) 复制到消费仓库根目录的 `github-packages.properties`，填入带 `read:packages` 权限的 classic PAT；文件不存在时，Gradle 会回退读取 `GITHUB_ACTOR`、`GITHUB_PACKAGES_TOKEN` 或 `GITHUB_TOKEN`。双发、CI 安全门禁和消费端仓库配置见 [Maven 发布文档](./docs/github-packages-publishing.md)。
 
 #### 新请求优先使用 `NetworkClient`
 新的 KMP 调用点建议把 `NetworkClient` 作为 typed request 边界，不再直接拼 `VBTransportRequest`。

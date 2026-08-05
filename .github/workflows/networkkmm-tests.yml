@@ -6,12 +6,179 @@ on:
       - "NetworkKMM/**"
       - "knoi/**"
       - ".github/workflows/networkkmm-tests.yml"
+      - ".github/workflows/publish-network-github-packages.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
+  publication-contract:
+    name: Immutable GitHub + Raft publication contract
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Resolve HarmonyOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot"
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
+
+      - name: Run dual-publication static contract and mutation teeth
+        shell: bash
+        run: python3 NetworkKMM/scripts/verify-network-dual-publication-contract.py
+
+      - name: Discover and dry-run both normal-tree repositories
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: contract-user
+          GITHUB_PACKAGES_TOKEN: contract-token
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: contract-token
+          NETWORK_DRY_RUN: "true"
+          NETWORK_REQUIRE_TASKS: "true"
+          NETWORK_REQUIRED_TASKS: >-
+            :network:publishAndroidPublicationToGithubPackagesRepository
+            :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository
+            :network:publishKotlinMultiplatformPublicationToGithubPackagesRepository
+        run: NetworkKMM/scripts/publish-github-packages.sh
+
+      - name: Discover and dry-run both OHOS-tree repositories
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: contract-user
+          GITHUB_PACKAGES_TOKEN: contract-token
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: contract-token
+          NETWORK_DRY_RUN: "true"
+          NETWORK_REQUIRE_TASKS: "true"
+          NETWORK_SETTINGS_FILE: settings.ohos.gradle.kts
+          NETWORK_REQUIRED_TASKS: >-
+            :network:publishOhosArm64PublicationToGithubPackagesRepository
+            :network-ohos-runtime:publishAllPublicationsToGithubPackagesRepository
+            :network-ohos-runtime-gradle-plugin:publishAllPublicationsToGithubPackagesRepository
+            :network:publishKotlinMultiplatformPublicationToGithubPackagesRepository
+        run: NetworkKMM/scripts/publish-github-packages.sh
+
+  publication-contract-ios:
+    name: Immutable iOS publication task graph
+    runs-on: macos-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Android SDK needed during project configuration
+        shell: bash
+        env:
+          ANDROID_HOME: /tmp/android-sdk
+          ANDROID_SDK_ROOT: /tmp/android-sdk
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip -o /tmp/android-command-line-tools.zip
+          unzip -q /tmp/android-command-line-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+
+      - name: Discover and dry-run both iOS repositories
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: contract-user
+          GITHUB_PACKAGES_TOKEN: contract-token
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: contract-token
+          NETWORK_DRY_RUN: "true"
+          NETWORK_REQUIRE_TASKS: "true"
+          NETWORK_REQUIRED_TASKS: >-
+            :network:publishIosX64PublicationToGithubPackagesRepository
+            :network:publishIosArm64PublicationToGithubPackagesRepository
+            :network:publishIosSimulatorArm64PublicationToGithubPackagesRepository
+        run: NetworkKMM/scripts/publish-github-packages.sh
+
+      - name: Publish and verify isolated iOS Maven artifacts
+        shell: bash
+        working-directory: NetworkKMM
+        env:
+          GITHUB_PACKAGES_USERNAME: contract-user
+          GITHUB_PACKAGES_TOKEN: contract-token
+        run: |
+          set -euo pipefail
+          source scripts/network-publication-manifest.sh
+          source_sha="$(git rev-parse HEAD)"
+          version="0.0.0-hosted-ios-contract"
+          repository_dir="$(mktemp -d "$RUNNER_TEMP/networkkmm-ios-maven.XXXXXX")"
+
+          ./gradlew --no-daemon --console=plain \
+            -PnetworkSourceSha="$source_sha" \
+            -PmavenVersion="$version" \
+            -Dmaven.repo.local="$repository_dir" \
+            :network:publishIosX64PublicationToMavenLocal \
+            :network:publishIosArm64PublicationToMavenLocal \
+            :network:publishIosSimulatorArm64PublicationToMavenLocal
+
+          publication_tasks=(
+            :network:publishIosX64PublicationToGithubPackagesRepository
+            :network:publishIosArm64PublicationToGithubPackagesRepository
+            :network:publishIosSimulatorArm64PublicationToGithubPackagesRepository
+          )
+          missing=0
+          for task in "${publication_tasks[@]}"; do
+            while IFS= read -r relative_path; do
+              [[ -n "$relative_path" ]] || continue
+              if [[ ! -f "$repository_dir/$relative_path" ]]; then
+                echo "::error::Missing isolated iOS Maven file: $relative_path"
+                missing=1
+              fi
+            done < <(network_required_paths_for "$task" "$version")
+          done
+
+          if [[ "$missing" -ne 0 ]]; then
+            REPOSITORY_DIR="$repository_dir" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["REPOSITORY_DIR"])
+          print("Actual isolated Maven files:")
+          for path in sorted(item.relative_to(root) for item in root.rglob("*") if item.is_file()):
+              print(path)
+          PY
+            exit 1
+          fi
+
+          REPOSITORY_DIR="$repository_dir" SOURCE_SHA="$source_sha" python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["REPOSITORY_DIR"])
+          source_sha = os.environ["SOURCE_SHA"]
+          poms = sorted(root.rglob("*.pom"))
+          if len(poms) != 3:
+              raise SystemExit(f"expected 3 iOS POMs, found {len(poms)}")
+          for pom in poms:
+              text = pom.read_text()
+              if f"<dev.raft.sourceSha>{source_sha}</dev.raft.sourceSha>" not in text:
+                  raise SystemExit(f"source SHA property missing from {pom.relative_to(root)}")
+              if f"<tag>{source_sha}</tag>" not in text:
+                  raise SystemExit(f"SCM tag missing from {pom.relative_to(root)}")
+          print("isolated iOS Maven files and source-SHA POM provenance: PASS")
+          PY
+
   ca-bundle-contract:
     name: App-owned CA bundle pin
     runs-on: ubuntu-latest

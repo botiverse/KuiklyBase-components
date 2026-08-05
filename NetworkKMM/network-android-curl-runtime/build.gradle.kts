@@ -1,4 +1,5 @@
 import org.gradle.api.publish.maven.MavenPublication
+import org.gradle.api.tasks.bundling.Jar
 import org.gradle.kotlin.dsl.`maven-publish`
 import org.gradle.kotlin.dsl.signing
 import org.gradle.plugins.signing.SigningExtension
@@ -28,7 +29,20 @@ android {
     }
 
     publishing {
-        singleVariant("release")
+        singleVariant("release") {
+            withSourcesJar()
+        }
+    }
+}
+
+tasks.withType<Jar>().configureEach {
+    if (name == "sourceReleaseJar") {
+        from(rootProject.file("ohosApp/pbcurlwrapper/src/main/cpp")) {
+            into("pbcurlwrapper")
+        }
+        from(rootProject.file("network/src/androidMain/cpp")) {
+            into("android-jni")
+        }
     }
 }
 

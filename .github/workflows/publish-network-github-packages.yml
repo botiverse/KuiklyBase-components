@@ -1,22 +1,22 @@
-name: Publish NetworkKMM to GitHub Packages
+name: Publish NetworkKMM to GitHub Packages and Raft Artifacts
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Override Maven version, for example 0.1.0-raft.0"
+        description: "Override Maven version, for example 0.1.0-raft.31"
         required: false
         type: string
       android_ohos_publish_tasks:
-        description: "Optional Android/OHOS publish task override"
+        description: "Exact missing-task allowlist for an Android/OHOS immutable retry"
         required: false
         type: string
       ios_publish_tasks:
-        description: "Optional iOS publish task override"
+        description: "Exact missing-task allowlist for an iOS immutable retry"
         required: false
         type: string
       metadata_publish_tasks:
-        description: "Optional KMP metadata publish task override"
+        description: "Exact missing-task allowlist for a metadata immutable retry"
         required: false
         type: string
   push:
@@ -29,20 +29,17 @@ permissions:
 
 jobs:
   publish-ohos-tree:
-    name: "Publish OHOS tree (ohosArm64 + root + runtime + plugin, -ohos version)"
+    name: "Publish OHOS tree (GitHub Packages + Raft Artifacts)"
     runs-on: ubuntu-latest
+    environment: raft-artifacts-production
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     outputs:
-      skipped: ${{ steps.check_version.outputs.skipped }}
+      skipped: ${{ steps.publication_state.outputs.skipped }}
     env:
-      # Android SDK comes baked in the image (/opt/android-sdk, task #240).
       NETWORK_REQUIRE_TASKS: "true"
-      # OHOS tree (task #18 dual-tree): publishes the -ohos version, including
-      # its OWN root kotlinMultiplatform module (variants: ohosArm64), plus
-      # the ohos-runtime modules. Selected via NETWORK_SETTINGS_FILE.
       NETWORK_SETTINGS_FILE: settings.ohos.gradle.kts
-      NETWORK_PUBLISH_TASKS: >-
+      NETWORK_REQUIRED_TASKS: >-
         :network:publishOhosArm64PublicationToGithubPackagesRepository
         :network-ohos-runtime:publishAllPublicationsToGithubPackagesRepository
         :network-ohos-runtime-gradle-plugin:publishAllPublicationsToGithubPackagesRepository
@@ -56,18 +53,11 @@ jobs:
         run: |
           set -euo pipefail
           ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
-          if [[ -z "$ohos_sdk_home" ]]; then
-            echo "OHOS_SDK_HOME or OHOS_BASE_SDK_HOME is required." >&2
-            exit 1
-          fi
-          if [[ ! -d "$ohos_sdk_home/native/sysroot" ]]; then
-            echo "HarmonyOS SDK sysroot not found at $ohos_sdk_home/native/sysroot" >&2
-            exit 1
-          fi
+          test -n "$ohos_sdk_home"
+          test -d "$ohos_sdk_home/native/sysroot"
           ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
           deveco_sdk_home="${DEVECO_SDK_HOME:-$(cd "$ohos_sdk_home/../.." && pwd)}"
           deveco_studio_home="${DEVECO_STUDIO_HOME:-$(cd "$deveco_sdk_home/.." && pwd)}"
-
           echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
           echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
           echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
@@ -81,65 +71,38 @@ jobs:
         shell: bash
         env:
           REQUESTED_VERSION: ${{ github.event.inputs.version }}
-          REQUESTED_TASKS: ${{ github.event.inputs.android_ohos_publish_tasks }}
         run: |
           set -euo pipefail
           project_version="$(sed -n 's/^mavenVersion=//p' NetworkKMM/gradle.properties | tail -n 1)"
           if [[ -n "${REQUESTED_VERSION:-}" ]]; then
-            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+            resolved_version="$REQUESTED_VERSION"
           elif [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == network-v* ]]; then
-            tag_version="${GITHUB_REF_NAME#network-v}"
-            if [[ "$project_version" != "$tag_version" ]]; then
-              echo "Tag version $tag_version does not match NetworkKMM mavenVersion $project_version." >&2
-              exit 1
-            fi
-            echo "MAVEN_VERSION=$tag_version" >> "$GITHUB_ENV"
+            resolved_version="${GITHUB_REF_NAME#network-v}"
+            test "$project_version" = "$resolved_version"
+          else
+            resolved_version="$project_version"
           fi
-
-          if [[ -n "${REQUESTED_TASKS:-}" ]]; then
-            echo "NETWORK_PUBLISH_TASKS=$REQUESTED_TASKS" >> "$GITHUB_ENV"
+          if [[ ! "$resolved_version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$resolved_version" == *SNAPSHOT* || "$resolved_version" == *-ohos ]]; then
+            echo "Invalid immutable Maven base version." >&2
+            exit 1
           fi
+          printf 'MAVEN_VERSION=%s\n' "$resolved_version" >> "$GITHUB_ENV"
 
-      # The OHOS tree publishes the -ohos suffixed version — check THAT, not the
-      # base version, or a partial retry after the normal-tree publish would
-      # silently skip the OHOS artifacts (Codex review caveat on #46).
-      - name: Check existing NetworkKMM version
-        id: check_version
+      - name: Plan immutable dual publication
+        id: publication_state
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Plain dispatches carry no version input — default to the repo's
-          # own mavenVersion so the probe always runs (empty MAVEN_VERSION
-          # skipped the probe entirely and every retry 409'd).
-          if [[ -z "${MAVEN_VERSION:-}" ]]; then
-            MAVEN_VERSION="$(grep '^mavenVersion=' NetworkKMM/gradle.properties | cut -d= -f2)"
-          fi
-          if [[ -z "$MAVEN_VERSION" ]]; then
-            exit 0
-          fi
-          # Probe an artifact THIS job publishes (HEAD): the root module's
-          # maven-metadata.xml listing lags/misses versions on GitHub Packages
-          # and produced 409 retries (raft.14 lesson).
-          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-ohosarm64/$MAVEN_VERSION-ohos/network-ohosarm64-$MAVEN_VERSION-ohos.klib"
-          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
-            echo "NetworkKMM version $MAVEN_VERSION-ohos (ohosarm64 klib) already exists; skipping publish."
-            echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
-            # issue #8 postmortem: expose the skip at job level so the final
-            # verify-published gate can fail a run where EVERY artifact was
-            # skipped (= re-publishing an existing immutable version with new
-            # source — the silent no-op that shipped a stale raft.15).
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-          fi
+          NETWORK_PUBLISH_TASKS: ${{ github.event.inputs.android_ohos_publish_tasks }}
+        run: NetworkKMM/scripts/network-publication-state.sh plan
 
-      - name: Skip existing NetworkKMM version
+      - name: Skip complete immutable lane
         if: env.NETWORK_SKIP_PUBLISH == 'true'
         shell: bash
-        run: echo "NetworkKMM version $MAVEN_VERSION already exists in GitHub Packages."
+        run: echo "The OHOS lane already exists completely in both repositories."
 
-      - name: Publish NetworkKMM publications
+      - name: Publish missing OHOS files to both repositories
         if: env.NETWORK_SKIP_PUBLISH != 'true'
         shell: bash
         env:
@@ -147,21 +110,27 @@ jobs:
           GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd NetworkKMM
-          ./scripts/publish-github-packages.sh
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: NetworkKMM/scripts/publish-github-packages.sh
+
+      - name: Verify OHOS convergence in both repositories
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: NetworkKMM/scripts/network-publication-state.sh verify
 
   publish-ios:
-    name: Publish iOS
+    name: Publish iOS (GitHub Packages + Raft Artifacts)
     runs-on: macos-latest
+    environment: raft-artifacts-production
     outputs:
-      skipped: ${{ steps.check_version.outputs.skipped }}
+      skipped: ${{ steps.publication_state.outputs.skipped }}
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
       NETWORK_REQUIRE_TASKS: "true"
-      NETWORK_PUBLISH_TASKS: >-
+      NETWORK_REQUIRED_TASKS: >-
         :network:publishIosX64PublicationToGithubPackagesRepository
         :network:publishIosArm64PublicationToGithubPackagesRepository
         :network:publishIosSimulatorArm64PublicationToGithubPackagesRepository
@@ -180,74 +149,48 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          curl -fsSL https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip -o /tmp/android-commandline-tools.zip
-          unzip -q /tmp/android-commandline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip -o /tmp/android-command-line-tools.zip
+          unzip -q /tmp/android-command-line-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
           mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
           yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
       - name: Resolve publish inputs
         shell: bash
         env:
           REQUESTED_VERSION: ${{ github.event.inputs.version }}
-          REQUESTED_TASKS: ${{ github.event.inputs.ios_publish_tasks }}
         run: |
           set -euo pipefail
           project_version="$(sed -n 's/^mavenVersion=//p' NetworkKMM/gradle.properties | tail -n 1)"
           if [[ -n "${REQUESTED_VERSION:-}" ]]; then
-            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+            resolved_version="$REQUESTED_VERSION"
           elif [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == network-v* ]]; then
-            tag_version="${GITHUB_REF_NAME#network-v}"
-            if [[ "$project_version" != "$tag_version" ]]; then
-              echo "Tag version $tag_version does not match NetworkKMM mavenVersion $project_version." >&2
-              exit 1
-            fi
-            echo "MAVEN_VERSION=$tag_version" >> "$GITHUB_ENV"
+            resolved_version="${GITHUB_REF_NAME#network-v}"
+            test "$project_version" = "$resolved_version"
+          else
+            resolved_version="$project_version"
           fi
-
-          if [[ -n "${REQUESTED_TASKS:-}" ]]; then
-            echo "NETWORK_PUBLISH_TASKS=$REQUESTED_TASKS" >> "$GITHUB_ENV"
+          if [[ ! "$resolved_version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$resolved_version" == *SNAPSHOT* || "$resolved_version" == *-ohos ]]; then
+            echo "Invalid immutable Maven base version." >&2
+            exit 1
           fi
+          printf 'MAVEN_VERSION=%s\n' "$resolved_version" >> "$GITHUB_ENV"
 
-      - name: Check existing NetworkKMM version
-        id: check_version
+      - name: Plan immutable dual publication
+        id: publication_state
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Plain dispatches carry no version input — default to the repo's
-          # own mavenVersion so the probe always runs (empty MAVEN_VERSION
-          # skipped the probe entirely and every retry 409'd).
-          if [[ -z "${MAVEN_VERSION:-}" ]]; then
-            MAVEN_VERSION="$(grep '^mavenVersion=' NetworkKMM/gradle.properties | cut -d= -f2)"
-          fi
-          if [[ -z "$MAVEN_VERSION" ]]; then
-            exit 0
-          fi
-          # Probe an artifact THIS job publishes (HEAD): the root module's
-          # maven-metadata.xml listing lags/misses versions on GitHub Packages
-          # and produced 409 retries (raft.14 lesson).
-          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-iosarm64/$MAVEN_VERSION/network-iosarm64-$MAVEN_VERSION.klib"
-          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
-            echo "NetworkKMM version $MAVEN_VERSION (iosarm64 klib) already exists; skipping publish."
-            echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-          fi
+          NETWORK_PUBLISH_TASKS: ${{ github.event.inputs.ios_publish_tasks }}
+        run: NetworkKMM/scripts/network-publication-state.sh plan
 
-      - name: Skip existing NetworkKMM version
+      - name: Skip complete immutable lane
         if: env.NETWORK_SKIP_PUBLISH == 'true'
         shell: bash
-        run: echo "NetworkKMM version $MAVEN_VERSION already exists in GitHub Packages."
+        run: echo "The iOS lane already exists completely in both repositories."
 
-      - name: Publish NetworkKMM iOS publications
+      - name: Publish missing iOS files to both repositories
         if: env.NETWORK_SKIP_PUBLISH != 'true'
         shell: bash
         env:
@@ -255,24 +198,27 @@ jobs:
           GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd NetworkKMM
-          ./scripts/publish-github-packages.sh
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: NetworkKMM/scripts/publish-github-packages.sh
 
-  # Normal tree: Android artifact at the base version (no suffix).
+      - name: Verify iOS convergence in both repositories
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: NetworkKMM/scripts/network-publication-state.sh verify
+
   publish-android:
-    name: Publish Android (normal tree)
+    name: Publish Android (GitHub Packages + Raft Artifacts)
     runs-on: ubuntu-latest
-    # The image bakes the Android SDK + JDK 17 (task #240) — this job needed
-    # nothing OHOS-specific, but the per-run SDK download is gone.
+    environment: raft-artifacts-production
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     outputs:
-      skipped: ${{ steps.check_version.outputs.skipped }}
+      skipped: ${{ steps.publication_state.outputs.skipped }}
     env:
       NETWORK_REQUIRE_TASKS: "true"
-      NETWORK_PUBLISH_TASKS: >-
+      NETWORK_REQUIRED_TASKS: >-
         :network:publishAndroidPublicationToGithubPackagesRepository
         :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository
     steps:
@@ -287,85 +233,63 @@ jobs:
           set -euo pipefail
           project_version="$(sed -n 's/^mavenVersion=//p' NetworkKMM/gradle.properties | tail -n 1)"
           if [[ -n "${REQUESTED_VERSION:-}" ]]; then
-            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+            resolved_version="$REQUESTED_VERSION"
           elif [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == network-v* ]]; then
-            tag_version="${GITHUB_REF_NAME#network-v}"
-            if [[ "$project_version" != "$tag_version" ]]; then
-              echo "Tag version $tag_version does not match NetworkKMM mavenVersion $project_version." >&2
-              exit 1
-            fi
-            echo "MAVEN_VERSION=$tag_version" >> "$GITHUB_ENV"
+            resolved_version="${GITHUB_REF_NAME#network-v}"
+            test "$project_version" = "$resolved_version"
+          else
+            resolved_version="$project_version"
           fi
+          if [[ ! "$resolved_version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$resolved_version" == *SNAPSHOT* || "$resolved_version" == *-ohos ]]; then
+            echo "Invalid immutable Maven base version." >&2
+            exit 1
+          fi
+          printf 'MAVEN_VERSION=%s\n' "$resolved_version" >> "$GITHUB_ENV"
 
-      - name: Check existing NetworkKMM version
-        id: check_version
+      - name: Plan immutable dual publication
+        id: publication_state
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Plain dispatches carry no version input — default to the repo's
-          # own mavenVersion so the probe always runs (empty MAVEN_VERSION
-          # skipped the probe entirely and every retry 409'd).
-          if [[ -z "${MAVEN_VERSION:-}" ]]; then
-            MAVEN_VERSION="$(grep '^mavenVersion=' NetworkKMM/gradle.properties | cut -d= -f2)"
-          fi
-          if [[ -z "$MAVEN_VERSION" ]]; then
-            exit 0
-          fi
-          normal_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-android/$MAVEN_VERSION/network-android-$MAVEN_VERSION.aar"
-          runtime_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network-android-curl-runtime/$MAVEN_VERSION/network-android-curl-runtime-$MAVEN_VERSION.aar"
-          normal_exists=false
-          runtime_exists=false
-          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$normal_url" -o /dev/null; then
-            normal_exists=true
-          fi
-          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$runtime_url" -o /dev/null; then
-            runtime_exists=true
-          fi
+          NETWORK_PUBLISH_TASKS: ${{ github.event.inputs.android_ohos_publish_tasks }}
+        run: NetworkKMM/scripts/network-publication-state.sh plan
 
-          missing_tasks=()
-          if [[ "$normal_exists" != "true" ]]; then
-            missing_tasks+=(":network:publishAndroidPublicationToGithubPackagesRepository")
-          fi
-          if [[ "$runtime_exists" != "true" ]]; then
-            missing_tasks+=(":network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository")
-          fi
+      - name: Skip complete immutable lane
+        if: env.NETWORK_SKIP_PUBLISH == 'true'
+        shell: bash
+        run: echo "The Android lane already exists completely in both repositories."
 
-          if (( ${#missing_tasks[@]} == 0 )); then
-            echo "NetworkKMM version $MAVEN_VERSION (Android AAR + curl runtime AAR) already exists; skipping publish."
-            echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "NETWORK_PUBLISH_TASKS=${missing_tasks[*]}" >> "$GITHUB_ENV"
-            echo "Android artifacts missing for $MAVEN_VERSION: ${missing_tasks[*]}"
-          fi
-
-      - name: Publish NetworkKMM Android publication
+      - name: Publish missing Android files to both repositories
         if: env.NETWORK_SKIP_PUBLISH != 'true'
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd NetworkKMM
-          ./scripts/publish-github-packages.sh
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: NetworkKMM/scripts/publish-github-packages.sh
+
+      - name: Verify Android convergence in both repositories
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: NetworkKMM/scripts/network-publication-state.sh verify
 
   publish-kmp-metadata:
-    name: "Publish KMP metadata (normal tree root, android + ios)"
+    name: Publish KMP metadata (GitHub Packages + Raft Artifacts)
     needs:
       - publish-android
       - publish-ios
     runs-on: macos-latest
+    environment: raft-artifacts-production
     outputs:
-      skipped: ${{ steps.check_version.outputs.skipped }}
+      skipped: ${{ steps.publication_state.outputs.skipped }}
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
       NETWORK_REQUIRE_TASKS: "true"
-      NETWORK_PUBLISH_TASKS: >-
+      NETWORK_REQUIRED_TASKS: >-
         :network:publishKotlinMultiplatformPublicationToGithubPackagesRepository
     steps:
       - name: Check out repository
@@ -382,74 +306,48 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
-          curl -fsSL https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip -o /tmp/android-commandline-tools.zip
-          unzip -q /tmp/android-commandline-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip -o /tmp/android-command-line-tools.zip
+          unzip -q /tmp/android-command-line-tools.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
           mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
           yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
-          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" \
-            "platform-tools" \
-            "platforms;android-36" \
-            "build-tools;36.0.0"
-          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
-          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
 
       - name: Resolve publish inputs
         shell: bash
         env:
           REQUESTED_VERSION: ${{ github.event.inputs.version }}
-          REQUESTED_TASKS: ${{ github.event.inputs.metadata_publish_tasks }}
         run: |
           set -euo pipefail
           project_version="$(sed -n 's/^mavenVersion=//p' NetworkKMM/gradle.properties | tail -n 1)"
           if [[ -n "${REQUESTED_VERSION:-}" ]]; then
-            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
+            resolved_version="$REQUESTED_VERSION"
           elif [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == network-v* ]]; then
-            tag_version="${GITHUB_REF_NAME#network-v}"
-            if [[ "$project_version" != "$tag_version" ]]; then
-              echo "Tag version $tag_version does not match NetworkKMM mavenVersion $project_version." >&2
-              exit 1
-            fi
-            echo "MAVEN_VERSION=$tag_version" >> "$GITHUB_ENV"
+            resolved_version="${GITHUB_REF_NAME#network-v}"
+            test "$project_version" = "$resolved_version"
+          else
+            resolved_version="$project_version"
           fi
-
-          if [[ -n "${REQUESTED_TASKS:-}" ]]; then
-            echo "NETWORK_PUBLISH_TASKS=$REQUESTED_TASKS" >> "$GITHUB_ENV"
+          if [[ ! "$resolved_version" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ || "$resolved_version" == *SNAPSHOT* || "$resolved_version" == *-ohos ]]; then
+            echo "Invalid immutable Maven base version." >&2
+            exit 1
           fi
+          printf 'MAVEN_VERSION=%s\n' "$resolved_version" >> "$GITHUB_ENV"
 
-      - name: Check existing NetworkKMM version
-        id: check_version
+      - name: Plan immutable dual publication
+        id: publication_state
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # Plain dispatches carry no version input — default to the repo's
-          # own mavenVersion so the probe always runs (empty MAVEN_VERSION
-          # skipped the probe entirely and every retry 409'd).
-          if [[ -z "${MAVEN_VERSION:-}" ]]; then
-            MAVEN_VERSION="$(grep '^mavenVersion=' NetworkKMM/gradle.properties | cut -d= -f2)"
-          fi
-          if [[ -z "$MAVEN_VERSION" ]]; then
-            exit 0
-          fi
-          # Probe an artifact THIS job publishes (HEAD): the root module's
-          # maven-metadata.xml listing lags/misses versions on GitHub Packages
-          # and produced 409 retries (raft.14 lesson).
-          probe_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/network/$MAVEN_VERSION/network-$MAVEN_VERSION.module"
-          if curl -fsI -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$probe_url" -o /dev/null; then
-            echo "NetworkKMM version $MAVEN_VERSION (root module) already exists; skipping publish."
-            echo "NETWORK_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
-            echo "skipped=true" >> "$GITHUB_OUTPUT"
-          fi
+          NETWORK_PUBLISH_TASKS: ${{ github.event.inputs.metadata_publish_tasks }}
+        run: NetworkKMM/scripts/network-publication-state.sh plan
 
-      - name: Skip existing NetworkKMM version
+      - name: Skip complete immutable lane
         if: env.NETWORK_SKIP_PUBLISH == 'true'
         shell: bash
-        run: echo "NetworkKMM version $MAVEN_VERSION already exists in GitHub Packages."
+        run: echo "The metadata lane already exists completely in both repositories."
 
-      - name: Publish NetworkKMM metadata publication
+      - name: Publish missing metadata files to both repositories
         if: env.NETWORK_SKIP_PUBLISH != 'true'
         shell: bash
         env:
@@ -457,19 +355,18 @@ jobs:
           GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd NetworkKMM
-          ./scripts/publish-github-packages.sh
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: NetworkKMM/scripts/publish-github-packages.sh
 
-  # issue #8 postmortem: each publish job skips (not 409s) when its artifact
-  # already exists — right for a partial retry, but when EVERY job skips the
-  # run published nothing yet still goes green. That silent no-op shipped a
-  # stale raft.15 (source changed, version not bumped, GitHub Packages
-  # immutable). This gate makes "green == actually published": it fails a run
-  # where all four publish jobs skipped, telling you to bump the version.
+      - name: Verify metadata convergence in both repositories
+        shell: bash
+        env:
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: NetworkKMM/scripts/network-publication-state.sh verify
+
   verify-published:
-    name: "Verify something was published (guard stale re-publish)"
+    name: Verify dual publication changed or converged
     needs:
       - publish-ohos-tree
       - publish-ios
@@ -478,21 +375,27 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - name: Fail if every artifact was skipped
+      - name: Fail on a broken lane or a stale all-skipped release
         shell: bash
         env:
+          OHOS_RESULT: ${{ needs.publish-ohos-tree.result }}
+          IOS_RESULT: ${{ needs.publish-ios.result }}
+          ANDROID_RESULT: ${{ needs.publish-android.result }}
+          METADATA_RESULT: ${{ needs.publish-kmp-metadata.result }}
           OHOS_SKIPPED: ${{ needs.publish-ohos-tree.outputs.skipped }}
           IOS_SKIPPED: ${{ needs.publish-ios.outputs.skipped }}
           ANDROID_SKIPPED: ${{ needs.publish-android.outputs.skipped }}
           METADATA_SKIPPED: ${{ needs.publish-kmp-metadata.outputs.skipped }}
         run: |
           set -euo pipefail
-          echo "skipped: ohos=${OHOS_SKIPPED:-} ios=${IOS_SKIPPED:-} android=${ANDROID_SKIPPED:-} metadata=${METADATA_SKIPPED:-}"
-          # A partial retry (some publish, some skip) is legitimate — only fail
-          # when NOTHING was published. A failed publish job leaves its output
-          # empty (not "true"), so this never masks a real publish failure.
-          if [[ "${OHOS_SKIPPED:-}" == "true" && "${IOS_SKIPPED:-}" == "true" && "${ANDROID_SKIPPED:-}" == "true" && "${METADATA_SKIPPED:-}" == "true" ]]; then
-            echo "::error::Every NetworkKMM artifact already exists — this run published nothing. GitHub Packages versions are immutable; to ship new content bump mavenVersion (cut a new raft.N) and tag it. The published artifacts were NOT updated."
+          for result in "$OHOS_RESULT" "$IOS_RESULT" "$ANDROID_RESULT" "$METADATA_RESULT"; do
+            if [[ "$result" != "success" ]]; then
+              echo "At least one publication lane did not complete successfully." >&2
+              exit 1
+            fi
+          done
+          if [[ "$OHOS_SKIPPED" == "true" && "$IOS_SKIPPED" == "true" && "$ANDROID_SKIPPED" == "true" && "$METADATA_SKIPPED" == "true" ]]; then
+            echo "Every immutable publication already existed in both repositories; bump mavenVersion instead of reusing a coordinate." >&2
             exit 1
           fi
-          echo "At least one artifact was published (or a partial retry converged)."
+          echo "Every lane converged in GitHub Packages and Raft Artifacts, and at least one immutable publication was new."

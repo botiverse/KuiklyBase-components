@@ -28,6 +28,12 @@ allprojects {
     }
 }
 
+subprojects {
+    pluginManager.withPlugin("maven-publish") {
+        apply(from = rootProject.file("gradle/raft-artifacts-publishing.gradle.kts"))
+    }
+}
+
 tasks.register("clean", Delete::class) {
     delete(rootProject.buildDir)
 }
