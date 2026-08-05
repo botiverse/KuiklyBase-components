@@ -54,6 +54,17 @@ fi
 SOURCE_DATE_EPOCH="$REPOSITORY_SOURCE_DATE_EPOCH"
 ZERO_AR_DATE=1
 export SOURCE_DATE_EPOCH ZERO_AR_DATE
+XCFRAMEWORK_ASSEMBLER="${SCRIPT_DIR}/assemble-ios-curl-xcframework.sh"
+XCFRAMEWORK_MATRIX="${SCRIPT_DIR}/ios-curl-xcframework-matrix.tsv"
+for required_file in "$XCFRAMEWORK_ASSEMBLER" "$XCFRAMEWORK_MATRIX"; do
+  if [[ ! -f "$required_file" ]]; then
+    echo "Required XCFramework producer input is missing: $required_file" >&2
+    exit 2
+  fi
+done
+XCFRAMEWORK_ASSEMBLER_SHA256="$(shasum -a 256 "$XCFRAMEWORK_ASSEMBLER" | awk '{print $1}')"
+XCFRAMEWORK_MATRIX_SHA256="$(shasum -a 256 "$XCFRAMEWORK_MATRIX" | awk '{print $1}')"
+SOURCE_DATE_EPOCH_FILE_SHA256="$(shasum -a 256 "$SOURCE_DATE_EPOCH_FILE" | awk '{print $1}')"
 CPP_ROOT="${NETWORK_ROOT}/ohosApp/pbcurlwrapper/src/main/cpp"
 WRAPPER_HEADER="${CPP_ROOT}/wrapper/include/curl_wrapper.h"
 OUT_DIR="${NETWORK_ROOT}/network/libs/ios"
@@ -120,7 +131,7 @@ build_slice_arch() {
   local nghttp3_stamp="${nghttp3_prefix}/.build-config"
   local wrapper_build="${slice_root}/wrapper-build"
   local merged="${slice_root}/libNetworkKMMCurl.a"
-  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}:source-date=${SOURCE_DATE_EPOCH}:zero-ar-date=${ZERO_AR_DATE}"
+  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}:source-date=${SOURCE_DATE_EPOCH}:zero-ar-date=${ZERO_AR_DATE}:epoch-file=${SOURCE_DATE_EPOCH_FILE_SHA256}:xcframework-assembler=${XCFRAMEWORK_ASSEMBLER_SHA256}:xcframework-matrix=${XCFRAMEWORK_MATRIX_SHA256}"
   local sdk_path
   sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
 
@@ -341,11 +352,26 @@ module NetworkKMMCurl {
 EOF
 
 echo "==> NetworkKMMCurl.xcframework"
-rm -rf "$XCFRAMEWORK"
+# Keep xcodebuild as an input/layout validator, but never use its randomly
+# ordered Info.plist as the final artifact. The repository-owned assembler is
+# the primary producer below.
+XCODEBUILD_VALIDATION_ROOT="${BUILD_ROOT}/xcodebuild-validation"
+XCODEBUILD_VALIDATION_XCFRAMEWORK="${XCODEBUILD_VALIDATION_ROOT}/NetworkKMMCurl.xcframework"
+rm -rf "$XCODEBUILD_VALIDATION_ROOT"
+mkdir -p "$XCODEBUILD_VALIDATION_ROOT"
 xcodebuild -create-xcframework \
   -library "${BUILD_ROOT}/iphoneos-arm64/libNetworkKMMCurl.a" -headers "$HEADERS_DIR" \
   -library "${SIM_FAT_DIR}/libNetworkKMMCurl.a" -headers "$HEADERS_DIR" \
-  -output "$XCFRAMEWORK"
+  -output "$XCODEBUILD_VALIDATION_XCFRAMEWORK"
+plutil -lint "$XCODEBUILD_VALIDATION_XCFRAMEWORK/Info.plist"
+
+bash "$XCFRAMEWORK_ASSEMBLER" \
+  --matrix "$XCFRAMEWORK_MATRIX" \
+  --device-library "${BUILD_ROOT}/iphoneos-arm64/libNetworkKMMCurl.a" \
+  --simulator-library "${SIM_FAT_DIR}/libNetworkKMMCurl.a" \
+  --headers "$HEADERS_DIR" \
+  --output "$XCFRAMEWORK"
+plutil -lint "$XCFRAMEWORK/Info.plist"
 
 echo "==> Verify exported wrapper surface"
 for lib in "$XCFRAMEWORK"/ios-arm64/libNetworkKMMCurl.a \
