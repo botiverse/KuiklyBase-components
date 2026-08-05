@@ -222,6 +222,16 @@ jobs:
         working-directory: NetworkKMM
         run: ./gradlew :network:compileCommonMainKotlinMetadata --no-daemon --stacktrace
 
+      # task #27: the androidApp is a real network demo exercising the
+      # production NetworkClient API (engine switch + buffered/streaming/
+      # upload/cancel panels). Contributor machines have no Android SDK, so CI
+      # is the compile gate for the app module — assemble it so the demo can't
+      # silently rot against network-module API changes.
+      - name: Assemble androidApp demo (compile gate)
+        shell: bash
+        working-directory: NetworkKMM
+        run: ./gradlew :androidApp:assembleDebug --no-daemon --stacktrace
+
       - name: Upload test reports
         if: failure()
         uses: actions/upload-artifact@v4

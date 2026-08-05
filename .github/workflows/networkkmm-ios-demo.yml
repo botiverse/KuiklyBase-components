@@ -1,0 +1,69 @@
+# task #27: the iosApp is a real network demo whose SwiftUI ContentView drives
+# the shared `NetworkDemo` facade (Kotlin commonMain) over the production
+# NetworkClient API. There is no macOS/iOS toolchain on contributor machines,
+# so this job is the compile gate for the iOS surface: build the `network`
+# Kotlin/Native framework and `swiftc -typecheck` the demo Swift against it.
+#
+# This verifies the Kotlin<->Swift interop the demo relies on (NetworkDemo /
+# NetworkDemoLogSink / NetworkDemoHandle) without the full CocoaPods + Xcode +
+# code-signing app build, which needs Tencent-internal pod sources and a
+# provisioned Xcode project unavailable on public runners.
+name: NetworkKMM iOS demo (typecheck)
+
+on:
+  pull_request:
+    paths:
+      - "NetworkKMM/iosApp/**"
+      - "NetworkKMM/network/src/commonMain/**"
+      - "NetworkKMM/network/src/iosMain/**"
+      - ".github/workflows/networkkmm-ios-demo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: networkkmm-ios-demo-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  swift-typecheck:
+    name: iOS demo ContentView typecheck
+    runs-on: macos-14
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Build network framework (iosSimulatorArm64, debug)
+        working-directory: NetworkKMM
+        run: |
+          ./gradlew :network:syncFramework \
+            -Pkotlin.native.cocoapods.platform=iphonesimulator \
+            -Pkotlin.native.cocoapods.archs=arm64 \
+            -Pkotlin.native.cocoapods.configuration=Debug \
+            --no-daemon --stacktrace
+
+      - name: Type-check demo Swift against the framework
+        working-directory: NetworkKMM
+        run: |
+          set -euo pipefail
+          FW_DIR="$(dirname "$(find network/build -type d -name 'network.framework' | head -n1)")"
+          if [ -z "$FW_DIR" ] || [ ! -d "$FW_DIR/network.framework" ]; then
+            echo "network.framework not found under network/build" >&2
+            exit 1
+          fi
+          echo "Framework dir: $FW_DIR"
+          SDK="$(xcrun --sdk iphonesimulator --show-sdk-path)"
+          swiftc -typecheck \
+            -sdk "$SDK" \
+            -target arm64-apple-ios14.0-simulator \
+            -F "$FW_DIR" \
+            iosApp/iosApp/ContentView.swift \
+            iosApp/iosApp/iOSApp.swift
+          echo "Swift typecheck OK against network.framework"

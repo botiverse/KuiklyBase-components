@@ -18,32 +18,73 @@ package com.tencent.kmm.component.template.android
 
 import android.app.Activity
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
 import android.view.View
-import com.tencent.kmm.network.service.VBTransportServiceTest
+import android.widget.Button
+import android.widget.EditText
+import android.widget.RadioGroup
+import android.widget.ScrollView
+import android.widget.TextView
+import com.tencent.kmm.network.demo.NetworkDemo
+import com.tencent.kmm.network.demo.NetworkDemoLogSink
 
+/**
+ * Network demo app (task #27) — Android surface.
+ *
+ * A thin UI shell over the shared [NetworkDemo] facade: it wires the engine
+ * toggle + four panel buttons (buffered / streaming / upload / cancel) to the
+ * facade and renders the facade's log lines on screen. All network logic
+ * (production NetworkClient API, engine switching, progress, cancel timing)
+ * lives in shared code, so this class only marshals log lines to the UI thread.
+ */
 class MainActivity : Activity() {
+
+    private lateinit var demo: NetworkDemo
+    private lateinit var logView: TextView
+    private lateinit var logScroll: ScrollView
+    private lateinit var baseUrlInput: EditText
+
+    private val ui = Handler(Looper.getMainLooper())
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        // Get请求测试
-        findViewById<View>(R.id.requestWithGet).setOnClickListener {
-            VBTransportServiceTest.testSendGetRequest()
+        logView = findViewById(R.id.logView)
+        logScroll = findViewById(R.id.logScroll)
+        baseUrlInput = findViewById(R.id.baseUrl)
+
+        demo = NetworkDemo(object : NetworkDemoLogSink {
+            override fun line(text: String) {
+                Log.i(TAG, text)
+                ui.post {
+                    logView.append(text + "\n")
+                    logScroll.post { logScroll.fullScroll(View.FOCUS_DOWN) }
+                }
+            }
+        })
+
+        findViewById<RadioGroup>(R.id.engineGroup).setOnCheckedChangeListener { _, checkedId ->
+            demo.selectEngine(if (checkedId == R.id.engineCurl) NetworkDemo.ENGINE_CURL else NetworkDemo.ENGINE_KTOR)
         }
 
-        // Post请求测试
-        findViewById<View>(R.id.requestWithPost).setOnClickListener {
-            VBTransportServiceTest.testSendPostRequest()
-        }
+        findViewById<Button>(R.id.btnBuffered).setOnClickListener { demo.runBuffered(baseUrl()) }
+        findViewById<Button>(R.id.btnStreaming).setOnClickListener { demo.runStreaming(baseUrl()) }
+        findViewById<Button>(R.id.btnUpload).setOnClickListener { demo.runUpload(baseUrl()) }
+        findViewById<Button>(R.id.btnCancel).setOnClickListener { demo.runCancel(baseUrl()) }
+        findViewById<Button>(R.id.btnClear).setOnClickListener { logView.text = "" }
+    }
 
-        // Bytes请求测试
-        findViewById<View>(R.id.requestWithBytes).setOnClickListener {
-            VBTransportServiceTest.testSendByteRequest()
-        }
+    override fun onDestroy() {
+        demo.close()
+        super.onDestroy()
+    }
 
-        // String请求测试
-        findViewById<View>(R.id.requestWithString).setOnClickListener {
-            VBTransportServiceTest.testSendStringRequest()
-        }
+    private fun baseUrl(): String = baseUrlInput.text.toString()
+
+    companion object {
+        private const val TAG = "NetworkKMMDemo"
     }
 }
