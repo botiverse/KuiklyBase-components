@@ -43,7 +43,8 @@ kotlin {
     }
 }
 dependencies {
+    // The app still hosts the legacy VBTransportServiceTest bootstrap directly.
     implementation(project(":network"))
+    implementation(project(":network-demo"))
 //    implementation("com.tencent.kuiklybase:network:0.0.3")
 }
-

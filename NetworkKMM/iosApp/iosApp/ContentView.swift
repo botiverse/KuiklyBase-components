@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 import SwiftUI
-import network
+import networkDemo
 
 /// Weak bridge from the Kotlin log sink back to the SwiftUI model. The Kotlin
 /// `NetworkDemo` strongly holds its sink, so if the sink held the model

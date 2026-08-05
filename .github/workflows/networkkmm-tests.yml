@@ -220,7 +220,48 @@ jobs:
       - name: Compile commonMain metadata
         shell: bash
         working-directory: NetworkKMM
-        run: ./gradlew :network:compileCommonMainKotlinMetadata --no-daemon --stacktrace
+        run: |
+          ./gradlew \
+            :network:compileCommonMainKotlinMetadata \
+            :network:allMetadataJar \
+            :network-demo:compileCommonMainKotlinMetadata \
+            :network-demo:bundleLibCompileToJarDebug \
+            :network-demo:testDebugUnitTest \
+            --no-daemon --stacktrace
+
+      - name: Verify demo-only module cannot enter production publication
+        shell: bash
+        working-directory: NetworkKMM
+        run: |
+          set -euo pipefail
+          python3 scripts/verify-network-demo-boundary.py --require-built
+          demo_tasks="$RUNNER_TEMP/network-demo-tasks.txt"
+          ./gradlew :network-demo:tasks --all --no-daemon --console=plain > "$demo_tasks"
+          if grep -Eq '^publish[A-Z].* - ' "$demo_tasks"; then
+            echo "::error::demo-only module unexpectedly exposes publication tasks"
+            grep -E '^publish[A-Z].* - ' "$demo_tasks"
+            exit 1
+          fi
+          echo "demo-only Gradle publication task discovery: absent"
+
+      - name: Stage and inspect production NetworkKMM Maven artifacts
+        shell: bash
+        working-directory: NetworkKMM
+        run: |
+          set -euo pipefail
+          staged_repository="$(mktemp -d "$RUNNER_TEMP/networkkmm-demo-boundary.XXXXXX")"
+          git_trust_home="$(mktemp -d "$RUNNER_TEMP/networkkmm-demo-git-trust.XXXXXX")"
+          HOME="$git_trust_home" git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          source_sha="$(HOME="$git_trust_home" git rev-parse HEAD)"
+          ./gradlew \
+            -PnetworkSourceSha="$source_sha" \
+            -Dmaven.repo.local="$staged_repository" \
+            :network:publishKotlinMultiplatformPublicationToMavenLocal \
+            :network:publishAndroidPublicationToMavenLocal \
+            --no-daemon --stacktrace
+          python3 scripts/verify-network-demo-boundary.py \
+            --require-built \
+            --staged-repository "$staged_repository"
 
       # task #27: the androidApp is a real network demo exercising the
       # production NetworkClient API (engine switch + buffered/streaming/
