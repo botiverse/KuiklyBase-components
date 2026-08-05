@@ -1,0 +1,3 @@
+# LibraryIdentifier	LibraryPath	HeadersPath	SupportedPlatform	SupportedPlatformVariant	SupportedArchitectures
+ios-arm64	libNetworkKMMCurl.a	Headers	ios	-	arm64
+ios-arm64_x86_64-simulator	libNetworkKMMCurl.a	Headers	ios	simulator	arm64,x86_64

@@ -21,6 +21,10 @@ on:
       - "NetworkKMM/network/src/iosMain/**"
       - "NetworkKMM/network/src/iosTest/**"
       - "NetworkKMM/scripts/build-ios-curl.sh"
+      - "NetworkKMM/scripts/assemble-ios-curl-xcframework.sh"
+      - "NetworkKMM/scripts/ios-curl-xcframework-matrix.tsv"
+      - "NetworkKMM/scripts/test-ios-curl-xcframework-assembler.sh"
+      - "NetworkKMM/scripts/native-source-date-epoch.txt"
       - "NetworkKMM/scripts/run-ios-curl-runtime-tests.sh"
       - ".github/workflows/networkkmm-ios-native.yml"
 
@@ -39,13 +43,17 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Test deterministic xcframework assembler
+        shell: bash
+        run: bash NetworkKMM/scripts/test-ios-curl-xcframework-assembler.sh
+
       # OpenSSL/curl/nghttp2/nghttp3 cross-compiles dominate the wall clock
       # (3 slices); cache the per-slice trees by every bit-changing input.
       - name: Cache native dependency build trees
         uses: actions/cache@v4
         with:
           path: NetworkKMM/build/ios-curl
-          key: ios-curl-${{ hashFiles('NetworkKMM/scripts/build-ios-curl.sh') }}
+          key: ios-curl-${{ hashFiles('NetworkKMM/scripts/build-ios-curl.sh', 'NetworkKMM/scripts/assemble-ios-curl-xcframework.sh', 'NetworkKMM/scripts/ios-curl-xcframework-matrix.tsv', 'NetworkKMM/scripts/native-source-date-epoch.txt') }}
 
       - name: Build xcframework
         shell: bash
