@@ -33,6 +33,7 @@ import kotlinx.atomicfu.atomic
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -61,31 +62,23 @@ class NetworkDemoHandle internal constructor(private val call: NetworkCall?) {
  * Drives the production [NetworkClient] API — engine switching plus four smoke
  * panels (buffered / streaming / upload / cancel) — and reports everything as
  * log lines through [NetworkDemoLogSink]. Both the Android and iOS sample apps
- * are thin UI shells over this one facade, so the demo behaviour lives in
- * shared code and the platform surfaces stay trivial (no Kotlin/Native ↔ Swift
- * interop against the config-heavy client from the app side).
+ * are thin UI shells over this one facade.
  *
- * All requests hit a caller-supplied `baseUrl` (the sample apps default to
- * `https://httpbin.org`, whose `/get`, `/drip`, `/post`, `/delay/{n}`
- * endpoints back the four panels).
+ * This is sample code, kept deliberately simple: [close] is a best-effort
+ * teardown (stop the cancel-panel timer, fence further logs/runs), not a
+ * production-grade linearizable lifecycle gate. A production close/callback
+ * contract is tracked separately, not in this demo.
  */
 class NetworkDemo(private val logSink: NetworkDemoLogSink) {
 
-    // Read inside the engineSelector (runs per call), so the UI can flip it at
-    // any time and the next request picks it up.
     private val engine = atomic(ENGINE_KTOR)
-
-    // Owns the cancel-after-delay timer for the cancel panel; internal to the
-    // facade so the platform apps never touch coroutines.
+    private val closed = atomic(false)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     private val client = NetworkClient(
         NetworkClientConfig(
             engineSelector = {
-                NetworkEngineSelection.fromExternalConfig(
-                    engine = engine.value,
-                    curlEnabled = true
-                )
+                NetworkEngineSelection.fromExternalConfig(engine = engine.value, curlEnabled = true)
             },
             engineDiagnostics = object : NetworkEngineDiagnosticsListener {
                 override fun onEngineCompleted(diagnostics: NetworkEngineExecutionDiagnostics) {
@@ -103,10 +96,11 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
 
     /**
      * Select the transport engine for subsequent requests ("ktor" / "curl").
-     * A no-op (and silent) when the engine is unchanged, so UI surfaces that
+     * A no-op (and silent) when unchanged or after [close], so UI surfaces that
      * lack a change callback can safely sync it before every request.
      */
     fun selectEngine(engine: String) {
+        if (closed.value) return
         if (this.engine.value == engine) return
         this.engine.value = engine
         log("引擎切换 → $engine")
@@ -114,8 +108,9 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
 
     /** Buffered: GET a full JSON body → status / protocol / snippet. */
     fun runBuffered(baseUrl: String): NetworkDemoHandle {
+        if (closed.value) return NetworkDemoHandle(null)
         val url = "${normalize(baseUrl)}/get"
-        log("→ [buffered] GET $url  (engine=${engine.value})")
+        log("→ [buffered] GET ${redactDemoUrl(url)}  (engine=${engine.value})")
         val request = NetworkRequest(method = VBTransportMethod.GET, url = url).apply {
             setHeader("X-Demo", "networkkmm")
             addQuery("panel", "buffered")
@@ -125,8 +120,9 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
 
     /** Streaming: download a slow drip and log each chunk as it arrives. */
     fun runStreaming(baseUrl: String): NetworkDemoHandle {
+        if (closed.value) return NetworkDemoHandle(null)
         val url = "${normalize(baseUrl)}/drip?duration=5&numbytes=2000&code=200&delay=0"
-        log("→ [stream] GET $url  (engine=${engine.value})")
+        log("→ [stream] GET ${redactDemoUrl(url)}  (engine=${engine.value})")
         val received = atomic(0L)
         return NetworkDemoHandle(
             client.downloadStream(
@@ -141,7 +137,7 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
                 onComplete = { response ->
                     val error = response.error
                     if (error != null) {
-                        log("✗ [stream] ${error.kind} ${error.message}")
+                        log("✗ [stream] ${error.kind}")
                     } else {
                         log("✓ [stream] done status=${response.statusCode} protocol=${response.protocol} total=${received.value}B")
                     }
@@ -152,9 +148,10 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
 
     /** Upload: POST a multipart body with an in-memory file part + progress. */
     fun runUpload(baseUrl: String): NetworkDemoHandle {
+        if (closed.value) return NetworkDemoHandle(null)
         val url = "${normalize(baseUrl)}/post"
         val payload = ByteArray(UPLOAD_BYTES) { (it % 251).toByte() }
-        log("→ [upload] POST $url  multipart ${payload.size}B (engine=${engine.value})")
+        log("→ [upload] POST ${redactDemoUrl(url)}  multipart ${payload.size}B (engine=${engine.value})")
         val request = NetworkRequest(
             method = VBTransportMethod.POST,
             url = url,
@@ -179,8 +176,9 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
 
     /** Cancel: start a slow request, then cancel it after a short delay. */
     fun runCancel(baseUrl: String): NetworkDemoHandle {
+        if (closed.value) return NetworkDemoHandle(null)
         val url = "${normalize(baseUrl)}/delay/10"
-        log("→ [cancel] GET $url — 将在 ${CANCEL_DELAY_MS}ms 后取消 (engine=${engine.value})")
+        log("→ [cancel] GET ${redactDemoUrl(url)} — 将在 ${CANCEL_DELAY_MS}ms 后取消 (engine=${engine.value})")
         val call = client.execute(NetworkRequest(method = VBTransportMethod.GET, url = url)) { response ->
             if (response.error?.kind == NetworkErrorKind.CANCELLED) {
                 log("✓ [cancel] 已取消 (CANCELLED)")
@@ -198,10 +196,21 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
         return NetworkDemoHandle(call)
     }
 
+    /**
+     * Best-effort teardown for the sample: stop the cancel-panel timer and
+     * fence further logs/runs. Idempotent. Hosts call it on Android
+     * `onDestroy` / iOS `deinit`.
+     */
+    fun close() {
+        if (!closed.compareAndSet(expect = false, update = true)) return
+        scope.cancel()
+    }
+
     private fun onResponse(tag: String, response: NetworkResponse) {
         val error = response.error
         if (error != null) {
-            log("✗ [$tag] ${error.kind} status=${error.statusCode ?: "-"} ${error.message}")
+            // Log only kind/status — error.message can echo the full request URL.
+            log("✗ [$tag] ${error.kind} status=${error.statusCode ?: "-"}")
             return
         }
         val bodyText = response.body.text() ?: ""
@@ -219,6 +228,7 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
     }
 
     private fun log(text: String) {
+        if (closed.value) return
         logSink.line(text)
     }
 
@@ -230,4 +240,29 @@ class NetworkDemo(private val logSink: NetworkDemoLogSink) {
         private const val UPLOAD_BYTES = 256 * 1024
         private const val SNIPPET_LIMIT = 240
     }
+}
+
+/**
+ * Redact a URL for logging: keep only `scheme://host[:port]/path`, dropping
+ * userinfo (`user:pass@`), query (`?...`) and fragment (`#...`) so a
+ * caller-typed Base URL cannot leak credentials or tokens into the log
+ * (Android logcat included). Fail-safe on invalid/partial URLs. Pure.
+ */
+internal fun redactDemoUrl(raw: String): String {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return ""
+    val noQuery = trimmed.substringBefore('#').substringBefore('?')
+    val schemeIndex = noQuery.indexOf("://")
+    if (schemeIndex >= 0) {
+        val scheme = noQuery.substring(0, schemeIndex + 3)
+        val rest = noQuery.substring(schemeIndex + 3)
+        val slashIndex = rest.indexOf('/')
+        val authority = if (slashIndex >= 0) rest.substring(0, slashIndex) else rest
+        val path = if (slashIndex >= 0) rest.substring(slashIndex) else ""
+        val atIndex = authority.lastIndexOf('@')
+        val hostPort = if (atIndex >= 0) authority.substring(atIndex + 1) else authority
+        return scheme + hostPort + path
+    }
+    val atIndex = noQuery.indexOf('@')
+    return if (atIndex >= 0) noQuery.substring(atIndex + 1) else noQuery
 }

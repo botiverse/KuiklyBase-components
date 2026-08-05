@@ -77,6 +77,11 @@ class MainActivity : Activity() {
         findViewById<Button>(R.id.btnClear).setOnClickListener { logView.text = "" }
     }
 
+    override fun onDestroy() {
+        demo.close()
+        super.onDestroy()
+    }
+
     private fun baseUrl(): String = baseUrlInput.text.toString()
 
     companion object {

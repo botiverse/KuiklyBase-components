@@ -17,34 +17,45 @@
 import SwiftUI
 import network
 
-/// iOS surface of the NetworkKMM demo (task #27).
-///
-/// A thin SwiftUI shell over the shared `NetworkDemo` facade (Kotlin
-/// commonMain): it wires the engine toggle + four panel buttons
-/// (buffered / streaming / upload / cancel) to the facade and renders the
-/// facade's log lines. All network logic lives in shared code, so this file
-/// only implements `NetworkDemoLogSink` and marshals log lines to the main
-/// queue — the same demo behaviour as the Android app.
-final class DemoModel: ObservableObject, NetworkDemoLogSink {
+/// Weak bridge from the Kotlin log sink back to the SwiftUI model. The Kotlin
+/// `NetworkDemo` strongly holds its sink, so if the sink held the model
+/// strongly we'd have a retain cycle (`DemoModel → NetworkDemo → sink →
+/// DemoModel`) and `deinit` — hence `NetworkDemo.close()` — would never run.
+/// Holding the model weakly here breaks that cycle.
+final class WeakLogSink: NetworkDemoLogSink {
+    weak var owner: DemoModel?
+    func line(text: String) {
+        owner?.appendLine(text)
+    }
+}
+
+/// View model owning the shared `NetworkDemo` facade. Closes it on `deinit` so
+/// the facade's coroutine scope and any in-flight calls are cancelled when the
+/// view goes away.
+final class DemoModel: ObservableObject {
 
     @Published var log: String = ""
 
-    // `NetworkDemo` needs the log sink at construction; `self` conforms to
-    // `NetworkDemoLogSink`, so build it once the stored properties have their
-    // defaults.
-    private lazy var demo: NetworkDemo = NetworkDemo(logSink: self)
+    private let sink = WeakLogSink()
+    private let demo: NetworkDemo
 
-    /// Called from the client's background dispatcher — hop to the main queue.
-    func line(text: String) {
+    init() {
+        demo = NetworkDemo(logSink: sink)
+        sink.owner = self
+    }
+
+    deinit {
+        demo.close()
+    }
+
+    /// Called from the Kotlin client's background dispatcher — hop to main.
+    func appendLine(_ text: String) {
         DispatchQueue.main.async {
             self.log += text + "\n"
         }
     }
 
-    func selectEngine(curl: Bool) {
-        demo.selectEngine(engine: curl ? "curl" : "ktor")
-    }
-
+    func selectEngine(curl: Bool) { demo.selectEngine(engine: curl ? "curl" : "ktor") }
     func buffered(_ baseUrl: String) { _ = demo.runBuffered(baseUrl: baseUrl) }
     func streaming(_ baseUrl: String) { _ = demo.runStreaming(baseUrl: baseUrl) }
     func upload(_ baseUrl: String) { _ = demo.runUpload(baseUrl: baseUrl) }
@@ -52,9 +63,12 @@ final class DemoModel: ObservableObject, NetworkDemoLogSink {
     func clear() { log = "" }
 }
 
+/// iOS surface of the NetworkKMM demo (task #27) — a thin SwiftUI shell over
+/// the shared `NetworkDemo` facade: engine toggle + four panel buttons
+/// (buffered / streaming / upload / cancel) + on-screen log.
 struct ContentView: View {
 
-    @ObservedObject private var model = DemoModel()
+    @StateObject private var model = DemoModel()
     @State private var baseUrl = "https://httpbin.org"
     @State private var engineIsCurl = false
 
