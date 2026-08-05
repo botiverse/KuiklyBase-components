@@ -31,6 +31,10 @@ rootProject.name = "NetworkKMM"
 // via buildFileName.
 include(":androidApp")
 include(":network")
+// Sample-only facade shared by androidApp/iosApp. This module deliberately
+// stays outside the OHOS build tree and every Maven publication task so demo
+// APIs cannot leak into the production :network SDK.
+include(":network-demo")
 include(":network-android-curl-runtime")
 if (gradle.startParameter.projectProperties.containsKey("androidCurlSpike")) {
     include(":android-curl-spike")

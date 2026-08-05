@@ -64,7 +64,8 @@ class NetworkDemoHandle internal constructor(private val call: NetworkCall?) {
  * log lines through [NetworkDemoLogSink]. Both the Android and iOS sample apps
  * are thin UI shells over this one facade.
  *
- * This is sample code, kept deliberately simple: [close] is a best-effort
+ * This lives in the non-published `:network-demo` module. It is sample code,
+ * kept deliberately simple: [close] is a best-effort
  * teardown (stop the cancel-panel timer, fence further logs/runs), not a
  * production-grade linearizable lifecycle gate. A production close/callback
  * contract is tracked separately, not in this demo.

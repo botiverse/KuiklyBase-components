@@ -1,8 +1,8 @@
 # task #27: the iosApp is a real network demo whose SwiftUI ContentView drives
-# the shared `NetworkDemo` facade (Kotlin commonMain) over the production
-# NetworkClient API. There is no macOS/iOS toolchain on contributor machines,
-# so this job is the compile gate for the iOS surface: build the `network`
-# Kotlin/Native framework and `swiftc -typecheck` the demo Swift against it.
+# the shared `NetworkDemo` facade in the non-published `:network-demo` module
+# over the production NetworkClient API. There is no macOS/iOS toolchain on
+# contributor machines, so this job is the compile gate for the iOS surface:
+# build the demo-only Kotlin/Native framework and `swiftc -typecheck` Swift.
 #
 # This verifies the Kotlin<->Swift interop the demo relies on (NetworkDemo /
 # NetworkDemoLogSink / NetworkDemoHandle) without the full CocoaPods + Xcode +
@@ -14,6 +14,7 @@ on:
   pull_request:
     paths:
       - "NetworkKMM/iosApp/**"
+      - "NetworkKMM/network-demo/**"
       - "NetworkKMM/network/src/commonMain/**"
       - "NetworkKMM/network/src/iosMain/**"
       - ".github/workflows/networkkmm-ios-demo.yml"
@@ -40,22 +41,19 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Build network framework (iosSimulatorArm64, debug)
+      - name: Build demo-only framework (iosSimulatorArm64, debug)
         working-directory: NetworkKMM
         run: |
-          ./gradlew :network:syncFramework \
-            -Pkotlin.native.cocoapods.platform=iphonesimulator \
-            -Pkotlin.native.cocoapods.archs=arm64 \
-            -Pkotlin.native.cocoapods.configuration=Debug \
+          ./gradlew :network-demo:linkDebugFrameworkIosSimulatorArm64 \
             --no-daemon --stacktrace
 
       - name: Type-check demo Swift against the framework
         working-directory: NetworkKMM
         run: |
           set -euo pipefail
-          FW_DIR="$(dirname "$(find network/build -type d -name 'network.framework' | head -n1)")"
-          if [ -z "$FW_DIR" ] || [ ! -d "$FW_DIR/network.framework" ]; then
-            echo "network.framework not found under network/build" >&2
+          FW_DIR="$(dirname "$(find network-demo/build -type d -name 'networkDemo.framework' | head -n1)")"
+          if [ -z "$FW_DIR" ] || [ ! -d "$FW_DIR/networkDemo.framework" ]; then
+            echo "networkDemo.framework not found under network-demo/build" >&2
             exit 1
           fi
           echo "Framework dir: $FW_DIR"
@@ -66,4 +64,4 @@ jobs:
             -F "$FW_DIR" \
             iosApp/iosApp/ContentView.swift \
             iosApp/iosApp/iOSApp.swift
-          echo "Swift typecheck OK against network.framework"
+          echo "Swift typecheck OK against demo-only networkDemo.framework"
