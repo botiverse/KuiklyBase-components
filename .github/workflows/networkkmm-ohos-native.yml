@@ -20,6 +20,7 @@ on:
       - master
     paths:
       - "NetworkKMM/scripts/build-ohos-native.sh"
+      - "NetworkKMM/scripts/native-source-date-epoch.txt"
       - "NetworkKMM/settings.gradle.kts"
       - "NetworkKMM/settings.ohos.gradle.kts"
       - "NetworkKMM/build.ohos.gradle.kts"
@@ -33,6 +34,7 @@ on:
   pull_request:
     paths:
       - "NetworkKMM/scripts/build-ohos-native.sh"
+      - "NetworkKMM/scripts/native-source-date-epoch.txt"
       - "NetworkKMM/settings.gradle.kts"
       - "NetworkKMM/settings.ohos.gradle.kts"
       - "NetworkKMM/build.ohos.gradle.kts"

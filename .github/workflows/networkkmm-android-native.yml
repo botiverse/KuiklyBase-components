@@ -20,6 +20,7 @@ on:
       - "NetworkKMM/ohosApp/pbcurlwrapper/src/main/cpp/**"
       - "NetworkKMM/network/src/androidMain/cpp/**"
       - "NetworkKMM/scripts/build-android-curl.sh"
+      - "NetworkKMM/scripts/native-source-date-epoch.txt"
       - ".github/workflows/networkkmm-android-native.yml"
 
 permissions:
@@ -54,7 +55,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: NetworkKMM/build/android-curl/${{ matrix.abi }}
-          key: android-curl-${{ matrix.abi }}-${{ env.NDK_VERSION }}-${{ hashFiles('NetworkKMM/scripts/build-android-curl.sh') }}
+          key: android-curl-${{ matrix.abi }}-${{ env.NDK_VERSION }}-${{ hashFiles('NetworkKMM/scripts/build-android-curl.sh', 'NetworkKMM/scripts/native-source-date-epoch.txt') }}
 
       # Seed the pinned OpenSSL/curl source tarballs baked into the image
       # (v1.1.0, build-time verified + labeled). fetch() sees them present,
