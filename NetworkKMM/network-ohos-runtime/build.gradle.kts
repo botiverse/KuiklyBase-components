@@ -1,4 +1,5 @@
 import org.gradle.api.publish.maven.MavenPublication
+import org.gradle.api.tasks.bundling.Jar
 import org.gradle.api.tasks.bundling.Zip
 import org.gradle.kotlin.dsl.`maven-publish`
 import org.gradle.kotlin.dsl.signing
@@ -103,6 +104,15 @@ val ohosRuntimeZip by tasks.registering(Zip::class) {
     }
 }
 
+val ohosRuntimeSourcesJar by tasks.registering(Jar::class) {
+    archiveBaseName.set("network-ohos-runtime")
+    archiveVersion.set(publishVersion)
+    archiveClassifier.set("sources")
+    from(rootProject.file("ohosApp/pbcurlwrapper/src/main/cpp")) {
+        into("pbcurlwrapper")
+    }
+}
+
 publishing {
     repositories {
         maven {
@@ -128,6 +138,7 @@ publishing {
         create<MavenPublication>("ohosRuntime") {
             artifactId = "network-ohos-runtime"
             artifact(ohosRuntimeZip)
+            artifact(ohosRuntimeSourcesJar)
             pom {
                 name.set("network-ohos-runtime")
                 description.set("HarmonyOS native runtime libraries for Tencent Http Service Library.")

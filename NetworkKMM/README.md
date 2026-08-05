@@ -46,7 +46,7 @@ implementation("com.tencent.kuiklybase:network:0.1.0-raft.0")
 ```
 
 #### GitHub Packages
-The bytemain fork publishes Android, iOS, and HarmonyOS KMP artifacts to GitHub Packages. GitHub Packages Maven requires credentials even for public packages. For local builds, copy [`docs/github-packages.properties.example`](./docs/github-packages.properties.example) to `github-packages.properties` in the consuming repository root and set a classic PAT with `read:packages`. If the file is missing, Gradle falls back to `GITHUB_ACTOR`, `GITHUB_PACKAGES_TOKEN`, or `GITHUB_TOKEN`. See [GitHub Packages Publishing](./docs/github-packages-publishing.md) for manual publish, CI publish, and consumer repository configuration.
+The bytemain fork publishes the same Android, iOS, and HarmonyOS KMP coordinates to both GitHub Packages and the public Raft Maven repository at `https://maven.artifacts.botiverse.dev`. GitHub Packages still requires credentials even for public packages; Raft reads do not. For local GitHub Packages builds, copy [`docs/github-packages.properties.example`](./docs/github-packages.properties.example) to `github-packages.properties` in the consuming repository root and set a classic PAT with `read:packages`. If the file is missing, Gradle falls back to `GITHUB_ACTOR`, `GITHUB_PACKAGES_TOKEN`, or `GITHUB_TOKEN`. See [dual Maven publishing](./docs/github-packages-publishing.md) for consumer configuration and the fail-closed release flow.
 
 #### Use `NetworkClient` for new request code
 For new KMP call sites, prefer `NetworkClient` as the typed request boundary instead of building

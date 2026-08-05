@@ -30,6 +30,12 @@ allprojects {
     }
 }
 
+subprojects {
+    pluginManager.withPlugin("maven-publish") {
+        apply(from = rootProject.file("gradle/raft-artifacts-publishing.gradle.kts"))
+    }
+}
+
 ext {
     group = "com.tencent.kuiklybase"
     version = "1.0.0"

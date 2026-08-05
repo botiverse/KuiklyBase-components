@@ -1,10 +1,15 @@
-# GitHub Packages Publishing
+# GitHub Packages and Raft Artifacts Publishing
 
-This project can publish the NetworkKMM Maven artifacts to GitHub Packages under:
+Every NetworkKMM release is published under the same Maven GAVs to both repositories:
 
 ```text
 https://maven.pkg.github.com/bytemain/KuiklyBase-components
+https://maven.artifacts.botiverse.dev
 ```
+
+Raft Artifacts is additive: it does not rename the group, artifact, or version,
+and it does not remove GitHub Packages. The Raft authorization scope is the
+original Maven group `com.tencent.kuiklybase`.
 
 The publishing flow covers all current Kotlin Multiplatform publications:
 
@@ -65,6 +70,24 @@ Keep both versions identical. Omitting this coordinate preserves the existing
 OkHttp default and makes `VBTransportCurl.nativeStatus.linked` false.
 
 HarmonyOS apps still need these native runtime libraries in the app entry module. The Maven/KLIB publication provides the Kotlin artifact; the Gradle plugin resolves `network-ohos-runtime` and copies the `.so` files into `entry/libs/arm64-v8a/`.
+
+## Consume From Raft Artifacts
+
+The `com.tencent.kuiklybase` scope is public, so consumers need no credential:
+
+```kotlin
+repositories {
+    maven {
+        name = "raftArtifacts"
+        url = uri("https://maven.artifacts.botiverse.dev")
+    }
+}
+```
+
+Add the same repository under `pluginManagement.repositories` when resolving
+`com.tencent.kuiklybase.network.ohos-runtime`. Coordinates and versions are
+identical to GitHub Packages, so switching repository order does not require a
+dependency rewrite.
 
 ## Consume From GitHub Packages
 
@@ -203,20 +226,31 @@ networkOhosRuntime {
 }
 ```
 
-## Manual Publish
+## Manual Dual Publish
 
-Use a classic GitHub PAT with `write:packages`:
+Use a classic GitHub PAT with `write:packages` and a Raft Maven token restricted
+to the `com.tencent.kuiklybase` scope. Do not place either token on the command
+line:
 
 ```bash
 export GITHUB_PACKAGES_USERNAME=bytemain
 export GITHUB_PACKAGES_TOKEN=ghp_xxx
+export RAFT_ARTIFACTS_PUBLISH_TOKEN=raft_xxx
 export MAVEN_VERSION=0.1.0-raft.0
 
 cd NetworkKMM
 ./scripts/publish-github-packages.sh
 ```
 
-By default the script publishes these tasks:
+The entrypoint rejects a dirty checkout, resolves provenance itself with
+`git rev-parse HEAD`, rejects SNAPSHOT and `-ohos`-suffixed base versions, and
+fails before Gradle if either destination credential is absent. It publishes
+each selected publication to both the existing `GithubPackagesRepository` and
+the derived `RaftArtifactsRepository` task. Repository tokens stay in inherited
+environment variables rather than Gradle process arguments.
+
+By default the script pairs these existing GitHub publication tasks with their
+Raft equivalents:
 
 ```text
 :network:publishAndroidPublicationToGithubPackagesRepository
@@ -239,7 +273,13 @@ ABIs, and each packaged byte stream equals the committed source `.so`.
 
 The root `kotlinMultiplatform` metadata publication is intentionally last in the default task list. If a target publication, runtime artifact, or plugin publication fails, consumers will not see new metadata that points at incomplete artifacts.
 
-To publish a subset while recovering or testing, override `NETWORK_PUBLISH_TASKS`:
+The release workflow probes every publication's primary file, POM, Gradle
+metadata where applicable, and sources artifact in both repositories. A whole
+publication may be retried only when all its required files are absent. A mixed
+immutable coordinate (some files present, some absent) fails closed instead of
+attempting an overwrite. `NETWORK_PUBLISH_TASKS` is an exact allowlist for an
+explicit retry and must equal all missing publications in that lane; it cannot
+silently omit work:
 
 ```bash
 NETWORK_PUBLISH_TASKS=":network:publishAndroidPublicationToGithubPackagesRepository :network:publishOhosArm64PublicationToGithubPackagesRepository" \
@@ -252,7 +292,7 @@ To require every requested task to exist on the current host:
 NETWORK_REQUIRE_TASKS=true ./scripts/publish-github-packages.sh
 ```
 
-## CI Publish
+## CI Dual Publish
 
 The workflow is `.github/workflows/publish-network-github-packages.yml`.
 
@@ -265,7 +305,7 @@ git push origin network-v0.1.0-raft.0
 
 The tag version must match `mavenVersion` in `NetworkKMM/gradle.properties`; CI fails early if they differ.
 
-Or run **Publish NetworkKMM to GitHub Packages** from GitHub Actions and optionally pass `version`.
+Or run **Publish NetworkKMM to GitHub Packages and Raft Artifacts** from GitHub Actions and optionally pass `version`.
 
 The workflow splits publishing by host:
 
@@ -274,7 +314,17 @@ The workflow splits publishing by host:
 - The macOS iOS job runs in parallel with the Linux job and publishes the iOS KLIB artifacts.
 - The macOS metadata job runs after the platform jobs succeed and publishes the root `kotlinMultiplatform` metadata publication.
 - All publish jobs install Android SDK platform 33 and build-tools 33.0.2 because the Android Gradle plugin is configured during project evaluation.
-- Publishes with `GITHUB_TOKEN` and `packages: write`, so no extra publish secret is required for this repository.
+- Every publication job binds the protected GitHub Environment
+  `raft-artifacts-production`. GitHub Packages uses the job-scoped
+  `GITHUB_TOKEN`; Raft uses the environment secret
+  `RAFT_ARTIFACTS_PUBLISH_TOKEN`, whose token is restricted to
+  `com.tencent.kuiklybase`.
+- Each job verifies both repositories after upload. The terminal job also fails
+  if any lane failed or every lane was already complete, preserving immutable
+  version semantics.
+- Every generated Maven POM records the exact clean-checkout SHA as both
+  `dev.raft.sourceSha` and the SCM tag. `${{ github.sha }}` is deliberately not
+  a provenance input.
 
 ## Host Notes
 
