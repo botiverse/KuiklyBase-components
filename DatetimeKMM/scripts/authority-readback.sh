@@ -55,6 +55,11 @@ command -v publication_urls >/dev/null 2>&1 \
 REGISTRY_ORIGIN="https://maven.pkg.github.com"
 OBJECT_ORIGIN="https://github-registry-files.githubusercontent.com"
 
+# The one authority set this workflow may read, and the publication exact its
+# manifest must come from. Both are frozen here, not taken from a dispatcher.
+AUTHORITY_VERSION="0.1.0-raft.0"
+EXPECTED_SOURCE_EXACT="8ffc865419ef2e210e2d78f18aedcae00ea9b9cc"
+
 EXPECTED_TOTAL="${READBACK_EXPECTED_TOTAL:-34}"
 CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-20}"
 MAX_TIME="${MAX_TIME:-300}"
@@ -103,9 +108,14 @@ _origin_allowed() {
 }
 
 # Last Location header, CR stripped. Never logged: it carries the signature.
+# POSIX only: awk's IGNORECASE is a GNU extension, and the default awk on the
+# Ubuntu runner is mawk, where it silently does nothing and every "Location:"
+# reads as absent.
 _last_location() {
   tr -d '\r' < "$1" \
-    | awk 'BEGIN{IGNORECASE=1} /^location:/{sub(/^[Ll]ocation:[ \t]*/,""); v=$0} END{if (v) print v}'
+    | grep -i '^location:' \
+    | tail -n 1 \
+    | sed 's/^[Ll][Oo][Cc][Aa][Tt][Ii][Oo][Nn]:[[:space:]]*//'
 }
 
 # Resolve a possibly-relative Location against the current absolute URL.
@@ -124,6 +134,25 @@ _resolve_location() {
 
 VERSION="${MAVEN_VERSION:?MAVEN_VERSION is required}"
 REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
+
+# Task #99 is exactly the 0.1.0-raft.0 / -ohos graph. Anything else is a
+# different authority set, so it is refused here rather than being carried to
+# the authenticated transport under this workflow's name. Exact equality also
+# removes the separators and control characters that made the version usable as
+# a path fragment.
+[ "$VERSION" = "$AUTHORITY_VERSION" ] \
+  || fail "version $VERSION is not the frozen authority version $AUTHORITY_VERSION"
+
+# Provenance of both trees, required before any transfer: a detached bundle
+# must be able to prove which manifest exact and which landed script produced
+# it, without the Actions page.
+SOURCE_EXACT="${AUTHORITY_SOURCE_EXACT:?AUTHORITY_SOURCE_EXACT is required}"
+READBACK_EXACT="${READBACK_SOURCE_EXACT:?READBACK_SOURCE_EXACT is required}"
+READBACK_REF="${READBACK_SOURCE_REF:?READBACK_SOURCE_REF is required}"
+READBACK_RUN_ID="${READBACK_RUN_ID:-}"
+READBACK_RUN_ATTEMPT="${READBACK_RUN_ATTEMPT:-}"
+[ "$SOURCE_EXACT" = "$EXPECTED_SOURCE_EXACT" ] \
+  || fail "manifest source exact $SOURCE_EXACT is not the publication exact $EXPECTED_SOURCE_EXACT"
 REPO_BASE="${DATETIME_REPO_BASE:-https://maven.pkg.github.com/${REPO}/build/raft/kuiklybase}"
 OUT_DIR="${READBACK_OUT_DIR:-readback-out}"
 BYTES_DIR="$OUT_DIR/bytes"
@@ -154,7 +183,27 @@ fetch() {
   local url="${REPO_BASE}/${artifact}/${version}/${file}"
   local rel="build/raft/kuiklybase/${artifact}/${version}/${file}"
   local dest="${BYTES_DIR}/${rel}"
+
+  # The path is built from the manifest, so it is policed before it is used to
+  # write: no traversal, no doubled or absolute separators, no control
+  # characters. The canonical destination is then asserted to stay inside
+  # BYTES_DIR, so nothing can be written outside the bundle even if a future
+  # manifest entry is hostile.
+  case "/$rel" in
+    */../*|*/..) fail "path traversal in manifest entry: $rel" ;;
+  esac
+  case "$rel" in
+    /*|*//*|'') fail "unsafe manifest entry: $rel" ;;
+    *[[:cntrl:]]*) fail "control character in manifest entry" ;;
+  esac
   mkdir -p "$(dirname "$dest")"
+  local canon_dir canon_base
+  canon_dir="$(cd "$(dirname "$dest")" && pwd -P)"
+  canon_base="$(cd "$BYTES_DIR" && pwd -P)"
+  case "$canon_dir/" in
+    "$canon_base"/*|"$canon_base/") ;;
+    *) fail "destination escapes the bundle directory for $rel" ;;
+  esac
 
   local hdr hops=0 code origin loc next
   hdr="$(mktemp)"
@@ -243,9 +292,12 @@ fetch_publication "datetime-ohosarm64" "$VERSION-ohos" "native-ohos"
 [ "$downloaded" -eq "$EXPECTED_TOTAL" ] \
   || fail "expected $EXPECTED_TOTAL files, got $downloaded (incomplete set)"
 
-python3 - "$MANIFEST_TSV" "$RECEIPT" "$VERSION" "$REPO" "$downloaded" <<'PY'
+python3 - "$MANIFEST_TSV" "$RECEIPT" "$VERSION" "$REPO" "$downloaded" \
+  "$SOURCE_EXACT" "$READBACK_EXACT" "$READBACK_REF" \
+  "$READBACK_RUN_ID" "$READBACK_RUN_ATTEMPT" <<'PY'
 import json, sys
 tsv, out, version, repo, total = sys.argv[1:6]
+source_exact, readback_exact, readback_ref, run_id, run_attempt = sys.argv[6:11]
 files = []
 with open(tsv) as fh:
     for line in fh:
@@ -263,6 +315,15 @@ json.dump(
         "repository": repo,
         "version": version,
         "fileCount": int(total),
+        # Both trees the bundle came from, so the carrier still proves its own
+        # origin once it is detached from the Actions page.
+        "provenance": {
+            "manifestSourceExact": source_exact,
+            "readbackSourceExact": readback_exact,
+            "readbackRef": readback_ref,
+            "runId": run_id,
+            "runAttempt": run_attempt,
+        },
         "files": files,
     },
     open(out, "w"),

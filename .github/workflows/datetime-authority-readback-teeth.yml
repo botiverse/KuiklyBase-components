@@ -1,0 +1,69 @@
+# Contract teeth for the authority readback, run on the runner itself.
+#
+# The readback workflow is dispatch-only and cannot run from a pull request, so
+# until now its teeth were exercised only on a developer machine. That hid a
+# gawk-only header parser: the runner's default awk is mawk, where the previous
+# parser read every "Location:" as absent and the readback could never have
+# followed a redirect. This job closes that gap by running the same teeth here,
+# under each awk implementation present.
+#
+# Offline and read-only: the teeth issue no request and this job needs no
+# package scope.
+name: Datetime authority readback teeth (offline contract)
+
+on:
+  pull_request:
+    paths:
+      - DatetimeKMM/scripts/authority-readback.sh
+      - DatetimeKMM/scripts/authority-readback-teeth.sh
+      - .github/workflows/datetime-authority-readback.yml
+      - .github/workflows/datetime-authority-readback-teeth.yml
+  push:
+    branches:
+      - master
+    paths:
+      - DatetimeKMM/scripts/authority-readback.sh
+      - DatetimeKMM/scripts/authority-readback-teeth.sh
+      - .github/workflows/datetime-authority-readback.yml
+      - .github/workflows/datetime-authority-readback-teeth.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: datetime-authority-readback-teeth-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  teeth:
+    name: Readback contract teeth (all awk implementations)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run teeth under the default awk
+        run: |
+          set -euo pipefail
+          echo "default awk: $(readlink -f "$(command -v awk)")"
+          cd DatetimeKMM
+          bash scripts/authority-readback-teeth.sh
+
+      - name: Run teeth under each awk implementation present
+        run: |
+          set -euo pipefail
+          ran=0
+          for impl in mawk gawk original-awk busybox-awk; do
+            path="$(command -v "$impl" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            shim="$(mktemp -d)"
+            ln -sf "$path" "$shim/awk"
+            echo "== teeth under $impl ($path) =="
+            ( cd DatetimeKMM && PATH="$shim:$PATH" bash scripts/authority-readback-teeth.sh )
+            ran=$(( ran + 1 ))
+          done
+          # Both implementations disagree about IGNORECASE, so covering only one
+          # of them would let that class of bug back in.
+          [ "$ran" -ge 2 ] \
+            || { echo "expected at least two awk implementations, ran $ran" >&2; exit 1; }

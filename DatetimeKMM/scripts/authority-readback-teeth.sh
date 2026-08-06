@@ -42,6 +42,9 @@ AUTHORITY_SOURCE_DIR="$stub_dir" \
 MAVEN_VERSION=0.1.0-raft.0 \
 GITHUB_REPOSITORY=botiverse/KuiklyBase-components \
 GITHUB_PACKAGES_USERNAME=teeth GITHUB_PACKAGES_TOKEN=teeth \
+AUTHORITY_SOURCE_EXACT=8ffc865419ef2e210e2d78f18aedcae00ea9b9cc \
+READBACK_SOURCE_EXACT=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+READBACK_SOURCE_REF=refs/heads/master \
 READBACK_OUT_DIR="$source_out" \
   . "$SCRIPT"
 
@@ -88,6 +91,9 @@ run_case() {
     MAVEN_VERSION=0.1.0-raft.0 \
     GITHUB_REPOSITORY=botiverse/KuiklyBase-components \
     GITHUB_PACKAGES_USERNAME=teeth GITHUB_PACKAGES_TOKEN=teeth \
+    AUTHORITY_SOURCE_EXACT=8ffc865419ef2e210e2d78f18aedcae00ea9b9cc \
+    READBACK_SOURCE_EXACT=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
+    READBACK_SOURCE_REF=refs/heads/master \
     "$@" bash "$SCRIPT" 2>&1)" || rc=$?
   if [ "$rc" -eq 0 ]; then
     no "$label (expected failure, got success)"
@@ -117,6 +123,26 @@ run_case "off-port base rejected before transfer" \
 run_case "object origin may not be the initial base" \
   "is not the registry origin" \
   DATETIME_REPO_BASE="https://github-registry-files.githubusercontent.com/x"
+
+# The frozen authority set: an unrelated or path-capable version must be
+# refused at admission, before it can reach the authenticated transport or be
+# interpolated into a destination path.
+run_case "unrelated version refused at admission" \
+  "is not the frozen authority version" MAVEN_VERSION=9.9.9-raft.0
+run_case "traversal version refused at admission" \
+  "is not the frozen authority version" MAVEN_VERSION="../../../../tmp/pwned"
+run_case "ohos suffix is derived, not dispatchable" \
+  "is not the frozen authority version" MAVEN_VERSION=0.1.0-raft.0-ohos
+
+# Provenance must be present and correct before any transfer, so a detached
+# bundle can prove which two trees produced it.
+run_case "missing manifest provenance fails closed" \
+  "AUTHORITY_SOURCE_EXACT" AUTHORITY_SOURCE_EXACT=
+run_case "missing readback provenance fails closed" \
+  "READBACK_SOURCE_EXACT" READBACK_SOURCE_EXACT=
+run_case "wrong manifest exact refused" \
+  "is not the publication exact" \
+  AUTHORITY_SOURCE_EXACT=1111111111111111111111111111111111111111
 
 # The manifest must come from a materialized publication exact, not silently
 # from whatever happens to sit next to the script.
@@ -258,6 +284,28 @@ if grep -rqF "$SECRET_SIG" "$source_out" 2>/dev/null; then
   no "signed Location must not reach the manifest/receipt"
 else
   ok "signed Location does not reach the manifest/receipt"
+fi
+
+# A hostile manifest entry must not be able to write outside the bundle. The
+# escape is refused before the transport is even reached.
+escape_probe="$fixture_root/escaped-marker"
+mock_reset 200
+if ( fetch datetime 0.1.0-raft.0 "../../../../../../..$escape_probe" ) >/dev/null 2>&1; then
+  no "traversal in a manifest entry is refused"
+else
+  ok "traversal in a manifest entry is refused"
+fi
+if [ -e "$escape_probe" ]; then
+  no "traversal wrote outside the bundle directory"
+else
+  ok "nothing was written outside the bundle directory"
+fi
+
+mock_reset 200
+if ( fetch datetime 0.1.0-raft.0 "sub/../still-inside.txt" ) >/dev/null 2>&1; then
+  no "embedded .. segment is refused"
+else
+  ok "embedded .. segment is refused"
 fi
 
 unset -f curl
