@@ -1,0 +1,122 @@
+name: Publish source-owned OHOS forks
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact reviewed and landed 40-character source SHA
+        required: true
+        type: string
+      manifest_sha256:
+        description: SHA-256 of release-manifest.json from fresh Hosted CI
+        required: true
+        type: string
+      confirmation:
+        description: Type "publish atomicfu-0.23.2-raft.1 coroutines-1.8.0-raft.1"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-source-owned-ohos-forks
+  cancel-in-progress: false
+
+jobs:
+  guarded-raft-publication:
+    name: Build once, publish and read back Raft Artifacts
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image@sha256:cbe95055b155c4eb71d234f24b47d481a1b20b7e96defe3f24ab3219aff55347
+    env:
+      OHOS_FORKS_HARMONY_IMAGE: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image@sha256:cbe95055b155c4eb71d234f24b47d481a1b20b7e96defe3f24ab3219aff55347
+      RAFT_ARTIFACTS_USERNAME: raft-ci
+      RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+    steps:
+      - name: Check out requested source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+
+      - name: Validate dispatch identity and current master
+        shell: bash
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUESTED_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+          REQUESTED_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$REQUESTED_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test "$REQUESTED_CONFIRMATION" = "publish atomicfu-0.23.2-raft.1 coroutines-1.8.0-raft.1"
+          git_home="$(mktemp -d)"
+          trap 'rm -rf -- "$git_home"' EXIT
+          HOME="$git_home" git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          test "$(HOME="$git_home" git rev-parse HEAD)" = "$REQUESTED_SOURCE_SHA"
+          HOME="$git_home" git fetch --quiet origin master
+          test "$(HOME="$git_home" git rev-parse origin/master)" = "$REQUESTED_SOURCE_SHA"
+          test -z "$(HOME="$git_home" git status --porcelain=v1 --untracked-files=all)"
+
+      - name: Resolve OpenHarmony SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot"
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd -P)"
+          printf 'OHOS_SDK_HOME=%s\n' "$ohos_sdk_home" >> "$GITHUB_ENV"
+          printf 'OHOS_BASE_SDK_HOME=%s\n' "$ohos_sdk_home" >> "$GITHUB_ENV"
+
+      - name: Verify publication contract controls
+        shell: bash
+        run: |
+          OHOSForks/scripts/verify-workflow-contract.py --self-test
+          OHOSForks/scripts/test-publication-contract.py
+
+      - name: Rebuild and verify exact source-owned release
+        shell: bash
+        run: OHOSForks/scripts/build-and-verify.sh "$RUNNER_TEMP/ohos-forks-output"
+
+      - name: Bind dispatch to rebuilt source and manifest
+        shell: bash
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUESTED_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          output="$RUNNER_TEMP/ohos-forks-output"
+          test "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["carrierSha"])' "$output/build-receipt.json")" = "$REQUESTED_SOURCE_SHA"
+          test "$(sha256sum "$output/manifest/release-manifest.json" | awk '{print $1}')" = "$REQUESTED_MANIFEST_SHA256"
+          test "$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1], encoding="utf-8"))["releaseManifestSha256"])' "$output/build-receipt.json")" = "$REQUESTED_MANIFEST_SHA256"
+
+      - name: Plan exact missing bytes in Raft Artifacts
+        shell: bash
+        run: |
+          OHOSForks/scripts/publication-state.py plan \
+            --manifest "$RUNNER_TEMP/ohos-forks-output/manifest/release-manifest.json" \
+            --output "$RUNNER_TEMP/ohos-forks-output/publication-plan.json"
+
+      - name: Upload only planned missing bytes
+        shell: bash
+        run: |
+          OHOSForks/scripts/publish-staging.py \
+            --repository "$RUNNER_TEMP/ohos-forks-output/staging" \
+            --manifest "$RUNNER_TEMP/ohos-forks-output/manifest/release-manifest.json" \
+            --plan "$RUNNER_TEMP/ohos-forks-output/publication-plan.json"
+
+      - name: Read back exact bytes from Raft Artifacts
+        shell: bash
+        run: |
+          OHOSForks/scripts/publication-state.py verify \
+            --manifest "$RUNNER_TEMP/ohos-forks-output/manifest/release-manifest.json"
+
+      - name: Upload production receipts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ohos-forks-publication-${{ inputs.source_sha }}
+          path: ${{ runner.temp }}/ohos-forks-output/
+          if-no-files-found: error
+          retention-days: 90

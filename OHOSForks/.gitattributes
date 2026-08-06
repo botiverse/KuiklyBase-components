@@ -1,0 +1,3 @@
+# These are checksum-pinned upstream patch bytes. Their whitespace is payload,
+# not carrier-source formatting, and changing it would invalidate source-lock.json.
+patches/*.patch whitespace=-blank-at-eol,-blank-at-eof
