@@ -19,8 +19,10 @@ package com.tencent.kmm.network.internal.platform
 import com.tencent.kmm.network.curl.contentLength
 import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
+import com.tencent.kmm.network.curl.isCurlProxyHttp3Incompatibility
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
+import com.tencent.kmm.network.curl.shouldFreshRetryCurlProxyHttp3Failure
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
 import com.tencent.kmm.network.export.NetworkByteStreamSink
@@ -40,8 +42,10 @@ import com.tencent.kmm.network.service.NetworkUploadStreamSource
 import com.tencent.kmm.network.service.StreamingUploadCancellationOwners
 import com.tencent.kmm.network.service.curlNetworkEngineCapabilities
 import com.tencent.kmm.network.service.curlRuntimeFailureResponse
+import com.tencent.kmm.network.service.forcePreparedCurlHttp2
 import com.tencent.kmm.network.service.hasPotentialStreamingSource
 import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
+import com.tencent.kmm.network.service.latchPreparedCurlProxyHttp3Fallback
 import com.tencent.kmm.network.service.prepareCurlRuntime
 import com.tencent.kmm.network.service.preparedCurlCaInfoPath
 import com.tencent.kmm.network.service.preparedCurlHttp3Enabled
@@ -117,6 +121,34 @@ internal class AndroidCurlNetworkEngine(
             contentType = body.contentType,
             timeoutMillis = request.policy.timeoutMillis,
         )
+        if (preparedCurlHttp3Enabled(request) &&
+            !preparedCurlProxyUrl(request).isNullOrBlank() &&
+            isCurlProxyHttp3Incompatibility(first.code, first.errorMsg)
+        ) {
+            val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
+            val environmentIsCurrent = latchPreparedCurlProxyHttp3Fallback(request)
+            if (!environmentIsCurrent || !shouldFreshRetryCurlProxyHttp3Failure(
+                    method = request.method,
+                    cancelled = call.isCancelled,
+                    remainingTimeoutMillis = remainingTimeout,
+                )) {
+                return first.toNetworkResponse(request)
+            }
+            forcePreparedCurlHttp2(request)
+            val retried = executeBufferedAttempt(
+                request = request,
+                call = call,
+                body = body.bytes,
+                contentType = body.contentType,
+                timeoutMillis = remainingTimeout ?: 0L,
+                freshConnection = true,
+            )
+            retried.elapse.retainFirstAttemptCurlFacts(first.elapse)
+            retried.elapse.freshRetry = true
+            retried.elapse.freshRetryResult =
+                if (retried.code == 0) "proxy_h3_to_h2_success" else "proxy_h3_to_h2_failure"
+            return retried.toNetworkResponse(request)
+        }
         if (!first.isBufferedBodyIdleTimeout()) {
             return first.toNetworkResponse(request)
         }
@@ -292,6 +324,7 @@ internal class AndroidCurlNetworkEngine(
         body: ByteArray?,
         contentType: String?,
         timeoutMillis: Long,
+        freshConnection: Boolean = false,
     ): CurlNativeResponse {
         val owner = Any()
         val requestId = androidCurlRequestOwners.reserve(owner)
@@ -315,7 +348,7 @@ internal class AndroidCurlNetworkEngine(
             return CurlNativeResponse(code = 42, errorMsg = "cancelled before Android curl native start")
         }
         return try {
-            bridge.execute(nativeRequest)
+            if (freshConnection) bridge.executeFresh(nativeRequest) else bridge.execute(nativeRequest)
         } finally {
             androidCurlRequestOwners.release(requestId, owner)
         }

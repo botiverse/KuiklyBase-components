@@ -125,6 +125,35 @@ class CurlRuntimePreparationTest {
     }
 
     @Test
+    fun proxyHttp3LatchAppliesOnlyToTheCurrentEnvironmentIdentity() {
+        VBTransportCurl.updateNetworkEnvironment("network-a")
+        val failed = NetworkRequest(url = "https://example.com/api")
+            .setCurlHttp3Enabled(true)
+        assertTrue(prepareCurlRuntime(failed, verifiedDefault, nativeHttp3Supported = true).available)
+        assertTrue(preparedCurlHttp3Enabled(failed))
+        assertTrue(latchPreparedCurlProxyHttp3Fallback(failed))
+
+        val latched = NetworkRequest(url = "https://example.com/next")
+            .setCurlHttp3Enabled(true)
+        assertTrue(prepareCurlRuntime(latched, verifiedDefault, nativeHttp3Supported = true).available)
+        assertFalse(preparedCurlHttp3Enabled(latched))
+        assertEquals(true, preparedCurlHttp3Requested(latched))
+
+        val sameGeneration = VBTransportCurl.updateNetworkEnvironment("network-a")
+        assertEquals(sameGeneration, VBTransportCurl.updateNetworkEnvironment("network-a"))
+        val sameEnvironment = NetworkRequest(url = "https://example.com/same")
+            .setCurlHttp3Enabled(true)
+        prepareCurlRuntime(sameEnvironment, verifiedDefault, nativeHttp3Supported = true)
+        assertFalse(preparedCurlHttp3Enabled(sameEnvironment))
+
+        VBTransportCurl.updateNetworkEnvironment("network-b")
+        val replacement = NetworkRequest(url = "https://example.com/replacement")
+            .setCurlHttp3Enabled(true)
+        prepareCurlRuntime(replacement, verifiedDefault, nativeHttp3Supported = true)
+        assertTrue(preparedCurlHttp3Enabled(replacement))
+    }
+
+    @Test
     fun unconfiguredStaysGatedWithoutVerifiedPlatformDefault() {
         val request = NetworkRequest(url = "https://example.com/api")
 

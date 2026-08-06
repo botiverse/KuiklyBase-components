@@ -17,6 +17,8 @@
 package com.tencent.kmm.network.export
 
 import kotlinx.atomicfu.atomic
+import kotlinx.atomicfu.locks.SynchronizedObject
+import kotlinx.atomicfu.locks.synchronized
 
 /** Pinned Mozilla CA snapshot used by the production staging helper. */
 object NetworkCurlCaBundleManifest {
@@ -142,6 +144,7 @@ object VBTransportCurl {
     private val configurationState = atomic<NetworkCurlRuntimeConfiguration?>(null)
     private val statusState = atomic(missingConfigurationStatus())
     private val trustModeState = atomic(NetworkCurlTrustMode.PLATFORM_DEFAULT)
+    private val proxyHttp3Recovery = NetworkCurlProxyHttp3RecoveryState()
 
     val configurationStatus: NetworkCurlConfigurationStatus
         get() = statusState.value
@@ -178,6 +181,7 @@ object VBTransportCurl {
             trustModeState.value = NetworkCurlTrustMode.FAILED_CLOSED
         }
         statusState.value = validation
+        proxyHttp3Recovery.configurationChanged()
         return validation
     }
 
@@ -186,9 +190,27 @@ object VBTransportCurl {
         configurationState.value = null
         statusState.value = missingConfigurationStatus()
         trustModeState.value = NetworkCurlTrustMode.PLATFORM_DEFAULT
+        proxyHttp3Recovery.configurationChanged()
     }
 
+    /**
+     * Publishes an opaque host network identity. A changed identity clears any
+     * proxy/H3 downgrade latch so the new network can probe HTTP/3 again.
+     *
+     * Hosts should include the active network, VPN transport and effective
+     * proxy identity, but must not include credentials. Re-publishing the same
+     * identity is a no-op. The returned generation is diagnostic only.
+     */
+    fun updateNetworkEnvironment(identity: String): Long =
+        proxyHttp3Recovery.updateEnvironment(identity)
+
     internal fun snapshot(): NetworkCurlRuntimeConfiguration? = configurationState.value
+
+    internal fun proxyHttp3Environment(proxyUrl: String): NetworkCurlProxyHttp3Environment =
+        proxyHttp3Recovery.snapshot(proxyUrl)
+
+    internal fun latchProxyHttp3Fallback(environment: NetworkCurlProxyHttp3Environment): Boolean =
+        proxyHttp3Recovery.latch(environment)
 
     /** Compatibility bridge for the old path-only Android/iOS API. */
     internal fun configureLegacyPath(path: String?): NetworkCurlConfigurationStatus {
@@ -286,6 +308,71 @@ object VBTransportCurl {
             failureReason = NetworkCurlConfigurationFailureReason.TRUST_STORE_PATH_BLANK,
             detail = "Curl runtime configuration has not been installed by the app."
         )
+}
+
+internal data class NetworkCurlProxyHttp3Environment(
+    val generation: Long,
+    val proxyFingerprint: String,
+    val fingerprint: String,
+    val h2Latched: Boolean
+)
+
+private class NetworkCurlProxyHttp3RecoveryState {
+    private val lock = SynchronizedObject()
+    private var environmentIdentity = ""
+    private var generation = 0L
+    private val h2LatchedFingerprints = mutableSetOf<String>()
+
+    fun updateEnvironment(identity: String): Long = synchronized(lock) {
+        val normalized = identity.trim()
+        if (normalized != environmentIdentity) {
+            environmentIdentity = normalized
+            advanceLocked()
+        }
+        generation
+    }
+
+    fun configurationChanged() = synchronized(lock) {
+        advanceLocked()
+    }
+
+    fun snapshot(proxyUrl: String): NetworkCurlProxyHttp3Environment = synchronized(lock) {
+        val proxyFingerprint = networkCurlSha256Hex(proxyUrl.encodeToByteArray())
+        val fingerprint = fingerprint(generation, environmentIdentity, proxyFingerprint)
+        NetworkCurlProxyHttp3Environment(
+            generation = generation,
+            proxyFingerprint = proxyFingerprint,
+            fingerprint = fingerprint,
+            h2Latched = fingerprint in h2LatchedFingerprints
+        )
+    }
+
+    /** Returns false when a stale request races a newer environment. */
+    fun latch(environment: NetworkCurlProxyHttp3Environment): Boolean = synchronized(lock) {
+        val currentFingerprint = fingerprint(
+            generation = generation,
+            environmentIdentity = environmentIdentity,
+            proxyFingerprint = environment.proxyFingerprint
+        )
+        if (environment.generation != generation || environment.fingerprint != currentFingerprint) {
+            return@synchronized false
+        }
+        h2LatchedFingerprints += environment.fingerprint
+        true
+    }
+
+    private fun advanceLocked() {
+        if (generation != Long.MAX_VALUE) generation += 1L
+        h2LatchedFingerprints.clear()
+    }
+
+    private fun fingerprint(
+        generation: Long,
+        environmentIdentity: String,
+        proxyFingerprint: String
+    ): String = networkCurlSha256Hex(
+        "$generation\u0000$environmentIdentity\u0000$proxyFingerprint".encodeToByteArray()
+    )
 }
 
 internal expect fun platformNetworkCurlNativeStatus(): NetworkCurlNativeStatus
