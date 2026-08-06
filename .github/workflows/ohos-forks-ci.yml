@@ -1,0 +1,73 @@
+name: Verify source-owned OHOS forks
+
+on:
+  pull_request:
+    paths:
+      - "OHOSForks/**"
+      - "NetworkKMM/gradle/**"
+      - "NetworkKMM/gradlew"
+      - "NetworkKMM/gradlew.bat"
+      - "NetworkKMM/gradle.properties"
+      - ".github/workflows/ohos-forks-ci.yml"
+      - ".github/workflows/publish-ohos-forks.yml"
+  push:
+    branches:
+      - master
+    paths:
+      - "OHOSForks/**"
+      - "NetworkKMM/gradle/**"
+      - "NetworkKMM/gradlew"
+      - "NetworkKMM/gradlew.bat"
+      - "NetworkKMM/gradle.properties"
+      - ".github/workflows/ohos-forks-ci.yml"
+      - ".github/workflows/publish-ohos-forks.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ohos-forks-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  source-build-abi-consumer:
+    name: Source prep, OHOS build, ABI and consumer closure
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image@sha256:cbe95055b155c4eb71d234f24b47d481a1b20b7e96defe3f24ab3219aff55347
+    env:
+      OHOS_FORKS_HARMONY_IMAGE: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image@sha256:cbe95055b155c4eb71d234f24b47d481a1b20b7e96defe3f24ab3219aff55347
+    steps:
+      - name: Check out exact carrier
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Resolve OpenHarmony SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot"
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd -P)"
+          printf 'OHOS_SDK_HOME=%s\n' "$ohos_sdk_home" >> "$GITHUB_ENV"
+          printf 'OHOS_BASE_SDK_HOME=%s\n' "$ohos_sdk_home" >> "$GITHUB_ENV"
+
+      - name: Verify publication contract controls
+        shell: bash
+        run: |
+          OHOSForks/scripts/verify-workflow-contract.py --self-test
+          OHOSForks/scripts/test-publication-contract.py
+
+      - name: Build and verify exact source-owned release
+        shell: bash
+        run: OHOSForks/scripts/build-and-verify.sh "$RUNNER_TEMP/ohos-forks-output"
+
+      - name: Upload immutable build evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ohos-forks-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/ohos-forks-output/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

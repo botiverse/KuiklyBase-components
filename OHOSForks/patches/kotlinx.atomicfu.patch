@@ -1,0 +1,369 @@
+Subject: [PATCH] kotlinx.atomicfu
+---
+Index: atomicfu/src/noOhosMain/kotlin/kotlinx/atomicfu/locks/Synchronized.noOhos.kt
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/atomicfu/src/noOhosMain/kotlin/kotlinx/atomicfu/locks/Synchronized.noOhos.kt b/atomicfu/src/noOhosMain/kotlin/kotlinx/atomicfu/locks/Synchronized.noOhos.kt
+new file mode 100644
+--- /dev/null	(date 1747740370869)
++++ b/atomicfu/src/noOhosMain/kotlin/kotlinx/atomicfu/locks/Synchronized.noOhos.kt	(date 1747740370869)
+@@ -0,0 +1,23 @@
++package kotlinx.atomicfu.locks
++
++import interop.*
++
++/*
++ * Tencent is pleased to support the open source community by making KuiklyBase available.
++ * Copyright (C) 2025 Tencent. All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++actual fun get_tid(): Int {
++    return get_tid_use_phtread_self()
++}
+\ No newline at end of file
+Index: gradle.properties
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>ISO-8859-1
+===================================================================
+diff --git a/gradle.properties b/gradle.properties
+--- a/gradle.properties	(revision 7e640bab1db140a398f735be97e3f07f97019ac0)
++++ b/gradle.properties	(date 1748259166598)
+@@ -2,16 +2,21 @@
+ # Copyright 2016-2020 JetBrains s.r.o. Use of this source code is governed by the Apache 2.0 license.
+ #
+ 
+-version=0.23.2-SNAPSHOT
++version=0.23.2-KBA-001
+ group=org.jetbrains.kotlinx
+ 
+-kotlin_version=1.9.21
++kotlin_version=2.0.21-dev-107
++kotlin_ios_version=2.0.21-deviOS-105
+ 
+ asm_version=9.6
+ slf4j_version=1.8.0-alpha2
+ junit_version=4.12
+ kotlinx_metadata_version=0.7.0
+ 
++maven_publish_url=https://xxxx/repository/maven/xxx
++maven_username=user_A
++maven_password=password_A
++
+ maven_version=3.5.3
+ 
+ gradle_node_version=3.1.1
+Index: atomicfu/build.gradle
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/atomicfu/build.gradle b/atomicfu/build.gradle
+--- a/atomicfu/build.gradle	(revision 7e640bab1db140a398f735be97e3f07f97019ac0)
++++ b/atomicfu/build.gradle	(date 1748258911778)
+@@ -11,11 +11,15 @@
+     nativeMainSets = []
+     nativeTestSets = []
+     nativeCompilations = []
++    noOhosMainSets = []
+ 
+     addNative = { preset ->
+         nativeMainSets.add(preset.compilations['main'].kotlinSourceSets.first())
+         nativeTestSets.add(preset.compilations['test'].kotlinSourceSets.first())
+-        nativeCompilations.add(preset.compilations['main'])
++            nativeCompilations.add(preset.compilations['main'])
++        if (preset.name != "ohosArm64") {
++            noOhosMainSets.add(preset.compilations['main'].kotlinSourceSets.first())
++        }
+     }
+ }
+ 
+@@ -130,8 +134,8 @@
+                 addNative(fromPreset(project.ext.ideaPreset, 'native'))
+             } else {
+                 // Support of all non-deprecated targets from official tier list: https://kotlinlang.org/docs/native-target-support.html
+-
+                 // Tier #1
++                addTarget(presets.ohosArm64)
+                 addTarget(presets.linuxX64)
+                 addTarget(presets.macosX64)
+                 addTarget(presets.macosArm64)
+@@ -170,6 +174,14 @@
+                     dependsOn nativeMain
+                 }
+ 
++                noOhosMain {
++                    dependsOn nativeMain
++                }
++
++                configure(noOhosMainSets) {
++                    dependsOn noOhosMain
++                }
++
+                 configure(nativeTestSets) {
+                     dependsOn nativeTest
+                 }
+@@ -367,3 +379,6 @@
+         exclude("tmp/.cache/expanded/expanded.lock")
+     })
+ }
++
++group 'org.jetbrains.kotlinx'
++version '0.23.2-KBA-001'
+\ No newline at end of file
+Index: atomicfu/src/ohosArm64Main/kotlin/kotlinx/atomicfu/locks/Synchronized.ohosArm64.kt
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/atomicfu/src/ohosArm64Main/kotlin/kotlinx/atomicfu/locks/Synchronized.ohosArm64.kt b/atomicfu/src/ohosArm64Main/kotlin/kotlinx/atomicfu/locks/Synchronized.ohosArm64.kt
+new file mode 100644
+--- /dev/null	(date 1747740388704)
++++ b/atomicfu/src/ohosArm64Main/kotlin/kotlinx/atomicfu/locks/Synchronized.ohosArm64.kt	(date 1747740388704)
+@@ -0,0 +1,24 @@
++package kotlinx.atomicfu.locks
++
++import platform.linux.SYS_gettid
++import platform.posix.syscall
++
++/*
++ * Tencent is pleased to support the open source community by making KuiklyBase available.
++ * Copyright (C) 2025 Tencent. All rights reserved.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++actual fun get_tid(): Int {
++    return syscall(SYS_gettid.toLong()).toInt()
++}
+\ No newline at end of file
+Index: atomicfu/src/nativeMain/kotlin/kotlinx/atomicfu/locks/Synchronized.kt
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/atomicfu/src/nativeMain/kotlin/kotlinx/atomicfu/locks/Synchronized.kt b/atomicfu/src/nativeMain/kotlin/kotlinx/atomicfu/locks/Synchronized.kt
+--- a/atomicfu/src/nativeMain/kotlin/kotlinx/atomicfu/locks/Synchronized.kt	(revision 7e640bab1db140a398f735be97e3f07f97019ac0)
++++ b/atomicfu/src/nativeMain/kotlin/kotlinx/atomicfu/locks/Synchronized.kt	(date 1747728928302)
+@@ -7,14 +7,17 @@
+ import kotlinx.atomicfu.locks.SynchronizedObject.Status.*
+ import kotlin.concurrent.AtomicNativePtr
+ import kotlin.concurrent.AtomicReference
++import kotlin.experimental.ExperimentalObjCRefinement
+ import kotlin.native.concurrent.*
+ 
+ public actual open class SynchronizedObject {
+ 
+     protected val lock = AtomicReference(LockState(UNLOCKED, 0, 0))
+ 
++    @OptIn(ExperimentalObjCRefinement::class)
++    @HiddenFromObjC
+     public fun lock() {
+-        val currentThreadId = pthread_self()!!
++        val currentThreadId = get_tid()
+         while (true) {
+             val state = lock.value
+             when (state.status) {
+@@ -65,7 +68,7 @@
+     }
+ 
+     public fun tryLock(): Boolean {
+-        val currentThreadId = pthread_self()!!
++        val currentThreadId = get_tid()
+         while (true) {
+             val state = lock.value
+             if (state.status == UNLOCKED) {
+@@ -85,7 +88,7 @@
+     }
+ 
+     public fun unlock() {
+-        val currentThreadId = pthread_self()!!
++        val currentThreadId = get_tid()
+         while (true) {
+             val state = lock.value
+             require(currentThreadId == state.ownerThreadId) { "Thin lock may be only released by the owner thread, expected: ${state.ownerThreadId}, real: $currentThreadId" }
+@@ -124,7 +127,7 @@
+         }
+     }
+ 
+-    private fun tryLockAfterResume(threadId: pthread_t) {
++    private fun tryLockAfterResume(threadId: Int) {
+         while (true) {
+             val state = lock.value
+             val newState = if (state.waiters == 0) // deflate
+@@ -145,7 +148,7 @@
+         val status: Status,
+         val nestedLocks: Int,
+         val waiters: Int,
+-        val ownerThreadId: pthread_t? = null,
++        val ownerThreadId: Int? = null,
+         val mutex: CPointer<mutex_node_t>? = null
+     )
+ 
+@@ -217,3 +220,5 @@
+         }
+     }
+ }
++
++expect fun get_tid(): Int
+\ No newline at end of file
+Index: .gitignore
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/.gitignore b/.gitignore
+--- a/.gitignore	(revision 7e640bab1db140a398f735be97e3f07f97019ac0)
++++ b/.gitignore	(date 1745841674287)
+@@ -2,4 +2,6 @@
+ *.iml
+ */target/*
+ build
+-.gradle
+\ No newline at end of file
++.gradle
++/local.properties
++.kotlin
+Index: build.gradle
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/build.gradle b/build.gradle
+--- a/build.gradle	(revision 7e640bab1db140a398f735be97e3f07f97019ac0)
++++ b/build.gradle	(date 1745841674292)
+@@ -30,6 +30,16 @@
+     }
+ 
+     repositories {
++
++        maven { url "https://mirrors.tencent.com/repository/maven/tmm-snapshot" }
++        maven { url "https://mirrors.tencent.com/repository/maven/tencentvideo" }
++        maven { url "https://mirrors.tencent.com/repository/maven/thirdparty" }
++        maven { url "https://mirrors.tencent.com/nexus/repository/maven-public/" }
++        maven { url "https://mirrors.tencent.com/repository/maven/tencentvideo-snapshot" }
++        maven { url "https://mirrors.tencent.com/repository/maven/thirdparty-snapshots" }
++        maven { url "https://mirrors.tencent.com/repository/maven/tencent_public" }
++        maven { url "https://maven.oa.com/nexus/content/groups/androidbuild/" }
++
+         mavenCentral()
+         gradlePluginPortal()
+         KotlinConfiguration.addCustomKotlinRepositoryIfEnabled(delegate, project)
+@@ -61,10 +71,27 @@
+             maven { url "https://oss.sonatype.org/content/repositories/snapshots" }
+         }
+     }
+-
++    def isIosTargetPlatform = project.hasProperty("targetPlatform") &&
++            project.property("targetPlatform") == "iOS"
++    def isIosTargetTask = gradle.startParameter.taskNames.any { taskName ->
++        taskName.contains("podPublish") || taskName.contains("podspec") || taskName.contains("syncFramework")
++    }
++    project.kotlin_version = isIosTargetPlatform || isIosTargetTask
++            ? rootProject.properties["kotlin_version"]
++            : rootProject.properties["kotlin_ios_version"]
+     logger.info("Using Kotlin compiler ${project.kotlin_version} for project ${project.name}")
+ 
+     repositories {
++
++        maven { url "https://mirrors.tencent.com/repository/maven/tmm-snapshot" }
++        maven { url "https://mirrors.tencent.com/repository/maven/tencentvideo" }
++        maven { url "https://mirrors.tencent.com/repository/maven/thirdparty" }
++        maven { url "https://mirrors.tencent.com/nexus/repository/maven-public/" }
++        maven { url "https://mirrors.tencent.com/repository/maven/tencentvideo-snapshot" }
++        maven { url "https://mirrors.tencent.com/repository/maven/thirdparty-snapshots" }
++        maven { url "https://mirrors.tencent.com/repository/maven/tencent_public" }
++        maven { url "https://maven.oa.com/nexus/content/groups/androidbuild/" }
++
+         mavenCentral()
+         KotlinConfiguration.addCustomKotlinRepositoryIfEnabled(delegate, project)
+         mavenLocal()
+Index: atomicfu/src/nativeInterop/cinterop/interop.def
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/atomicfu/src/nativeInterop/cinterop/interop.def b/atomicfu/src/nativeInterop/cinterop/interop.def
+--- a/atomicfu/src/nativeInterop/cinterop/interop.def	(revision 7e640bab1db140a398f735be97e3f07f97019ac0)
++++ b/atomicfu/src/nativeInterop/cinterop/interop.def	(date 1745841674288)
+@@ -42,4 +42,8 @@
+     ls->locked = 0;
+     pthread_cond_broadcast(&ls->cond);
+     pthread_mutex_unlock(&ls->mutex);
++}
++
++int get_tid_use_phtread_self() {
++  return (int)pthread_self();
+ }
+\ No newline at end of file
+Index: gradle/targets.gradle
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/gradle/targets.gradle b/gradle/targets.gradle
+--- a/gradle/targets.gradle	(revision 7e640bab1db140a398f735be97e3f07f97019ac0)
++++ b/gradle/targets.gradle	(date 1745841674294)
+@@ -5,14 +5,14 @@
+ /*
+  *  This is a hack to avoid creating unsupported native source sets when importing project into IDEA
+  */
+-project.ext.ideaActive = System.getProperty('idea.active') == 'true'
++project.ext.ideaActive = false
+ 
+ kotlin {
+     targets {
+         def manager = project.ext.hostManager
+-        def linuxEnabled = manager.isEnabled(presets.linuxX64.konanTarget)
+-        def macosEnabled = manager.isEnabled(presets.macosX64.konanTarget)
+-        def winEnabled = manager.isEnabled(presets.mingwX64.konanTarget)
++        def linuxEnabled = false
++        def macosEnabled = false
++        def winEnabled = false
+ 
+         project.ext.isLinuxHost = linuxEnabled
+         project.ext.isMacosHost = macosEnabled
+Index: buildSrc/src/main/kotlin/Publishing.kt
+IDEA additional info:
+Subsystem: com.intellij.openapi.diff.impl.patch.CharsetEP
+<+>UTF-8
+===================================================================
+diff --git a/buildSrc/src/main/kotlin/Publishing.kt b/buildSrc/src/main/kotlin/Publishing.kt
+--- a/buildSrc/src/main/kotlin/Publishing.kt	(revision 7e640bab1db140a398f735be97e3f07f97019ac0)
++++ b/buildSrc/src/main/kotlin/Publishing.kt	(date 1748259166592)
+@@ -57,10 +57,10 @@
+ 
+ fun configureMavenPublication(rh: RepositoryHandler, project: Project) {
+     rh.maven {
+-        url = mavenRepositoryUri()
++        url = URI(project.findProperty("maven_publish_url") as String)
+         credentials {
+-            username = project.getSensitiveProperty("libs.sonatype.user")
+-            password = project.getSensitiveProperty("libs.sonatype.password")
++            username = project.findProperty("maven_username") as String
++            password = project.findProperty("maven_password") as String
+         }
+     }
+ }

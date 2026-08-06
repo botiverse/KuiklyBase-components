@@ -1,0 +1,1336 @@
+diff --git a/.gitignore b/.gitignore
+index 76d3585d2..e282abddf 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -14,3 +14,4 @@ target
+ local.properties
+ benchmarks.jar
+ /kotlin-js-store
++.kotlin
+diff --git a/benchmarks/build.gradle.kts b/benchmarks/build.gradle.kts
+index 7006c915d..6f7afc6ca 100644
+--- a/benchmarks/build.gradle.kts
++++ b/benchmarks/build.gradle.kts
+@@ -9,6 +9,7 @@ plugins {
+ }
+ 
+ repositories {
++    maven(url = "https://mirrors.tencent.com/nexus/repository/maven-public")
+     maven("https://repo.typesafe.com/typesafe/releases/")
+ }
+ 
+diff --git a/build.gradle.kts b/build.gradle.kts
+index 002a1d89f..ced65f767 100644
+--- a/build.gradle.kts
++++ b/build.gradle.kts
+@@ -5,11 +5,13 @@ import org.gradle.kotlin.dsl.*
+ buildscript {
+     if (shouldUseLocalMaven(rootProject)) {
+         repositories {
++            maven(url = "https://mirrors.tencent.com/nexus/repository/maven-public")
+             mavenLocal()
+         }
+     }
+ 
+     repositories {
++        maven(url = "https://mirrors.tencent.com/nexus/repository/maven-public")
+         mavenCentral()
+         maven(url = "https://plugins.gradle.org/m2/")
+         addDevRepositoryIfEnabled(this, project)
+@@ -25,7 +27,7 @@ buildscript {
+         classpath("org.jetbrains.kotlinx:kotlinx-knit:${version("knit")}")
+         classpath("org.jetbrains.kotlinx:binary-compatibility-validator:${version("binary_compatibility_validator")}")
+         classpath("ru.vyarus:gradle-animalsniffer-plugin:${version("animalsniffer")}") // Android API check
+-        classpath("org.jetbrains.kotlin:atomicfu:${version("kotlin")}")
++        classpath("org.jetbrains.kotlin:atomicfu:${version("atomicfu")}")
+         classpath("org.jetbrains.kotlinx:kover-gradle-plugin:${version("kover")}")
+ 
+         // JMH plugins
+@@ -82,7 +84,9 @@ apiValidation {
+ 
+ // Configure repositories
+ allprojects {
++
+     repositories {
++        maven(url = "https://mirrors.tencent.com/nexus/repository/maven-public")
+         /*
+          * google should be first in the repository list because some of the play services
+          * transitive dependencies was removed from jcenter, thus breaking gradle dependency resolution
+diff --git a/buildSrc/build.gradle.kts b/buildSrc/build.gradle.kts
+index 96d718e04..98b13ff6e 100644
+--- a/buildSrc/build.gradle.kts
++++ b/buildSrc/build.gradle.kts
+@@ -1,3 +1,4 @@
++import org.jetbrains.kotlin.gradle.plugin.mpp.pm20.util.*
+ import java.util.*
+ 
+ plugins {
+@@ -9,6 +10,7 @@ val buildSnapshotTrain = properties["build_snapshot_train"]?.toString()?.toBoole
+ val kotlinDevUrl = project.rootProject.properties["kotlin_repo_url"] as? String
+ 
+ repositories {
++    maven(url = "https://mirrors.tencent.com/nexus/repository/maven-public")
+     mavenCentral()
+     if (cacheRedirectorEnabled) {
+         maven("https://cache-redirector.jetbrains.com/plugins.gradle.org/m2")
+@@ -63,4 +65,4 @@ dependencies {
+     }
+     implementation("org.jetbrains.kotlinx:kotlinx-benchmark-plugin:0.4.9")
+     implementation("org.jetbrains.kotlinx:kotlinx-knit:${version("knit")}")
+-}
++}
+\ No newline at end of file
+diff --git a/buildSrc/settings.gradle.kts b/buildSrc/settings.gradle.kts
+index 2ad2ddbea..d1547fcb4 100644
+--- a/buildSrc/settings.gradle.kts
++++ b/buildSrc/settings.gradle.kts
+@@ -1,6 +1,7 @@
+ pluginManagement {
+     val build_snapshot_train: String? by settings
+     repositories {
++        maven(url = "https://mirrors.tencent.com/nexus/repository/maven-public")
+         val cacheRedirectorEnabled = System.getenv("CACHE_REDIRECTOR")?.toBoolean() == true
+         if (cacheRedirectorEnabled) {
+             println("Redirecting repositories for buildSrc buildscript")
+diff --git a/buildSrc/src/main/kotlin/Idea.kt b/buildSrc/src/main/kotlin/Idea.kt
+index 615b8aad7..9e3fe26b2 100644
+--- a/buildSrc/src/main/kotlin/Idea.kt
++++ b/buildSrc/src/main/kotlin/Idea.kt
+@@ -1,5 +1,5 @@
+ object Idea {
+     @JvmStatic // for Gradle
+     val active: Boolean
+-        get() = System.getProperty("idea.active") == "true"
++        get() = false
+ }
+diff --git a/buildSrc/src/main/kotlin/Publishing.kt b/buildSrc/src/main/kotlin/Publishing.kt
+index 2e5028a82..3cb815df8 100644
+--- a/buildSrc/src/main/kotlin/Publishing.kt
++++ b/buildSrc/src/main/kotlin/Publishing.kt
+@@ -50,32 +50,16 @@ fun MavenPom.configureMavenCentralMetadata(project: Project) {
+  */
+ private val spacePublicationEnabled = System.getenv("libs.space.pub")?.equals("true") ?: false
+ 
+-fun mavenRepositoryUri(): URI {
+-    if (spacePublicationEnabled) {
+-        return URI("https://maven.pkg.jetbrains.space/public/p/kotlinx-coroutines/maven")
+-    }
+-
+-    val repositoryId: String? = System.getenv("libs.repository.id")
+-    return if (repositoryId == null) {
+-        URI("https://oss.sonatype.org/service/local/staging/deploy/maven2/")
+-    } else {
+-        URI("https://oss.sonatype.org/service/local/staging/deployByRepositoryId/$repositoryId")
+-    }
++fun Project.mavenRepositoryUri(): URI {
++    return URI(project.findProperty("maven_publish_url") as String)
+ }
+ 
+ fun configureMavenPublication(rh: RepositoryHandler, project: Project) {
+     rh.maven {
+-        url = mavenRepositoryUri()
++        url = project.mavenRepositoryUri()
+         credentials {
+-            if (spacePublicationEnabled) {
+-                // Configure space credentials
+-                username = project.getSensitiveProperty("libs.space.user")
+-                password = project.getSensitiveProperty("libs.space.password")
+-            } else {
+-                // Configure sonatype credentials
+-                username = project.getSensitiveProperty("libs.sonatype.user")
+-                password = project.getSensitiveProperty("libs.sonatype.password")
+-            }
++            username = project.findProperty("maven_username") as String
++            password = project.findProperty("maven_password") as String
+         }
+     }
+ }
+diff --git a/buildSrc/src/main/kotlin/configure-compilation-conventions.gradle.kts b/buildSrc/src/main/kotlin/configure-compilation-conventions.gradle.kts
+index 26ffe1136..bc52a6830 100644
+--- a/buildSrc/src/main/kotlin/configure-compilation-conventions.gradle.kts
++++ b/buildSrc/src/main/kotlin/configure-compilation-conventions.gradle.kts
+@@ -20,7 +20,7 @@ configure(subprojects) {
+                 versionsAreNotOverridden = false
+             }
+             if (isMainTaskName && versionsAreNotOverridden && !unpublished.contains(project.name)) {
+-                allWarningsAsErrors = true
++                allWarningsAsErrors = false
+                 freeCompilerArgs.add("-Xexplicit-api=strict")
+             }
+             /* Coroutines do not interop with Java and these flags provide a significant
+diff --git a/buildSrc/src/main/kotlin/kotlin-multiplatform-conventions.gradle.kts b/buildSrc/src/main/kotlin/kotlin-multiplatform-conventions.gradle.kts
+index fd2d3fdba..b644390e5 100644
+--- a/buildSrc/src/main/kotlin/kotlin-multiplatform-conventions.gradle.kts
++++ b/buildSrc/src/main/kotlin/kotlin-multiplatform-conventions.gradle.kts
+@@ -23,6 +23,7 @@ kotlin {
+     if (nativeTargetsAreEnabled) {
+         // According to https://kotlinlang.org/docs/native-target-support.html
+         // Tier 1
++        ohosArm64 {}
+         linuxX64()
+         macosX64()
+         macosArm64()
+@@ -84,10 +85,10 @@ kotlin {
+             api("org.jetbrains.kotlin:kotlin-test-junit:${version("kotlin")}")
+             api("junit:junit:${version("junit")}")
+         }
+-        nativeMain.dependencies {
+-            // workaround for #3968 until this is fixed on atomicfu's side
+-            api("org.jetbrains.kotlinx:atomicfu:0.23.1")
+-        }
++//        nativeMain.dependencies {
++//            // workaround for #3968 until this is fixed on atomicfu's side
++//            api("org.jetbrains.kotlinx:atomicfu:0.23.1")
++//        }
+         jsMain { }
+         jsTest {
+             dependencies {
+diff --git a/gradle.properties b/gradle.properties
+index 0aa26b50d..0fc57d3d3 100644
+--- a/gradle.properties
++++ b/gradle.properties
+@@ -1,10 +1,12 @@
+ # Kotlin
+-version=1.8.0-SNAPSHOT
++version=1.8.0-KBA-001
+ group=org.jetbrains.kotlinx
+-kotlin_version=1.9.21
+-# DO NOT rename this property without adapting kotlinx.train build chain:
+-atomicfu_version=0.23.1
++kotlin_version=2.0.21-KBA-001
++kotlin_snapshot_version=2.0.21-KBA-001
++build_snapshot_train=true
++skip_snapshot_checks=true
+ 
++atomicfu_version=0.23.2-KBA-001
+ # Dependencies
+ junit_version=4.12
+ junit5_version=5.7.0
+@@ -50,3 +52,7 @@ kotlinx.atomicfu.enableJvmIrTransformation=true
+ # usages of `moveForward` in `ConcurrentLinkedList.kt` correctly.
+ kotlinx.atomicfu.enableJsIrTransformation=false
+ kotlinx.atomicfu.enableNativeIrTransformation=true
++
++maven_publish_url=""
++maven_username=""
++maven_password=""
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/build.gradle.kts b/kotlinx-coroutines-core/build.gradle.kts
+index 9efc7847c..95c7768de 100644
+--- a/kotlinx-coroutines-core/build.gradle.kts
++++ b/kotlinx-coroutines-core/build.gradle.kts
+@@ -1,9 +1,6 @@
+ import org.gradle.api.tasks.testing.*
+ import org.gradle.kotlin.dsl.*
+-import org.jetbrains.kotlin.gradle.plugin.mpp.*
+-import org.jetbrains.kotlin.gradle.targets.native.tasks.*
+ import org.jetbrains.kotlin.gradle.tasks.*
+-import org.jetbrains.kotlin.gradle.testing.*
+ 
+ plugins {
+     kotlin("multiplatform")
+@@ -62,6 +59,13 @@ However, when creating a new compilation, we have to take care of creating a def
+  ========================================================================== */
+ 
+ kotlin {
++    ohosArm64 {
++        val main by compilations.getting
++        val interop by main.cinterops.creating {
++            includeDirs("$projectDir/src/nativeInterop/cinterop/cpp/include")
++        }
++    }
++
+     sourceSets {
+         // using the source set names from <https://kotlinlang.org/docs/multiplatform-hierarchy.html#see-the-full-hierarchy-template>
+         groupSourceSets("concurrent", listOf("jvm", "native"), listOf("common"))
+@@ -69,6 +73,7 @@ kotlin {
+             // TODO: 'nativeDarwin' behaves exactly like 'apple', we can remove it
+             groupSourceSets("nativeDarwin", listOf("apple"), listOf("native"))
+             groupSourceSets("nativeOther", listOf("linux", "mingw", "androidNative"), listOf("native"))
++            groupSourceSets("nativeOhos", listOf("ohosArm64"), listOf("native"))
+         }
+         jvmMain {
+             dependencies {
+@@ -83,33 +88,33 @@ kotlin {
+                 implementation("org.openjdk.jol:jol-core:0.16")
+             }
+         }
+-    }
+-    /*
++        ohosArm64Main {}
++    }/*
+      * Configure two test runs for Native:
+      * 1) Main thread
+      * 2) BG thread (required for Dispatchers.Main tests on Darwin)
+      *
+      * All new MM targets are build with optimize = true to have stress tests properly run.
+      */
+-    targets.withType(KotlinNativeTargetWithTests::class).configureEach {
+-        binaries.getTest(DEBUG).apply {
+-            optimized = true
+-        }
+-
+-        binaries.test("workerTest", listOf(DEBUG)) {
+-            val thisTest = this
+-            optimized = true
+-            freeCompilerArgs = freeCompilerArgs + listOf("-e", "kotlinx.coroutines.mainBackground")
+-            testRuns.create("workerTest") {
+-                this as KotlinTaskTestRun<*, *>
+-                setExecutionSourceFrom(thisTest)
+-                executionTask.configure {
+-                    this as KotlinNativeTest
+-                    targetName = "$targetName worker with new MM"
+-                }
+-            }
+-        }
+-    }
++//    targets.withType(KotlinNativeTargetWithTests::class).configureEach {
++//        binaries.getTest(DEBUG).apply {
++//            optimized = true
++//        }
++//
++//        binaries.test("workerTest", listOf(DEBUG)) {
++//            val thisTest = this
++//            optimized = true
++//            freeCompilerArgs = freeCompilerArgs + listOf("-e", "kotlinx.coroutines.mainBackground")
++//            testRuns.create("workerTest") {
++//                this as KotlinTaskTestRun<*, *>
++//                setExecutionSourceFrom(thisTest)
++//                executionTask.configure {
++//                    this as KotlinNativeTest
++//                    targetName = "$targetName worker with new MM"
++//                }
++//            }
++//        }
++//    }
+ 
+     /**
+      * See: https://youtrack.jetbrains.com/issue/KTIJ-25959
+@@ -315,3 +320,6 @@ artifacts {
+ tasks.named("dokkaHtmlPartial") {
+     dependsOn(jvmJar)
+ }
++
++group = "org.jetbrains.kotlinx"
++version = project.properties["version"]!!
+diff --git a/kotlinx-coroutines-core/common/src/AbstractCoroutine.kt b/kotlinx-coroutines-core/common/src/AbstractCoroutine.kt
+index 56e960812..49a34b856 100644
+--- a/kotlinx-coroutines-core/common/src/AbstractCoroutine.kt
++++ b/kotlinx-coroutines-core/common/src/AbstractCoroutine.kt
+@@ -34,7 +34,8 @@ import kotlin.coroutines.*
+ public abstract class AbstractCoroutine<in T>(
+     parentContext: CoroutineContext,
+     initParentJob: Boolean,
+-    active: Boolean
++    active: Boolean,
++    internal val track: Boolean = false
+ ) : JobSupport(active), Job, Continuation<T>, CoroutineScope {
+ 
+     init {
+@@ -65,7 +66,12 @@ public abstract class AbstractCoroutine<in T>(
+      * This function is invoked once when the job was completed normally with the specified [value],
+      * right before all the waiters for the coroutine's completion are notified.
+      */
+-    protected open fun onCompleted(value: T) {}
++    protected open fun onCompleted(value: T) {
++        // 打印协程完成时的日志
++        if (track) {
++            log("AbstractCoroutine") { "5. onCompleted:${this} with result:${value}" }
++        }
++    }
+ 
+     /**
+      * This function is invoked once when the job was cancelled with the specified [cause],
+@@ -78,7 +84,12 @@ public abstract class AbstractCoroutine<in T>(
+      * @param cause The cancellation (failure) cause
+      * @param handled `true` if the exception was handled by parent (always `true` when it is a [CancellationException])
+      */
+-    protected open fun onCancelled(cause: Throwable, handled: Boolean) {}
++    protected open fun onCancelled(cause: Throwable, handled: Boolean) {
++        // 打印协程取消的日志，并且打印取消原因
++        if (track) {
++            log("AbstractCoroutine") { "5. onCancelled:${this} with Cause:${cause} Handled:${handled}" }
++        }
++    }
+ 
+     override fun cancellationExceptionMessage(): String = "$classSimpleName was cancelled"
+ 
+diff --git a/kotlinx-coroutines-core/common/src/Builders.common.kt b/kotlinx-coroutines-core/common/src/Builders.common.kt
+index 95c1be8a8..ddcd07aab 100644
+--- a/kotlinx-coroutines-core/common/src/Builders.common.kt
++++ b/kotlinx-coroutines-core/common/src/Builders.common.kt
+@@ -47,8 +47,26 @@ public fun CoroutineScope.launch(
+ ): Job {
+     val newContext = newCoroutineContext(context)
+     val coroutine = if (start.isLazy)
+-        LazyStandaloneCoroutine(newContext, block) else
+-        StandaloneCoroutine(newContext, active = true)
++        LazyStandaloneCoroutine(newContext, block = block, track = false) else
++        StandaloneCoroutine(newContext, active = true, track = false)
++    coroutine.start(start, coroutine, block)
++    return coroutine
++}
++
++public fun CoroutineScope.launch(
++    context: CoroutineContext = EmptyCoroutineContext,
++    start: CoroutineStart = CoroutineStart.DEFAULT,
++    track: Boolean = false,
++    block: suspend CoroutineScope.() -> Unit
++): Job {
++    val newContext = newCoroutineContext(context)
++    val coroutine = if (start.isLazy)
++        LazyStandaloneCoroutine(newContext, block = block, track = track) else
++        StandaloneCoroutine(newContext, active = true, track = track)
++    if (track) {
++        // 打印协程创建时候的日志，并且将协程与Block绑定
++        log("CoroutineScope.launch") { "1. Create Coroutine:${coroutine}" }
++    }
+     coroutine.start(start, coroutine, block)
+     return coroutine
+ }
+@@ -82,8 +100,26 @@ public fun <T> CoroutineScope.async(
+ ): Deferred<T> {
+     val newContext = newCoroutineContext(context)
+     val coroutine = if (start.isLazy)
+-        LazyDeferredCoroutine(newContext, block) else
+-        DeferredCoroutine<T>(newContext, active = true)
++        LazyDeferredCoroutine(newContext, block = block, track = false) else
++        DeferredCoroutine<T>(newContext, active = true, track = false)
++    coroutine.start(start, coroutine, block)
++    return coroutine
++}
++
++public fun <T> CoroutineScope.async(
++    context: CoroutineContext = EmptyCoroutineContext,
++    start: CoroutineStart = CoroutineStart.DEFAULT,
++    track: Boolean = false,
++    block: suspend CoroutineScope.() -> T
++): Deferred<T> {
++    val newContext = newCoroutineContext(context)
++    val coroutine = if (start.isLazy)
++        LazyDeferredCoroutine(newContext, block = block, track = track) else
++        DeferredCoroutine<T>(newContext, active = true, track = track)
++    if (track) {
++        // 打印协程创建时候的日志，并且将协程与Block绑定
++        log("CoroutineScope.async") { "1. Create Coroutine:${coroutine}" }
++    }
+     coroutine.start(start, coroutine, block)
+     return coroutine
+ }
+@@ -91,8 +127,9 @@ public fun <T> CoroutineScope.async(
+ @Suppress("UNCHECKED_CAST")
+ private open class DeferredCoroutine<T>(
+     parentContext: CoroutineContext,
+-    active: Boolean
+-) : AbstractCoroutine<T>(parentContext, true, active = active), Deferred<T> {
++    active: Boolean,
++    track: Boolean = false,
++) : AbstractCoroutine<T>(parentContext, true, active = active, track = track), Deferred<T> {
+     override fun getCompleted(): T = getCompletedInternal() as T
+     override suspend fun await(): T = awaitInternal() as T
+     override val onAwait: SelectClause1<T> get() = onAwaitInternal as SelectClause1<T>
+@@ -100,8 +137,9 @@ private open class DeferredCoroutine<T>(
+ 
+ private class LazyDeferredCoroutine<T>(
+     parentContext: CoroutineContext,
++    track: Boolean = false,
+     block: suspend CoroutineScope.() -> T
+-) : DeferredCoroutine<T>(parentContext, active = false) {
++) : DeferredCoroutine<T>(parentContext, active = false, track = track) {
+     private val continuation = block.createCoroutineUnintercepted(this, this)
+ 
+     override fun onStart() {
+@@ -142,7 +180,7 @@ public suspend fun <T> withContext(
+     contract {
+         callsInPlace(block, InvocationKind.EXACTLY_ONCE)
+     }
+-    return suspendCoroutineUninterceptedOrReturn sc@ { uCont ->
++    return suspendCoroutineUninterceptedOrReturn sc@{ uCont ->
+         // compute new context
+         val oldContext = uCont.context
+         // Copy CopyableThreadContextElement if necessary
+@@ -184,8 +222,9 @@ public suspend inline operator fun <T> CoroutineDispatcher.invoke(
+ 
+ private open class StandaloneCoroutine(
+     parentContext: CoroutineContext,
+-    active: Boolean
+-) : AbstractCoroutine<Unit>(parentContext, initParentJob = true, active = active) {
++    active: Boolean,
++    track: Boolean = false,
++) : AbstractCoroutine<Unit>(parentContext, initParentJob = true, active = active, track = track) {
+     override fun handleJobException(exception: Throwable): Boolean {
+         handleCoroutineException(context, exception)
+         return true
+@@ -194,8 +233,9 @@ private open class StandaloneCoroutine(
+ 
+ private class LazyStandaloneCoroutine(
+     parentContext: CoroutineContext,
++    track: Boolean = false,
+     block: suspend CoroutineScope.() -> Unit
+-) : StandaloneCoroutine(parentContext, active = false) {
++) : StandaloneCoroutine(parentContext, active = false, track = track) {
+     private val continuation = block.createCoroutineUnintercepted(this, this)
+ 
+     override fun onStart() {
+diff --git a/kotlinx-coroutines-core/common/src/Job.kt b/kotlinx-coroutines-core/common/src/Job.kt
+index 817ac4d60..7a527ec71 100644
+--- a/kotlinx-coroutines-core/common/src/Job.kt
++++ b/kotlinx-coroutines-core/common/src/Job.kt
+@@ -560,6 +560,42 @@ public fun CoroutineContext.cancel(cause: CancellationException? = null) {
+     this[Job]?.cancel(cause)
+ }
+ 
++/**
++ * track [AbstractCoroutine] dispatch with [runnable].
++ * See [AbstractCoroutine.track] for details
++ */
++public fun CoroutineContext.trackDispatch(runnable: Runnable) {
++    (this[Job] as? AbstractCoroutine<*>)?.takeIf { it.track }?.let {
++        log("[CoroutineContext.Dispatch]") {
++            "2. Context:${this} Dispatch:${runnable}"
++        }
++    }
++}
++
++/**
++ * track [AbstractCoroutine] start Run with [runnable].
++ * See [AbstractCoroutine.track] for details
++ */
++public fun CoroutineContext.trackStartRun(runnable: Runnable) {
++    (this[Job] as? AbstractCoroutine<*>)?.takeIf { it.track }?.let {
++        log("[CoroutineContext.Run]") {
++            "3. Context:${this} StartRunInThread:${runnable}"
++        }
++    }
++}
++
++/**
++ * track [AbstractCoroutine] Run finish with [runnable].
++ * See [AbstractCoroutine.track] for details
++ */
++public fun CoroutineContext.trackEndRun(runnable: Runnable) {
++    (this[Job] as? AbstractCoroutine<*>)?.takeIf { it.track }?.let {
++        log("[CoroutineContext.Run]") {
++            "4. Context:${this} EndRunInThread:${runnable}"
++        }
++    }
++}
++
+ /**
+  * @suppress This method implements old version of JVM ABI. Use [CoroutineContext.cancel].
+  */
+diff --git a/kotlinx-coroutines-core/common/src/Runnable.common.kt b/kotlinx-coroutines-core/common/src/Runnable.common.kt
+index 462ed6a7f..829d16f77 100644
+--- a/kotlinx-coroutines-core/common/src/Runnable.common.kt
++++ b/kotlinx-coroutines-core/common/src/Runnable.common.kt
+@@ -15,3 +15,5 @@ public expect interface Runnable {
+  */
+ @Suppress("FunctionName")
+ public expect inline fun Runnable(crossinline block: () -> Unit): Runnable
++
++internal expect fun log(tag: String, messageBlock: () -> String)
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/common/src/internal/DispatchedTask.kt b/kotlinx-coroutines-core/common/src/internal/DispatchedTask.kt
+index 5a38d0de9..7de548064 100644
+--- a/kotlinx-coroutines-core/common/src/internal/DispatchedTask.kt
++++ b/kotlinx-coroutines-core/common/src/internal/DispatchedTask.kt
+@@ -85,6 +85,7 @@ internal abstract class DispatchedTask<in T> internal constructor(
+             val continuation = delegate.continuation
+             withContinuationContext(continuation, delegate.countOrElement) {
+                 val context = continuation.context
++                context.trackStartRun(this)
+                 val state = takeState() // NOTE: Must take state in any case, even if cancelled
+                 val exception = getExceptionalResult(state)
+                 /*
+@@ -104,10 +105,12 @@ internal abstract class DispatchedTask<in T> internal constructor(
+                         continuation.resume(getSuccessfulResult(state))
+                     }
+                 }
++                context.trackEndRun(this)
+             }
+         } catch (e: Throwable) {
+             // This instead of runCatching to have nicer stacktrace and debug experience
+             fatalException = e
++            log("[DispatchedTask.Exception]") { "DispatchedTask Exception:$e" }
+         } finally {
+             val result = runCatching { taskContext.afterTask() }
+             handleFatalException(fatalException, result.exceptionOrNull())
+diff --git a/kotlinx-coroutines-core/jsAndWasmShared/src/Runnable.kt b/kotlinx-coroutines-core/jsAndWasmShared/src/Runnable.kt
+index 1a9e0ae7a..b085cf6e9 100644
+--- a/kotlinx-coroutines-core/jsAndWasmShared/src/Runnable.kt
++++ b/kotlinx-coroutines-core/jsAndWasmShared/src/Runnable.kt
+@@ -20,3 +20,7 @@ public actual inline fun Runnable(crossinline block: () -> Unit): Runnable =
+             block()
+         }
+     }
++
++internal actual fun log(tag: String, messageBlock: () -> String) {
++    // Do Nothing
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/jvm/src/CoroutineHostApi.kt b/kotlinx-coroutines-core/jvm/src/CoroutineHostApi.kt
+new file mode 100644
+index 000000000..5aa10889b
+--- /dev/null
++++ b/kotlinx-coroutines-core/jvm/src/CoroutineHostApi.kt
+@@ -0,0 +1,49 @@
++package kotlinx.coroutines
++
++import kotlinx.coroutines.scheduling.DefaultIoScheduler
++import kotlinx.coroutines.scheduling.DefaultScheduler
++import java.util.concurrent.atomic.AtomicReference
++
++/**
++ * 外部注入的协程Dispatcher，用于解决Android华为协程库线程创建过多，超出500个后导致运行时Crash，
++ * 所以使用外部注入的[CoroutineDispatcher]，作为协程线程池的实现，避免协程内部创建线程
++ */
++public interface CoroutineHostApi {
++
++    public fun ioDispatcher(): CoroutineDispatcher
++
++    public fun defaultDispatcher(): CoroutineDispatcher
++
++    public fun log(tag: String, messageBlock: () -> String)
++}
++
++public object CoroutineHostConfiguration {
++
++    private const val TAG_COROUTINE_DEBUG = "COROUTINE_DEBUG"
++
++    /**
++     * 宿主设置的[CoroutineHostApi]对象，通过[AtomicReference]以及CAS保证线程安全
++     */
++    private var hostApi = AtomicReference<CoroutineHostApi?>(null)
++
++    /**
++     * CAS设置宿主对象，返回设置是否成功
++     */
++    public fun setCoroutinesHostApi(host: CoroutineHostApi): Boolean =
++        hostApi.compareAndSet(null, host)
++
++    /**
++     * 替换原有的IODispatcher对象
++     */
++    internal fun getIODispatcher(): CoroutineDispatcher =
++        hostApi.get()?.ioDispatcher() ?: DefaultIoScheduler
++
++    /**
++     * 替换原有的DefaultDispatcher对象
++     */
++    internal fun getDefaultDispatcher(): CoroutineDispatcher =
++        hostApi.get()?.defaultDispatcher() ?: DefaultScheduler
++
++    internal fun log(tag: String, messageBlock: () -> String) =
++        hostApi.get()?.log("[${TAG_COROUTINE_DEBUG}:${tag}]", messageBlock)
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/jvm/src/Dispatchers.kt b/kotlinx-coroutines-core/jvm/src/Dispatchers.kt
+index 6b3fa5e5e..2946c4975 100644
+--- a/kotlinx-coroutines-core/jvm/src/Dispatchers.kt
++++ b/kotlinx-coroutines-core/jvm/src/Dispatchers.kt
+@@ -14,7 +14,8 @@ public const val IO_PARALLELISM_PROPERTY_NAME: String = "kotlinx.coroutines.io.p
+  */
+ public actual object Dispatchers {
+     @JvmStatic
+-    public actual val Default: CoroutineDispatcher = DefaultScheduler
++    public actual val Default: CoroutineDispatcher
++        get() = CoroutineHostConfiguration.getDefaultDispatcher()
+ 
+     @JvmStatic
+     public actual val Main: MainCoroutineDispatcher get() = MainDispatcherLoader.dispatcher
+@@ -62,7 +63,8 @@ public actual object Dispatchers {
+      * during operations over IO dispatcher.
+      */
+     @JvmStatic
+-    public val IO: CoroutineDispatcher = DefaultIoScheduler
++    public val IO: CoroutineDispatcher
++        get() = CoroutineHostConfiguration.getIODispatcher()
+ 
+     /**
+      * Shuts down built-in dispatchers, such as [Default] and [IO],
+diff --git a/kotlinx-coroutines-core/jvm/src/Executors.kt b/kotlinx-coroutines-core/jvm/src/Executors.kt
+index 53ef77dcc..fcfebd8d2 100644
+--- a/kotlinx-coroutines-core/jvm/src/Executors.kt
++++ b/kotlinx-coroutines-core/jvm/src/Executors.kt
+@@ -127,6 +127,7 @@ internal class ExecutorCoroutineDispatcherImpl(override val executor: Executor)
+     }
+ 
+     override fun dispatch(context: CoroutineContext, block: Runnable) {
++        context.trackDispatch(block)
+         try {
+             executor.execute(wrapTask(block))
+         } catch (e: RejectedExecutionException) {
+diff --git a/kotlinx-coroutines-core/jvm/src/Runnable.common.jvm.kt b/kotlinx-coroutines-core/jvm/src/Runnable.common.jvm.kt
+new file mode 100644
+index 000000000..57e276746
+--- /dev/null
++++ b/kotlinx-coroutines-core/jvm/src/Runnable.common.jvm.kt
+@@ -0,0 +1,5 @@
++package kotlinx.coroutines
++
++internal actual fun log(tag: String, messageBlock: () -> String) {
++    CoroutineHostConfiguration.log(tag, messageBlock)
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/libs/libnapi_func.a b/kotlinx-coroutines-core/libs/libnapi_func.a
+new file mode 100644
+index 0000000000000000000000000000000000000000..92910b1f1c5b61030cbecf83a7fb6843ad00aa24
+GIT binary patch
+literal 2362
+zcmb7_O>7fK6oB7)4TRJRh~^NLQg7QJfz&MiOX8@ga+N@HKy}5B+Mbs2dK?@4*Uct{
+z2C0#dsvaAN1Q(F19Ez=;dg-l2<-&yn7uq9KRZG<qN)E}vr0?y{n8|vL#FO64n{VE{
+zH?!k;e)~9c?D7YL$BdnlP=>y(wuUj@bvQo=01?zhQrqFo<!8^F{Iuehr&+aHVD?3@
+z(GYBgxeQ7Rb=$O?O|#+W?FPfFYMzNq#@k0Kne`3h{NUFoPMwTs8Yc5agP-BWNK$}r
+zcfGK4o|%IfdTvi^4?9bGYa<_Rb?(8+0Kj+adZfKJ4G$x*d~HLA_JEe#BE54pzWJ*j
+z-^AssYr3`hM31-sMEwi(Z`6NKpW3kUSRZa5hUL@SI&7`4L5ut;?&E!aoYqxqlj6m-
+zz5jg=aCRd<)9Nfuw{R~jcXjI#`FECn!98iMjt(p9y4I$B5U1Er^w--P`43y~V2*cD
+zJ4?Ua!MS0`&*sk<M~Zy$s9{%Gea=|q&U~d&H<IIK!ps;)s@28XSkq}-;I?Z_6jFuk
+zM5@SBnFKG5v#Cs)Po>kDOfoygCmBx`CKHK7DR~rQ!+vT|w69KscI7SYU@Q)A;&{ZP
+z05_?h8T#Z@?2vIivKqa;`__PgC`%kAL(R;PF{{iI>L<r>A_~v8!{&9+d+__-rT21j
+z)Iqs?v2w!m@8wC4@9ByEp2zq0@Sl(zQ1;_}2V}pa%5SDF8pb$b{6ruBZ~E{k#yOyz
+z%lp3Q%lr7#_QUc@Hi-`E=|<6?Bpcu|&q3t$)TI=KLHsodu`dfd7{4iaF#f9G6elKZ
+z>V_3Qr0|5W-$4I;3a8&D$u8tnj-=4<iiCL7H~qHGniY#GljWANY8B^MiCa{eTzo**
+zmsr27rc-G+756fjF2Cf0X*X&$UU$3o3;Y;f%?pd-&oldrg^I&N9V~0!#R_TJ<%?E{
+zRjOdt8!k6L`uN<KHvy)@tISJphSyf#ftRh4!)hGVfO8AXDS|ogIxZ_<f4S!MO2j~2
+zR*!?LD)l*Q!7XKBv}mTONx|qPGf9oS1@(izn*A@jhrQleaY;G6FI56V7{f_oyHzK&
+zbAhoO?znq|Kcc>Dy?odG*8hML6f-9sM4uCfq5@4qZ-Ws2A9yk%`sdh(<^My>%XcS+
+zJAb<fw@}0KKNb1q4N-oodcpi@WRzd}q3KDCAj;={*KGy%))2gbDp}VF4ITzVd>;s=
+zzEz4-7VAHwfg*DM65U55?EE9*qUE{h{8Z=UdinjIAq(b41b0RLWzkbdYlG|m2Mc^H
+AVgLXD
+
+literal 0
+HcmV?d00001
+
+diff --git a/kotlinx-coroutines-core/native/src/CrashReporter.kt b/kotlinx-coroutines-core/native/src/CrashReporter.kt
+new file mode 100644
+index 000000000..f1b993ac5
+--- /dev/null
++++ b/kotlinx-coroutines-core/native/src/CrashReporter.kt
+@@ -0,0 +1,9 @@
++package kotlinx.coroutines
++
++public object CrashReporter {
++    public var reportImpl: ((throwable: Throwable) -> Unit)? = null
++
++    public fun reportThrowable(throwable: Throwable) {
++        reportImpl?.invoke(throwable)
++    }
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/native/src/Dispatchers.kt b/kotlinx-coroutines-core/native/src/Dispatchers.kt
+index 996518630..7159d54e4 100644
+--- a/kotlinx-coroutines-core/native/src/Dispatchers.kt
++++ b/kotlinx-coroutines-core/native/src/Dispatchers.kt
+@@ -18,8 +18,6 @@ public actual object Dispatchers {
+     internal fun injectMain(dispatcher: MainCoroutineDispatcher) {
+         injectedMainDispatcher = dispatcher
+     }
+-
+-    internal val IO: CoroutineDispatcher = DefaultIoScheduler
+ }
+ 
+ internal object DefaultIoScheduler : CoroutineDispatcher() {
+@@ -45,8 +43,4 @@ internal object DefaultIoScheduler : CoroutineDispatcher() {
+     override fun toString(): String = "Dispatchers.IO"
+ }
+ 
+-
+-@Suppress("EXTENSION_SHADOWED_BY_MEMBER")
+-public actual val Dispatchers.IO: CoroutineDispatcher get() = IO
+-
+ internal expect fun createMainDispatcher(default: CoroutineDispatcher): MainCoroutineDispatcher
+diff --git a/kotlinx-coroutines-core/native/src/internal/CoroutineExceptionHandlerImpl.kt b/kotlinx-coroutines-core/native/src/internal/CoroutineExceptionHandlerImpl.kt
+index 621b8a9c0..4493bf871 100644
+--- a/kotlinx-coroutines-core/native/src/internal/CoroutineExceptionHandlerImpl.kt
++++ b/kotlinx-coroutines-core/native/src/internal/CoroutineExceptionHandlerImpl.kt
+@@ -20,6 +20,7 @@ internal actual fun ensurePlatformExceptionHandlerLoaded(callback: CoroutineExce
+ @OptIn(ExperimentalStdlibApi::class)
+ internal actual fun propagateExceptionFinalResort(exception: Throwable) {
+     // log exception
++    CrashReporter.reportImpl?.invoke(exception)
+     processUnhandledException(exception)
+ }
+ 
+diff --git a/kotlinx-coroutines-core/nativeDarwin/src/Dispatchers.kt b/kotlinx-coroutines-core/nativeDarwin/src/Dispatchers.kt
+index 786f0f215..9e753b9cb 100644
+--- a/kotlinx-coroutines-core/nativeDarwin/src/Dispatchers.kt
++++ b/kotlinx-coroutines-core/nativeDarwin/src/Dispatchers.kt
+@@ -9,6 +9,35 @@ import kotlin.coroutines.*
+ import kotlin.concurrent.*
+ import kotlin.native.internal.NativePtr
+ 
++// region Tencent Code
++private var useGCDBlock: (() -> Boolean)? = null
++
++public fun useGCDIODispatcher(block: () -> Boolean) { useGCDBlock = block }
++
++private val useGCDIODispatcher by lazy {
++    useGCDBlock?.invoke() ?: false
++}
++
++internal fun getDarwinIODispatchers(): CoroutineDispatcher = if (useGCDIODispatcher) {
++    DarwinGlobalIOQueueDispatcher
++} else {
++    DefaultIoScheduler
++}
++
++/**
++ * [Dispatchers.IO] implement by GCD, to reduce creating [kotlin.native.concurrent.Worker]
++ */
++private object DarwinGlobalIOQueueDispatcher : CoroutineDispatcher() {
++    override fun dispatch(context: CoroutineContext, block: Runnable) {
++        autoreleasepool {
++            dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_BACKGROUND.convert(), 0u)) {
++                block.run()
++            }
++        }
++    }
++}
++// endregion
++
+ internal fun isMainThread(): Boolean = CFRunLoopGetCurrent() == CFRunLoopGetMain()
+ 
+ internal actual fun createMainDispatcher(default: CoroutineDispatcher): MainCoroutineDispatcher = DarwinMainDispatcher(false)
+diff --git a/kotlinx-coroutines-core/nativeDarwin/src/Dispatchers.nativeDarwin.kt b/kotlinx-coroutines-core/nativeDarwin/src/Dispatchers.nativeDarwin.kt
+new file mode 100644
+index 000000000..0b6546684
+--- /dev/null
++++ b/kotlinx-coroutines-core/nativeDarwin/src/Dispatchers.nativeDarwin.kt
+@@ -0,0 +1,34 @@
++package kotlinx.coroutines
++
++/**
++ * The [CoroutineDispatcher] that is designed for offloading blocking IO tasks to a shared pool of threads.
++ * Additional threads in this pool are created on demand.
++ * Default IO pool size is `64`; on JVM it can be configured using JVM-specific mechanisms,
++ * please refer to `Dispatchers.IO` documentation on JVM platform.
++ *
++ * ### Elasticity for limited parallelism
++ *
++ * `Dispatchers.IO` has a unique property of elasticity: its views
++ * obtained with [CoroutineDispatcher.limitedParallelism] are
++ * not restricted by the `Dispatchers.IO` parallelism. Conceptually, there is
++ * a dispatcher backed by an unlimited pool of threads, and both `Dispatchers.IO`
++ * and views of `Dispatchers.IO` are actually views of that dispatcher. In practice
++ * this means that, despite not abiding by `Dispatchers.IO`'s parallelism
++ * restrictions, its views share threads and resources with it.
++ *
++ * In the following example
++ * ```
++ * // 100 threads for MySQL connection
++ * val myMysqlDbDispatcher = Dispatchers.IO.limitedParallelism(100)
++ * // 60 threads for MongoDB connection
++ * val myMongoDbDispatcher = Dispatchers.IO.limitedParallelism(60)
++ * ```
++ * the system may have up to `64 + 100 + 60` threads dedicated to blocking tasks during peak loads,
++ * but during its steady state there is only a small number of threads shared
++ * among `Dispatchers.IO`, `myMysqlDbDispatcher` and `myMongoDbDispatcher`
++ */
++@Suppress("EXTENSION_SHADOWED_BY_MEMBER")
++public actual val Dispatchers.IO: CoroutineDispatcher
++    // region Tencent Code
++    get() = getDarwinIODispatchers()
++    // endregion
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/nativeDarwin/src/Runnable.common.nativeDarwin.kt b/kotlinx-coroutines-core/nativeDarwin/src/Runnable.common.nativeDarwin.kt
+new file mode 100644
+index 000000000..fa50c0839
+--- /dev/null
++++ b/kotlinx-coroutines-core/nativeDarwin/src/Runnable.common.nativeDarwin.kt
+@@ -0,0 +1,5 @@
++package kotlinx.coroutines
++
++internal actual fun log(tag: String, messageBlock: () -> String) {
++    // Do Nothing
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/nativeOhos/src/Dispatchers.nativeOhos.kt b/kotlinx-coroutines-core/nativeOhos/src/Dispatchers.nativeOhos.kt
+new file mode 100644
+index 000000000..cc1b5e10f
+--- /dev/null
++++ b/kotlinx-coroutines-core/nativeOhos/src/Dispatchers.nativeOhos.kt
+@@ -0,0 +1,34 @@
++package kotlinx.coroutines
++
++/**
++ * The [CoroutineDispatcher] that is designed for offloading blocking IO tasks to a shared pool of threads.
++ * Additional threads in this pool are created on demand.
++ * Default IO pool size is `64`; on JVM it can be configured using JVM-specific mechanisms,
++ * please refer to `Dispatchers.IO` documentation on JVM platform.
++ *
++ * ### Elasticity for limited parallelism
++ *
++ * `Dispatchers.IO` has a unique property of elasticity: its views
++ * obtained with [CoroutineDispatcher.limitedParallelism] are
++ * not restricted by the `Dispatchers.IO` parallelism. Conceptually, there is
++ * a dispatcher backed by an unlimited pool of threads, and both `Dispatchers.IO`
++ * and views of `Dispatchers.IO` are actually views of that dispatcher. In practice
++ * this means that, despite not abiding by `Dispatchers.IO`'s parallelism
++ * restrictions, its views share threads and resources with it.
++ *
++ * In the following example
++ * ```
++ * // 100 threads for MySQL connection
++ * val myMysqlDbDispatcher = Dispatchers.IO.limitedParallelism(100)
++ * // 60 threads for MongoDB connection
++ * val myMongoDbDispatcher = Dispatchers.IO.limitedParallelism(60)
++ * ```
++ * the system may have up to `64 + 100 + 60` threads dedicated to blocking tasks during peak loads,
++ * but during its steady state there is only a small number of threads shared
++ * among `Dispatchers.IO`, `myMysqlDbDispatcher` and `myMongoDbDispatcher`
++ */
++@Suppress("EXTENSION_SHADOWED_BY_MEMBER")
++public actual val Dispatchers.IO: CoroutineDispatcher
++    // region Tencent Code
++    get() = DefaultIoScheduler
++    // endregion
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/nativeOhos/src/MainHandler.kt b/kotlinx-coroutines-core/nativeOhos/src/MainHandler.kt
+new file mode 100644
+index 000000000..bcb896029
+--- /dev/null
++++ b/kotlinx-coroutines-core/nativeOhos/src/MainHandler.kt
+@@ -0,0 +1,49 @@
++package kotlinx.coroutines
++
++import kotlinx.cinterop.*
++import platform.ohos.*
++
++@OptIn(ExperimentalForeignApi::class)
++private lateinit var tsfn: napi_threadsafe_function
++
++@OptIn(ExperimentalForeignApi::class)
++private var mainTid: Int = coroutines_get_pid()
++
++@OptIn(ExperimentalForeignApi::class)
++internal fun isMainThread(): Boolean {
++    return coroutines_get_tid() == mainTid
++}
++
++@OptIn(ExperimentalForeignApi::class)
++private fun callJSInThreadSafeFunction(
++    env: napi_env?,
++    value: napi_value?,
++    context: COpaquePointer?,
++    data: COpaquePointer?
++) {
++    val blockRef = data?.asStableRef<() -> Unit>() ?: return
++    val block = blockRef.get()
++    blockRef.dispose()
++    return block.invoke()
++}
++
++@OptIn(ExperimentalForeignApi::class)
++public fun initMainHandler(env: napi_env) {
++    tsfn = createTSFWithCallback(
++        env,
++        "MainHandlerWorker",
++        staticCFunction(::callJSInThreadSafeFunction)
++    )!!
++    OH_LOG_Print(LOG_APP, LOG_INFO, 0u, "MainHandler", "initMainHandler success")
++}
++
++@OptIn(ExperimentalForeignApi::class)
++internal fun runOnMainThread(immediately: Boolean, block: () -> Unit) {
++    if (immediately && isMainThread()) {
++        block()
++    } else {
++        val ref = StableRef.create(block)
++        callTSFWithData(tsfn, ref.asCPointer())
++    }
++}
++
+diff --git a/kotlinx-coroutines-core/nativeOhos/src/OhosMainDispatchers.kt b/kotlinx-coroutines-core/nativeOhos/src/OhosMainDispatchers.kt
+new file mode 100644
+index 000000000..b1fbead5b
+--- /dev/null
++++ b/kotlinx-coroutines-core/nativeOhos/src/OhosMainDispatchers.kt
+@@ -0,0 +1,46 @@
++@file:OptIn(ExperimentalNativeApi::class)
++
++package kotlinx.coroutines
++
++import kotlin.coroutines.*
++import kotlin.experimental.*
++import kotlin.native.*
++
++private const val MAX_DELAY = Long.MAX_VALUE / 2
++
++internal actual fun createMainDispatcher(default: CoroutineDispatcher): MainCoroutineDispatcher =
++    OhosMainCoroutineDispatcher(false)
++
++internal actual fun createDefaultDispatcher(): CoroutineDispatcher = DefaultDispatcher
++
++private object DefaultDispatcher : CoroutineDispatcher() {
++    @OptIn(ExperimentalNativeApi::class)
++    private val ctx = newFixedThreadPoolContext(
++        Platform.getAvailableProcessors().coerceAtLeast(2),
++        "Dispatchers.Default"
++    )
++
++    override fun dispatch(context: CoroutineContext, block: Runnable) {
++        ctx.dispatch(context, block)
++    }
++}
++
++@OptIn(InternalCoroutinesApi::class)
++private class OhosMainCoroutineDispatcher(
++    private val invokeImmediately: Boolean
++) : MainCoroutineDispatcher() {
++    override val immediate: MainCoroutineDispatcher = if (invokeImmediately) this else OhosMainCoroutineDispatcher(true)
++
++    override fun dispatch(context: CoroutineContext, block: Runnable) {
++        runOnMainThread(invokeImmediately){
++            block.run()
++        }
++    }
++
++    override fun isDispatchNeeded(context: CoroutineContext): Boolean {
++        return !(invokeImmediately && isMainThread())
++    }
++
++}
++
++internal actual inline fun platformAutoreleasePool(crossinline block: () -> Unit) = block()
+diff --git a/kotlinx-coroutines-core/nativeOhos/src/Runnable.common.nativeOhos.kt b/kotlinx-coroutines-core/nativeOhos/src/Runnable.common.nativeOhos.kt
+new file mode 100644
+index 000000000..fa50c0839
+--- /dev/null
++++ b/kotlinx-coroutines-core/nativeOhos/src/Runnable.common.nativeOhos.kt
+@@ -0,0 +1,5 @@
++package kotlinx.coroutines
++
++internal actual fun log(tag: String, messageBlock: () -> String) {
++    // Do Nothing
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/nativeOther/src/Dispatchers.nativeOther.kt b/kotlinx-coroutines-core/nativeOther/src/Dispatchers.nativeOther.kt
+new file mode 100644
+index 000000000..cc1b5e10f
+--- /dev/null
++++ b/kotlinx-coroutines-core/nativeOther/src/Dispatchers.nativeOther.kt
+@@ -0,0 +1,34 @@
++package kotlinx.coroutines
++
++/**
++ * The [CoroutineDispatcher] that is designed for offloading blocking IO tasks to a shared pool of threads.
++ * Additional threads in this pool are created on demand.
++ * Default IO pool size is `64`; on JVM it can be configured using JVM-specific mechanisms,
++ * please refer to `Dispatchers.IO` documentation on JVM platform.
++ *
++ * ### Elasticity for limited parallelism
++ *
++ * `Dispatchers.IO` has a unique property of elasticity: its views
++ * obtained with [CoroutineDispatcher.limitedParallelism] are
++ * not restricted by the `Dispatchers.IO` parallelism. Conceptually, there is
++ * a dispatcher backed by an unlimited pool of threads, and both `Dispatchers.IO`
++ * and views of `Dispatchers.IO` are actually views of that dispatcher. In practice
++ * this means that, despite not abiding by `Dispatchers.IO`'s parallelism
++ * restrictions, its views share threads and resources with it.
++ *
++ * In the following example
++ * ```
++ * // 100 threads for MySQL connection
++ * val myMysqlDbDispatcher = Dispatchers.IO.limitedParallelism(100)
++ * // 60 threads for MongoDB connection
++ * val myMongoDbDispatcher = Dispatchers.IO.limitedParallelism(60)
++ * ```
++ * the system may have up to `64 + 100 + 60` threads dedicated to blocking tasks during peak loads,
++ * but during its steady state there is only a small number of threads shared
++ * among `Dispatchers.IO`, `myMysqlDbDispatcher` and `myMongoDbDispatcher`
++ */
++@Suppress("EXTENSION_SHADOWED_BY_MEMBER")
++public actual val Dispatchers.IO: CoroutineDispatcher
++    // region Tencent Code
++    get() = DefaultIoScheduler
++    // endregion
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/nativeOther/src/Runnable.common.nativeOther.kt b/kotlinx-coroutines-core/nativeOther/src/Runnable.common.nativeOther.kt
+new file mode 100644
+index 000000000..fa50c0839
+--- /dev/null
++++ b/kotlinx-coroutines-core/nativeOther/src/Runnable.common.nativeOther.kt
+@@ -0,0 +1,5 @@
++package kotlinx.coroutines
++
++internal actual fun log(tag: String, messageBlock: () -> String) {
++    // Do Nothing
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/CMakeLists.txt b/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/CMakeLists.txt
+new file mode 100644
+index 000000000..fca2ace08
+--- /dev/null
++++ b/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/CMakeLists.txt
+@@ -0,0 +1,28 @@
++# 指定CMake的最小版本
++CMAKE_MINIMUM_REQUIRED(VERSION 3.16)
++PROJECT(napi_func)
++
++add_definitions(-DOHOS_PLATFORM)
++
++set(NAPI_BRIDGE_ROOT_PATH ${CMAKE_CURRENT_SOURCE_DIR})
++
++set(TARGET_NAME napi_func)
++
++SET(NAPI_BRIDGE_SRC ${NAPI_BRIDGE_ROOT_PATH}/src)
++
++include_directories(${NAPI_BRIDGE_ROOT_PATH}/include)
++
++add_library(${TARGET_NAME} STATIC
++        include/func.h
++        src/func.cpp
++)
++
++set_target_properties(${TARGET_NAME} PROPERTIES IMPORTED_NO_SONAME TRUE)
++
++SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2")
++
++SET(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} -Wl,--emit-relocs --verbose")
++
++target_link_libraries(${TARGET_NAME} PUBLIC libace_napi.z.so)
++target_compile_features(${TARGET_NAME} PUBLIC cxx_std_17)
++
+diff --git a/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/README.md b/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/README.md
+new file mode 100644
+index 000000000..31b3cc901
+--- /dev/null
++++ b/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/README.md
+@@ -0,0 +1,28 @@
++# NApi Bridge
++
++本库旨在解决 Kotlin Native 写 C 逻辑较为晦涩难懂。主要有以下几个职责：
++
++### 职责
++
++1. 承接 Kotlin Native 调用 napi 底层接口的能力
++2. 期望使用 C++ 高级特性的代码（但最终暴露仍然需要以 C 符号进行暴露
++
++### 编译指引
++
++1. 创建 build 文件夹
++
++```bash
++mkdir build && cd build
++```
++
++2. 生成 CMake 所需的编译文件
++
++```bash
++cmake -DOHOS_STL=c++_shared -DCMAKE_BUILD_TYPE=Rlease -DOHOS_PLATFORM=OHOS -DCMAKE_TOOLCHAIN_FILE=$OHOS_SDK_NATIVE/build/cmake/ohos.toolchain.cmake ..
++```
++
++3. 编译
++
++```bash
++cmake --build .
++```
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/include/func.h b/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/include/func.h
+new file mode 100644
+index 000000000..d25b9093e
+--- /dev/null
++++ b/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/include/func.h
+@@ -0,0 +1,18 @@
++#ifndef NAPI_BRIDGE_FUNCTION_H
++#define NAPI_BRIDGE_FUNCTION_H
++
++#include "napi/native_api.h"
++#include "js_native_api.h"
++#include "js_native_api_types.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++napi_threadsafe_function createTSFWithCallback(napi_env env, const char *workName, void *callback);
++
++void callTSFWithData(napi_threadsafe_function tsfn, void *data);
++
++#ifdef __cplusplus
++}
++#endif
++#endif //NAPI_BRIDGE_FUNCTION_H
+diff --git a/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/src/func.cpp b/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/src/func.cpp
+new file mode 100644
+index 000000000..af5eef43b
+--- /dev/null
++++ b/kotlinx-coroutines-core/src/nativeInterop/cinterop/cpp/src/func.cpp
+@@ -0,0 +1,17 @@
++#include "func.h"
++
++napi_threadsafe_function
++createTSFWithCallback(napi_env env, const char *workName, void *callback) {
++    napi_value workNameNapiValue = 0;
++    napi_create_string_utf8(env, workName, NAPI_AUTO_LENGTH, &workNameNapiValue);
++    napi_threadsafe_function tsfn;
++    napi_create_threadsafe_function(env, 0, NULL, workNameNapiValue, 0, 1, NULL, NULL, NULL,
++                                    (napi_threadsafe_function_call_js) callback, &tsfn);
++    return tsfn;
++}
++
++void callTSFWithData(napi_threadsafe_function tsfn, void *data) {
++    napi_acquire_threadsafe_function(tsfn);
++    napi_call_threadsafe_function_with_priority(tsfn, data, napi_priority_high, true);
++}
++
+diff --git a/kotlinx-coroutines-core/src/nativeInterop/cinterop/interop.def b/kotlinx-coroutines-core/src/nativeInterop/cinterop/interop.def
+new file mode 100644
+index 000000000..d21bfa861
+--- /dev/null
++++ b/kotlinx-coroutines-core/src/nativeInterop/cinterop/interop.def
+@@ -0,0 +1,17 @@
++package = kotlinx.coroutines
++headers = func.h
++staticLibraries = libnapi_func.a
++libraryPaths = libs
++linkerOpts = -lace_napi.z
++
++---
++
++#include <unistd.h>
++
++int coroutines_get_tid() {
++  return (int)gettid();
++}
++
++int coroutines_get_pid() {
++  return (int)getpid();
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-test/js/src/TestBuilders.kt b/kotlinx-coroutines-test/js/src/TestBuilders.kt
+index 8d30201c3..edd1ca178 100644
+--- a/kotlinx-coroutines-test/js/src/TestBuilders.kt
++++ b/kotlinx-coroutines-test/js/src/TestBuilders.kt
+@@ -1,15 +1,16 @@
+ package kotlinx.coroutines.test
++
+ import kotlinx.coroutines.*
+-import kotlin.js.*
++import kotlinx.coroutines.test.internal.*
+ 
+ @Suppress("ACTUAL_WITHOUT_EXPECT", "ACTUAL_TYPE_ALIAS_TO_CLASS_WITH_DECLARATION_SITE_VARIANCE")
+-public actual typealias TestResult = Promise<Unit>
++public actual typealias TestResult = JsPromiseInterfaceForTesting
+ 
+ internal actual fun systemPropertyImpl(name: String): String? = null
+ 
+ internal actual fun createTestResult(testProcedure: suspend CoroutineScope.() -> Unit): TestResult =
+     GlobalScope.promise {
+         testProcedure()
+-    }
++    } as JsPromiseInterfaceForTesting
+ 
+ internal actual fun dumpCoroutines() { }
+diff --git a/kotlinx-coroutines-test/js/src/internal/JsPromiseInterfaceForTesting.kt b/kotlinx-coroutines-test/js/src/internal/JsPromiseInterfaceForTesting.kt
+new file mode 100644
+index 000000000..753c51dfa
+--- /dev/null
++++ b/kotlinx-coroutines-test/js/src/internal/JsPromiseInterfaceForTesting.kt
+@@ -0,0 +1,19 @@
++package kotlinx.coroutines.test.internal
++
++/* This is a declaration of JS's `Promise<Unit>`. We need to keep it a separate class, because
++`actual typealias TestResult = Promise<Unit>` fails: you can't instantiate an `expect class` with a typealias to
++a parametric class. So, we make a non-parametric class just for this. */
++/**
++ * @suppress
++ */
++@JsName("Promise")
++public external class JsPromiseInterfaceForTesting {
++    /**
++     * @suppress
++     */
++    public fun then(onFulfilled: ((Unit) -> Unit), onRejected: ((Throwable) -> Unit)): JsPromiseInterfaceForTesting
++    /**
++     * @suppress
++     */
++    public fun then(onFulfilled: ((Unit) -> Unit)): JsPromiseInterfaceForTesting
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-test/wasmJs/src/TestBuilders.kt b/kotlinx-coroutines-test/wasmJs/src/TestBuilders.kt
+index 7794b8ec7..6500d485f 100644
+--- a/kotlinx-coroutines-test/wasmJs/src/TestBuilders.kt
++++ b/kotlinx-coroutines-test/wasmJs/src/TestBuilders.kt
+@@ -1,15 +1,16 @@
+ package kotlinx.coroutines.test
+ import kotlinx.coroutines.*
++import kotlinx.coroutines.test.internal.*
+ import kotlin.js.*
+ 
+ @Suppress("ACTUAL_WITHOUT_EXPECT", "ACTUAL_TYPE_ALIAS_TO_CLASS_WITH_DECLARATION_SITE_VARIANCE")
+-public actual typealias TestResult = Promise<JsAny?>
++public actual typealias TestResult = JsPromiseInterfaceForTesting
+ 
+ internal actual fun systemPropertyImpl(name: String): String? = null
+ 
+ internal actual fun createTestResult(testProcedure: suspend CoroutineScope.() -> Unit): TestResult =
+     GlobalScope.promise {
+         testProcedure()
+-    }
++    }.unsafeCast()
+ 
+ internal actual fun dumpCoroutines() { }
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-test/wasmJs/src/internal/JsPromiseInterfaceForTesting.kt b/kotlinx-coroutines-test/wasmJs/src/internal/JsPromiseInterfaceForTesting.kt
+new file mode 100644
+index 000000000..e6697db30
+--- /dev/null
++++ b/kotlinx-coroutines-test/wasmJs/src/internal/JsPromiseInterfaceForTesting.kt
+@@ -0,0 +1,19 @@
++package kotlinx.coroutines.test.internal
++
++/* This is a declaration of JS's `Promise<Unit>`. We need to keep it a separate class, because
++`actual typealias TestResult = Promise<Unit>` fails: you can't instantiate an `expect class` with a typealias to
++a parametric class. So, we make a non-parametric class just for this. */
++/**
++ * @suppress
++ */
++@JsName("Promise")
++public external class JsPromiseInterfaceForTesting {
++    /**
++     * @suppress
++     */
++    public fun then(onFulfilled: ((JsAny) -> Unit), onRejected: ((JsAny) -> Unit)): JsPromiseInterfaceForTesting
++    /**
++     * @suppress
++     */
++    public fun then(onFulfilled: ((JsAny) -> Unit)): JsPromiseInterfaceForTesting
++}
+\ No newline at end of file
+diff --git a/kotlinx-coroutines-test/wasmJs/src/internal/TestMainDispatcher.kt b/kotlinx-coroutines-test/wasmJs/src/internal/TestMainDispatcher.kt
+index 175a84695..be0b1686a 100644
+--- a/kotlinx-coroutines-test/wasmJs/src/internal/TestMainDispatcher.kt
++++ b/kotlinx-coroutines-test/wasmJs/src/internal/TestMainDispatcher.kt
+@@ -1,7 +1,7 @@
+ package kotlinx.coroutines.test.internal
+ import kotlinx.coroutines.*
+ 
+-@Suppress("INVISIBLE_MEMBER")
++@Suppress("INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")
+ internal actual fun Dispatchers.getTestMainDispatcher(): TestMainDispatcher =
+     when (val mainDispatcher = Main) {
+         is TestMainDispatcher -> mainDispatcher
+diff --git a/settings.gradle.kts b/settings.gradle.kts
+index 423c613f3..2d53c0e32 100644
+--- a/settings.gradle.kts
++++ b/settings.gradle.kts
+@@ -6,6 +6,7 @@ pluginManagement {
+     }
+ 
+     repositories {
++        maven(url = "https://mirrors.tencent.com/nexus/repository/maven-public")
+         maven(url = "https://maven.pkg.jetbrains.space/kotlin/p/dokka/dev/")
+         gradlePluginPortal()
+     }
+diff --git a/ui/kotlinx-coroutines-android/build.gradle.kts b/ui/kotlinx-coroutines-android/build.gradle.kts
+index a09d02ca7..d050b7739 100644
+--- a/ui/kotlinx-coroutines-android/build.gradle.kts
++++ b/ui/kotlinx-coroutines-android/build.gradle.kts
+@@ -5,6 +5,7 @@ configurations {
+ }
+ 
+ repositories {
++    maven(url = "https://mirrors.tencent.com/nexus/repository/maven-public")
+     mavenCentral()
+ }
+ 

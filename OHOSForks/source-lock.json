@@ -1,0 +1,23 @@
+{
+  "schema": 1,
+  "sources": {
+    "atomicfu": {
+      "repository": "https://github.com/Kotlin/kotlinx.atomicfu.git",
+      "commit": "7e640bab1db140a398f735be97e3f07f97019ac0",
+      "patch": "patches/kotlinx.atomicfu.patch",
+      "patchSha256": "71690f6bb553cd0741ba0132711aa576e73fb9e02b3a0600e02f8676c6d50f70",
+      "preparedTree": "e78b0d497ed39dc8f055851c79460da4d775cc2b",
+      "preparedTreeManifestSha256": "9d77a588e5227306b9e4f3557f7bfe236144128a8320473b03833d7bc7f206c8",
+      "positiveControl": "atomicfu/src/ohosArm64Main/kotlin/kotlinx/atomicfu/locks/Synchronized.ohosArm64.kt"
+    },
+    "coroutines": {
+      "repository": "https://github.com/Kotlin/kotlinx.coroutines.git",
+      "commit": "8c516f5ab1fcc39629d2838489598135eedd7b80",
+      "patch": "patches/kotlinx-coroutines.patch",
+      "patchSha256": "b85b83e2a3237fee2a5e593ad72baade99c6e1f3bb9f6130122ff9fbd42b2636",
+      "preparedTree": "7b4988bcfece075bf4b641a997dbdd8caf4e7745",
+      "preparedTreeManifestSha256": "056cbcd159ab4a9721d1226ceb9b609ea260166249a6c2b054884dd976015c20",
+      "positiveControl": "kotlinx-coroutines-core/nativeOhos/src/MainHandler.kt"
+    }
+  }
+}

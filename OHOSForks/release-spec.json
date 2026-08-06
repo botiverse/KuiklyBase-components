@@ -1,0 +1,47 @@
+{
+  "schema": 1,
+  "carrierRepository": "https://github.com/botiverse/KuiklyBase-components.git",
+  "kotlinVersion": "2.0.21-KBA-010",
+  "atomicfuBuildPluginVersion": "0.23.2",
+  "harmonyImage": "ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image@sha256:cbe95055b155c4eb71d234f24b47d481a1b20b7e96defe3f24ab3219aff55347",
+  "components": {
+    "atomicfu": {
+      "group": "org.jetbrains.kotlinx",
+      "rootArtifact": "atomicfu",
+      "targetArtifact": "atomicfu-ohosarm64",
+      "version": "0.23.2-raft.1",
+      "upstreamRepository": "https://github.com/Kotlin/kotlinx.atomicfu.git",
+      "upstreamSha": "7e640bab1db140a398f735be97e3f07f97019ac0",
+      "patchSha256": "71690f6bb553cd0741ba0132711aa576e73fb9e02b3a0600e02f8676c6d50f70",
+      "preparedTree": "e78b0d497ed39dc8f055851c79460da4d775cc2b",
+      "preparedTreeManifestSha256": "9d77a588e5227306b9e4f3557f7bfe236144128a8320473b03833d7bc7f206c8",
+      "abiControl": {
+        "coordinate": "org.jetbrains.kotlinx:atomicfu-ohosarm64:0.23.2-KBA-001",
+        "url": "https://mirrors.tencent.com/nexus/repository/maven-public/org/jetbrains/kotlinx/atomicfu-ohosarm64/0.23.2-KBA-001/atomicfu-ohosarm64-0.23.2-KBA-001.klib",
+        "sha256": "f6138483f286d356e5d33eb3168d727f357b4583766ab0faec29dc65d320468f",
+        "normalizedAbiSha256": "aee69e75e93055a3b617afed73fa54b9a4e3baeb76cffe828822b1edcb329aac"
+      }
+    },
+    "coroutines": {
+      "group": "org.jetbrains.kotlinx",
+      "rootArtifact": "kotlinx-coroutines-core",
+      "targetArtifact": "kotlinx-coroutines-core-ohosarm64",
+      "version": "1.8.0-raft.1",
+      "upstreamRepository": "https://github.com/Kotlin/kotlinx.coroutines.git",
+      "upstreamSha": "8c516f5ab1fcc39629d2838489598135eedd7b80",
+      "patchSha256": "b85b83e2a3237fee2a5e593ad72baade99c6e1f3bb9f6130122ff9fbd42b2636",
+      "preparedTree": "7b4988bcfece075bf4b641a997dbdd8caf4e7745",
+      "preparedTreeManifestSha256": "056cbcd159ab4a9721d1226ceb9b609ea260166249a6c2b054884dd976015c20",
+      "abiControl": {
+        "coordinate": "org.jetbrains.kotlinx:kotlinx-coroutines-core-ohosarm64:1.8.0-KBA-002",
+        "url": "https://mirrors.tencent.com/nexus/repository/maven-public/org/jetbrains/kotlinx/kotlinx-coroutines-core-ohosarm64/1.8.0-KBA-002/kotlinx-coroutines-core-ohosarm64-1.8.0-KBA-002.klib",
+        "sha256": "06265093e5d8fe265e43dd4143e49811eba5d732fc6535cbfde3deb5fdb8255e",
+        "normalizedAbiSha256": "a6c8aa29e5b4686fb5457a8501a4f80fb17fe4ac0a2e1434675b2597e4cb4dac",
+        "embeddedArchive": {
+          "path": "default/targets/ohos_arm64/included/libnapi_func.a",
+          "sha256": "9df6a4843a8df6db6b08b882e0968d44a672147c65b0e684b9cb944763968f26"
+        }
+      }
+    }
+  }
+}
