@@ -79,6 +79,9 @@ internal interface AndroidCurlNativeBridge {
 
     suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse
 
+    /** Executes outside the process pooled CURLM engines on a new easy handle. */
+    suspend fun executeFresh(request: AndroidCurlNativeRequest): CurlNativeResponse
+
     suspend fun downloadStream(
         request: AndroidCurlNativeRequest,
         onResponseStart: (Long, String) -> Unit,
@@ -126,6 +129,9 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
             perform(request, MODE_BUFFERED, null, null, null)
         }
     }
+
+    override suspend fun executeFresh(request: AndroidCurlNativeRequest): CurlNativeResponse =
+        perform(request, MODE_BUFFERED, null, null, null)
 
     override suspend fun downloadStream(
         request: AndroidCurlNativeRequest,

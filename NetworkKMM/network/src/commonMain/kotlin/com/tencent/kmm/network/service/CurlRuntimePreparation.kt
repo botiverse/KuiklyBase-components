@@ -18,6 +18,7 @@ package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.export.NetworkCurlConfigurationFailureReason
 import com.tencent.kmm.network.export.NetworkCurlProxyMode
+import com.tencent.kmm.network.export.NetworkCurlProxyHttp3Environment
 import com.tencent.kmm.network.export.NetworkCurlTrustMode
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
 import com.tencent.kmm.network.export.NetworkEngineFeatureReason
@@ -35,6 +36,14 @@ private const val CURL_RUNTIME_CA_PATH = "com.tencent.kmm.network.curl.runtime.c
 private const val CURL_RUNTIME_PROXY_URL = "com.tencent.kmm.network.curl.runtime.proxy_url"
 private const val CURL_RUNTIME_TRUST = "com.tencent.kmm.network.curl.runtime.trust"
 private const val CURL_RUNTIME_HTTP3 = "com.tencent.kmm.network.curl.runtime.http3"
+private const val CURL_RUNTIME_HTTP3_REQUESTED =
+    "com.tencent.kmm.network.curl.runtime.http3_requested"
+private const val CURL_RUNTIME_PROXY_HTTP3_GENERATION =
+    "com.tencent.kmm.network.curl.runtime.proxy_http3_generation"
+private const val CURL_RUNTIME_PROXY_HTTP3_FINGERPRINT =
+    "com.tencent.kmm.network.curl.runtime.proxy_http3_fingerprint"
+private const val CURL_RUNTIME_PROXY_FINGERPRINT =
+    "com.tencent.kmm.network.curl.runtime.proxy_fingerprint"
 
 internal const val CURL_RUNTIME_TRUST_PLATFORM_DEFAULT = "platform_default"
 internal const val CURL_RUNTIME_TRUST_APP_OWNED = "app_owned"
@@ -84,22 +93,24 @@ internal expect fun resolveCurlSystemProxy(url: String): CurlSystemProxyResoluti
 internal fun prepareCurlRuntime(
     request: NetworkRequest,
     platformDefaultTrust: CurlPlatformDefaultTrust = curlPlatformDefaultTrust,
-    nativeHttp3Supported: Boolean = platformCurlSupportsHttp3()
+    nativeHttp3Supported: Boolean = platformCurlSupportsHttp3(),
+    onRuntimeSnapshot: (() -> Unit)? = null
 ): NetworkEngineAvailability {
     if (request.metadata[CURL_RUNTIME_READY] == "true") {
         return NetworkEngineAvailability.Available
     }
-    val configuration = VBTransportCurl.snapshot()
+    val runtimeSnapshot = VBTransportCurl.runtimeSnapshot()
+    onRuntimeSnapshot?.invoke()
+    val configuration = runtimeSnapshot.configuration
     val http3Requested = request.curlHttp3EnabledOverride
         ?: configuration?.http3Enabled
         ?: false
-    // Record the effective per-request decision before eligibility checks so
-    // completion diagnostics can distinguish an H3 request that failed over
-    // or failed closed from ordinary curl/H2 traffic. CURL_RUNTIME_READY is
-    // still written only after every runtime input has been validated.
-    request.metadata[CURL_RUNTIME_HTTP3] = http3Requested.toString()
+    // Preserve intent separately from the effective mode. A proxy/H3 latch may
+    // force this request onto H2 while diagnostics still need to show that H3
+    // was requested by policy.
+    request.metadata[CURL_RUNTIME_HTTP3_REQUESTED] = http3Requested.toString()
     if (configuration == null) {
-        if (VBTransportCurl.trustMode == NetworkCurlTrustMode.PLATFORM_DEFAULT &&
+        if (runtimeSnapshot.trustMode == NetworkCurlTrustMode.PLATFORM_DEFAULT &&
             platformDefaultTrust.available
         ) {
             if (http3Requested && !nativeHttp3Supported) {
@@ -113,12 +124,17 @@ internal fun prepareCurlRuntime(
             // compiled CURL_CA_BUNDLE applies) and the proxy is pinned to
             // explicit direct ("" disables libcurl's environment proxies),
             // so the default's semantics are deterministic, not ambient.
-            request.metadata[CURL_RUNTIME_PROXY_URL] = ""
+            prepareCurlProxyAndHttp3(
+                request = request,
+                proxyUrl = "",
+                http3Requested = http3Requested,
+                expectedGeneration = runtimeSnapshot.proxyHttp3Generation
+            )
             request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_PLATFORM_DEFAULT
             request.metadata[CURL_RUNTIME_READY] = "true"
             return NetworkEngineAvailability.Available
         }
-        val status = VBTransportCurl.configurationStatus
+        val status = runtimeSnapshot.status
         val reason = when (status.failureReason) {
             NetworkCurlConfigurationFailureReason.TRUST_STORE_PATH_BLANK ->
                 NetworkEngineUnavailableReason.TRUST_STORE_NOT_CONFIGURED
@@ -173,7 +189,12 @@ internal fun prepareCurlRuntime(
         }
     }
     request.metadata[CURL_RUNTIME_CA_PATH] = configuration.trustStore.path
-    request.metadata[CURL_RUNTIME_PROXY_URL] = proxyUrl
+    prepareCurlProxyAndHttp3(
+        request = request,
+        proxyUrl = proxyUrl,
+        http3Requested = http3Requested,
+        expectedGeneration = runtimeSnapshot.proxyHttp3Generation
+    )
     request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_APP_OWNED
     request.metadata[CURL_RUNTIME_READY] = "true"
     return NetworkEngineAvailability.Available
@@ -193,13 +214,52 @@ internal fun preparedCurlHttp3Enabled(request: NetworkRequest): Boolean =
     request.metadata[CURL_RUNTIME_HTTP3] == "true"
 
 internal fun preparedCurlHttp3Requested(request: NetworkRequest): Boolean? =
-    request.metadata[CURL_RUNTIME_HTTP3]?.let { value ->
+    request.metadata[CURL_RUNTIME_HTTP3_REQUESTED]?.let { value ->
         when (value) {
             "true" -> true
             "false" -> false
             else -> null
         }
     }
+
+internal fun preparedCurlProxyHttp3Environment(
+    request: NetworkRequest
+): NetworkCurlProxyHttp3Environment? {
+    val generation = request.metadata[CURL_RUNTIME_PROXY_HTTP3_GENERATION]?.toLongOrNull()
+        ?: return null
+    val proxyFingerprint = request.metadata[CURL_RUNTIME_PROXY_FINGERPRINT] ?: return null
+    val fingerprint = request.metadata[CURL_RUNTIME_PROXY_HTTP3_FINGERPRINT] ?: return null
+    return NetworkCurlProxyHttp3Environment(
+        generation = generation,
+        proxyFingerprint = proxyFingerprint,
+        fingerprint = fingerprint,
+        h2Latched = !preparedCurlHttp3Enabled(request) && preparedCurlHttp3Requested(request) == true
+    )
+}
+
+internal fun latchPreparedCurlProxyHttp3Fallback(request: NetworkRequest): Boolean {
+    val environment = preparedCurlProxyHttp3Environment(request) ?: return false
+    return VBTransportCurl.latchProxyHttp3Fallback(environment)
+}
+
+internal fun forcePreparedCurlHttp2(request: NetworkRequest) {
+    request.metadata[CURL_RUNTIME_HTTP3] = "false"
+}
+
+private fun prepareCurlProxyAndHttp3(
+    request: NetworkRequest,
+    proxyUrl: String,
+    http3Requested: Boolean,
+    expectedGeneration: Long
+) {
+    val environment = VBTransportCurl.proxyHttp3Environment(proxyUrl, expectedGeneration)
+    request.metadata[CURL_RUNTIME_PROXY_URL] = proxyUrl
+    request.metadata[CURL_RUNTIME_HTTP3] =
+        (http3Requested && !environment.h2Latched).toString()
+    request.metadata[CURL_RUNTIME_PROXY_HTTP3_GENERATION] = environment.generation.toString()
+    request.metadata[CURL_RUNTIME_PROXY_HTTP3_FINGERPRINT] = environment.fingerprint
+    request.metadata[CURL_RUNTIME_PROXY_FINGERPRINT] = environment.proxyFingerprint
+}
 
 internal fun curlRuntimeFailureResponse(
     request: NetworkRequest,

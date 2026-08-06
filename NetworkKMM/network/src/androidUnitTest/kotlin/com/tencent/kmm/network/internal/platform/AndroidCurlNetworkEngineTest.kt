@@ -318,6 +318,206 @@ class AndroidCurlNetworkEngineTest {
     }
 
     @Test
+    fun explicitProxyHttp3FailureRetriesGetOnceOnFreshH2AndLatchesEnvironment() = runBlocking {
+        configureManualProxyHttp3()
+        VBTransportCurl.updateNetworkEnvironment("android-network-1|vpn=true|proxy=127.0.0.1:8888")
+        val bridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(
+                code = 35,
+                errorMsg = "HTTP/3 is not supported over an HTTP proxy"
+            )
+            freshExecuteResponse = CurlNativeResponse(
+                code = 0,
+                httpCode = 200,
+                data = "ok".encodeToByteArray()
+            )
+        }
+        val request = NetworkRequest(
+            method = VBTransportMethod.GET,
+            url = "https://example.test/runtime-models",
+            policy = NetworkRequestPolicy(timeoutMillis = 20_000)
+        )
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals("ok", response.body.text())
+        assertEquals(1, bridge.executeRequests.size)
+        assertEquals(1, bridge.freshExecuteRequests.size)
+        assertTrue(bridge.executeRequests.single().http3Enabled)
+        assertFalse(bridge.freshExecuteRequests.single().http3Enabled)
+        assertTrue(bridge.freshExecuteRequests.single().timeoutMillis in 1..20_000)
+        assertTrue(response.timing.freshRetry)
+        assertEquals("proxy_h3_to_h2_success", response.timing.freshRetryResult)
+        assertEquals(true, preparedCurlHttp3Requested(request))
+
+        bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val next = NetworkRequest(url = "https://example.test/agents")
+        AndroidCurlNetworkEngine(bridge).execute(next, NetworkCall(next))
+        assertFalse(bridge.executeRequests.last().http3Enabled)
+        assertEquals(true, preparedCurlHttp3Requested(next))
+    }
+
+    @Test
+    fun explicitProxyHttp3FailureAlsoRetriesHeadButNeverReplaysPost() = runBlocking {
+        configureManualProxyHttp3()
+        val message = "HTTP/3 is not supported over an HTTP proxy"
+        val headBridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(code = 56, errorMsg = message)
+            freshExecuteResponse = CurlNativeResponse(code = 0, httpCode = 204)
+        }
+        val head = NetworkRequest(method = VBTransportMethod.HEAD, url = "https://example.test/health")
+        assertEquals(204, AndroidCurlNetworkEngine(headBridge).execute(head, NetworkCall(head)).statusCode)
+        assertEquals(1, headBridge.freshExecuteRequests.size)
+
+        VBTransportCurl.updateNetworkEnvironment("post-environment")
+        val postBridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(code = 35, errorMsg = message)
+        }
+        val post = NetworkRequest(
+            method = VBTransportMethod.POST,
+            url = "https://example.test/agents/start",
+            body = NetworkBody.Json("{}")
+        )
+        val failed = AndroidCurlNetworkEngine(postBridge).execute(post, NetworkCall(post))
+
+        assertNull(failed.statusCode)
+        assertEquals(1, postBridge.executeRequests.size)
+        assertEquals(0, postBridge.freshExecuteRequests.size)
+        assertFalse(failed.timing.freshRetry)
+
+        postBridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val afterPost = NetworkRequest(url = "https://example.test/runtime-models")
+        AndroidCurlNetworkEngine(postBridge).execute(afterPost, NetworkCall(afterPost))
+        assertFalse(postBridge.executeRequests.last().http3Enabled)
+    }
+
+    @Test
+    fun broadCurlErrorsAndHttpStatusesDoNotDowngradeOrRetry() = runBlocking {
+        configureManualProxyHttp3()
+        val bridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(code = 35, errorMsg = "TLS certificate verify failed")
+        }
+        val tls = NetworkRequest(url = "https://example.test/tls")
+        AndroidCurlNetworkEngine(bridge).execute(tls, NetworkCall(tls))
+        assertEquals(0, bridge.freshExecuteRequests.size)
+
+        bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 407)
+        val status = NetworkRequest(url = "https://example.test/proxy-auth")
+        val statusResponse = AndroidCurlNetworkEngine(bridge).execute(status, NetworkCall(status))
+        assertEquals(407, statusResponse.statusCode)
+        assertEquals(0, bridge.freshExecuteRequests.size)
+        assertTrue(bridge.executeRequests.all { it.http3Enabled })
+    }
+
+    @Test
+    fun proxyHttp3RetryIsBoundedAndEnvironmentChangeClearsLatch() = runBlocking {
+        configureManualProxyHttp3()
+        VBTransportCurl.updateNetworkEnvironment("network-a")
+        val message = "HTTP/3 is not supported over an HTTP proxy"
+        val bridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(code = 35, errorMsg = message)
+            freshExecuteResponse = CurlNativeResponse(code = 56, errorMsg = message)
+        }
+        val first = NetworkRequest(url = "https://example.test/first")
+
+        val failed = AndroidCurlNetworkEngine(bridge).execute(first, NetworkCall(first))
+
+        assertEquals(1, bridge.executeRequests.size)
+        assertEquals(1, bridge.freshExecuteRequests.size)
+        assertEquals("proxy_h3_to_h2_failure", failed.timing.freshRetryResult)
+
+        VBTransportCurl.updateNetworkEnvironment("network-b")
+        bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val next = NetworkRequest(url = "https://example.test/next")
+        AndroidCurlNetworkEngine(bridge).execute(next, NetworkCall(next))
+        assertTrue(bridge.executeRequests.last().http3Enabled)
+    }
+
+    @Test
+    fun proxyHttp3RetryRespectsCancellationAndRemainingDeadline() = runBlocking {
+        configureManualProxyHttp3()
+        val message = "HTTP/3 is not supported over an HTTP proxy"
+        lateinit var cancelledCall: NetworkCall
+        val cancelledBridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(code = 35, errorMsg = message)
+            onExecute = { _, _ -> cancelledCall.cancel() }
+        }
+        val cancelled = NetworkRequest(url = "https://example.test/cancelled")
+        cancelledCall = NetworkCall(cancelled)
+        AndroidCurlNetworkEngine(cancelledBridge).execute(cancelled, cancelledCall)
+        assertEquals(0, cancelledBridge.freshExecuteRequests.size)
+
+        VBTransportCurl.updateNetworkEnvironment("deadline-environment")
+        val exhaustedBridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(code = 35, errorMsg = message)
+            executeDelayMillis = 5
+        }
+        val exhausted = NetworkRequest(
+            url = "https://example.test/exhausted",
+            policy = NetworkRequestPolicy(timeoutMillis = 1)
+        )
+        AndroidCurlNetworkEngine(exhaustedBridge).execute(exhausted, NetworkCall(exhausted))
+        assertEquals(0, exhaustedBridge.freshExecuteRequests.size)
+    }
+
+    @Test
+    fun staleProxyFailureCannotLatchAReplacementEnvironment() = runBlocking {
+        configureManualProxyHttp3()
+        VBTransportCurl.updateNetworkEnvironment("network-old")
+        val bridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(
+                code = 35,
+                errorMsg = "HTTP/3 is not supported over an HTTP proxy"
+            )
+            onExecute = { _, _ -> VBTransportCurl.updateNetworkEnvironment("network-new") }
+        }
+        val stale = NetworkRequest(url = "https://example.test/stale")
+
+        AndroidCurlNetworkEngine(bridge).execute(stale, NetworkCall(stale))
+
+        assertEquals(0, bridge.freshExecuteRequests.size)
+        bridge.onExecute = null
+        bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val next = NetworkRequest(url = "https://example.test/new")
+        AndroidCurlNetworkEngine(bridge).execute(next, NetworkCall(next))
+        assertTrue(bridge.executeRequests.last().http3Enabled)
+    }
+
+    @Test
+    fun configurationReplacementAfterSnapshotRejectsOldFailureWithSameProxy() = runBlocking {
+        configureManualProxyHttp3()
+        VBTransportCurl.updateNetworkEnvironment("network-shared")
+        val bridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(
+                code = 35,
+                errorMsg = "HTTP/3 is not supported over an HTTP proxy"
+            )
+        }
+        var replacementPublished = false
+        val staleEngine = AndroidCurlNetworkEngine(bridge) {
+            check(!replacementPublished)
+            replacementPublished = true
+            configureManualProxyHttp3()
+        }
+        val stale = NetworkRequest(url = "https://example.test/stale-configuration")
+
+        staleEngine.execute(stale, NetworkCall(stale))
+
+        assertTrue(replacementPublished)
+        assertEquals(1, bridge.executeRequests.size)
+        assertTrue(bridge.executeRequests.single().http3Enabled)
+        assertEquals(0, bridge.freshExecuteRequests.size)
+
+        bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val current = NetworkRequest(url = "https://example.test/current-configuration")
+        AndroidCurlNetworkEngine(bridge).execute(current, NetworkCall(current))
+
+        assertEquals(2, bridge.executeRequests.size)
+        assertTrue(bridge.executeRequests.last().http3Enabled)
+        assertEquals(0, bridge.freshExecuteRequests.size)
+    }
+
+    @Test
     fun http3OptInRequiresNativeFeatureAndReachesTheRequest() = runBlocking {
         VBTransportCurl.configure(
             NetworkCurlRuntimeConfiguration(
@@ -1024,8 +1224,10 @@ class AndroidCurlNetworkEngineTest {
         override val supportsHttp3: Boolean = false
     ) : AndroidCurlNativeBridge {
         var executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        var freshExecuteResponse = CurlNativeResponse(code = 0, httpCode = 200)
         val executeResponses = mutableListOf<CurlNativeResponse>()
         val executeRequests = mutableListOf<AndroidCurlNativeRequest>()
+        val freshExecuteRequests = mutableListOf<AndroidCurlNativeRequest>()
         var streamResponse = CurlNativeResponse(code = 0, httpCode = 200)
         var uploadResponse = CurlNativeResponse(code = 0, httpCode = 200)
         var streamStatus = 200L
@@ -1046,6 +1248,12 @@ class AndroidCurlNetworkEngineTest {
             onExecute?.invoke(request, executeRequests.size)
             if (executeDelayMillis > 0) delay(executeDelayMillis)
             return if (executeResponses.isEmpty()) executeResponse else executeResponses.removeAt(0)
+        }
+
+        override suspend fun executeFresh(request: AndroidCurlNativeRequest): CurlNativeResponse {
+            lastRequest = request
+            freshExecuteRequests += request
+            return freshExecuteResponse
         }
 
         override suspend fun downloadStream(
@@ -1079,6 +1287,19 @@ class AndroidCurlNetworkEngineTest {
         override fun cancel(requestId: Int) {
             cancelledIds += requestId
         }
+    }
+
+    private fun configureManualProxyHttp3() {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.manual("http://127.0.0.1:8888"),
+                http3Enabled = true
+            )
+        )
     }
 
     private class BlockingBridge : FakeBridge() {
