@@ -93,12 +93,15 @@ internal expect fun resolveCurlSystemProxy(url: String): CurlSystemProxyResoluti
 internal fun prepareCurlRuntime(
     request: NetworkRequest,
     platformDefaultTrust: CurlPlatformDefaultTrust = curlPlatformDefaultTrust,
-    nativeHttp3Supported: Boolean = platformCurlSupportsHttp3()
+    nativeHttp3Supported: Boolean = platformCurlSupportsHttp3(),
+    onRuntimeSnapshot: (() -> Unit)? = null
 ): NetworkEngineAvailability {
     if (request.metadata[CURL_RUNTIME_READY] == "true") {
         return NetworkEngineAvailability.Available
     }
-    val configuration = VBTransportCurl.snapshot()
+    val runtimeSnapshot = VBTransportCurl.runtimeSnapshot()
+    onRuntimeSnapshot?.invoke()
+    val configuration = runtimeSnapshot.configuration
     val http3Requested = request.curlHttp3EnabledOverride
         ?: configuration?.http3Enabled
         ?: false
@@ -107,7 +110,7 @@ internal fun prepareCurlRuntime(
     // was requested by policy.
     request.metadata[CURL_RUNTIME_HTTP3_REQUESTED] = http3Requested.toString()
     if (configuration == null) {
-        if (VBTransportCurl.trustMode == NetworkCurlTrustMode.PLATFORM_DEFAULT &&
+        if (runtimeSnapshot.trustMode == NetworkCurlTrustMode.PLATFORM_DEFAULT &&
             platformDefaultTrust.available
         ) {
             if (http3Requested && !nativeHttp3Supported) {
@@ -121,12 +124,17 @@ internal fun prepareCurlRuntime(
             // compiled CURL_CA_BUNDLE applies) and the proxy is pinned to
             // explicit direct ("" disables libcurl's environment proxies),
             // so the default's semantics are deterministic, not ambient.
-            prepareCurlProxyAndHttp3(request, proxyUrl = "", http3Requested = http3Requested)
+            prepareCurlProxyAndHttp3(
+                request = request,
+                proxyUrl = "",
+                http3Requested = http3Requested,
+                expectedGeneration = runtimeSnapshot.proxyHttp3Generation
+            )
             request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_PLATFORM_DEFAULT
             request.metadata[CURL_RUNTIME_READY] = "true"
             return NetworkEngineAvailability.Available
         }
-        val status = VBTransportCurl.configurationStatus
+        val status = runtimeSnapshot.status
         val reason = when (status.failureReason) {
             NetworkCurlConfigurationFailureReason.TRUST_STORE_PATH_BLANK ->
                 NetworkEngineUnavailableReason.TRUST_STORE_NOT_CONFIGURED
@@ -181,7 +189,12 @@ internal fun prepareCurlRuntime(
         }
     }
     request.metadata[CURL_RUNTIME_CA_PATH] = configuration.trustStore.path
-    prepareCurlProxyAndHttp3(request, proxyUrl = proxyUrl, http3Requested = http3Requested)
+    prepareCurlProxyAndHttp3(
+        request = request,
+        proxyUrl = proxyUrl,
+        http3Requested = http3Requested,
+        expectedGeneration = runtimeSnapshot.proxyHttp3Generation
+    )
     request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_APP_OWNED
     request.metadata[CURL_RUNTIME_READY] = "true"
     return NetworkEngineAvailability.Available
@@ -236,9 +249,10 @@ internal fun forcePreparedCurlHttp2(request: NetworkRequest) {
 private fun prepareCurlProxyAndHttp3(
     request: NetworkRequest,
     proxyUrl: String,
-    http3Requested: Boolean
+    http3Requested: Boolean,
+    expectedGeneration: Long
 ) {
-    val environment = VBTransportCurl.proxyHttp3Environment(proxyUrl)
+    val environment = VBTransportCurl.proxyHttp3Environment(proxyUrl, expectedGeneration)
     request.metadata[CURL_RUNTIME_PROXY_URL] = proxyUrl
     request.metadata[CURL_RUNTIME_HTTP3] =
         (http3Requested && !environment.h2Latched).toString()

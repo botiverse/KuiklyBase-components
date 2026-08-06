@@ -484,6 +484,40 @@ class AndroidCurlNetworkEngineTest {
     }
 
     @Test
+    fun configurationReplacementAfterSnapshotRejectsOldFailureWithSameProxy() = runBlocking {
+        configureManualProxyHttp3()
+        VBTransportCurl.updateNetworkEnvironment("network-shared")
+        val bridge = FakeBridge(supportsHttp3 = true).apply {
+            executeResponse = CurlNativeResponse(
+                code = 35,
+                errorMsg = "HTTP/3 is not supported over an HTTP proxy"
+            )
+        }
+        var replacementPublished = false
+        val staleEngine = AndroidCurlNetworkEngine(bridge) {
+            check(!replacementPublished)
+            replacementPublished = true
+            configureManualProxyHttp3()
+        }
+        val stale = NetworkRequest(url = "https://example.test/stale-configuration")
+
+        staleEngine.execute(stale, NetworkCall(stale))
+
+        assertTrue(replacementPublished)
+        assertEquals(1, bridge.executeRequests.size)
+        assertTrue(bridge.executeRequests.single().http3Enabled)
+        assertEquals(0, bridge.freshExecuteRequests.size)
+
+        bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val current = NetworkRequest(url = "https://example.test/current-configuration")
+        AndroidCurlNetworkEngine(bridge).execute(current, NetworkCall(current))
+
+        assertEquals(2, bridge.executeRequests.size)
+        assertTrue(bridge.executeRequests.last().http3Enabled)
+        assertEquals(0, bridge.freshExecuteRequests.size)
+    }
+
+    @Test
     fun http3OptInRequiresNativeFeatureAndReachesTheRequest() = runBlocking {
         VBTransportCurl.configure(
             NetworkCurlRuntimeConfiguration(

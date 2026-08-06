@@ -141,6 +141,7 @@ enum class NetworkCurlTrustMode {
 
 /** Shared, verified curl runtime configuration used by every platform delegate. */
 object VBTransportCurl {
+    private val runtimeStateLock = SynchronizedObject()
     private val configurationState = atomic<NetworkCurlRuntimeConfiguration?>(null)
     private val statusState = atomic(missingConfigurationStatus())
     private val trustModeState = atomic(NetworkCurlTrustMode.PLATFORM_DEFAULT)
@@ -167,30 +168,34 @@ object VBTransportCurl {
      */
     fun configure(configuration: NetworkCurlRuntimeConfiguration): NetworkCurlConfigurationStatus {
         val validation = validate(configuration)
-        if (validation.configured) {
-            configurationState.value = configuration.copy(
-                trustStore = configuration.trustStore.copy(
-                    path = configuration.trustStore.path.trim(),
-                    sha256 = configuration.trustStore.sha256.trim().lowercase()
-                ),
-                proxy = configuration.proxy.copy(url = configuration.proxy.url?.trim())
-            )
-            trustModeState.value = NetworkCurlTrustMode.APP_OWNED
-        } else {
-            configurationState.value = null
-            trustModeState.value = NetworkCurlTrustMode.FAILED_CLOSED
+        synchronized(runtimeStateLock) {
+            if (validation.configured) {
+                configurationState.value = configuration.copy(
+                    trustStore = configuration.trustStore.copy(
+                        path = configuration.trustStore.path.trim(),
+                        sha256 = configuration.trustStore.sha256.trim().lowercase()
+                    ),
+                    proxy = configuration.proxy.copy(url = configuration.proxy.url?.trim())
+                )
+                trustModeState.value = NetworkCurlTrustMode.APP_OWNED
+            } else {
+                configurationState.value = null
+                trustModeState.value = NetworkCurlTrustMode.FAILED_CLOSED
+            }
+            statusState.value = validation
+            proxyHttp3Recovery.configurationChanged()
         }
-        statusState.value = validation
-        proxyHttp3Recovery.configurationChanged()
         return validation
     }
 
     /** Returns to the platform-default trust source (pre-configure state). */
     fun clear() {
-        configurationState.value = null
-        statusState.value = missingConfigurationStatus()
-        trustModeState.value = NetworkCurlTrustMode.PLATFORM_DEFAULT
-        proxyHttp3Recovery.configurationChanged()
+        synchronized(runtimeStateLock) {
+            configurationState.value = null
+            statusState.value = missingConfigurationStatus()
+            trustModeState.value = NetworkCurlTrustMode.PLATFORM_DEFAULT
+            proxyHttp3Recovery.configurationChanged()
+        }
     }
 
     /**
@@ -204,10 +209,23 @@ object VBTransportCurl {
     fun updateNetworkEnvironment(identity: String): Long =
         proxyHttp3Recovery.updateEnvironment(identity)
 
-    internal fun snapshot(): NetworkCurlRuntimeConfiguration? = configurationState.value
+    internal fun snapshot(): NetworkCurlRuntimeConfiguration? =
+        synchronized(runtimeStateLock) { configurationState.value }
 
-    internal fun proxyHttp3Environment(proxyUrl: String): NetworkCurlProxyHttp3Environment =
-        proxyHttp3Recovery.snapshot(proxyUrl)
+    internal fun runtimeSnapshot(): NetworkCurlRuntimeSnapshot = synchronized(runtimeStateLock) {
+        NetworkCurlRuntimeSnapshot(
+            configuration = configurationState.value,
+            status = statusState.value,
+            trustMode = trustModeState.value,
+            proxyHttp3Generation = proxyHttp3Recovery.currentGeneration()
+        )
+    }
+
+    internal fun proxyHttp3Environment(
+        proxyUrl: String,
+        expectedGeneration: Long
+    ): NetworkCurlProxyHttp3Environment =
+        proxyHttp3Recovery.snapshot(proxyUrl, expectedGeneration)
 
     internal fun latchProxyHttp3Fallback(environment: NetworkCurlProxyHttp3Environment): Boolean =
         proxyHttp3Recovery.latch(environment)
@@ -226,8 +244,12 @@ object VBTransportCurl {
                 failureReason = NetworkCurlConfigurationFailureReason.TRUST_STORE_UNREADABLE,
                 detail = "Curl trust store is missing or unreadable: $normalized"
             )
-            configurationState.value = null
-            statusState.value = status
+            synchronized(runtimeStateLock) {
+                configurationState.value = null
+                statusState.value = status
+                trustModeState.value = NetworkCurlTrustMode.FAILED_CLOSED
+                proxyHttp3Recovery.configurationChanged()
+            }
             return status
         }
         return configure(
@@ -310,6 +332,13 @@ object VBTransportCurl {
         )
 }
 
+internal data class NetworkCurlRuntimeSnapshot(
+    val configuration: NetworkCurlRuntimeConfiguration?,
+    val status: NetworkCurlConfigurationStatus,
+    val trustMode: NetworkCurlTrustMode,
+    val proxyHttp3Generation: Long
+)
+
 internal data class NetworkCurlProxyHttp3Environment(
     val generation: Long,
     val proxyFingerprint: String,
@@ -336,14 +365,19 @@ private class NetworkCurlProxyHttp3RecoveryState {
         advanceLocked()
     }
 
-    fun snapshot(proxyUrl: String): NetworkCurlProxyHttp3Environment = synchronized(lock) {
+    fun currentGeneration(): Long = synchronized(lock) { generation }
+
+    fun snapshot(
+        proxyUrl: String,
+        expectedGeneration: Long
+    ): NetworkCurlProxyHttp3Environment = synchronized(lock) {
         val proxyFingerprint = networkCurlSha256Hex(proxyUrl.encodeToByteArray())
-        val fingerprint = fingerprint(generation, environmentIdentity, proxyFingerprint)
+        val fingerprint = fingerprint(expectedGeneration, environmentIdentity, proxyFingerprint)
         NetworkCurlProxyHttp3Environment(
-            generation = generation,
+            generation = expectedGeneration,
             proxyFingerprint = proxyFingerprint,
             fingerprint = fingerprint,
-            h2Latched = fingerprint in h2LatchedFingerprints
+            h2Latched = expectedGeneration == generation && fingerprint in h2LatchedFingerprints
         )
     }
 

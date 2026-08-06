@@ -76,16 +76,25 @@ internal object AndroidCurlEngineProvider {
 }
 
 internal class AndroidCurlNetworkEngine(
-    private val bridge: AndroidCurlNativeBridge
+    private val bridge: AndroidCurlNativeBridge,
+    private val onRuntimeSnapshot: (() -> Unit)? = null
 ) : NetworkEngine {
     override val capabilities
         get() = curlNetworkEngineCapabilities(bridge.supportsHttp3)
 
     override fun availability(request: NetworkRequest): NetworkEngineAvailability =
-        prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
+        prepareCurlRuntime(
+            request,
+            nativeHttp3Supported = bridge.supportsHttp3,
+            onRuntimeSnapshot = onRuntimeSnapshot
+        )
 
     override suspend fun execute(request: NetworkRequest, call: NetworkCall): NetworkResponse {
-        val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
+        val availability = prepareCurlRuntime(
+            request,
+            nativeHttp3Supported = bridge.supportsHttp3,
+            onRuntimeSnapshot = onRuntimeSnapshot
+        )
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         if ((request.method == VBTransportMethod.GET || request.method == VBTransportMethod.HEAD) &&
             request.body.hasPotentialStreamingSource()
@@ -187,7 +196,11 @@ internal class AndroidCurlNetworkEngine(
         onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
         onChunk: (ByteArray) -> Unit
     ): NetworkResponse {
-        val availability = prepareCurlRuntime(request, nativeHttp3Supported = bridge.supportsHttp3)
+        val availability = prepareCurlRuntime(
+            request,
+            nativeHttp3Supported = bridge.supportsHttp3,
+            onRuntimeSnapshot = onRuntimeSnapshot
+        )
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         val owner = Any()
         val requestId = androidCurlRequestOwners.reserve(owner)
