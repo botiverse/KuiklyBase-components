@@ -1,0 +1,76 @@
+# Read-only readback of the already-published DatetimeKMM authority.
+#
+# Raft task #99. Publish run 30342129145 shipped all seven publications but its
+# own verification step never completed, so the 34-file GitHub Packages matrix
+# has never been machine-verified. This workflow downloads that matrix with the
+# run-scoped token and uploads the bytes plus a digest receipt for independent
+# review. It publishes nothing and writes nothing back.
+name: Datetime authority readback (read-only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      maven_version:
+        description: Published version to read back
+        required: false
+        default: 0.1.0-raft.0
+
+# Read-only by construction: no packages:write, no contents:write. The job uses
+# the ephemeral run-scoped token only; it adds no secret and prints none.
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: datetime-authority-readback-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  readback:
+    name: Authority readback (34-file matrix)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout authority source exact
+        uses: actions/checkout@v4
+        with:
+          # The publication's own source exact. The file manifest is read from
+          # this tree, so the readback cannot drift from what was published.
+          ref: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          persist-credentials: false
+
+      - name: Read back published matrix
+        env:
+          MAVEN_VERSION: ${{ inputs.maven_version || '0.1.0-raft.0' }}
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ github.token }}
+          READBACK_OUT_DIR: readback-out
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/authority-readback.sh
+
+      - name: Assert receipt shape before upload
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          receipt = json.load(open("DatetimeKMM/readback-out/readback-receipt.json"))
+          assert receipt["status"] == "complete", receipt["status"]
+          assert receipt["fileCount"] == 34, receipt["fileCount"]
+          assert len(receipt["files"]) == 34, len(receipt["files"])
+          for entry in receipt["files"]:
+              assert len(entry["sha256"]) == 64, entry
+          print("receipt ok:", receipt["fileCount"], "files")
+          PY
+
+      - name: Upload authority bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-authority-bundle
+          # Public package bytes and the digest receipt only. No logs, headers,
+          # credentials or pre-signed URLs (those carry signatures).
+          path: |
+            DatetimeKMM/readback-out/bytes/**
+            DatetimeKMM/readback-out/readback-receipt.json
+          if-no-files-found: error
+          retention-days: 7
