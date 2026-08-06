@@ -339,5 +339,88 @@ fi
 unset -f curl
 rm -rf "$fixture_root"
 
+echo "== pre-upload receipt assertion =="
+# The last gate before a bundle becomes authority. Driven here with crafted
+# receipts, because an assertion that only runs on a real dispatch has never
+# been tested by anything.
+ASSERT="$here/assert-readback-receipt.py"
+receipt_dir="$(mktemp -d)"
+
+write_receipt() {
+  # write_receipt <path> <python-dict-mutation>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+path, mutation = sys.argv[1], sys.argv[2]
+receipt = {
+    "status": "complete",
+    "repository": "botiverse/KuiklyBase-components",
+    "version": "0.1.0-raft.0",
+    "fileCount": 2,
+    "provenance": {
+        "manifestSourceExact": "8ffc865419ef2e210e2d78f18aedcae00ea9b9cc",
+        "readbackSourceExact": "cafe1234cafe1234cafe1234cafe1234cafe1234",
+        "readbackRef": "refs/heads/master",
+        "runId": "424242",
+        "runAttempt": "1",
+    },
+    "files": [
+        {"path": "build/raft/kuiklybase/datetime/0.1.0-raft.0/a.pom", "sha256": "a" * 64},
+        {"path": "build/raft/kuiklybase/datetime/0.1.0-raft.0/b.pom", "sha256": "b" * 64},
+    ],
+}
+exec(mutation)
+json.dump(receipt, open(path, "w"))
+PY
+}
+
+assert_receipt() {
+  # assert_receipt <label> <expect-pass|expect-fail> <mutation> [env...]
+  local label="$1" mode="$2" mutation="$3"; shift 3
+  local file="$receipt_dir/receipt.json" out rc=0
+  write_receipt "$file" "$mutation"
+  out="$(env EXPECT_VERSION=0.1.0-raft.0 EXPECT_COUNT=2 \
+    EXPECT_MANIFEST_EXACT=8ffc865419ef2e210e2d78f18aedcae00ea9b9cc \
+    EXPECT_READBACK_EXACT=cafe1234cafe1234cafe1234cafe1234cafe1234 \
+    EXPECT_READBACK_REF=refs/heads/master \
+    EXPECT_RUN_ID=424242 EXPECT_RUN_ATTEMPT=1 \
+    "$@" python3 "$ASSERT" "$file" 2>&1)" || rc=$?
+  if [ "$mode" = "expect-pass" ]; then
+    if [ "$rc" -eq 0 ]; then ok "$label"; else no "$label (got: $(printf '%s' "$out" | tail -1))"; fi
+  else
+    if [ "$rc" -ne 0 ]; then ok "$label"; else no "$label (assertion accepted it)"; fi
+  fi
+}
+
+assert_receipt "a well-formed receipt passes" expect-pass "pass"
+assert_receipt "wrong run attempt is refused" expect-fail \
+  "receipt['provenance']['runAttempt'] = '2'"
+assert_receipt "wrong run id is refused" expect-fail \
+  "receipt['provenance']['runId'] = '999'"
+assert_receipt "wrong readback exact is refused" expect-fail \
+  "receipt['provenance']['readbackSourceExact'] = 'f'*40"
+assert_receipt "wrong manifest exact is refused" expect-fail \
+  "receipt['provenance']['manifestSourceExact'] = '1'*40"
+assert_receipt "wrong ref is refused" expect-fail \
+  "receipt['provenance']['readbackRef'] = 'refs/heads/other'"
+assert_receipt "empty run attempt is refused" expect-fail \
+  "receipt['provenance']['runAttempt'] = ''"
+assert_receipt "missing provenance is refused" expect-fail \
+  "del receipt['provenance']"
+assert_receipt "short digest is refused" expect-fail \
+  "receipt['files'][0]['sha256'] = 'abc'"
+assert_receipt "non-hex digest is refused" expect-fail \
+  "receipt['files'][0]['sha256'] = 'z'*64"
+assert_receipt "traversal path is refused" expect-fail \
+  "receipt['files'][0]['path'] = '../escaped.pom'"
+assert_receipt "duplicate path is refused" expect-fail \
+  "receipt['files'][1]['path'] = receipt['files'][0]['path']"
+assert_receipt "count mismatch is refused" expect-fail \
+  "receipt['fileCount'] = 34"
+assert_receipt "unrelated version is refused" expect-fail \
+  "receipt['version'] = '9.9.9-raft.0'"
+assert_receipt "incomplete status is refused" expect-fail \
+  "receipt['status'] = 'partial'"
+rm -rf "$receipt_dir"
+
 echo "== teeth: ${pass} passed, ${fail} failed =="
 [ "$fail" -eq 0 ] || exit 1

@@ -108,35 +108,17 @@ jobs:
 
       - name: Assert receipt shape and provenance before upload
         env:
+          EXPECT_VERSION: 0.1.0-raft.0
+          EXPECT_COUNT: "34"
+          EXPECT_MANIFEST_EXACT: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
           EXPECT_READBACK_EXACT: ${{ github.sha }}
           EXPECT_READBACK_REF: ${{ github.ref }}
           EXPECT_RUN_ID: ${{ github.run_id }}
           EXPECT_RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, os
-          receipt = json.load(open("DatetimeKMM/readback-out/readback-receipt.json"))
-          assert receipt["status"] == "complete", receipt["status"]
-          assert receipt["version"] == "0.1.0-raft.0", receipt["version"]
-          assert receipt["fileCount"] == 34, receipt["fileCount"]
-          assert len(receipt["files"]) == 34, len(receipt["files"])
-          for entry in receipt["files"]:
-              assert len(entry["sha256"]) == 64, entry
-              assert ".." not in entry["path"], entry
-          prov = receipt["provenance"]
-          assert prov["manifestSourceExact"] == "8ffc865419ef2e210e2d78f18aedcae00ea9b9cc", prov
-          assert prov["readbackSourceExact"] == os.environ["EXPECT_READBACK_EXACT"], prov
-          assert prov["readbackRef"] == os.environ["EXPECT_READBACK_REF"], prov
-          # Run identity is part of the carrier's proof, so every field is
-          # asserted -- a wrong attempt must not pass because only the id was
-          # compared.
-          assert prov["runId"] == os.environ["EXPECT_RUN_ID"], prov
-          assert prov["runAttempt"] == os.environ["EXPECT_RUN_ATTEMPT"], prov
-          for key, value in prov.items():
-              assert value, f"empty provenance field {key}"
-          print("receipt ok:", receipt["fileCount"], "files, provenance bound")
-          PY
+          python3 DatetimeKMM/scripts/assert-readback-receipt.py \
+            DatetimeKMM/readback-out/readback-receipt.json
 
       - name: Upload authority bundle
         uses: actions/upload-artifact@v4
