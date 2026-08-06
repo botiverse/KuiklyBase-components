@@ -9,30 +9,118 @@
 #
 # Contract:
 #   - read-only: no writes to GitHub Packages, Raft Artifacts, tags or source;
-#   - the file set comes from publish-lib.sh publication_urls(), the same locked
-#     per-kind manifest the publisher and PR CI already check, so this script
-#     cannot drift from the publication contract;
+#   - the file set comes from publication_urls() read out of the *publication's
+#     own source exact*, materialized separately by the caller and pointed at by
+#     AUTHORITY_SOURCE_DIR. The runnable script therefore lives at the successor
+#     exact while the manifest still cannot drift from what was published;
 #   - every deviation fails closed: transport failure, non-200, empty body,
-#     unexpected redirect host, corrupt archive, or a file count other than the
-#     expected total;
-#   - redirects: GitHub Packages answers with a 302 to a pre-signed object URL
-#     on a different host. curl follows it (-L) and drops credentials across
-#     hosts by default; --location-trusted is forbidden because it would forward
-#     the Authorization header to that host. The effective host must be either
-#     the registry itself or the single allow-listed object host below. A new
-#     GitHub object host must go red here and be added by source review, never
-#     by a wildcard.
+#     disallowed origin on any hop, corrupt archive, or a file count other than
+#     the expected total;
+#   - redirects are followed by a bounded MANUAL loop, never by curl -L. Each
+#     Location is resolved to an absolute URL and its full origin (scheme, host
+#     and effective port) is validated against the two exact allowed origins
+#     before the next request is issued. A new GitHub object host must go red
+#     here and be added by source review, never by a wildcard;
+#   - credentials are attached to the FIRST request only, which is proven to be
+#     the registry origin before any transfer happens. No later hop re-attaches
+#     them, even if the chain returns to the registry origin. Pre-signed object
+#     URLs need no credentials, so none are offered to them;
+#   - HTTPS only: --proto/--proto-redir pin the scheme and the origin check
+#     rejects any non-https URL, so an http downgrade cannot carry a request;
 #   - the receipt records paths and sha256 only: no headers, no credentials and
-#     no pre-signed URLs (they embed signatures).
+#     no pre-signed URLs or Location values (they embed signatures).
 #
 # Env: MAVEN_VERSION, GITHUB_REPOSITORY, GITHUB_PACKAGES_USERNAME/TOKEN
-#      (fallback GITHUB_ACTOR/GITHUB_TOKEN), optional DATETIME_REPO_BASE,
-#      READBACK_OUT_DIR (default: readback-out).
+#      (fallback GITHUB_ACTOR/GITHUB_TOKEN), AUTHORITY_SOURCE_DIR (defaults to
+#      this script's directory), optional DATETIME_REPO_BASE, READBACK_OUT_DIR
+#      (default: readback-out).
 set -euo pipefail
 
+fail() { echo "READBACK FAIL: $*" >&2; exit 1; }
+
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# The publication manifest is read from the publication's own source exact,
+# materialized by the caller. Falling back to $here keeps local use working.
+AUTHORITY_SOURCE_DIR="${AUTHORITY_SOURCE_DIR:-$here}"
+AUTHORITY_LIB="$AUTHORITY_SOURCE_DIR/publish-lib.sh"
+[ -f "$AUTHORITY_LIB" ] \
+  || fail "authority source lib not found: $AUTHORITY_LIB (materialize the publication exact first)"
 # shellcheck source=publish-lib.sh
-. "$here/publish-lib.sh"
+. "$AUTHORITY_LIB"
+command -v publication_urls >/dev/null 2>&1 \
+  || fail "publication_urls() not provided by $AUTHORITY_LIB"
+
+# Exact allowed origins: scheme + host + effective port. Nothing else.
+REGISTRY_ORIGIN="https://maven.pkg.github.com"
+OBJECT_ORIGIN="https://github-registry-files.githubusercontent.com"
+
+EXPECTED_TOTAL="${READBACK_EXPECTED_TOTAL:-34}"
+CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-20}"
+MAX_TIME="${MAX_TIME:-300}"
+MAX_REDIRS="${MAX_REDIRS:-5}"
+
+# Normalize a URL to scheme://host[:port], dropping the default 443. Returns
+# non-zero for anything unparsable, non-https, or carrying userinfo (which
+# would let "https://allowed.host@evil.example" read as the allowed host).
+_origin_of() {
+  local url="$1" scheme rest hostport host port
+  case "$url" in
+    *://*) ;;
+    *) return 1 ;;
+  esac
+  scheme="${url%%://*}"
+  [ "$scheme" = "https" ] || return 1
+  rest="${url#*://}"
+  hostport="${rest%%/*}"
+  case "$hostport" in
+    ''|*@*) return 1 ;;
+  esac
+  host="${hostport%%:*}"
+  [ -n "$host" ] || return 1
+  if [ "$hostport" = "$host" ]; then
+    port=""
+  else
+    port="${hostport#*:}"
+    case "$port" in
+      ''|*[!0-9]*) return 1 ;;
+      443) port="" ;;
+    esac
+  fi
+  if [ -n "$port" ]; then
+    printf '%s://%s:%s' "$scheme" "$host" "$port"
+  else
+    printf '%s://%s' "$scheme" "$host"
+  fi
+}
+
+# An origin is allowed only if it matches one of the two exact origins.
+_origin_allowed() {
+  case "$1" in
+    "$REGISTRY_ORIGIN"|"$OBJECT_ORIGIN") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Last Location header, CR stripped. Never logged: it carries the signature.
+_last_location() {
+  tr -d '\r' < "$1" \
+    | awk 'BEGIN{IGNORECASE=1} /^location:/{sub(/^[Ll]ocation:[ \t]*/,""); v=$0} END{if (v) print v}'
+}
+
+# Resolve a possibly-relative Location against the current absolute URL.
+_resolve_location() {
+  local base="$1" loc="$2" base_origin
+  case "$loc" in
+    *://*) printf '%s' "$loc"; return 0 ;;
+    /*)
+      base_origin="$(_origin_of "$base")" || return 1
+      printf '%s%s' "$base_origin" "$loc"
+      return 0
+      ;;
+    *) return 1 ;;
+  esac
+}
 
 VERSION="${MAVEN_VERSION:?MAVEN_VERSION is required}"
 REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
@@ -43,24 +131,22 @@ RECEIPT="$OUT_DIR/readback-receipt.json"
 
 USER_NAME="${GITHUB_PACKAGES_USERNAME:-${GITHUB_ACTOR:-}}"
 TOKEN="${GITHUB_PACKAGES_TOKEN:-${GITHUB_TOKEN:-}}"
-[ -n "$USER_NAME" ] && [ -n "$TOKEN" ] || { echo "READBACK FAIL: missing credentials" >&2; exit 1; }
+[ -n "$USER_NAME" ] && [ -n "$TOKEN" ] || fail "missing credentials"
 AUTH="${USER_NAME}:${TOKEN}"
 
-# The registry redirects downloads to this object host. Exact match only.
-REGISTRY_HOST="maven.pkg.github.com"
-OBJECT_HOST="github-registry-files.githubusercontent.com"
+# Validate the initial origin BEFORE any credentialed transfer: the documented
+# DATETIME_REPO_BASE override must not be able to hand the token to a foreign
+# origin, and the first request is the only one that carries credentials.
+BASE_ORIGIN="$(_origin_of "$REPO_BASE")" \
+  || fail "initial repo base is not a parsable https origin"
+[ "$BASE_ORIGIN" = "$REGISTRY_ORIGIN" ] \
+  || fail "initial origin $BASE_ORIGIN is not the registry origin $REGISTRY_ORIGIN"
 
-EXPECTED_TOTAL="${READBACK_EXPECTED_TOTAL:-34}"
-CONNECT_TIMEOUT="${CONNECT_TIMEOUT:-20}"
-MAX_TIME="${MAX_TIME:-300}"
-MAX_REDIRS="${MAX_REDIRS:-5}"
-
-_host_of() { printf '%s' "${1#*://}" | cut -d/ -f1 | cut -d: -f1; }
-
-fail() { echo "READBACK FAIL: $*" >&2; exit 1; }
-
+# Output roots must exist before anything is written into them.
+mkdir -p "$OUT_DIR" "$BYTES_DIR"
+MANIFEST_TSV="$OUT_DIR/.manifest.tsv"
 downloaded=0
-: > "$OUT_DIR/.manifest.tsv"
+: > "$MANIFEST_TSV"
 
 # fetch <artifact> <version> <file>
 fetch() {
@@ -70,22 +156,46 @@ fetch() {
   local dest="${BYTES_DIR}/${rel}"
   mkdir -p "$(dirname "$dest")"
 
-  local response code effective eff_host curl_exit
-  # No --location-trusted: credentials must not follow the cross-host redirect.
-  response="$(curl -sS -L --max-redirs "$MAX_REDIRS" \
-    --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
-    -w '%{http_code} %{url_effective}' -u "$AUTH" -o "$dest" "$url" 2>/dev/null)" \
-    && curl_exit=0 || curl_exit=$?
-  [ "$curl_exit" -eq 0 ] || fail "transport error (curl exit $curl_exit) for $rel"
+  local hdr hops=0 code origin loc next
+  hdr="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$hdr'" RETURN
 
-  code="${response%% *}"
-  effective="${response#* }"
-  eff_host="$(_host_of "$effective")"
-  case "$eff_host" in
-    "$REGISTRY_HOST"|"$OBJECT_HOST") ;;
-    *) fail "redirect to unexpected host '$eff_host' for $rel (allowed: $REGISTRY_HOST, $OBJECT_HOST)" ;;
-  esac
-  [ "$code" = "200" ] || fail "HTTP $code for $rel"
+  while :; do
+    origin="$(_origin_of "$url")" \
+      || fail "hop $hops for $rel is not a parsable https origin"
+    _origin_allowed "$origin" \
+      || fail "hop $hops origin $origin not allowed for $rel (allowed: $REGISTRY_ORIGIN, $OBJECT_ORIGIN)"
+
+    # Credentials ride the first request only. It is proven above to be the
+    # registry origin; no later hop re-attaches them, even back on registry.
+    if [ "$hops" -eq 0 ]; then
+      code="$(curl -sS --proto '=https' --proto-redir '=https' \
+        --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+        -D "$hdr" -o "$dest" -w '%{http_code}' -u "$AUTH" "$url" 2>/dev/null)" \
+        || fail "transport error on hop $hops for $rel"
+    else
+      code="$(curl -sS --proto '=https' --proto-redir '=https' \
+        --connect-timeout "$CONNECT_TIMEOUT" --max-time "$MAX_TIME" \
+        -D "$hdr" -o "$dest" -w '%{http_code}' "$url" 2>/dev/null)" \
+        || fail "transport error on hop $hops for $rel"
+    fi
+
+    case "$code" in
+      200) break ;;
+      301|302|303|307|308)
+        hops=$(( hops + 1 ))
+        [ "$hops" -le "$MAX_REDIRS" ] || fail "more than $MAX_REDIRS redirects for $rel"
+        loc="$(_last_location "$hdr")"
+        [ -n "$loc" ] || fail "redirect without Location on hop $hops for $rel"
+        next="$(_resolve_location "$url" "$loc")" \
+          || fail "unresolvable redirect target on hop $hops for $rel"
+        url="$next"
+        ;;
+      *) fail "HTTP $code on hop $hops for $rel" ;;
+    esac
+  done
+
   [ -s "$dest" ] || fail "empty body for $rel"
 
   case "$file" in
@@ -100,7 +210,7 @@ fetch() {
 
   local sha
   sha="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$dest")"
-  printf '%s\t%s\n' "$rel" "$sha" >> "$OUT_DIR/.manifest.tsv"
+  printf '%s\t%s\n' "$rel" "$sha" >> "$MANIFEST_TSV"
   downloaded=$(( downloaded + 1 ))
   echo "  ok ${rel}"
 }
@@ -113,7 +223,13 @@ fetch_publication() {
   done < <(publication_urls "$REPO_BASE" "$artifact" "$version" "$kind")
 }
 
-mkdir -p "$BYTES_DIR"
+if [ "${READBACK_SELFTEST:-}" = "1" ]; then
+  # Teeth source this file to drive the policy helpers and the redirect loop
+  # itself against a mocked transport. Nothing below this line runs, so no
+  # request is ever issued by a sourcing test.
+  return 0 2>/dev/null || exit 0
+fi
+
 echo "== authority readback: ${REPO} version=${VERSION} (read-only) =="
 
 fetch_publication "datetime" "$VERSION" "root-metadata"
@@ -127,7 +243,7 @@ fetch_publication "datetime-ohosarm64" "$VERSION-ohos" "native-ohos"
 [ "$downloaded" -eq "$EXPECTED_TOTAL" ] \
   || fail "expected $EXPECTED_TOTAL files, got $downloaded (incomplete set)"
 
-python3 - "$OUT_DIR/.manifest.tsv" "$RECEIPT" "$VERSION" "$REPO" "$downloaded" <<'PY'
+python3 - "$MANIFEST_TSV" "$RECEIPT" "$VERSION" "$REPO" "$downloaded" <<'PY'
 import json, sys
 tsv, out, version, repo, total = sys.argv[1:6]
 files = []
@@ -156,5 +272,5 @@ json.dump(
 open(out, "a").write("\n")
 PY
 
-rm -f "$OUT_DIR/.manifest.tsv"
+rm -f "$MANIFEST_TSV"
 echo "== authority readback complete: ${downloaded}/${EXPECTED_TOTAL} files, receipt ${RECEIPT} =="

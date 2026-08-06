@@ -30,13 +30,43 @@ jobs:
     name: Authority readback (34-file matrix)
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout authority source exact
+      # Two trees, because one tree cannot serve both roles: the runnable script
+      # exists only at this exact, while the file manifest must come from the
+      # tree that was actually published.
+      - name: Checkout readback exact (runnable script)
         uses: actions/checkout@v4
         with:
-          # The publication's own source exact. The file manifest is read from
-          # this tree, so the readback cannot drift from what was published.
-          ref: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
           persist-credentials: false
+
+      - name: Materialize publication source exact (manifest only)
+        uses: actions/checkout@v4
+        with:
+          # The publication's own source exact. publication_urls() is read from
+          # here, so the readback cannot drift from what was published.
+          ref: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          path: .authority-source
+          persist-credentials: false
+
+      - name: Assert the two trees are distinct and correctly rolled
+        run: |
+          set -euo pipefail
+          lib=.authority-source/DatetimeKMM/scripts/publish-lib.sh
+          [ -f "$lib" ] || { echo "publication exact is missing publish-lib.sh" >&2; exit 1; }
+          # The published tree predates this workflow: it must NOT be the source
+          # of the runnable script, or the readback silently reverts to it.
+          if [ -e .authority-source/DatetimeKMM/scripts/authority-readback.sh ]; then
+            echo "publication exact unexpectedly carries the readback script" >&2
+            exit 1
+          fi
+          [ -f DatetimeKMM/scripts/authority-readback.sh ] \
+            || { echo "readback exact is missing the script" >&2; exit 1; }
+          echo "dual tree ok: script from readback exact, manifest from publication exact"
+
+      - name: Contract teeth (offline, no transfer)
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/authority-readback-teeth.sh
 
       - name: Read back published matrix
         env:
@@ -44,6 +74,7 @@ jobs:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ github.token }}
           READBACK_OUT_DIR: readback-out
+          AUTHORITY_SOURCE_DIR: ${{ github.workspace }}/.authority-source/DatetimeKMM/scripts
         run: |
           set -euo pipefail
           cd DatetimeKMM
