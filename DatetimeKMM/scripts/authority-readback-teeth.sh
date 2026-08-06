@@ -227,6 +227,39 @@ expect_loop_fail "redirect without Location is refused" "redirect without Locati
 mock_reset 403
 expect_loop_fail "non-200 status fails closed" "HTTP 403"
 
+# The pre-signed Location carries the signature: it must never reach a log,
+# an error message or the receipt, on either the failing or the passing path.
+SECRET_SIG="s3cr3t-signature-must-not-leak"
+mock_reset 302 200; MOCK_LOCS=("https://evil.example/o?sig=$SECRET_SIG" "")
+leak_out="$( ( fetch datetime 0.1.0-raft.0 authority.txt ) 2>&1 || true )"
+if printf '%s' "$leak_out" | grep -qF "$SECRET_SIG"; then
+  no "refused redirect must not echo the signed Location"
+else
+  ok "refused redirect does not echo the signed Location"
+fi
+
+mock_reset 302 200
+MOCK_LOCS=("https://github-registry-files.githubusercontent.com/o?sig=$SECRET_SIG" "")
+downloaded=0
+pass_out="$( ( fetch datetime 0.1.0-raft.0 authority.txt ) 2>&1 || true )"
+if printf '%s' "$pass_out" | grep -qF "$SECRET_SIG"; then
+  no "successful fetch must not echo the signed Location"
+else
+  ok "successful fetch does not echo the signed Location"
+fi
+# Non-vacuity: the signature must really have travelled through the loop,
+# otherwise the two checks above would pass without proving anything.
+if printf '%s' "$(hop_url 2)" | grep -qF "$SECRET_SIG"; then
+  ok "signed Location did reach the transport (leak checks are live)"
+else
+  no "signed Location did reach the transport (leak checks are live)"
+fi
+if grep -rqF "$SECRET_SIG" "$source_out" 2>/dev/null; then
+  no "signed Location must not reach the manifest/receipt"
+else
+  ok "signed Location does not reach the manifest/receipt"
+fi
+
 unset -f curl
 rm -rf "$fixture_root"
 
