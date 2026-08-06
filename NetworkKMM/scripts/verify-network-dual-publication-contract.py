@@ -24,6 +24,8 @@ FILES = {
     "test_workflow": ".github/workflows/networkkmm-tests.yml",
     "publisher": "NetworkKMM/scripts/publish-github-packages.sh",
     "state": "NetworkKMM/scripts/network-publication-state.sh",
+    "curl_compat": "NetworkKMM/scripts/network-curl-compat.sh",
+    "curl_compat_test": "NetworkKMM/scripts/test-network-curl-compat.sh",
     "manifest": "NetworkKMM/scripts/network-publication-manifest.sh",
     "convention": "NetworkKMM/gradle/raft-artifacts-publishing.gradle.kts",
     "normal_root": "NetworkKMM/build.gradle.kts",
@@ -195,6 +197,54 @@ def validate(files: Mapping[str, str]) -> None:
         "partial-file-fence",
         "mixed file state within one publication must fail closed",
     )
+    curl_compat = files["curl_compat"]
+    require(
+        "if command curl --retry-all-errors --version >/dev/null 2>&1; then" in curl_compat,
+        "curl-feature-probe",
+        "retry-all-errors must be enabled by an executable curl feature probe",
+    )
+    require(
+        "NETWORK_CURL_RETRY_ARGS=(--retry 2)" in curl_compat
+        and "NETWORK_CURL_RETRY_ARGS+=(--retry-all-errors)" in curl_compat,
+        "curl-retry-policy",
+        "every curl needs two baseline retries and supported curls need retry-all-errors",
+    )
+    curl_wrapper_block = (
+        "command curl \\\n"
+        "    --silent --show-error \\\n"
+        "    --connect-timeout 15 --max-time 60 \\\n"
+        '    "${NETWORK_CURL_RETRY_ARGS[@]}"'
+    )
+    require(
+        curl_wrapper_block in curl_compat,
+        "curl-wrapper-policy",
+        "the shared wrapper must retain diagnostics, timeouts, and the resolved retry policy",
+    )
+    require(
+        '    "$@"' in curl_compat,
+        "curl-argument-forwarding",
+        "the shared wrapper must forward every caller-provided argument unchanged",
+    )
+    require(
+        'source "$SCRIPT_DIR/network-curl-compat.sh"' in state
+        and state.count("network_resolve_curl_retry_args") == 1
+        and state.count("network_curl --") == 2
+        and "--retry-all-errors" not in state
+        and "--retry 2" not in state,
+        "state-curl-wrapper",
+        "both immutable-state probes must use the one resolved compatibility wrapper",
+    )
+
+    curl_compat_test = files["curl_compat_test"]
+    require(
+        "NETWORK_FAKE_CURL_MODE=old" in curl_compat_test
+        and "command curl --retry-all-errors --version" in curl_compat_test
+        and "run_case old false" in curl_compat_test
+        and "run_case modern true" in curl_compat_test
+        and 'cmp -s "$expected_log" "$fake_log"' in curl_compat_test,
+        "curl-executable-contract",
+        "the executable contract must reproduce old-curl rejection and compare exact old/modern arguments",
+    )
 
     manifest = files["manifest"]
     require(
@@ -250,6 +300,9 @@ def validate(files: Mapping[str, str]) -> None:
     )
 
     test_workflow = files["test_workflow"]
+    publication_contract_job = test_workflow.split("  publication-contract:\n", 1)[1].split(
+        "\n  publication-contract-ios:\n", 1
+    )[0]
     require(
         '".github/workflows/publish-network-github-packages.yml"' in test_workflow,
         "test-path-trigger",
@@ -259,6 +312,13 @@ def validate(files: Mapping[str, str]) -> None:
         "verify-network-dual-publication-contract.py" in test_workflow,
         "hosted-contract",
         "Hosted CI must execute the static and mutation contract",
+    )
+    require(
+        "image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280"
+        in publication_contract_job
+        and "run: NetworkKMM/scripts/test-network-curl-compat.sh" in publication_contract_job,
+        "hosted-curl-compat",
+        "Hosted must execute the curl compatibility test inside the pinned old Harmony image",
     )
     require(
         "publishIosX64PublicationToMavenLocal" in test_workflow
@@ -298,6 +358,41 @@ def run_mutations(files: Mapping[str, str]) -> None:
         ("drop-normal-convention", mutate_once(files, "normal_root", '        apply(from = rootProject.file("gradle/raft-artifacts-publishing.gradle.kts"))\n'), "normal-convention"),
         ("drop-android-sources", mutate_once(files, "android_runtime", "            withSourcesJar()\n"), "android-sources"),
         ("drop-post-verify", mutate_once(files, "workflow", "        run: NetworkKMM/scripts/network-publication-state.sh verify\n"), "verifier-count"),
+        (
+            "drop-curl-feature-probe",
+            mutate_once(
+                files,
+                "curl_compat",
+                "if command curl --retry-all-errors --version >/dev/null 2>&1; then",
+                "if true; then",
+            ),
+            "curl-feature-probe",
+        ),
+        (
+            "restore-unconditional-retry-all-errors",
+            mutate_once(
+                files,
+                "curl_compat",
+                '    "${NETWORK_CURL_RETRY_ARGS[@]}" \\\n',
+                "    --retry 2 --retry-all-errors \\\n",
+            ),
+            "curl-wrapper-policy",
+        ),
+        (
+            "drop-baseline-retry",
+            mutate_once(files, "curl_compat", "NETWORK_CURL_RETRY_ARGS=(--retry 2)", "NETWORK_CURL_RETRY_ARGS=()"),
+            "curl-retry-policy",
+        ),
+        (
+            "drop-curl-caller-arguments",
+            mutate_once(files, "curl_compat", '    "$@"\n', ""),
+            "curl-argument-forwarding",
+        ),
+        (
+            "drop-hosted-curl-contract",
+            mutate_once(files, "test_workflow", "        run: NetworkKMM/scripts/test-network-curl-compat.sh\n"),
+            "hosted-curl-compat",
+        ),
     ]
     for name, mutated, expected_code in mutations:
         try:

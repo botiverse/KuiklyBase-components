@@ -41,6 +41,10 @@ jobs:
         shell: bash
         run: python3 NetworkKMM/scripts/verify-network-dual-publication-contract.py
 
+      - name: Verify old and modern curl publication compatibility
+        shell: bash
+        run: NetworkKMM/scripts/test-network-curl-compat.sh
+
       - name: Verify native source-date workflow dependency graph
         shell: bash
         run: python3 NetworkKMM/scripts/verify-native-source-date-workflow-contract.py

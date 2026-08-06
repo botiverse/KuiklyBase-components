@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/network-publication-manifest.sh"
+source "$SCRIPT_DIR/network-curl-compat.sh"
+network_resolve_curl_retry_args
 
 mode="${1:-plan}"
 if [[ "$mode" != "plan" && "$mode" != "verify" ]]; then
@@ -97,8 +99,7 @@ curl_code() {
       return 1
       ;;
   esac
-  curl --silent --show-error --head --output /dev/null --write-out '%{http_code}' \
-    --connect-timeout 15 --max-time 60 --retry 2 --retry-all-errors \
+  network_curl --head --output /dev/null --write-out '%{http_code}' \
     ${auth_args[@]+"${auth_args[@]}"} "$base_url/$relative_path"
 }
 
@@ -110,8 +111,7 @@ assert_positive_controls() {
     echo "GitHub Packages positive control failed with HTTP $github_code; publication absence results are void." >&2
     exit 1
   fi
-  raft_code="$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
-    --connect-timeout 15 --max-time 60 --retry 2 --retry-all-errors \
+  raft_code="$(network_curl --output /dev/null --write-out '%{http_code}' \
     "$raft_browser_url/scopes/com.tencent.kuiklybase")"
   if [[ "$raft_code" != "200" ]]; then
     echo "Raft Artifacts scope positive control failed with HTTP $raft_code; publication absence results are void." >&2

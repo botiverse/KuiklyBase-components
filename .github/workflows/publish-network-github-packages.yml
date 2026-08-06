@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Override Maven version, for example 0.1.0-raft.31"
+        description: "Override Maven version, for example 0.1.0-raft.32"
         required: false
         type: string
       android_ohos_publish_tasks:
