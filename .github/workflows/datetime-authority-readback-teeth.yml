@@ -2,10 +2,11 @@
 #
 # The readback workflow is dispatch-only and cannot run from a pull request, so
 # until now its teeth were exercised only on a developer machine. That hid a
-# gawk-only header parser: the runner's default awk is mawk, where the previous
-# parser read every "Location:" as absent and the readback could never have
-# followed a redirect. This job closes that gap by running the same teeth here,
-# under each awk implementation present.
+# gawk-only header parser: under mawk -- the default awk on a stock Ubuntu 24.04
+# install -- it read every "Location:" as absent, so the readback could not have
+# followed a redirect there. This runner image resolves awk to gawk, so the
+# defect is portability plus the missing coverage, not an observed failure here.
+# Running under every implementation present is what keeps either from hiding.
 #
 # Offline and read-only: the teeth issue no request and this job needs no
 # package scope.

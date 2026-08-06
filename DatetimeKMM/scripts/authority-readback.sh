@@ -108,9 +108,11 @@ _origin_allowed() {
 }
 
 # Last Location header, CR stripped. Never logged: it carries the signature.
-# POSIX only: awk's IGNORECASE is a GNU extension, and the default awk on the
-# Ubuntu runner is mawk, where it silently does nothing and every "Location:"
-# reads as absent.
+# POSIX only: awk's IGNORECASE is a GNU extension. Under mawk -- the default
+# awk on a stock Ubuntu 24.04 install -- it silently does nothing and every
+# "Location:" reads as absent. The current GitHub runner image happens to
+# resolve awk to gawk, so this is a portability defect rather than a failure
+# observed on that image; the teeth run under both implementations.
 _last_location() {
   tr -d '\r' < "$1" \
     | grep -i '^location:' \
@@ -149,8 +151,8 @@ REPO="${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
 SOURCE_EXACT="${AUTHORITY_SOURCE_EXACT:?AUTHORITY_SOURCE_EXACT is required}"
 READBACK_EXACT="${READBACK_SOURCE_EXACT:?READBACK_SOURCE_EXACT is required}"
 READBACK_REF="${READBACK_SOURCE_REF:?READBACK_SOURCE_REF is required}"
-READBACK_RUN_ID="${READBACK_RUN_ID:-}"
-READBACK_RUN_ATTEMPT="${READBACK_RUN_ATTEMPT:-}"
+READBACK_RUN_ID="${READBACK_RUN_ID:?READBACK_RUN_ID is required}"
+READBACK_RUN_ATTEMPT="${READBACK_RUN_ATTEMPT:?READBACK_RUN_ATTEMPT is required}"
 [ "$SOURCE_EXACT" = "$EXPECTED_SOURCE_EXACT" ] \
   || fail "manifest source exact $SOURCE_EXACT is not the publication exact $EXPECTED_SOURCE_EXACT"
 REPO_BASE="${DATETIME_REPO_BASE:-https://maven.pkg.github.com/${REPO}/build/raft/kuiklybase}"

@@ -45,6 +45,8 @@ GITHUB_PACKAGES_USERNAME=teeth GITHUB_PACKAGES_TOKEN=teeth \
 AUTHORITY_SOURCE_EXACT=8ffc865419ef2e210e2d78f18aedcae00ea9b9cc \
 READBACK_SOURCE_EXACT=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
 READBACK_SOURCE_REF=refs/heads/master \
+READBACK_RUN_ID=424242 \
+READBACK_RUN_ATTEMPT=1 \
 READBACK_OUT_DIR="$source_out" \
   . "$SCRIPT"
 
@@ -94,6 +96,8 @@ run_case() {
     AUTHORITY_SOURCE_EXACT=8ffc865419ef2e210e2d78f18aedcae00ea9b9cc \
     READBACK_SOURCE_EXACT=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef \
     READBACK_SOURCE_REF=refs/heads/master \
+    READBACK_RUN_ID=424242 \
+    READBACK_RUN_ATTEMPT=1 \
     "$@" bash "$SCRIPT" 2>&1)" || rc=$?
   if [ "$rc" -eq 0 ]; then
     no "$label (expected failure, got success)"
@@ -143,6 +147,14 @@ run_case "missing readback provenance fails closed" \
 run_case "wrong manifest exact refused" \
   "is not the publication exact" \
   AUTHORITY_SOURCE_EXACT=1111111111111111111111111111111111111111
+run_case "missing ref provenance fails closed" \
+  "READBACK_SOURCE_REF" READBACK_SOURCE_REF=
+# Run identity is part of the carrier's proof, so an empty run id or attempt
+# must fail before transfer rather than produce an unattributable bundle.
+run_case "missing run id fails closed" \
+  "READBACK_RUN_ID" READBACK_RUN_ID=
+run_case "missing run attempt fails closed" \
+  "READBACK_RUN_ATTEMPT" READBACK_RUN_ATTEMPT=
 
 # The manifest must come from a materialized publication exact, not silently
 # from whatever happens to sit next to the script.
@@ -286,17 +298,33 @@ else
   ok "signed Location does not reach the manifest/receipt"
 fi
 
-# A hostile manifest entry must not be able to write outside the bundle. The
-# escape is refused before the transport is even reached.
-escape_probe="$fixture_root/escaped-marker"
+# A hostile manifest entry must not be able to write outside the bundle.
+#
+# The probe watches the destination the path actually normalizes to, not an
+# arbitrary location: fetch builds
+#   $BYTES_DIR/build/raft/kuiklybase/<artifact>/<version>/<file>
+# so the file sits five directories below BYTES_DIR. Six "../" therefore lands
+# in BYTES_DIR's parent. Watching anything else would leave this tooth green no
+# matter what the guards do.
+escape_rel="../../../../../../escape-probe-dir/marker.txt"
+escape_outside_dir="$(dirname "$(cd "$BYTES_DIR" && pwd -P)")/escape-probe-dir"
+rm -rf "$escape_outside_dir"
+
 mock_reset 200
-if ( fetch datetime 0.1.0-raft.0 "../../../../../../..$escape_probe" ) >/dev/null 2>&1; then
+if ( fetch datetime 0.1.0-raft.0 "$escape_rel" ) >/dev/null 2>&1; then
   no "traversal in a manifest entry is refused"
 else
   ok "traversal in a manifest entry is refused"
 fi
-if [ -e "$escape_probe" ]; then
-  no "traversal wrote outside the bundle directory"
+# Two separate observations, so removing either guard is caught on its own: the
+# lexical check runs before the mkdir, the containment check before the write.
+if [ -d "$escape_outside_dir" ]; then
+  no "no directory was created outside the bundle"
+else
+  ok "no directory was created outside the bundle"
+fi
+if [ -e "$escape_outside_dir/marker.txt" ]; then
+  no "nothing was written outside the bundle directory"
 else
   ok "nothing was written outside the bundle directory"
 fi
