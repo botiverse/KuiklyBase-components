@@ -429,6 +429,25 @@ echo "== trigger coverage =="
 # trigger did exactly that, so the wiring is asserted here rather than
 # remembered.
 TEETH_WORKFLOW="$here/../../.github/workflows/datetime-authority-readback-teeth.yml"
+
+# Counted per block, never summed: a path listed twice under pull_request and
+# not at all under push also totals two, while leaving master pushes uncovered.
+_trigger_counts() {
+  awk -v want="$2" '
+    /^  pull_request:/ { section = "pr";   inpaths = 0 }
+    /^  push:/         { section = "push"; inpaths = 0 }
+    /^    paths:/      { if (section != "") inpaths = 1; next }
+    /^      - /        { if (inpaths && $2 == want) n[section]++; next }
+    /^[^ ]/            { section = ""; inpaths = 0 }
+    END { printf "%d %d", n["pr"] + 0, n["push"] + 0 }
+  ' "$1"
+}
+
+# The decision is a function of its own so the teeth can exercise it directly.
+# Left inline, a later "pr + push >= 2" would restore the summing bug with
+# nothing to catch it.
+_trigger_ok() { [ "$1" -eq 1 ] && [ "$2" -eq 1 ]; }
+
 if [ ! -f "$TEETH_WORKFLOW" ]; then
   no "teeth workflow is present at the expected path"
 else
@@ -440,22 +459,54 @@ else
     ".github/workflows/datetime-authority-readback.yml" \
     ".github/workflows/datetime-authority-readback-teeth.yml"
   do
-    # Count the path once per trigger block: it must be listed under both
-    # pull_request and push, or one of the two entry points misses it.
-    listed="$(awk -v want="$guarded" '
-      /^  (pull_request|push):/ { section = 1; inpaths = 0 }
-      /^    paths:/             { if (section) inpaths = 1; next }
-      /^      - /               { if (inpaths) { p = $2; if (p == want) n++ }; next }
-      /^[^ ]/                   { section = 0; inpaths = 0 }
-      END { print n + 0 }
-    ' "$TEETH_WORKFLOW")"
-    if [ "$listed" -ge 2 ]; then
+    counts="$(_trigger_counts "$TEETH_WORKFLOW" "$guarded")"
+    pr_count="${counts%% *}"
+    push_count="${counts##* }"
+    if _trigger_ok "$pr_count" "$push_count"; then
       ok "trigger covers $guarded"
     else
-      no "trigger covers $guarded (listed in $listed of 2 trigger blocks)"
+      no "trigger covers $guarded (pull_request=$pr_count, push=$push_count; each must be exactly 1)"
     fi
   done
 fi
+
+# Counter and decision are both checked against fixtures, so "each block" is
+# proven rather than asserted.
+trigger_fixture="$(mktemp -d)"
+_write_trigger_fixture() {
+  local file="$1" pr="$2" push="$3" i
+  {
+    printf 'on:\n  pull_request:\n    paths:\n'
+    for (( i = 0; i < pr; i++ )); do printf '      - GUARDED\n'; done
+    printf '      - other/file.txt\n'
+    printf '  push:\n    branches:\n      - master\n    paths:\n'
+    for (( i = 0; i < push; i++ )); do printf '      - GUARDED\n'; done
+    printf '      - other/file.txt\n'
+    printf 'jobs:\n  teeth:\n    runs-on: ubuntu-latest\n'
+  } > "$file"
+}
+expect_counts() {
+  local label="$1" pr="$2" push="$3" want="$4" file="$trigger_fixture/wf.yml"
+  _write_trigger_fixture "$file" "$pr" "$push"
+  expect_eq "$label" "$want" "$(_trigger_counts "$file" GUARDED)"
+}
+expect_counts "counter sees one entry in each block"       1 1 "1 1"
+expect_counts "counter keeps a duplicate and a gap apart"  2 0 "2 0"
+expect_counts "counter reports a pull_request-only entry"  1 0 "1 0"
+expect_counts "counter reports a push-only entry"          0 1 "0 1"
+expect_counts "counter reports an absent path"             0 0 "0 0"
+
+expect_decision() {
+  local label="$1" pr="$2" push="$3" want="$4"
+  if _trigger_ok "$pr" "$push"; then got=accept; else got=reject; fi
+  expect_eq "$label" "$want" "$got"
+}
+expect_decision "one in each block is accepted"                1 1 accept
+expect_decision "duplicate in one block, absent in other, rejected" 2 0 reject
+expect_decision "pull_request only is rejected"                1 0 reject
+expect_decision "push only is rejected"                        0 1 reject
+expect_decision "absent everywhere is rejected"                0 0 reject
+rm -rf "$trigger_fixture"
 
 echo "== teeth: ${pass} passed, ${fail} failed =="
 [ "$fail" -eq 0 ] || exit 1
