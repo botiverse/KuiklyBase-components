@@ -1,6 +1,19 @@
 # NetworkKMM Raft fork changelog
 
-## 0.1.0-raft.31 / 0.1.0-raft.31-ohos (curl completion diagnostics)
+## 0.1.0-raft.32 / 0.1.0-raft.32-ohos (canonical curl completion diagnostics release)
+
+- Carry the same reviewed product source and deterministic Android, iOS, and
+  OHOS native payloads as `.31`; there is no runtime or native-carrier change.
+- Make immutable publication-state probes compatible with the older curl in
+  the pinned HarmonyOS build image. Every runner retains `--retry 2`, timeout,
+  authentication, HTTP-classification, and caller-argument behavior; modern
+  curl additionally receives `--retry-all-errors` after a feature probe.
+- `.31` is a failed partial publication: only its three iOS coordinates were
+  published, while Android, OHOS, and metadata were never uploaded. It remains
+  immutable for audit and must not be used as the canonical consumer version.
+  Consume the complete `.32` coordinate instead.
+
+## 0.1.0-raft.31 / 0.1.0-raft.31-ohos (failed partial; do not consume)
 
 - Add completion-only curl transfer facts for Android and iOS: normalized
   DNS/connect/TLS/pre-transfer/first-byte/total timings, independent
@@ -14,8 +27,9 @@
   artifacts. Completion facts are observational only: this release adds no
   stale-connection detection, retry, or recovery behavior.
 - `0.1.0-raft.30` was reserved by the Socket.IO source change but was never
-  published. Consume `.31`; it contains that preceding source plus these
-  completion diagnostics under one fresh immutable coordinate.
+  published. `.31` contains that preceding source plus these completion
+  diagnostics, but its release failed after only the iOS lane converged. Use
+  `.32`, which carries the same payload under a complete fresh coordinate.
 
 ## 0.1.0-raft.30 / 0.1.0-raft.30-ohos (C++ curl Socket.IO v1)
 
