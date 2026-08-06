@@ -17,6 +17,7 @@ on:
     paths:
       - DatetimeKMM/scripts/authority-readback.sh
       - DatetimeKMM/scripts/authority-readback-teeth.sh
+      - DatetimeKMM/scripts/assert-readback-receipt.py
       - .github/workflows/datetime-authority-readback.yml
       - .github/workflows/datetime-authority-readback-teeth.yml
   push:
@@ -25,6 +26,7 @@ on:
     paths:
       - DatetimeKMM/scripts/authority-readback.sh
       - DatetimeKMM/scripts/authority-readback-teeth.sh
+      - DatetimeKMM/scripts/assert-readback-receipt.py
       - .github/workflows/datetime-authority-readback.yml
       - .github/workflows/datetime-authority-readback-teeth.yml
 

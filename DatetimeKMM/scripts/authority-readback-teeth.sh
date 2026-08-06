@@ -422,5 +422,40 @@ assert_receipt "incomplete status is refused" expect-fail \
   "receipt['status'] = 'partial'"
 rm -rf "$receipt_dir"
 
+echo "== trigger coverage =="
+# A gate whose file is not in the workflow's paths filter is a gate no pull
+# request will exercise: the job simply does not run, and the PR goes green
+# having tested nothing. Adding assert-readback-receipt.py without wiring its
+# trigger did exactly that, so the wiring is asserted here rather than
+# remembered.
+TEETH_WORKFLOW="$here/../../.github/workflows/datetime-authority-readback-teeth.yml"
+if [ ! -f "$TEETH_WORKFLOW" ]; then
+  no "teeth workflow is present at the expected path"
+else
+  ok "teeth workflow is present at the expected path"
+  for guarded in \
+    "DatetimeKMM/scripts/authority-readback.sh" \
+    "DatetimeKMM/scripts/authority-readback-teeth.sh" \
+    "DatetimeKMM/scripts/assert-readback-receipt.py" \
+    ".github/workflows/datetime-authority-readback.yml" \
+    ".github/workflows/datetime-authority-readback-teeth.yml"
+  do
+    # Count the path once per trigger block: it must be listed under both
+    # pull_request and push, or one of the two entry points misses it.
+    listed="$(awk -v want="$guarded" '
+      /^  (pull_request|push):/ { section = 1; inpaths = 0 }
+      /^    paths:/             { if (section) inpaths = 1; next }
+      /^      - /               { if (inpaths) { p = $2; if (p == want) n++ }; next }
+      /^[^ ]/                   { section = 0; inpaths = 0 }
+      END { print n + 0 }
+    ' "$TEETH_WORKFLOW")"
+    if [ "$listed" -ge 2 ]; then
+      ok "trigger covers $guarded"
+    else
+      no "trigger covers $guarded (listed in $listed of 2 trigger blocks)"
+    fi
+  done
+fi
+
 echo "== teeth: ${pass} passed, ${fail} failed =="
 [ "$fail" -eq 0 ] || exit 1
