@@ -1,0 +1,133 @@
+# Read-only readback of the already-published DatetimeKMM authority.
+#
+# Raft task #99. Publish run 30342129145 shipped all seven publications but its
+# own verification step never completed, so the 34-file GitHub Packages matrix
+# has never been machine-verified. This workflow downloads that matrix with the
+# run-scoped token and uploads the bytes plus a digest receipt for independent
+# review. It publishes nothing and writes nothing back.
+name: Datetime authority readback (read-only)
+
+on:
+  # No inputs. The version is the frozen authority set for Raft task #99, so a
+  # dispatcher cannot point this workflow's name at a different one.
+  workflow_dispatch:
+
+# Read-only by construction: no packages:write, no contents:write. The job uses
+# the ephemeral run-scoped token only; it adds no secret and prints none.
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: datetime-authority-readback-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  readback:
+    name: Authority readback (34-file matrix)
+    runs-on: ubuntu-latest
+    steps:
+      # Only a landed-current-master dispatch is authority. workflow_dispatch
+      # lets the caller select any branch or tag, so this is refused here --
+      # before any checkout, credential or network use -- rather than left to a
+      # reviewer reading run metadata afterwards.
+      - name: Admission (repository and landed master only)
+        env:
+          EVENT_REPO: ${{ github.repository }}
+          EVENT_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT_REPO" = "botiverse/KuiklyBase-components" ] \
+            || { echo "refusing dispatch from repository $EVENT_REPO" >&2; exit 1; }
+          [ "$EVENT_REF" = "refs/heads/master" ] \
+            || { echo "refusing dispatch from ref $EVENT_REF (master only)" >&2; exit 1; }
+          echo "admission ok: $EVENT_REPO $EVENT_REF"
+
+      # Two trees, because one tree cannot serve both roles: the runnable script
+      # exists only at this exact, while the file manifest must come from the
+      # tree that was actually published.
+      - name: Checkout readback exact (runnable script)
+        uses: actions/checkout@v4
+        with:
+          # Pinned to the event SHA, which is also carried into the receipt.
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Materialize publication source exact (manifest only)
+        uses: actions/checkout@v4
+        with:
+          # The publication's own source exact. publication_urls() is read from
+          # here, so the readback cannot drift from what was published.
+          ref: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          path: .authority-source
+          persist-credentials: false
+
+      - name: Assert the two trees are distinct and correctly rolled
+        run: |
+          set -euo pipefail
+          lib=.authority-source/DatetimeKMM/scripts/publish-lib.sh
+          [ -f "$lib" ] || { echo "publication exact is missing publish-lib.sh" >&2; exit 1; }
+          # The published tree predates this workflow: it must NOT be the source
+          # of the runnable script, or the readback silently reverts to it.
+          if [ -e .authority-source/DatetimeKMM/scripts/authority-readback.sh ]; then
+            echo "publication exact unexpectedly carries the readback script" >&2
+            exit 1
+          fi
+          [ -f DatetimeKMM/scripts/authority-readback.sh ] \
+            || { echo "readback exact is missing the script" >&2; exit 1; }
+          # The materialized tree must be the publication exact itself, not
+          # merely a tree that happens to carry a publish-lib.sh.
+          got="$(git -C .authority-source rev-parse HEAD)"
+          want=8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          [ "$got" = "$want" ] \
+            || { echo "materialized manifest exact $got is not $want" >&2; exit 1; }
+          echo "dual tree ok: script from readback exact, manifest from publication exact"
+
+      - name: Contract teeth (offline, no transfer)
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/authority-readback-teeth.sh
+
+      - name: Read back published matrix
+        env:
+          MAVEN_VERSION: 0.1.0-raft.0
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ github.token }}
+          READBACK_OUT_DIR: readback-out
+          AUTHORITY_SOURCE_DIR: ${{ github.workspace }}/.authority-source/DatetimeKMM/scripts
+          AUTHORITY_SOURCE_EXACT: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          READBACK_SOURCE_EXACT: ${{ github.sha }}
+          READBACK_SOURCE_REF: ${{ github.ref }}
+          READBACK_RUN_ID: ${{ github.run_id }}
+          READBACK_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/authority-readback.sh
+
+      - name: Assert receipt shape and provenance before upload
+        env:
+          EXPECT_VERSION: 0.1.0-raft.0
+          EXPECT_COUNT: "34"
+          EXPECT_MANIFEST_EXACT: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          EXPECT_READBACK_EXACT: ${{ github.sha }}
+          EXPECT_READBACK_REF: ${{ github.ref }}
+          EXPECT_RUN_ID: ${{ github.run_id }}
+          EXPECT_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 DatetimeKMM/scripts/assert-readback-receipt.py \
+            DatetimeKMM/readback-out/readback-receipt.json
+
+      - name: Upload authority bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-authority-bundle
+          # Public package bytes and the digest receipt only. No logs, headers,
+          # credentials or pre-signed URLs (those carry signatures).
+          path: |
+            DatetimeKMM/readback-out/bytes/**
+            DatetimeKMM/readback-out/readback-receipt.json
+          if-no-files-found: error
+          retention-days: 7
