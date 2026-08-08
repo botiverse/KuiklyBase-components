@@ -48,10 +48,12 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import io
 import json
 import os
 import re
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.parse
@@ -260,6 +262,33 @@ def allowed_aux(staged_set: set[str], expected_set: set[str]) -> set[str]:
     return aux
 
 
+def parse_pom_gav(pom_path: Path, label: str) -> dict[str, str]:
+    """Parse a staged POM's direct groupId/artifactId/version, tolerating the
+    Maven default namespace. Parent-POM coordinates are not accepted as the
+    project's own."""
+    import xml.etree.ElementTree as ET
+
+    try:
+        tree = ET.parse(pom_path)
+    except ET.ParseError as error:
+        raise PublishError(f"staged POM is not valid XML: {label}") from error
+    root = tree.getroot()
+    tag = root.tag
+    require(tag.endswith("project"), f"staged POM root is not <project>: {label}")
+    ns = tag[: -len("project")] if tag != "project" else ""
+
+    def child(name: str) -> Optional[str]:
+        element = root.find(f"{ns}{name}")
+        if element is None or element.text is None:
+            return None
+        return element.text.strip()
+
+    gav = {"groupId": child("groupId"), "artifactId": child("artifactId"), "version": child("version")}
+    for key, value in gav.items():
+        require(value, f"staged POM lacks its own {key}: {label}")
+    return gav  # type: ignore[return-value]
+
+
 def build_manifest(staging: Path, expected: list[str], version: str) -> dict:
     require(staging.is_dir(), f"staging directory missing: {staging}")
     source_sha = os.environ.get("DATETIME_SOURCE_SHA", "")
@@ -301,9 +330,10 @@ def build_manifest(staging: Path, expected: list[str], version: str) -> dict:
         require(f"<tag>{source_sha}</tag>" in text, f"staged POM lacks the dispatch scm tag: {entry['path']}")
 
     # GAV/version binding: every file's version directory must be this exact
-    # release version (or its -ohos variant), and every staged POM must carry
-    # the matching groupId/version -- a manifest can never claim one version
-    # while carrying another's bytes.
+    # release version (or its -ohos variant), and every staged POM's parsed
+    # groupId/artifactId/version must equal its path coordinates -- a manifest
+    # can never claim one version while carrying another's bytes, and a POM
+    # cannot smuggle the right strings past in a comment or parent block.
     allowed_versions = {version, version + "-ohos"}
     for entry in files:
         dir_version = entry["path"].rsplit("/", 2)[-2]
@@ -312,14 +342,18 @@ def build_manifest(staging: Path, expected: list[str], version: str) -> dict:
             f"staged path is not the release version {version}: {entry['path']}",
         )
     for entry in pom_files:
-        text = (staging / entry["path"]).read_text(encoding="utf-8")
-        dir_version = entry["path"].rsplit("/", 2)[-2]
+        pom_gav = parse_pom_gav(staging / entry["path"], entry["path"])
+        parts = entry["path"].split("/")
         require(
-            "<groupId>build.raft.kuiklybase</groupId>" in text,
-            f"staged POM lacks the lane groupId: {entry['path']}",
+            pom_gav["groupId"] == "build.raft.kuiklybase",
+            f"staged POM groupId is not the lane group: {entry['path']}",
         )
         require(
-            f"<version>{dir_version}</version>" in text,
+            pom_gav["artifactId"] == parts[-3],
+            f"staged POM artifactId does not match its path: {entry['path']}",
+        )
+        require(
+            pom_gav["version"] == parts[-2],
             f"staged POM version does not match its directory: {entry['path']}",
         )
 
@@ -509,6 +543,43 @@ def command_revalidate(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_freeze(args: argparse.Namespace) -> int:
+    """Package the revalidated staged bytes into THE frozen bundle: one
+    deterministic tar holding exactly the manifest primaries (never aux), so
+    every later consumer uses byte-identical input. The bundle digest is the
+    integrity anchor writers verify against the global plan."""
+    import tarfile
+
+    manifest = load_manifest(Path(args.manifest))
+    roots = [Path(p) for p in args.staging_roots]
+    require(roots, "freeze needs at least one staging root")
+    out = Path(args.output)
+    digest_lines = []
+    with tarfile.open(out, "w") as tar:
+        for entry in sorted(manifest["files"], key=lambda f: f["path"]):
+            relative = entry["path"]
+            candidates = [root / relative for root in roots]
+            present = [c for c in candidates if c.is_file()]
+            require(len(present) == 1, f"manifest path staged {len(present)} times for freeze: {relative}")
+            body = present[0].read_bytes()
+            require(
+                sha256_bytes(body) == entry["sha256"],
+                f"staged bytes changed after manifest: {relative}",
+            )
+            info = tarfile.TarInfo(relative)
+            info.size = len(body)
+            info.mtime = 0
+            info.mode = 0o444
+            tar.addfile(info, io.BytesIO(body))
+            digest_lines.append(relative)
+    require(len(digest_lines) == manifest["fileCount"], "freeze count mismatch")
+    bundle_sha = sha256_bytes(out.read_bytes())
+    print(f"freeze: {len(digest_lines)} primaries -> {out} sha256={bundle_sha}")
+    if args.digest_out:
+        Path(args.digest_out).write_text(bundle_sha + "\n", encoding="utf-8")
+    return 0
+
+
 def command_merge(args: argparse.Namespace) -> int:
     """Merge per-platform shard manifests into the single aggregate release
     manifest. Every shard must agree on version and dispatch source SHA; file
@@ -549,61 +620,89 @@ def command_classify(args: argparse.Namespace) -> int:
 
 
 def command_publish(args: argparse.Namespace) -> int:
+    """Single-writer publish: consumes ONLY the plan-frozen bundle.
+
+    First-PUT barrier (all before any remote mutation): bundle digest must
+    equal the global plan's recorded digest; every member is read into memory
+    and validated against the manifest (exact path set, size, SHA); the remote
+    is re-probed (a publish decision requires every path still absent); the
+    job's own token self-receipt is minted; and the still-landed master is
+    re-fetched and re-bound. PUTs then send only those in-memory bytes -- a
+    tampered file after this point cannot change what is sent."""
     manifest = load_manifest(Path(args.manifest))
     plan = load_plan(Path(args.plan))
     require(plan["decision"] == "publish", "plan decision is not publish — nothing to upload")
-    only = set(load_expected(Path(args.only))) if getattr(args, "only", None) else None
-    selected = [entry for entry in manifest["files"] if only is None or entry["path"] in only]
-    require(selected, "publish selection is empty")
-    require(
-        set(plan["missing"]) >= {entry["path"] for entry in selected},
-        "plan missing set does not cover the publish selection",
-    )
-    staging = Path(args.staging)
-    client = client_from_env()
 
-    # Phase 1 -- freeze the upload set BEFORE any remote mutation: re-read and
-    # re-hash every selected staged file against the manifest and re-enumerate
-    # the staging repository so a late digest change or an added file means
-    # exactly zero PUTs, never a half-written set (review B2).
-    manifest_paths = {entry["path"] for entry in manifest["files"]}
-    current_staged = {str(p.relative_to(staging)) for p in staging.rglob("*") if p.is_file()}
-    aux = allowed_aux(current_staged, manifest_paths)
-    unexpected_primaries = sorted(p for p in (current_staged - aux) if p not in manifest_paths)
+    bundle = Path(args.bundle)
+    require(bundle.is_file(), f"frozen bundle missing: {bundle}")
+    recorded = plan.get("bundleSha256")
+    require(isinstance(recorded, str) and SHA256_RE.fullmatch(recorded) is not None,
+            "global plan carries no bundle digest")
     require(
-        not unexpected_primaries,
-        f"staging gained files after the manifest: {', '.join(unexpected_primaries[:5])}",
+        sha256_bytes(bundle.read_bytes()) == recorded,
+        "frozen bundle digest does not match the global plan — not the same bundle",
     )
-    bodies: list[tuple[str, bytes]] = []
-    for entry in selected:
-        relative = entry["path"]
-        local = staging / relative
-        require(local.is_file(), f"staged byte missing: {relative}")
-        body = local.read_bytes()
+
+    manifest_paths = {entry["path"] for entry in manifest["files"]}
+    bodies: dict[str, bytes] = {}
+    with tarfile.open(bundle, "r") as tar:
+        members = [m for m in tar.getmembers() if m.isfile()]
+        require(
+            sorted(m.name for m in members) == sorted(manifest_paths),
+            "bundle member set does not equal the manifest primary set",
+        )
+        for member in members:
+            require(
+                PATH_RE.fullmatch(member.name) is not None
+                and not member.name.startswith("/")
+                and ".." not in member.name.split("/"),
+                f"unsafe bundle member: {member.name!r}",
+            )
+            extracted = tar.extractfile(member)
+            require(extracted is not None, f"cannot read bundle member {member.name}")
+            bodies[member.name] = extracted.read()
+    require(len(bodies) == manifest["fileCount"], "bundle member count mismatch")
+    for entry in manifest["files"]:
+        body = bodies[entry["path"]]
+        require(len(body) == entry["size"], f"bundle size mismatch: {entry['path']}")
         require(
             sha256_bytes(body) == entry["sha256"],
-            f"staged bytes changed after manifest: {relative}",
+            f"bundle bytes do not match the manifest: {entry['path']}",
         )
-        bodies.append((relative, body))
 
-    # Phase 2 -- create-only PUTs of the frozen bytes.
+    client = client_from_env()
+    # Remote re-probe: the classification happened at plan time; re-prove the
+    # publish precondition (every path still absent) right here, before the
+    # first PUT.
+    for entry in manifest["files"]:
+        status, _ = client.request(entry["path"], "HEAD")
+        require(status == 404, f"remote no longer absent before first PUT: {entry['path']} (HTTP {status})")
+
+    # This job's own token self-receipt: minted from the actual injected
+    # secret that the PUTs below use, and uploaded for the terminal identity
+    # cross-check.
+    token_receipt = fetch_token_self_receipt()
+    Path(args.token_receipt_out).write_text(
+        json.dumps(token_receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
     uploaded = 0
-    for relative, body in bodies:
-        status, _ = client.request(relative, "PUT", body)
+    for entry in manifest["files"]:
+        relative = entry["path"]
+        status, _ = client.request(relative, "PUT", bodies[relative])
         # The server's create-if-absent answers 409 on an occupied release path
         # and keeps the original bytes: a foreign write that landed after the
-        # classification stops the run here instead of being overwritten.
+        # barrier stops the run here instead of being overwritten.
         require(
             status != 409,
-            f"conflict: {relative} was occupied after classification — foreign write, stopping",
+            f"conflict: {relative} was occupied after the barrier — foreign write, stopping",
         )
         require(status in {200, 201, 204}, f"PUT failed with HTTP {status} for {relative}")
         uploaded += 1
         print(f"  put {relative}")
-    require(uploaded == len(bodies), "upload count mismatch")
-    print(f"publish: {uploaded}/{len(bodies)} uploaded")
+    require(uploaded == manifest["fileCount"], "upload count mismatch")
+    print(f"publish: {uploaded}/{manifest['fileCount']} uploaded from the frozen bundle")
     return 0
-
 
 def command_verify(args: argparse.Namespace) -> int:
     manifest = load_manifest(Path(args.manifest))
@@ -720,27 +819,29 @@ def fetch_token_self_receipt(opener: Optional[urllib.request.OpenerDirector] = N
     require(isinstance(expires_at, int) and expires_at != 0, "task token has no expiry (expected a short-lived cap)")
     now_ms = int(time.time() * 1000)
     require(expires_at > now_ms, "task token is already expired")
-    # Structural grant check (never substring matching): a non-empty principal
-    # and at least one grant whose scope is exactly the lane prefix with an
-    # explicit publish permission.
-    principal = record.get("principal")
-    require(isinstance(principal, str) and principal != "", "task token record has no principal")
+    # Structural grant check against the live TokenSummary schema (allowlist:
+    # hash/label/createdAt/expiresAt/revokedAt/grants -- there is NO top-level
+    # principal; the principal lives inside each Grant). At least one grant
+    # must carry exactly the lane scope with an explicit publish permission.
     grants = record.get("grants")
     require(isinstance(grants, list) and grants, "task token carries no grants")
+    lane_grants = [
+        grant
+        for grant in grants
+        if isinstance(grant, dict)
+        and grant.get("scope") == "build.raft.kuiklybase"
+        and isinstance(grant.get("permissions"), list)
+        and "publish" in grant["permissions"]
+    ]
+    require(lane_grants, "task token grants do not include exactly scope=build.raft.kuiklybase + publish")
     require(
-        any(
-            isinstance(grant, dict)
-            and grant.get("scope") == "build.raft.kuiklybase"
-            and isinstance(grant.get("permissions"), list)
-            and "publish" in grant["permissions"]
-            for grant in grants
-        ),
-        "task token grants do not include exactly scope=build.raft.kuiklybase + publish",
+        any(grant.get("principal") for grant in lane_grants),
+        "lane grant carries no principal",
     )
     return {
         "hashPrefix": local_hash[:16],
         "fullHashMatchedLocally": True,
-        "principal": record.get("principal", ""),
+        "principal": lane_grants[0].get("principal"),
         "grants": grants,
         "expiresAt": expires_at,
         "revokedAtAbsent": True,
@@ -774,15 +875,21 @@ def build_parser() -> argparse.ArgumentParser:
     p_reval.add_argument("--manifest", required=True)
     p_reval.add_argument("--staging-roots", required=True, nargs="+")
     p_reval.set_defaults(func=command_revalidate)
+    p_freeze = sub.add_parser("freeze")
+    p_freeze.add_argument("--manifest", required=True)
+    p_freeze.add_argument("--staging-roots", required=True, nargs="+")
+    p_freeze.add_argument("--output", required=True)
+    p_freeze.add_argument("--digest-out", default="")
+    p_freeze.set_defaults(func=command_freeze)
     p_classify = sub.add_parser("classify")
     p_classify.add_argument("--manifest", required=True)
     p_classify.add_argument("--output", required=True)
     p_classify.set_defaults(func=command_classify)
     p_publish = sub.add_parser("publish")
     p_publish.add_argument("--manifest", required=True)
-    p_publish.add_argument("--staging", required=True)
     p_publish.add_argument("--plan", required=True)
-    p_publish.add_argument("--only", default="")
+    p_publish.add_argument("--bundle", required=True)
+    p_publish.add_argument("--token-receipt-out", required=True)
     p_publish.set_defaults(func=command_publish)
     p_verify = sub.add_parser("verify")
     p_verify.add_argument("--manifest", required=True)

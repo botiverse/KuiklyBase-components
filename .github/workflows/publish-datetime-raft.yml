@@ -403,17 +403,25 @@ jobs:
           # prove one token served the whole run.
           python3 scripts/raft-publish.py token-receipt --output token-receipt.json
           python3 scripts/raft-publish.py classify --manifest merged-manifest.json --output global-plan.json
+          # Freeze THE bundle: one content-addressed tar of exactly the
+          # revalidated primaries. The single writer later consumes only this.
+          python3 scripts/raft-publish.py freeze \
+            --manifest merged-manifest.json \
+            --staging-roots "${roots[@]}" \
+            --output frozen-bundle.tar \
+            --digest-out bundle.sha256
           python3 - <<'PY'
           import json
           plan = json.load(open("global-plan.json"))
           token = json.load(open("token-receipt.json"))
           plan["tokenHashPrefix"] = token["hashPrefix"]
+          plan["bundleSha256"] = open("bundle.sha256").read().strip()
           json.dump(plan, open("global-plan.json", "w"), indent=2, sort_keys=True)
           open("global-plan.json", "a").write("\n")
           PY
           decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["decision"])' global-plan.json)"
           echo "decision=$decision" >> "$GITHUB_OUTPUT"
-      - name: Upload aggregate plan
+      - name: Upload aggregate plan + frozen bundle
         uses: actions/upload-artifact@v4
         with:
           name: datetime-raft-global-plan
@@ -421,29 +429,29 @@ jobs:
             DatetimeKMM/merged-manifest.json
             DatetimeKMM/global-plan.json
             DatetimeKMM/token-receipt.json
+            DatetimeKMM/frozen-bundle.tar
+            DatetimeKMM/bundle.sha256
           if-no-files-found: error
           retention-days: 90
 
-  # --- Shard writers: consume the ONE global decision ------------------------
-  publish-ohos:
-    name: "Publish OHOS shard (create-only, then byte readback)"
-    needs: [plan, stage-ohos]
+  # --- THE single writer: consumes only the plan-frozen bundle --------------
+  publish:
+    name: "Publish whole release (single writer, frozen bundle, create-only)"
+    needs: [plan]
     runs-on: ubuntu-latest
     environment: raft-artifacts-production
-    container:
-      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
-      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-        shell: bash
-      - name: Download global plan and shard
+        with:
+          fetch-depth: 0
+      - name: Download global plan + frozen bundle
         uses: actions/download-artifact@v4
         with:
-          pattern: datetime-raft-*
+          name: datetime-raft-global-plan
           path: artifacts-in
-      - name: Publish + verify shard per global decision
+      - name: Publish + verify per global decision
         shell: bash
         env:
           RAFT_ARTIFACTS_USERNAME: raft-ci
@@ -452,188 +460,46 @@ jobs:
         run: |
           set -euo pipefail
           cd DatetimeKMM
+          # Common first-PUT barrier piece: the landed master must still equal
+          # the admitted dispatch source right here, before any mutation.
+          git fetch --quiet origin master
+          [ "$(git rev-parse origin/master)" = "${GITHUB_SHA}" ]             || { echo "landed master drifted before publish — stop" >&2; exit 1; }
           case "$GLOBAL_DECISION" in
             publish)
               python3 scripts/raft-publish.py publish \
-                --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
-                --staging ../artifacts-in/datetime-raft-shard-ohos/datetime-staging \
-                --plan ../artifacts-in/datetime-raft-global-plan/global-plan.json \
-                --only ../artifacts-in/datetime-raft-shard-ohos/datetime-staging.work/expect.txt
+                --manifest ../artifacts-in/merged-manifest.json \
+                --plan ../artifacts-in/global-plan.json \
+                --bundle ../artifacts-in/frozen-bundle.tar \
+                --token-receipt-out publish-token-receipt.json
               ;;
             noop-verified)
-              echo "global decision is noop-verified: zero PUTs for this shard"
+              # Verified no-op: zero PUTs. The token receipt is still minted so
+              # the terminal identity check sees this job's credential shape.
+              python3 scripts/raft-publish.py token-receipt --output publish-token-receipt.json
+              echo "global decision is noop-verified: zero PUTs"
               ;;
             *)
               echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
           esac
           python3 scripts/raft-publish.py verify \
-            --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
-            --only ../artifacts-in/datetime-raft-shard-ohos/datetime-staging.work/expect.txt \
-            --output shard-receipt.json
-      - name: Upload shard receipt
+            --manifest ../artifacts-in/merged-manifest.json \
+            --output publish-receipt.json
+      - name: Upload publish receipts
         uses: actions/upload-artifact@v4
         with:
-          name: datetime-raft-receipt-ohos
-          path: DatetimeKMM/shard-receipt.json
+          name: datetime-raft-receipt-publish
+          path: |
+            DatetimeKMM/publish-receipt.json
+            DatetimeKMM/publish-token-receipt.json
           if-no-files-found: error
           retention-days: 90
 
-  publish-android:
-    name: "Publish Android shard (create-only, then byte readback)"
-    needs: [plan, stage-android]
-    runs-on: ubuntu-latest
-    environment: raft-artifacts-production
-    container:
-      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-        shell: bash
-      - name: Download global plan and shard
-        uses: actions/download-artifact@v4
-        with:
-          pattern: datetime-raft-*
-          path: artifacts-in
-      - name: Publish + verify shard per global decision
-        shell: bash
-        env:
-          RAFT_ARTIFACTS_USERNAME: raft-ci
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
-          GLOBAL_DECISION: ${{ needs.plan.outputs.decision }}
-        run: |
-          set -euo pipefail
-          cd DatetimeKMM
-          case "$GLOBAL_DECISION" in
-            publish)
-              python3 scripts/raft-publish.py publish \
-                --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
-                --staging ../artifacts-in/datetime-raft-shard-android/datetime-staging \
-                --plan ../artifacts-in/datetime-raft-global-plan/global-plan.json \
-                --only ../artifacts-in/datetime-raft-shard-android/datetime-staging.work/expect.txt
-              ;;
-            noop-verified)
-              echo "global decision is noop-verified: zero PUTs for this shard"
-              ;;
-            *)
-              echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
-          esac
-          python3 scripts/raft-publish.py verify \
-            --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
-            --only ../artifacts-in/datetime-raft-shard-android/datetime-staging.work/expect.txt \
-            --output shard-receipt.json
-      - name: Upload shard receipt
-        uses: actions/upload-artifact@v4
-        with:
-          name: datetime-raft-receipt-android
-          path: DatetimeKMM/shard-receipt.json
-          if-no-files-found: error
-          retention-days: 90
-
-  publish-ios:
-    name: "Publish iOS shard (create-only, then byte readback)"
-    needs: [plan, stage-ios]
-    runs-on: ubuntu-latest
-    environment: raft-artifacts-production
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download global plan and shard
-        uses: actions/download-artifact@v4
-        with:
-          pattern: datetime-raft-*
-          path: artifacts-in
-      - name: Publish + verify shard per global decision
-        shell: bash
-        env:
-          RAFT_ARTIFACTS_USERNAME: raft-ci
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
-          GLOBAL_DECISION: ${{ needs.plan.outputs.decision }}
-        run: |
-          set -euo pipefail
-          cd DatetimeKMM
-          case "$GLOBAL_DECISION" in
-            publish)
-              python3 scripts/raft-publish.py publish \
-                --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
-                --staging ../artifacts-in/datetime-raft-shard-ios/datetime-staging \
-                --plan ../artifacts-in/datetime-raft-global-plan/global-plan.json \
-                --only ../artifacts-in/datetime-raft-shard-ios/datetime-staging.work/expect.txt
-              ;;
-            noop-verified)
-              echo "global decision is noop-verified: zero PUTs for this shard"
-              ;;
-            *)
-              echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
-          esac
-          python3 scripts/raft-publish.py verify \
-            --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
-            --only ../artifacts-in/datetime-raft-shard-ios/datetime-staging.work/expect.txt \
-            --output shard-receipt.json
-      - name: Upload shard receipt
-        uses: actions/upload-artifact@v4
-        with:
-          name: datetime-raft-receipt-ios
-          path: DatetimeKMM/shard-receipt.json
-          if-no-files-found: error
-          retention-days: 90
-
-  publish-metadata:
-    name: "Publish metadata shard (create-only, then byte readback)"
-    needs: [plan, stage-android, stage-ios]
-    runs-on: ubuntu-latest
-    environment: raft-artifacts-production
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-      - name: Download global plan and shard
-        uses: actions/download-artifact@v4
-        with:
-          pattern: datetime-raft-*
-          path: artifacts-in
-      - name: Publish + verify shard per global decision
-        shell: bash
-        env:
-          RAFT_ARTIFACTS_USERNAME: raft-ci
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
-          GLOBAL_DECISION: ${{ needs.plan.outputs.decision }}
-        run: |
-          set -euo pipefail
-          cd DatetimeKMM
-          case "$GLOBAL_DECISION" in
-            publish)
-              python3 scripts/raft-publish.py publish \
-                --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
-                --staging ../artifacts-in/datetime-raft-shard-metadata/datetime-staging \
-                --plan ../artifacts-in/datetime-raft-global-plan/global-plan.json \
-                --only ../artifacts-in/datetime-raft-shard-metadata/datetime-staging.work/expect.txt
-              ;;
-            noop-verified)
-              echo "global decision is noop-verified: zero PUTs for this shard"
-              ;;
-            *)
-              echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
-          esac
-          python3 scripts/raft-publish.py verify \
-            --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
-            --only ../artifacts-in/datetime-raft-shard-metadata/datetime-staging.work/expect.txt \
-            --output shard-receipt.json
-      - name: Upload shard receipt
-        uses: actions/upload-artifact@v4
-        with:
-          name: datetime-raft-receipt-metadata
-          path: DatetimeKMM/shard-receipt.json
-          if-no-files-found: error
-          retention-days: 90
-
-  # --- Terminal aggregate receipt: cross-checks every shard receipt, the
-  # merged manifest, and the (non-secret) token-scope claims ---------------
+  # --- Terminal aggregate receipt: cross-checks the publish receipt, the
+  # merged manifest, and the (non-secret) token identities of every
+  # credentialed job ---------------------------------------------------------------
   receipt:
     name: Aggregate publication receipt
-    needs: [plan, publish-ohos, publish-android, publish-ios, publish-metadata]
+    needs: [plan, publish]
     runs-on: ubuntu-latest
     environment: raft-artifacts-production
     permissions:
@@ -662,37 +528,42 @@ jobs:
           set -euo pipefail
           cd DatetimeKMM
           python3 - <<'PY'
-          import json, subprocess
+          import json, os, subprocess
           merged = json.load(open("../artifacts-in/datetime-raft-global-plan/merged-manifest.json"))
           plan = json.load(open("../artifacts-in/datetime-raft-global-plan/global-plan.json"))
+          publish_receipt = json.load(open("../artifacts-in/datetime-raft-receipt-publish/publish-receipt.json"))
+          publish_token = json.load(open("../artifacts-in/datetime-raft-receipt-publish/publish-token-receipt.json"))
           token_receipt = json.load(open("token-receipt.json"))
-          receipts = []
-          for name in ("ohos", "android", "ios", "metadata"):
-              receipts.append(json.load(open(f"../artifacts-in/datetime-raft-receipt-{name}/shard-receipt.json")))
-          for r in receipts:
-              assert r["status"] == "complete", "shard receipt incomplete"
-              assert r["version"] == merged["version"], "shard receipt version drift"
-              assert r["sourceSha"] == merged["sourceSha"], "shard receipt sourceSha drift"
-          covered = sorted(p for r in receipts for p in (f["path"] for f in r["files"]))
+          # The publish receipt covers the whole merged manifest byte-set.
+          assert publish_receipt["status"] == "complete", "publish receipt incomplete"
+          assert publish_receipt["version"] == merged["version"], "publish receipt version drift"
+          assert publish_receipt["sourceSha"] == merged["sourceSha"], "publish receipt sourceSha drift"
+          covered = sorted(f["path"] for f in publish_receipt["files"])
           expected = sorted(f["path"] for f in merged["files"])
-          assert covered == expected, "shard receipts do not cover the merged manifest exactly"
+          assert covered == expected, "publish receipt does not cover the merged manifest exactly"
           # Landed-release binding: live current master == dispatch SHA ==
-          # the sourceSha baked into every staged POM == the shard receipts.
+          # the sourceSha baked into every staged POM == every receipt.
           live_master = subprocess.run(
               ["git", "rev-parse", "origin/master"], check=True, capture_output=True, text=True
           ).stdout.strip()
-          import os
           dispatch_sha = os.environ.get("GITHUB_SHA", "")
           assert live_master == dispatch_sha == merged["sourceSha"], "landed-release binding drift"
           committed = subprocess.run(
               ["grep", "^mavenVersion=", "gradle.properties"], check=True, capture_output=True, text=True
           ).stdout.strip().split("=", 1)[1]
           assert committed == merged["version"], "manifest version is not the committed mavenVersion"
-          assert token_receipt["fullHashMatchedLocally"] is True
-          assert token_receipt["revokedAtAbsent"] is True
-          # One token must have served the whole run: the plan-time introspection
-          # prefix (bound into the global plan before any PUT) equals this one.
-          assert plan.get("tokenHashPrefix") == token_receipt["hashPrefix"], "token changed mid-run"
+          # One token identity must serve plan, publish and this terminal job
+          # alike (A->B->A must go red).
+          prefixes = {
+              plan.get("tokenHashPrefix"),
+              publish_token["hashPrefix"],
+              token_receipt["hashPrefix"],
+          }
+          assert len(prefixes) == 1 and prefixes != {""} and None not in prefixes, \
+              f"token identity drifted across jobs: {sorted(prefixes)}"
+          for r in (publish_token, token_receipt):
+              assert r["fullHashMatchedLocally"] is True
+              assert r["revokedAtAbsent"] is True
           aggregate = {
               "status": "complete",
               "version": merged["version"],
@@ -701,12 +572,12 @@ jobs:
               "fileCount": merged["fileCount"],
               "files": merged["files"],
               "plan": plan,
-              "tokenReceipt": token_receipt,
-              "shardReceipts": ["ohos", "android", "ios", "metadata"],
+              "tokenIdentities": sorted(prefixes),
+              "receipts": ["plan", "publish", "receipt"],
           }
           json.dump(aggregate, open("aggregate-receipt.json", "w"), indent=2, sort_keys=True)
           open("aggregate-receipt.json", "a").write("\n")
-          print(f"aggregate receipt: {merged['fileCount']} files, version={merged['version']}, source={merged['sourceSha'][:12]}, token={token_receipt['hashPrefix']}")
+          print(f"aggregate receipt: {merged['fileCount']} files, version={merged['version']}, source={merged['sourceSha'][:12]}, token={sorted(prefixes)[0]}")
           PY
       - name: Upload aggregate receipt
         uses: actions/upload-artifact@v4

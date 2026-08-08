@@ -108,6 +108,7 @@ def pom_text(sha: str, version: str = VERSION) -> str:
     return (
         "<project>"
         "<groupId>build.raft.kuiklybase</groupId>"
+        "<artifactId>datetime</artifactId>"
         f"<version>{version}</version>"
         "<properties>"
         f"<dev.raft.sourceSha>{sha}</dev.raft.sourceSha>"
@@ -139,13 +140,25 @@ def write_expect(root: Path, paths: list[str]) -> Path:
     return f
 
 
+FAKE_TOKEN_RECEIPT = {
+    "hashPrefix": "f" * 16,
+    "fullHashMatchedLocally": True,
+    "principal": "agents/test",
+    "grants": [],
+    "expiresAt": 1,
+    "revokedAtAbsent": True,
+}
+
+
 def run_cmd(argv: list[str], client: FakeClient, env: dict[str, str] | None = None) -> int:
     original_client = pub.client_from_env
     original_listing = pub.list_primaries_from_env
+    original_token = pub.fetch_token_self_receipt
     saved_env: dict[str, str] = {}
     env = env or {}
     pub.client_from_env = lambda: client
     pub.list_primaries_from_env = client.listing
+    pub.fetch_token_self_receipt = lambda *a, **k: dict(FAKE_TOKEN_RECEIPT)
     for key, value in env.items():
         saved_env[key] = os.environ.get(key, "")
         os.environ[key] = value
@@ -154,6 +167,7 @@ def run_cmd(argv: list[str], client: FakeClient, env: dict[str, str] | None = No
     finally:
         pub.client_from_env = original_client
         pub.list_primaries_from_env = original_listing
+        pub.fetch_token_self_receipt = original_token
         for key, value in saved_env.items():
             if value == "":
                 os.environ.pop(key, None)
@@ -164,10 +178,12 @@ def run_cmd(argv: list[str], client: FakeClient, env: dict[str, str] | None = No
 def run_direct(argv: list[str], client: FakeClient, env: dict[str, str] | None = None) -> int:
     original_client = pub.client_from_env
     original_listing = pub.list_primaries_from_env
+    original_token = pub.fetch_token_self_receipt
     saved_env: dict[str, str] = {}
     env = env or {}
     pub.client_from_env = lambda: client
     pub.list_primaries_from_env = client.listing
+    pub.fetch_token_self_receipt = lambda *a, **k: dict(FAKE_TOKEN_RECEIPT)
     for key, value in env.items():
         saved_env[key] = os.environ.get(key, "")
         os.environ[key] = value
@@ -177,6 +193,7 @@ def run_direct(argv: list[str], client: FakeClient, env: dict[str, str] | None =
     finally:
         pub.client_from_env = original_client
         pub.list_primaries_from_env = original_listing
+        pub.fetch_token_self_receipt = original_token
         for key, value in saved_env.items():
             if value == "":
                 os.environ.pop(key, None)
@@ -320,56 +337,139 @@ def main() -> int:
         code = run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], outsider, env)
         check("classify_ignores_outside_prefix", code == 0)
 
+        # 8-12. bundle-model publish teeth. freeze helper: plan + bundle with
+        # the digest recorded in the plan, exactly as the plan job does it.
+        def freeze_into(staging_dir: Path, plan_file: Path, out_name: str) -> Path:
+            bundle = root / out_name
+            digest_out = root / (out_name + ".sha")
+            run_cmd(["freeze", "--manifest", str(manifest_path), "--staging-roots", str(staging_dir),
+                     "--output", str(bundle), "--digest-out", str(digest_out)], FakeClient(), env)
+            plan = json.loads(plan_file.read_text())
+            plan["bundleSha256"] = digest_out.read_text().strip()
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            return bundle
+
         # 8. publish refuses a noop plan
         run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], full, env)
+        noop_bundle = freeze_into(staging, plan_path, "noop.tar")
         expect_raises(
             "publish_refuses_noop_plan",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path), "--staging", str(staging),
-                                "--plan", str(plan_path)], full, env),
+            lambda: run_direct(["publish", "--manifest", str(manifest_path),
+                                "--plan", str(plan_path), "--bundle", str(noop_bundle),
+                                "--token-receipt-out", str(root / "tr1.json")], full, env),
             "not publish",
         )
 
-        # 9. publish re-hashes staged bytes (tamper after manifest -> red)
+        # 9. bundle digest must match the plan (not the same bundle -> red, 0 PUT)
         run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], client, env)
-        tampered = root / "tampered"
-        tampered_staging = make_staging(tampered, paths)
-        victim = tampered_staging / paths[2]
-        victim.write_bytes(b"tampered")
+        good_bundle = freeze_into(staging, plan_path, "good.tar")
+        wrong_plan = root / "wrong-plan.json"
+        wrong_plan.write_text(json.dumps({**json.loads(plan_path.read_text()), "bundleSha256": "0" * 64}), encoding="utf-8")
+        digest_fail = FakeClient()
         expect_raises(
-            "publish_refuses_tampered_staging",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path), "--staging", str(tampered_staging),
-                                "--plan", str(plan_path)], client, env),
-            "changed after manifest",
+            "publish_rejects_wrong_bundle_digest",
+            lambda: run_direct(["publish", "--manifest", str(manifest_path),
+                                "--plan", str(wrong_plan), "--bundle", str(good_bundle),
+                                "--token-receipt-out", str(root / "tr2.json")], digest_fail, env),
+            "not the same bundle",
         )
+        check("wrong_digest_zero_puts", not [c for c in digest_fail.calls if c[0] == "PUT"])
 
-        # 10. causal race tooth: foreign bytes after classify -> 409 -> fail, preserved
-        race = FakeClient()
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], race, env)
-        race.store[paths[0]] = b"foreign-post-plan-bytes"
+        # 9b. bundle member tampered after freeze (digest re-recorded to match
+        # the tampered bundle) -> member-vs-manifest check catches it, 0 PUT
+        import tarfile as _tf
+        evil_bundle = root / "evil.tar"
+        with _tf.open(good_bundle) as src_tar, _tf.open(evil_bundle, "w") as dst_tar:
+            for m in src_tar.getmembers():
+                body = src_tar.extractfile(m).read()
+                if m.name == paths[1]:
+                    # same length, different bytes: must trip the SHA guard,
+                    # not the size guard
+                    body = bytes(b ^ 0xFF for b in body)
+                info = _tf.TarInfo(m.name)
+                info.size = len(body)
+                dst_tar.addfile(info, __import__("io").BytesIO(body))
+        evil_plan = root / "evil-plan.json"
+        evil_plan.write_text(json.dumps({**json.loads(plan_path.read_text()),
+                                          "bundleSha256": hashlib.sha256(evil_bundle.read_bytes()).hexdigest()}), encoding="utf-8")
+        evil_client = FakeClient()
+        expect_raises(
+            "publish_rejects_tampered_bundle_member",
+            lambda: run_direct(["publish", "--manifest", str(manifest_path),
+                                "--plan", str(evil_plan), "--bundle", str(evil_bundle),
+                                "--token-receipt-out", str(root / "tr3.json")], evil_client, env),
+            "do not match the manifest",
+        )
+        check("tampered_bundle_zero_puts", not [c for c in evil_client.calls if c[0] == "PUT"])
+
+        # 9c. remote no longer absent at the barrier -> red, 0 PUT
+        occupied = FakeClient()
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], occupied, env)
+        barrier_bundle = freeze_into(staging, plan_path, "barrier.tar")
+        occupied.store[paths[2]] = b"occupied-by-someone-else"
+        expect_raises(
+            "publish_fails_when_remote_occupied_at_barrier",
+            lambda: run_direct(["publish", "--manifest", str(manifest_path),
+                                "--plan", str(plan_path), "--bundle", str(barrier_bundle),
+                                "--token-receipt-out", str(root / "tr4.json")], occupied, env),
+            "no longer absent",
+        )
+        check("occupied_barrier_zero_puts", not [c for c in occupied.calls if c[0] == "PUT"])
+        check("occupied_bytes_preserved", occupied.store[paths[2]] == b"occupied-by-someone-else")
+
+        # 10. 409 race still fail-closed even after the barrier (belt and
+        # suspenders: the re-probe passed, then a foreign write wins the PUT race)
+        class LateOccupier(FakeClient):
+            def request(self, relative, method, body=None):
+                if method == "PUT" and relative == paths[0]:
+                    self.store[relative] = b"race-winner"
+                    return 409, b""
+                return super().request(relative, method, body)
+
+        racer = LateOccupier()
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], racer, env)
+        race_bundle = freeze_into(staging, plan_path, "race.tar")
         expect_raises(
             "publish_never_overwrites_post_plan_foreign_bytes",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path), "--staging", str(staging),
-                                "--plan", str(plan_path)], race, env),
+            lambda: run_direct(["publish", "--manifest", str(manifest_path),
+                                "--plan", str(plan_path), "--bundle", str(race_bundle),
+                                "--token-receipt-out", str(root / "tr5.json")], racer, env),
             "foreign write, stopping",
         )
-        check("race_foreign_bytes_preserved", race.store[paths[0]] == b"foreign-post-plan-bytes")
+        check("race_foreign_bytes_preserved", racer.store[paths[0]] == b"race-winner")
 
-        # 11. publish aborts on non-409 PUT failure
+        # 11. PUT failure aborts
         failing = FakeClient()
         failing.put_fail_status[paths[1]] = 500
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], failing, env)
+        fail_bundle = freeze_into(staging, plan_path, "fail.tar")
         expect_raises(
             "publish_aborts_on_put_failure",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path), "--staging", str(staging),
-                                "--plan", str(plan_path)], failing, env),
+            lambda: run_direct(["publish", "--manifest", str(manifest_path),
+                                "--plan", str(plan_path), "--bundle", str(fail_bundle),
+                                "--token-receipt-out", str(root / "tr6.json")], failing, env),
             "PUT failed with HTTP 500",
         )
 
-        # 12. e2e: empty -> classify -> publish -> verify + receipt
+        # 12. e2e: empty -> classify -> freeze -> publish -> verify + receipt;
+        # THE precision tooth: staging files tampered AFTER freeze do not
+        # change what the remote receives (frozen in-memory bytes only).
         e2e = FakeClient()
         run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], e2e, env)
-        code = run_cmd(["publish", "--manifest", str(manifest_path), "--staging", str(staging),
-                        "--plan", str(plan_path)], e2e, env)
+        e2e_bundle = freeze_into(staging, plan_path, "e2e.tar")
+        for rel in paths:
+            (staging / rel).write_bytes(b"tampered-after-freeze")
+        code = run_cmd(["publish", "--manifest", str(manifest_path),
+                        "--plan", str(plan_path), "--bundle", str(e2e_bundle),
+                        "--token-receipt-out", str(root / "tr7.json")], e2e, env)
         check("e2e_publish_all", code == 0 and len(e2e.store) == len(paths))
+        check(
+            "publish_sends_frozen_bytes_despite_later_staging_tamper",
+            e2e.store[paths[0]] == content_for(paths[0]),
+        )
+        # restore for the verify pass
+        for rel in paths:
+            (staging / rel).write_bytes(content_for(rel))
         os.environ["GITHUB_RUN_ID"] = "777"
         receipt_path = root / "receipt.json"
         code = run_cmd(["verify", "--manifest", str(manifest_path), "--output", str(receipt_path)], e2e, env)
@@ -381,14 +481,15 @@ def main() -> int:
         check("receipt_has_no_secret", "Authorization" not in blob and "raft-ci:" not in blob)
         del os.environ["GITHUB_RUN_ID"]
 
-        # 12b. publish uploads ONLY primaries: local aux in staging never
-        # becomes a remote write.
-        auxe2e = FakeClient()
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], auxe2e, env)
-        code = run_cmd(["publish", "--manifest", str(manifest_path), "--staging", str(auxok),
-                        "--plan", str(plan_path)], auxe2e, env)
-        puts = sorted(p for m, p in auxe2e.calls if m == "PUT")
-        check("publish_puts_only_primaries", code == 0 and puts == sorted(paths))
+        # 12b. freeze packs ONLY primaries: local aux never enters the bundle.
+        aux_bundle = root / "aux.tar"
+        aux_digest = root / "aux.sha"
+        run_cmd(["freeze", "--manifest", str(manifest_path), "--staging-roots", str(auxok),
+                 "--output", str(aux_bundle), "--digest-out", str(aux_digest)], FakeClient(), env)
+        import tarfile as _tf2
+        with _tf2.open(aux_bundle) as t:
+            names = sorted(m.name for m in t.getmembers() if m.isfile())
+        check("freeze_packs_only_primaries", names == sorted(paths))
 
         # 12c. audit-staging (preflight pattern gate): primaries+aux green,
         # third-kind file red, empty red.
@@ -530,29 +631,12 @@ def main() -> int:
             and cp_url.startswith(pub.CONTROL_PLANE_BASE_URL),
         )
 
-        # 16b. REVIEW B2 hardening: a late digest failure issues ZERO PUTs
-        # (two-phase publish revalidates everything before the first PUT),
-        # and a file added to staging after the manifest is caught the same way.
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], FakeClient(), env)
-        late = FakeClient()
-        late_staging = make_staging(root / "late", paths)
-        late_victim = late_staging / paths[3]
-        late_victim.write_bytes(b"late-mutation")
-        expect_raises(
-            "late_digest_failure_issues_zero_puts",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path), "--staging", str(late_staging),
-                                "--plan", str(plan_path)], late, env),
-            "changed after manifest",
-        )
-        check("late_digest_zero_puts", not [c for c in late.calls if c[0] == "PUT"])
-        added = make_staging(root / "added", paths)
-        (added / LANE / "datetime" / VERSION / "datetime-added-primary.jar").write_bytes(b"new")
-        expect_raises(
-            "added_file_after_manifest_issues_zero_puts",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path), "--staging", str(added),
-                                "--plan", str(plan_path)], FakeClient(), env),
-            "gained files after the manifest",
-        )
+        # 16b. B2 hardening coverage note: late-digest / added-file / occupied-
+        # remote zero-PUT cases are now asserted by the bundle barrier teeth
+        # above (wrong_digest_zero_puts, tampered_bundle_zero_puts,
+        # occupied_barrier_zero_puts, race + the frozen-bytes precision tooth).
+        # publish never re-reads mutable paths, so a post-freeze staging
+        # mutation cannot influence the upload set by construction.
 
         # 16c. merge teeth: green union, version/source disagreement red,
         # path collision red.
@@ -603,7 +687,7 @@ def main() -> int:
             "manifest_rejects_pom_without_groupid",
             lambda: run_direct(["manifest", "--staging", str(nogav), "--expect", str(expect),
                                 "--version", VERSION, "--output", str(root / "mw.json")], FakeClient(), env),
-            "lacks the lane groupId",
+            "lacks its own groupId",
         )
         driftv = make_staging(root / "driftv", paths)
         for pom_path in driftv.rglob("*.pom"):
@@ -648,31 +732,21 @@ def main() -> int:
         check("workflow_no_packages_write", "packages: write" not in wf)
         check("workflow_no_github_writer_credential", "GITHUB_PACKAGES" not in wf)
         check("workflow_no_github_packages_host", "maven.pkg.github.com" not in wf)
-        publish_jobs = re.findall(r"\n  (publish-[a-z]+):\n(?:.*\n)*?    environment: raft-artifacts-production", wf)
-        check("workflow_all_publish_jobs_environment_pinned", sorted(publish_jobs) == ["publish-android", "publish-ios", "publish-metadata", "publish-ohos"])
-        plan_job = wf[wf.find("\n  plan:"):]
-        check("workflow_plan_before_publish", "\n  plan:" in wf and wf.find("\n  plan:") < wf.find("\n  publish-ohos:"))
-        # Causal: each publish job's own needs list must contain plan. Removing
-        # plan from any one job turns this tooth red (review false-green fix).
-        publish_blocks = re.split(r"\n  (?=publish-[a-z]+:\n)", wf)
-        named = {}
-        for block in publish_blocks:
-            m = re.match(r"(publish-[a-z]+):\n", block.lstrip("\n "))
-            if m:
-                named[m.group(1)] = block
-        needs_ok = len(named) == 4 and all(
-            re.search(r"needs:\s*\[[^\]]*\bplan\b[^\]]*\]", block) is not None for block in named.values()
-        )
-        check("workflow_publish_jobs_need_plan", needs_ok)
-        # sanity for the split itself: a fabricated block without plan must fail
-        check(
-            "workflow_needs_tooth_is_causal",
-            re.search(r"needs:\s*\[[^\]]*\bplan\b[^\]]*\]", "needs: [stage-ohos]") is None,
-        )
+        # Single-writer structure: exactly one publish job, pinned to the
+        # environment, gated on the aggregate plan.
+        publish_jobs = re.findall(r"\n  (publish-[a-z]+):", wf)
+        check("workflow_single_writer", publish_jobs == [] and "\n  publish:" in wf)
+        publish_block = wf[wf.find("\n  publish:"):wf.find("\n  receipt:")]
+        check("workflow_publish_environment_pinned", "environment: raft-artifacts-production" in publish_block)
+        check("workflow_publish_needs_plan", re.search(r"needs:\s*\[[^\]]*\bplan\b[^\]]*\]", publish_block) is not None)
+        check("workflow_plan_before_publish", wf.find("\n  plan:") < wf.find("\n  publish:"))
+        check("workflow_needs_tooth_is_causal", re.search(r"needs:\s*\[[^\]]*\bplan\b[^\]]*\]", "needs: [stage-ohos]") is None)
         stage_section = wf[wf.find("\n  stage-ohos:"):wf.find("\n  plan:")]
         check("workflow_stage_jobs_have_no_environment", "environment:" not in stage_section)
         check("workflow_admission_requires_source_exact", "REQUESTED_SOURCE_SHA" in wf and "origin/master" in wf)
-        check("workflow_has_aggregate_receipt", "\n  receipt:" in wf and "token-receipt" in wf)
+        receipt_block = wf[wf.find("\n  receipt:"):]
+        check("workflow_receipt_environment_pinned", "environment: raft-artifacts-production" in receipt_block)
+        check("workflow_has_aggregate_receipt", "token-receipt" in wf)
         check("workflow_no_stale_guard_red_on_noop", "stale-rerun" not in wf)
 
         # 18. token self-receipt teeth (fake introspection opener).
@@ -751,12 +825,19 @@ def main() -> int:
                 lambda: with_opener(TokenOpener({"tokens": [evil_grants]})),
                 "exactly scope=build.raft.kuiklybase",
             )
-            no_principal = {k: v for k, v in good_record.items() if k != "principal"}
-            expect_raises(
-                "token_receipt_rejects_missing_principal",
-                lambda: with_opener(TokenOpener({"tokens": [no_principal]})),
-                "no principal",
+            grantless_principal = dict(
+                good_record,
+                grants=[{"scope": "build.raft.kuiklybase", "permissions": ["read", "publish"]}],
             )
+            expect_raises(
+                "token_receipt_rejects_grant_without_principal",
+                lambda: with_opener(TokenOpener({"tokens": [grantless_principal]})),
+                "carries no principal",
+            )
+            # live-schema shape: no top-level principal key at all still passes
+            live_shape = {k: v for k, v in good_record.items() if k != "principal"}
+            r = with_opener(TokenOpener({"tokens": [live_shape]}))
+            check("token_receipt_live_schema_shape", r["fullHashMatchedLocally"] is True)
         finally:
             os.environ.pop("RAFT_ARTIFACTS_PUBLISH_TOKEN", None)
             os.environ.pop("RAFT_ARTIFACTS_USERNAME", None)
