@@ -1,0 +1,195 @@
+# One-way mirror of the verified DatetimeKMM authority bytes to Raft Artifacts.
+#
+# Raft task #99, write half. The 0.1.0-raft.0 / -ohos matrix (34 files) exists
+# only on GitHub Packages; datetime-authority-readback.yml proves the bytes
+# and freezes a digest receipt. This workflow re-fetches those exact bytes
+# read-only, then plans against the Raft side (fail-closed unless the lane is
+# fully absent or already fully identical), uploads, and reads every file back
+# byte-compared. It never rebuilds, never overwrites different remote bytes,
+# and never touches GitHub Packages for write.
+name: Datetime Raft mirror (publish + readback)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character landed master SHA this dispatch must run from
+        required: true
+        type: string
+      confirmation:
+        description: Type "mirror datetime 0.1.0-raft.0 to raft"
+        required: true
+        type: string
+
+# Read from GitHub only; the Raft credential comes from the protected
+# environment below, never from a repository secret a PR could print.
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  # One writer per coordinate: two dispatches can never interleave a mirror.
+  group: datetime-raft-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror 34 authority bytes to Raft Artifacts
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    steps:
+      # Refuse anything but a landed-master dispatch with the exact spoken
+      # confirmation -- before any checkout, credential or network use.
+      - name: Admission (repository, landed master, confirmation)
+        env:
+          EVENT_REPO: ${{ github.repository }}
+          EVENT_REF: ${{ github.ref }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUESTED_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT_REPO" = "botiverse/KuiklyBase-components" ] \
+            || { echo "refusing dispatch from repository $EVENT_REPO" >&2; exit 1; }
+          [ "$EVENT_REF" = "refs/heads/master" ] \
+            || { echo "refusing dispatch from ref $EVENT_REF (master only)" >&2; exit 1; }
+          [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "source_sha is not a 40-hex SHA" >&2; exit 1; }
+          [ "$REQUESTED_CONFIRMATION" = "mirror datetime 0.1.0-raft.0 to raft" ] \
+            || { echo "confirmation string mismatch" >&2; exit 1; }
+          echo "admission ok: $EVENT_REPO $EVENT_REF $REQUESTED_SOURCE_SHA"
+
+      - name: Checkout mirror exact (runnable scripts)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind dispatch to landed current master
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$REQUESTED_SOURCE_SHA" ] \
+            || { echo "checked-out HEAD is not the requested source_sha" >&2; exit 1; }
+          git fetch --quiet origin master
+          [ "$(git rev-parse origin/master)" = "$REQUESTED_SOURCE_SHA" ] \
+            || { echo "requested source_sha is not current landed master" >&2; exit 1; }
+          [ -z "$(git status --porcelain=v1 --untracked-files=all)" ] \
+            || { echo "workspace is not clean" >&2; exit 1; }
+          echo "dispatch bound to landed master $REQUESTED_SOURCE_SHA"
+
+      - name: Materialize publication source exact (manifest only)
+        uses: actions/checkout@v4
+        with:
+          # The publication's own source exact. publication_urls() is read
+          # from here, so the fetched set cannot drift from what was published.
+          ref: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          path: .authority-source
+          persist-credentials: false
+
+      - name: Assert the two trees are distinct and correctly rolled
+        run: |
+          set -euo pipefail
+          lib=.authority-source/DatetimeKMM/scripts/publish-lib.sh
+          [ -f "$lib" ] || { echo "publication exact is missing publish-lib.sh" >&2; exit 1; }
+          if [ -e .authority-source/DatetimeKMM/scripts/raft-mirror.py ]; then
+            echo "publication exact unexpectedly carries the mirror script" >&2
+            exit 1
+          fi
+          [ -f DatetimeKMM/scripts/raft-mirror.py ] \
+            || { echo "mirror exact is missing raft-mirror.py" >&2; exit 1; }
+          [ -f DatetimeKMM/scripts/authority-readback.sh ] \
+            || { echo "mirror exact is missing authority-readback.sh" >&2; exit 1; }
+          got="$(git -C .authority-source rev-parse HEAD)"
+          want=8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          [ "$got" = "$want" ] \
+            || { echo "materialized manifest exact $got is not $want" >&2; exit 1; }
+          echo "dual tree ok: scripts from mirror exact, manifest from publication exact"
+
+      # Both contract suites run BEFORE any network transfer: the readback
+      # teeth guard the fetch half, the mirror teeth guard the write half.
+      - name: Contract teeth (offline, no transfer)
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/authority-readback-teeth.sh
+          python3 scripts/test-raft-mirror.py
+
+      - name: Fetch authority bytes (read-only, GitHub Packages)
+        env:
+          MAVEN_VERSION: 0.1.0-raft.0
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ github.token }}
+          READBACK_OUT_DIR: readback-out
+          AUTHORITY_SOURCE_DIR: ${{ github.workspace }}/.authority-source/DatetimeKMM/scripts
+          AUTHORITY_SOURCE_EXACT: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          READBACK_SOURCE_EXACT: ${{ github.sha }}
+          READBACK_SOURCE_REF: ${{ github.ref }}
+          READBACK_RUN_ID: ${{ github.run_id }}
+          READBACK_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/authority-readback.sh
+
+      - name: Assert receipt shape and provenance before any Raft call
+        env:
+          EXPECT_VERSION: 0.1.0-raft.0
+          EXPECT_COUNT: "34"
+          EXPECT_MANIFEST_EXACT: 8ffc865419ef2e210e2d78f18aedcae00ea9b9cc
+          EXPECT_READBACK_EXACT: ${{ github.sha }}
+          EXPECT_READBACK_REF: ${{ github.ref }}
+          EXPECT_RUN_ID: ${{ github.run_id }}
+          EXPECT_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          python3 DatetimeKMM/scripts/assert-readback-receipt.py \
+            DatetimeKMM/readback-out/readback-receipt.json
+
+      - name: Plan against Raft (all-absent or all-identical, else stop)
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          python3 scripts/raft-mirror.py plan \
+            --receipt readback-out/readback-receipt.json \
+            --output readback-out/mirror-plan.json
+
+      - name: Upload only planned missing bytes
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          python3 scripts/raft-mirror.py publish \
+            --receipt readback-out/readback-receipt.json \
+            --bytes-dir readback-out/bytes \
+            --plan readback-out/mirror-plan.json
+
+      - name: Read back exact bytes from Raft Artifacts
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          python3 scripts/raft-mirror.py verify \
+            --receipt readback-out/readback-receipt.json \
+            --output readback-out/mirror-receipt.json
+
+      - name: Upload mirror receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-mirror-${{ inputs.source_sha }}
+          # Receipts and the plan only: paths, digests and provenance. No
+          # bytes (immutable at both ends), no headers, no credentials.
+          path: |
+            DatetimeKMM/readback-out/readback-receipt.json
+            DatetimeKMM/readback-out/mirror-plan.json
+            DatetimeKMM/readback-out/mirror-receipt.json
+          if-no-files-found: error
+          retention-days: 90
