@@ -300,6 +300,29 @@ def build_manifest(staging: Path, expected: list[str], version: str) -> dict:
         )
         require(f"<tag>{source_sha}</tag>" in text, f"staged POM lacks the dispatch scm tag: {entry['path']}")
 
+    # GAV/version binding: every file's version directory must be this exact
+    # release version (or its -ohos variant), and every staged POM must carry
+    # the matching groupId/version -- a manifest can never claim one version
+    # while carrying another's bytes.
+    allowed_versions = {version, version + "-ohos"}
+    for entry in files:
+        dir_version = entry["path"].rsplit("/", 2)[-2]
+        require(
+            dir_version in allowed_versions,
+            f"staged path is not the release version {version}: {entry['path']}",
+        )
+    for entry in pom_files:
+        text = (staging / entry["path"]).read_text(encoding="utf-8")
+        dir_version = entry["path"].rsplit("/", 2)[-2]
+        require(
+            "<groupId>build.raft.kuiklybase</groupId>" in text,
+            f"staged POM lacks the lane groupId: {entry['path']}",
+        )
+        require(
+            f"<version>{dir_version}</version>" in text,
+            f"staged POM version does not match its directory: {entry['path']}",
+        )
+
     return {
         "schema": 1,
         "version": version,
@@ -448,6 +471,41 @@ def command_audit_staging(args: argparse.Namespace) -> int:
         f"staging audit found files that are neither lane primaries nor local aux: {', '.join(bad[:5])}",
     )
     print(f"staging audit ok: {len(staged)} file(s), primaries+local-aux only")
+    return 0
+
+
+def command_revalidate(args: argparse.Namespace) -> int:
+    """Release-wide pre-PUT barrier, run once in the plan job over ALL shard
+    stagings before the global classification: every manifest byte is re-hashed
+    against its staged file and every staging root is re-enumerated for added
+    or unknown primaries. A failure here means zero PUTs anywhere."""
+    manifest = load_manifest(Path(args.manifest))
+    roots = [Path(p) for p in args.staging_roots]
+    require(roots, "revalidate needs at least one staging root")
+    manifest_paths = {entry["path"] for entry in manifest["files"]}
+    for root in roots:
+        require(root.is_dir(), f"shard staging missing: {root}")
+        staged = {str(p.relative_to(root)) for p in root.rglob("*") if p.is_file()}
+        aux = allowed_aux(staged, manifest_paths)
+        unexpected = sorted(p for p in (staged - aux) if p not in manifest_paths)
+        require(
+            not unexpected,
+            f"shard staging {root} gained or carries unknown files: {', '.join(unexpected[:5])}",
+        )
+    bodies = 0
+    for entry in manifest["files"]:
+        relative = entry["path"]
+        candidates = [root / relative for root in roots]
+        present = [c for c in candidates if c.is_file()]
+        require(len(present) == 1, f"manifest path staged {len(present)} times (expected exactly 1): {relative}")
+        body = present[0].read_bytes()
+        require(
+            sha256_bytes(body) == entry["sha256"],
+            f"staged bytes changed after manifest: {relative}",
+        )
+        bodies += 1
+    require(bodies == manifest["fileCount"], "revalidate count mismatch")
+    print(f"revalidate: {bodies}/{manifest['fileCount']} staged bytes re-hashed across {len(roots)} shard roots, zero drift")
     return 0
 
 
@@ -662,12 +720,22 @@ def fetch_token_self_receipt(opener: Optional[urllib.request.OpenerDirector] = N
     require(isinstance(expires_at, int) and expires_at != 0, "task token has no expiry (expected a short-lived cap)")
     now_ms = int(time.time() * 1000)
     require(expires_at > now_ms, "task token is already expired")
+    # Structural grant check (never substring matching): a non-empty principal
+    # and at least one grant whose scope is exactly the lane prefix with an
+    # explicit publish permission.
+    principal = record.get("principal")
+    require(isinstance(principal, str) and principal != "", "task token record has no principal")
     grants = record.get("grants")
     require(isinstance(grants, list) and grants, "task token carries no grants")
-    serialized = json.dumps(grants, sort_keys=True)
     require(
-        "build.raft.kuiklybase" in serialized and "publish" in serialized,
-        "task token grants do not cover the expected scope prefix + publish",
+        any(
+            isinstance(grant, dict)
+            and grant.get("scope") == "build.raft.kuiklybase"
+            and isinstance(grant.get("permissions"), list)
+            and "publish" in grant["permissions"]
+            for grant in grants
+        ),
+        "task token grants do not include exactly scope=build.raft.kuiklybase + publish",
     )
     return {
         "hashPrefix": local_hash[:16],
@@ -702,6 +770,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_merge.add_argument("--manifests", required=True, nargs="+")
     p_merge.add_argument("--output", required=True)
     p_merge.set_defaults(func=command_merge)
+    p_reval = sub.add_parser("revalidate")
+    p_reval.add_argument("--manifest", required=True)
+    p_reval.add_argument("--staging-roots", required=True, nargs="+")
+    p_reval.set_defaults(func=command_revalidate)
     p_classify = sub.add_parser("classify")
     p_classify.add_argument("--manifest", required=True)
     p_classify.add_argument("--output", required=True)

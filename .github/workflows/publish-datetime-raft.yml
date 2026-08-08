@@ -375,7 +375,7 @@ jobs:
         with:
           pattern: datetime-raft-shard-*
           path: shards
-      - name: Merge shard manifests + aggregate classification
+      - name: Merge shard manifests + release-wide revalidation + aggregate classification
         id: plan
         shell: bash
         env:
@@ -385,12 +385,32 @@ jobs:
           set -euo pipefail
           cd DatetimeKMM
           maps=()
-          for work in ../shards/*/datetime-staging.work; do
-            maps+=("$work/manifest.json")
+          roots=()
+          for shard in ../shards/*/; do
+            maps+=("${shard}datetime-staging.work/manifest.json")
+            roots+=("${shard}datetime-staging")
           done
           [ "${#maps[@]}" -eq 4 ] || { echo "expected 4 shard manifests, got ${#maps[@]}"; exit 1; }
           python3 scripts/raft-publish.py merge --manifests "${maps[@]}" --output merged-manifest.json
+          # Release-wide zero-PUT barrier: every staged byte of the whole
+          # version is re-hashed and every shard staging re-enumerated BEFORE
+          # classification, so no writer job can ever start from drifted bytes.
+          python3 scripts/raft-publish.py revalidate \
+            --manifest merged-manifest.json \
+            --staging-roots "${roots[@]}"
+          # The token self-receipt is minted at the first credentialed contact
+          # and its hash prefix rides the plan, so the terminal receipt can
+          # prove one token served the whole run.
+          python3 scripts/raft-publish.py token-receipt --output token-receipt.json
           python3 scripts/raft-publish.py classify --manifest merged-manifest.json --output global-plan.json
+          python3 - <<'PY'
+          import json
+          plan = json.load(open("global-plan.json"))
+          token = json.load(open("token-receipt.json"))
+          plan["tokenHashPrefix"] = token["hashPrefix"]
+          json.dump(plan, open("global-plan.json", "w"), indent=2, sort_keys=True)
+          open("global-plan.json", "a").write("\n")
+          PY
           decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["decision"])' global-plan.json)"
           echo "decision=$decision" >> "$GITHUB_OUTPUT"
       - name: Upload aggregate plan
@@ -400,6 +420,7 @@ jobs:
           path: |
             DatetimeKMM/merged-manifest.json
             DatetimeKMM/global-plan.json
+            DatetimeKMM/token-receipt.json
           if-no-files-found: error
           retention-days: 90
 
@@ -669,6 +690,9 @@ jobs:
           assert committed == merged["version"], "manifest version is not the committed mavenVersion"
           assert token_receipt["fullHashMatchedLocally"] is True
           assert token_receipt["revokedAtAbsent"] is True
+          # One token must have served the whole run: the plan-time introspection
+          # prefix (bound into the global plan before any PUT) equals this one.
+          assert plan.get("tokenHashPrefix") == token_receipt["hashPrefix"], "token changed mid-run"
           aggregate = {
               "status": "complete",
               "version": merged["version"],

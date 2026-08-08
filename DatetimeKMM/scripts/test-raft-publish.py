@@ -104,9 +104,12 @@ def expected_paths() -> list[str]:
     ]
 
 
-def pom_text(sha: str) -> str:
+def pom_text(sha: str, version: str = VERSION) -> str:
     return (
-        "<project><properties>"
+        "<project>"
+        "<groupId>build.raft.kuiklybase</groupId>"
+        f"<version>{version}</version>"
+        "<properties>"
         f"<dev.raft.sourceSha>{sha}</dev.raft.sourceSha>"
         "</properties><scm>"
         f"<tag>{sha}</tag>"
@@ -584,6 +587,60 @@ def main() -> int:
             "owned by two shard manifests",
         )
 
+        # 16d. GAV/version binding teeth (review B3): a mismatched --version,
+        # a POM without GAV, or a POM whose version disagrees with its
+        # directory all turn the manifest red.
+        expect_raises(
+            "manifest_rejects_wrong_version_param",
+            lambda: run_direct(["manifest", "--staging", str(staging), "--expect", str(expect),
+                                "--version", "9.9.9-wrong", "--output", str(root / "mv.json")], FakeClient(), env),
+            "not the release version",
+        )
+        nogav = make_staging(root / "nogav", paths)
+        for pom_path in nogav.rglob("*.pom"):
+            pom_path.write_text(pom_text(SOURCE_SHA).replace("<groupId>build.raft.kuiklybase</groupId>", ""), encoding="utf-8")
+        expect_raises(
+            "manifest_rejects_pom_without_groupid",
+            lambda: run_direct(["manifest", "--staging", str(nogav), "--expect", str(expect),
+                                "--version", VERSION, "--output", str(root / "mw.json")], FakeClient(), env),
+            "lacks the lane groupId",
+        )
+        driftv = make_staging(root / "driftv", paths)
+        for pom_path in driftv.rglob("*.pom"):
+            pom_path.write_text(pom_text(SOURCE_SHA, version="0.0.0-drift"), encoding="utf-8")
+        expect_raises(
+            "manifest_rejects_pom_version_drift",
+            lambda: run_direct(["manifest", "--staging", str(driftv), "--expect", str(expect),
+                                "--version", VERSION, "--output", str(root / "mz.json")], FakeClient(), env),
+            "does not match its directory",
+        )
+
+        # 16e. revalidate barrier teeth (review B1): the release-wide
+        # pre-classification rehash catches tampered, added, or missing shard
+        # bytes -- this is what runs before any writer job exists.
+        code = run_cmd(["revalidate", "--manifest", str(manifest_path), "--staging-roots", str(staging)], FakeClient(), env)
+        check("revalidate_green", code == 0)
+        tampered_root = make_staging(root / "reval-t", paths)
+        (tampered_root / paths[2]).write_bytes(b"drifted")
+        expect_raises(
+            "revalidate_catches_drifted_bytes",
+            lambda: run_direct(["revalidate", "--manifest", str(manifest_path), "--staging-roots", str(tampered_root)], FakeClient(), env),
+            "changed after manifest",
+        )
+        added_root = make_staging(root / "reval-a", paths)
+        (added_root / LANE / "datetime" / VERSION / "datetime-extra.jar").write_bytes(b"new")
+        expect_raises(
+            "revalidate_catches_added_primary",
+            lambda: run_direct(["revalidate", "--manifest", str(manifest_path), "--staging-roots", str(added_root)], FakeClient(), env),
+            "unknown files",
+        )
+        short_root = make_staging(root / "reval-m", paths[:-1])
+        expect_raises(
+            "revalidate_catches_missing_primary",
+            lambda: run_direct(["revalidate", "--manifest", str(manifest_path), "--staging-roots", str(short_root)], FakeClient(), env),
+            "expected exactly 1",
+        )
+
         # 17. B4 workflow contract teeth (text-level, causal): the production
         # workflow must never regain a GitHub writer, the aggregate wiring must
         # keep its shape, and the stage jobs must never see the token.
@@ -594,9 +651,24 @@ def main() -> int:
         publish_jobs = re.findall(r"\n  (publish-[a-z]+):\n(?:.*\n)*?    environment: raft-artifacts-production", wf)
         check("workflow_all_publish_jobs_environment_pinned", sorted(publish_jobs) == ["publish-android", "publish-ios", "publish-metadata", "publish-ohos"])
         plan_job = wf[wf.find("\n  plan:"):]
-        publish_section = wf[wf.find("\n  publish-ohos:"):]
         check("workflow_plan_before_publish", "\n  plan:" in wf and wf.find("\n  plan:") < wf.find("\n  publish-ohos:"))
-        check("workflow_publish_jobs_need_plan", publish_section.count("needs: [plan,") >= 3 or "needs: [plan, stage-ohos]" in wf)
+        # Causal: each publish job's own needs list must contain plan. Removing
+        # plan from any one job turns this tooth red (review false-green fix).
+        publish_blocks = re.split(r"\n  (?=publish-[a-z]+:\n)", wf)
+        named = {}
+        for block in publish_blocks:
+            m = re.match(r"(publish-[a-z]+):\n", block.lstrip("\n "))
+            if m:
+                named[m.group(1)] = block
+        needs_ok = len(named) == 4 and all(
+            re.search(r"needs:\s*\[[^\]]*\bplan\b[^\]]*\]", block) is not None for block in named.values()
+        )
+        check("workflow_publish_jobs_need_plan", needs_ok)
+        # sanity for the split itself: a fabricated block without plan must fail
+        check(
+            "workflow_needs_tooth_is_causal",
+            re.search(r"needs:\s*\[[^\]]*\bplan\b[^\]]*\]", "needs: [stage-ohos]") is None,
+        )
         stage_section = wf[wf.find("\n  stage-ohos:"):wf.find("\n  plan:")]
         check("workflow_stage_jobs_have_no_environment", "environment:" not in stage_section)
         check("workflow_admission_requires_source_exact", "REQUESTED_SOURCE_SHA" in wf and "origin/master" in wf)
@@ -619,7 +691,7 @@ def main() -> int:
         good_record = {
             "hash": token_hash,
             "principal": "agents/cc-wow2",
-            "grants": [{"groupIdPrefix": "build.raft.kuiklybase", "permissions": ["read", "publish"]}],
+            "grants": [{"scope": "build.raft.kuiklybase", "principal": "agents/cc-wow2", "permissions": ["read", "publish"]}],
             "expiresAt": 9999999999999,
         }
         os.environ["RAFT_ARTIFACTS_PUBLISH_TOKEN"] = raw_token
@@ -659,11 +731,31 @@ def main() -> int:
                 lambda: with_opener(TokenOpener({"tokens": [no_expiry]})),
                 "no expiry",
             )
-            wrong_grants = dict(good_record, grants=[{"groupIdPrefix": "org.other", "permissions": ["read"]}])
+            wrong_grants = dict(good_record, grants=[{"scope": "org.other", "principal": "agents/cc-wow2", "permissions": ["read", "publish"]}])
             expect_raises(
                 "token_receipt_rejects_wrong_grants",
                 lambda: with_opener(TokenOpener({"tokens": [wrong_grants]})),
-                "expected scope prefix",
+                "exactly scope=build.raft.kuiklybase",
+            )
+            # the old substring attack: evil scope + publish elsewhere must fail
+            evil_grants = dict(
+                good_record,
+                principal="agents/cc-wow2",
+                grants=[
+                    {"scope": "build.raft.kuiklybase.evil", "principal": "agents/cc-wow2", "permissions": ["delete"]},
+                ],
+                label="publish",
+            )
+            expect_raises(
+                "token_receipt_rejects_substring_grant_attack",
+                lambda: with_opener(TokenOpener({"tokens": [evil_grants]})),
+                "exactly scope=build.raft.kuiklybase",
+            )
+            no_principal = {k: v for k, v in good_record.items() if k != "principal"}
+            expect_raises(
+                "token_receipt_rejects_missing_principal",
+                lambda: with_opener(TokenOpener({"tokens": [no_principal]})),
+                "no principal",
             )
         finally:
             os.environ.pop("RAFT_ARTIFACTS_PUBLISH_TOKEN", None)
