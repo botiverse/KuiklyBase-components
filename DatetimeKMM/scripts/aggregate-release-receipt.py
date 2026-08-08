@@ -24,14 +24,75 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 
 def fail(message: str) -> None:
     print(f"AGGREGATE FAIL: {message}", file=sys.stderr)
     raise SystemExit(1)
+
+
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+HEX16_RE = re.compile(r"[0-9a-f]{16}")
+
+
+def validate_file_entries(files: object, label: str) -> list[dict]:
+    if not isinstance(files, list) or not files:
+        fail(f"{label}: files must be a non-empty list")
+    seen: set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict) or set(entry) != {"path", "sha256", "size"}:
+            fail(f"{label}: invalid file entry keys")
+        path = entry["path"]
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or ".." in path.split("/")
+            or "//" in path
+        ):
+            fail(f"{label}: unsafe path {path!r}")
+        if path in seen:
+            fail(f"{label}: duplicate path {path}")
+        seen.add(path)
+        if not isinstance(entry["sha256"], str) or SHA256_RE.fullmatch(entry["sha256"]) is None:
+            fail(f"{label}: invalid sha256 for {path}")
+        if not isinstance(entry["size"], int) or entry["size"] <= 0:
+            fail(f"{label}: invalid size for {path}")
+    return files
+
+
+def validate_token_receipt(record: object, label: str) -> dict:
+    if not isinstance(record, dict):
+        fail(f"{label}: token receipt is not an object")
+    if not isinstance(record.get("hashPrefix"), str) or HEX16_RE.fullmatch(record["hashPrefix"]) is None:
+        fail(f"{label}: hashPrefix is not 16-hex")
+    if record.get("fullHashMatchedLocally") is not True:
+        fail(f"{label}: lacks a local full-hash match")
+    if record.get("revokedAtAbsent") is not True:
+        fail(f"{label}: token was revoked")
+    expires_at = record.get("expiresAt")
+    if not isinstance(expires_at, int) or expires_at == 0:
+        fail(f"{label}: token has no expiry")
+    if expires_at <= int(time.time() * 1000):
+        fail(f"{label}: token receipt is expired")
+    grants = record.get("grants")
+    if not isinstance(grants, list) or len(grants) != 1:
+        fail(f"{label}: token must carry exactly one minimal grant")
+    grant = grants[0]
+    if not isinstance(grant, dict) or grant.get("scope") != "build.raft.kuiklybase":
+        fail(f"{label}: grant scope is not exactly the lane prefix")
+    permissions = grant.get("permissions")
+    if not isinstance(permissions, list) or "publish" not in permissions or not set(permissions) <= {"read", "publish"}:
+        fail(f"{label}: grant permissions are not the minimal lane cap")
+    principal = grant.get("principal")
+    if not isinstance(principal, dict) or principal.get("kind") != "agent" or not principal.get("id"):
+        fail(f"{label}: grant principal is not an agent principal")
+    return record
 
 
 def load_json(path: Path) -> dict:
@@ -57,6 +118,17 @@ def main(argv: list[str]) -> int:
     publish_receipt = load_json(root / "datetime-raft-receipt-publish" / "publish-receipt.json")
     publish_token = load_json(root / "datetime-raft-receipt-publish" / "publish-token-receipt.json")
     token_receipt = load_json(Path(args.terminal_token_receipt))
+
+    merged_files = validate_file_entries(merged.get("files"), "merged manifest")
+    validate_file_entries(publish_receipt.get("files"), "publish receipt")
+    if plan.get("decision") not in {"publish", "noop-verified"}:
+        fail("plan decision is not a known value")
+    if plan.get("fileCount") != len(merged_files):
+        fail("plan fileCount does not equal the merged manifest")
+    if not isinstance(plan.get("tokenHashPrefix"), str) or HEX16_RE.fullmatch(plan["tokenHashPrefix"]) is None:
+        fail("plan carries no 16-hex tokenHashPrefix (plan-time token receipt is required)")
+    validate_token_receipt(publish_token, "publish")
+    validate_token_receipt(token_receipt, "terminal")
 
     if publish_receipt.get("status") != "complete":
         fail("publish receipt incomplete")

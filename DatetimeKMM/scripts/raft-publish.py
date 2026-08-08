@@ -262,10 +262,11 @@ def allowed_aux(staged_set: set[str], expected_set: set[str]) -> set[str]:
     return aux
 
 
-def parse_pom_gav(pom_path: Path, label: str) -> dict[str, str]:
-    """Parse a staged POM's direct groupId/artifactId/version, tolerating the
-    Maven default namespace. Parent-POM coordinates are not accepted as the
-    project's own."""
+def parse_pom_provenance(pom_path: Path, label: str) -> dict[str, str]:
+    """Parse a staged POM's direct GAV plus the provenance nodes
+    (properties/dev.raft.sourceSha and scm/tag), tolerating the Maven default
+    namespace. Values hidden in XML comments never parse as nodes, so they
+    cannot spoof the binding. Parent-POM coordinates are not accepted."""
     import xml.etree.ElementTree as ET
 
     try:
@@ -277,16 +278,25 @@ def parse_pom_gav(pom_path: Path, label: str) -> dict[str, str]:
     require(tag.endswith("project"), f"staged POM root is not <project>: {label}")
     ns = tag[: -len("project")] if tag != "project" else ""
 
-    def child(name: str) -> Optional[str]:
-        element = root.find(f"{ns}{name}")
+    def child(name: str, under: Optional[str] = None) -> Optional[str]:
+        parent = root if under is None else root.find(f"{ns}{under}")
+        if parent is None:
+            return None
+        element = parent.find(f"{ns}{name}")
         if element is None or element.text is None:
             return None
         return element.text.strip()
 
-    gav = {"groupId": child("groupId"), "artifactId": child("artifactId"), "version": child("version")}
-    for key, value in gav.items():
-        require(value, f"staged POM lacks its own {key}: {label}")
-    return gav  # type: ignore[return-value]
+    out = {
+        "groupId": child("groupId"),
+        "artifactId": child("artifactId"),
+        "version": child("version"),
+        "sourceSha": child("dev.raft.sourceSha", under="properties"),
+        "scmTag": child("tag", under="scm"),
+    }
+    for key, value in out.items():
+        require(value, f"staged POM lacks its own {key} node: {label}")
+    return out  # type: ignore[return-value]
 
 
 def build_manifest(staging: Path, expected: list[str], version: str) -> dict:
@@ -317,17 +327,21 @@ def build_manifest(staging: Path, expected: list[str], version: str) -> dict:
         require(len(body) > 0, f"staged byte empty: {relative}")
         files.append({"path": relative, "sha256": sha256_bytes(body), "size": len(body)})
 
-    # Cross-binding: every staged POM must point back at the dispatch SHA,
-    # both as the dev.raft.sourceSha property and as the scm tag.
+    # Cross-binding: every staged POM must point back at the dispatch SHA via
+    # REAL XML nodes (properties/dev.raft.sourceSha and scm/tag) -- strings
+    # hidden in XML comments never parse as nodes and cannot spoof this.
     pom_files = [f for f in files if f["path"].endswith(".pom")]
     require(pom_files, "no POM staged -- publication shape is wrong")
     for entry in pom_files:
-        text = (staging / entry["path"]).read_text(encoding="utf-8")
+        pom = parse_pom_provenance(staging / entry["path"], entry["path"])
         require(
-            f"<dev.raft.sourceSha>{source_sha}</dev.raft.sourceSha>" in text,
-            f"staged POM lacks the dispatch sourceSha property: {entry['path']}",
+            pom["sourceSha"] == source_sha,
+            f"staged POM's sourceSha node is not the dispatch SHA: {entry['path']}",
         )
-        require(f"<tag>{source_sha}</tag>" in text, f"staged POM lacks the dispatch scm tag: {entry['path']}")
+        require(
+            pom["scmTag"] == source_sha,
+            f"staged POM's scm tag node is not the dispatch SHA: {entry['path']}",
+        )
 
     # GAV/version binding: every file's version directory must be this exact
     # release version (or its -ohos variant), and every staged POM's parsed
@@ -342,18 +356,18 @@ def build_manifest(staging: Path, expected: list[str], version: str) -> dict:
             f"staged path is not the release version {version}: {entry['path']}",
         )
     for entry in pom_files:
-        pom_gav = parse_pom_gav(staging / entry["path"], entry["path"])
+        pom = parse_pom_provenance(staging / entry["path"], entry["path"])
         parts = entry["path"].split("/")
         require(
-            pom_gav["groupId"] == "build.raft.kuiklybase",
+            pom["groupId"] == "build.raft.kuiklybase",
             f"staged POM groupId is not the lane group: {entry['path']}",
         )
         require(
-            pom_gav["artifactId"] == parts[-3],
+            pom["artifactId"] == parts[-3],
             f"staged POM artifactId does not match its path: {entry['path']}",
         )
         require(
-            pom_gav["version"] == parts[-2],
+            pom["version"] == parts[-2],
             f"staged POM version does not match its directory: {entry['path']}",
         )
 
@@ -671,12 +685,41 @@ def command_publish(args: argparse.Namespace) -> int:
         )
 
     client = client_from_env()
-    # Remote re-probe: the classification happened at plan time; re-prove the
-    # publish precondition (every path still absent) right here, before the
-    # first PUT.
+    # Remote re-probe, complete: the classification happened at plan time, so
+    # right here, before the first PUT, re-prove BOTH halves of the publish
+    # precondition -- every expected path still absent AND no late unexpected
+    # primary appeared under the owned prefixes.
     for entry in manifest["files"]:
         status, _ = client.request(entry["path"], "HEAD")
         require(status == 404, f"remote no longer absent before first PUT: {entry['path']} (HTTP {status})")
+    prefixes = sorted({entry["path"].rsplit("/", 1)[0] for entry in manifest["files"]})
+    primaries = list_primaries_from_env()
+    late_extra = sorted(
+        item["key"]
+        for item in primaries
+        if any(item["key"].startswith(prefix + "/") for prefix in prefixes)
+        and item["key"] not in manifest_paths
+    )
+    require(
+        not late_extra,
+        "unexpected carriers appeared under owned prefixes after the plan — stop: " + ", ".join(late_extra[:5]),
+    )
+
+    # Landed-master re-fetch inside the command itself (not only a workflow
+    # step): a drifted master between admission and the first PUT stops here.
+    dispatch_sha = os.environ.get("GITHUB_SHA", "")
+    if dispatch_sha:
+        import subprocess
+
+        fetch = subprocess.run(["git", "fetch", "--quiet", "origin", "master"], check=False)
+        require(fetch.returncode == 0, "cannot fetch origin master at the barrier")
+        current = subprocess.run(
+            ["git", "rev-parse", "origin/master"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        require(
+            current == dispatch_sha == manifest["sourceSha"],
+            "landed master drifted between admission and the first PUT — stop",
+        )
 
     # This job's own token self-receipt: minted from the actual injected
     # secret that the PUTs below use, and uploaded for the terminal identity
@@ -821,27 +864,33 @@ def fetch_token_self_receipt(opener: Optional[urllib.request.OpenerDirector] = N
     require(expires_at > now_ms, "task token is already expired")
     # Structural grant check against the live TokenSummary schema (allowlist:
     # hash/label/createdAt/expiresAt/revokedAt/grants -- there is NO top-level
-    # principal; the principal lives inside each Grant). At least one grant
-    # must carry exactly the lane scope with an explicit publish permission.
+    # principal; the principal lives inside each Grant). The cap must be
+    # EXACTLY the minimal lane grant: a single grant, exact lane scope,
+    # permissions drawn only from {read, publish} and including publish, and
+    # an agent-shaped principal. Extra grants, admin anywhere, or a
+    # human-shaped principal are all red.
     grants = record.get("grants")
     require(isinstance(grants, list) and grants, "task token carries no grants")
-    lane_grants = [
-        grant
-        for grant in grants
-        if isinstance(grant, dict)
-        and grant.get("scope") == "build.raft.kuiklybase"
-        and isinstance(grant.get("permissions"), list)
-        and "publish" in grant["permissions"]
-    ]
-    require(lane_grants, "task token grants do not include exactly scope=build.raft.kuiklybase + publish")
+    require(len(grants) == 1, f"task token must carry exactly one minimal grant, got {len(grants)}")
+    grant = grants[0]
+    require(isinstance(grant, dict), "grant is not an object")
+    require(grant.get("scope") == "build.raft.kuiklybase", "grant scope is not exactly build.raft.kuiklybase")
+    permissions = grant.get("permissions")
+    require(isinstance(permissions, list), "grant permissions missing")
+    require("publish" in permissions, "grant lacks publish permission")
     require(
-        any(grant.get("principal") for grant in lane_grants),
-        "lane grant carries no principal",
+        set(permissions) <= {"read", "publish"},
+        f"grant carries beyond-minimal permissions: {sorted(set(permissions) - {'read', 'publish'})}",
+    )
+    principal = grant.get("principal")
+    require(
+        isinstance(principal, dict) and principal.get("kind") == "agent" and bool(principal.get("id")),
+        "lane grant principal is not a non-empty agent principal",
     )
     return {
         "hashPrefix": local_hash[:16],
         "fullHashMatchedLocally": True,
-        "principal": lane_grants[0].get("principal"),
+        "principal": grant.get("principal"),
         "grants": grants,
         "expiresAt": expires_at,
         "revokedAtAbsent": True,

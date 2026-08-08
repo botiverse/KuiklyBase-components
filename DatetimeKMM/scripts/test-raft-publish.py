@@ -143,9 +143,15 @@ def write_expect(root: Path, paths: list[str]) -> Path:
 FAKE_TOKEN_RECEIPT = {
     "hashPrefix": "f" * 16,
     "fullHashMatchedLocally": True,
-    "principal": "agents/test",
-    "grants": [],
-    "expiresAt": 1,
+    "principal": {"kind": "agent", "id": "cc-wow2"},
+    "grants": [
+        {
+            "scope": "build.raft.kuiklybase",
+            "principal": {"kind": "agent", "id": "cc-wow2"},
+            "permissions": ["read", "publish"],
+        }
+    ],
+    "expiresAt": 9999999999999,
     "revokedAtAbsent": True,
 }
 
@@ -263,7 +269,7 @@ def main() -> int:
             "manifest_rejects_pom_source_mismatch",
             lambda: run_direct(["manifest", "--staging", str(wrong_sha), "--expect", str(expect),
                                 "--version", VERSION, "--output", str(root / "m3.json")], FakeClient(), env),
-            "lacks the dispatch sourceSha",
+            "sourceSha node is not the dispatch SHA",
         )
         expect_raises(
             "manifest_requires_dispatch_sha_env",
@@ -750,7 +756,7 @@ def main() -> int:
         agg = importlib.util.module_from_spec(agg_spec)
         agg_spec.loader.exec_module(agg)
 
-        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False):
+        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False):
             """One self-contained aggregate-receipt case: temp git repo whose
             HEAD is the release exact (master == dispatch == fixture sha)."""
             repo = base / "repo"
@@ -769,15 +775,25 @@ def main() -> int:
             merged = {"schema": 1, "version": VERSION, "sourceSha": sha,
                       "destination": pub.RAFT_ARTIFACTS_BASE_URL, "fileCount": len(paths), "files": files}
             json.dump(merged, open(artifacts / "datetime-raft-global-plan" / "merged-manifest.json", "w"))
-            json.dump({"decision": "publish", "fileCount": len(paths), "tokenHashPrefix": plan_prefix},
-                      open(artifacts / "datetime-raft-global-plan" / "global-plan.json", "w"))
+            plan_obj = {"decision": "publish", "fileCount": len(paths), "tokenHashPrefix": plan_prefix}
+            if bad_plan_decision:
+                plan_obj["decision"] = "teleport"
+            if missing_plan_prefix:
+                del plan_obj["tokenHashPrefix"]
+            json.dump(plan_obj, open(artifacts / "datetime-raft-global-plan" / "global-plan.json", "w"))
             receipt_files = files[:-1] if drop_last_file else files
+            receipt_files = [dict(f) for f in receipt_files]
+            if bad_receipt_sha:
+                receipt_files[0]["sha256"] = "z" * 64
             json.dump({"status": "complete", "version": VERSION, "sourceSha": sha,
                        "fileCount": len(receipt_files), "files": receipt_files},
                       open(artifacts / "datetime-raft-receipt-publish" / "publish-receipt.json", "w"))
             json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=publish_prefix),
                       open(artifacts / "datetime-raft-receipt-publish" / "publish-token-receipt.json", "w"))
-            json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=terminal_prefix), open(base / "terminal-token.json", "w"))
+            terminal_record = dict(FAKE_TOKEN_RECEIPT, hashPrefix=terminal_prefix)
+            if expired_terminal:
+                terminal_record["expiresAt"] = 1
+            json.dump(terminal_record, open(base / "terminal-token.json", "w"))
 
             argv = ["--artifacts", str(artifacts), "--terminal-token-receipt", str(base / "terminal-token.json"),
                     "--output", str(base / "agg.json")]
@@ -812,6 +828,19 @@ def main() -> int:
             check("aggregate_coverage_red", False, "(no failure raised)")
         except SystemExit as e:
             check("aggregate_coverage_red", e.code == 1)
+        for name, kwargs in (
+            ("aggregate_rejects_bad_receipt_sha", {"bad_receipt_sha": True}),
+            ("aggregate_rejects_bad_plan_decision", {"bad_plan_decision": True}),
+            ("aggregate_rejects_missing_plan_prefix", {"missing_plan_prefix": True}),
+            ("aggregate_rejects_expired_terminal_receipt", {"expired_terminal": True}),
+        ):
+            case_dir = root / ("agg-" + name)
+            case_dir.mkdir()
+            try:
+                run_agg_case(case_dir, **kwargs)
+                check(name, False, "(no failure raised)")
+            except SystemExit as e:
+                check(name, e.code == 1)
 
         # 16h. frozen-bytes causal catcher: a FakeClient that rewrites the
         # bundle file after the first PUT. Under the shipped code the remote
@@ -905,6 +934,8 @@ def main() -> int:
             and '^[0-9a-f]{40}$' in admission_block
             and 'REQUESTED_SOURCE_SHA: ${{ github.event.inputs.source_sha }}' in admission_block,
         )
+        plan_block = wf[wf.find("\n  plan:"):wf.find("\n  publish:")]
+        check("workflow_plan_environment_pinned", "environment: raft-artifacts-production" in plan_block)
         receipt_block = wf[wf.find("\n  receipt:"):]
         check("workflow_receipt_environment_pinned", "environment: raft-artifacts-production" in receipt_block)
         check("workflow_has_aggregate_receipt", "token-receipt" in wf)
@@ -934,8 +965,13 @@ def main() -> int:
         token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
         good_record = {
             "hash": token_hash,
-            "principal": "agents/cc-wow2",
-            "grants": [{"scope": "build.raft.kuiklybase", "principal": "agents/cc-wow2", "permissions": ["read", "publish"]}],
+            "grants": [
+                {
+                    "scope": "build.raft.kuiklybase",
+                    "principal": {"kind": "agent", "id": "cc-wow2"},
+                    "permissions": ["read", "publish"],
+                }
+            ],
             "expiresAt": 9999999999999,
         }
         os.environ["RAFT_ARTIFACTS_PUBLISH_TOKEN"] = raw_token
@@ -979,30 +1015,57 @@ def main() -> int:
             expect_raises(
                 "token_receipt_rejects_wrong_grants",
                 lambda: with_opener(TokenOpener({"tokens": [wrong_grants]})),
-                "exactly scope=build.raft.kuiklybase",
+                "not exactly build.raft.kuiklybase",
             )
             # the old substring attack: evil scope + publish elsewhere must fail
             evil_grants = dict(
                 good_record,
-                principal="agents/cc-wow2",
                 grants=[
-                    {"scope": "build.raft.kuiklybase.evil", "principal": "agents/cc-wow2", "permissions": ["delete"]},
+                    {"scope": "build.raft.kuiklybase.evil", "principal": {"kind": "agent", "id": "cc-wow2"}, "permissions": ["delete"]},
                 ],
                 label="publish",
             )
             expect_raises(
                 "token_receipt_rejects_substring_grant_attack",
                 lambda: with_opener(TokenOpener({"tokens": [evil_grants]})),
-                "exactly scope=build.raft.kuiklybase",
+                "not exactly build.raft.kuiklybase",
             )
             grantless_principal = dict(
                 good_record,
                 grants=[{"scope": "build.raft.kuiklybase", "permissions": ["read", "publish"]}],
             )
+            # human-shaped principal is equally red
+            human_principal = dict(
+                good_record,
+                grants=[{"scope": "build.raft.kuiklybase", "principal": {"kind": "human", "id": "wrong-human"}, "permissions": ["read", "publish"]}],
+            )
             expect_raises(
                 "token_receipt_rejects_grant_without_principal",
                 lambda: with_opener(TokenOpener({"tokens": [grantless_principal]})),
-                "carries no principal",
+                "non-empty agent principal",
+            )
+            expect_raises(
+                "token_receipt_rejects_human_principal",
+                lambda: with_opener(TokenOpener({"tokens": [human_principal]})),
+                "agent principal",
+            )
+            admin_cap = dict(
+                good_record,
+                grants=[{"scope": "build.raft.kuiklybase", "principal": {"kind": "agent", "id": "cc-wow2"}, "permissions": ["read", "publish", "admin"]}],
+            )
+            expect_raises(
+                "token_receipt_rejects_admin_permission",
+                lambda: with_opener(TokenOpener({"tokens": [admin_cap]})),
+                "beyond-minimal permissions",
+            )
+            extra_grant = dict(
+                good_record,
+                grants=good_record["grants"] + [{"scope": "org.other", "principal": {"kind": "agent", "id": "x"}, "permissions": ["admin"]}],
+            )
+            expect_raises(
+                "token_receipt_rejects_extra_grant",
+                lambda: with_opener(TokenOpener({"tokens": [extra_grant]})),
+                "exactly one minimal grant",
             )
             # live-schema shape: no top-level principal key at all still passes
             live_shape = {k: v for k, v in good_record.items() if k != "principal"}
