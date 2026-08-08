@@ -165,6 +165,9 @@ def run_cmd(argv: list[str], client: FakeClient, env: dict[str, str] | None = No
     pub.client_from_env = lambda: client
     pub.list_primaries_from_env = client.listing
     pub.fetch_token_self_receipt = lambda *a, **k: dict(FAKE_TOKEN_RECEIPT)
+    # The Hosted runner always exports GITHUB_SHA; offline teeth must not trip
+    # the publish barrier's live master recheck unless a tooth sets it.
+    sha_was = os.environ.pop("GITHUB_SHA", None)
     for key, value in env.items():
         saved_env[key] = os.environ.get(key, "")
         os.environ[key] = value
@@ -174,6 +177,8 @@ def run_cmd(argv: list[str], client: FakeClient, env: dict[str, str] | None = No
         pub.client_from_env = original_client
         pub.list_primaries_from_env = original_listing
         pub.fetch_token_self_receipt = original_token
+        if sha_was is not None:
+            os.environ["GITHUB_SHA"] = sha_was
         for key, value in saved_env.items():
             if value == "":
                 os.environ.pop(key, None)
@@ -190,6 +195,7 @@ def run_direct(argv: list[str], client: FakeClient, env: dict[str, str] | None =
     pub.client_from_env = lambda: client
     pub.list_primaries_from_env = client.listing
     pub.fetch_token_self_receipt = lambda *a, **k: dict(FAKE_TOKEN_RECEIPT)
+    sha_was = os.environ.pop("GITHUB_SHA", None)
     for key, value in env.items():
         saved_env[key] = os.environ.get(key, "")
         os.environ[key] = value
@@ -200,6 +206,8 @@ def run_direct(argv: list[str], client: FakeClient, env: dict[str, str] | None =
         pub.client_from_env = original_client
         pub.list_primaries_from_env = original_listing
         pub.fetch_token_self_receipt = original_token
+        if sha_was is not None:
+            os.environ["GITHUB_SHA"] = sha_was
         for key, value in saved_env.items():
             if value == "":
                 os.environ.pop(key, None)
