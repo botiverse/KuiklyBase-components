@@ -831,12 +831,16 @@ def main() -> int:
             merged = {"schema": 1, "version": VERSION, "sourceSha": sha,
                       "destination": pub.RAFT_ARTIFACTS_BASE_URL, "fileCount": len(paths), "files": files}
             json.dump(merged, open(artifacts / "datetime-raft-global-plan" / "merged-manifest.json", "w"))
-            plan_obj = {"decision": "publish", "fileCount": len(paths), "tokenHashPrefix": plan_prefix}
+            plan_obj = {"decision": "publish", "fileCount": len(paths), "tokenHashPrefix": plan_prefix,
+                        "bundleSha256": "b" * 64, "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
+                        "missing": sorted(paths)}
             if bad_plan_decision:
                 plan_obj["decision"] = "teleport"
             if missing_plan_prefix:
                 del plan_obj["tokenHashPrefix"]
             json.dump(plan_obj, open(artifacts / "datetime-raft-global-plan" / "global-plan.json", "w"))
+            json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=plan_prefix),
+                      open(artifacts / "datetime-raft-global-plan" / "token-receipt.json", "w"))
             receipt_files = files[:-1] if drop_last_file else files
             receipt_files = [dict(f) for f in receipt_files]
             if bad_receipt_sha:
@@ -855,7 +859,9 @@ def main() -> int:
                     "--output", str(base / "agg.json")]
             old_cwd = os.getcwd()
             old_sha = os.environ.get("GITHUB_SHA", "")
+            old_ep = os.environ.get("RAFT_ARTIFACTS_EXPECT_PRINCIPAL", "")
             os.environ["GITHUB_SHA"] = sha
+            os.environ["RAFT_ARTIFACTS_EXPECT_PRINCIPAL"] = "cc-wow2"
             try:
                 os.chdir(repo)
                 return agg.main(argv)
@@ -865,6 +871,10 @@ def main() -> int:
                     os.environ.pop("GITHUB_SHA", None)
                 else:
                     os.environ["GITHUB_SHA"] = old_sha
+                if old_ep == "":
+                    os.environ.pop("RAFT_ARTIFACTS_EXPECT_PRINCIPAL", None)
+                else:
+                    os.environ["RAFT_ARTIFACTS_EXPECT_PRINCIPAL"] = old_ep
 
         agg_ok = root / "agg-ok"
         agg_ok.mkdir()
@@ -1032,6 +1042,7 @@ def main() -> int:
         }
         os.environ["RAFT_ARTIFACTS_PUBLISH_TOKEN"] = raw_token
         os.environ["RAFT_ARTIFACTS_USERNAME"] = "raft-ci"
+        os.environ["RAFT_ARTIFACTS_EXPECT_PRINCIPAL"] = "cc-wow2"
         try:
             def with_opener(opener):
                 return pub.fetch_token_self_receipt(opener)
@@ -1105,6 +1116,15 @@ def main() -> int:
                 lambda: with_opener(TokenOpener({"tokens": [human_principal]})),
                 "agent principal",
             )
+            wrong_agent = dict(
+                good_record,
+                grants=[{"scope": "build.raft.kuiklybase", "principal": {"kind": "agent", "id": "someone-else"}, "permissions": ["read", "publish"]}],
+            )
+            expect_raises(
+                "token_receipt_rejects_wrong_agent_principal",
+                lambda: with_opener(TokenOpener({"tokens": [wrong_agent]})),
+                "expected release principal",
+            )
             admin_cap = dict(
                 good_record,
                 grants=[{"scope": "build.raft.kuiklybase", "principal": {"kind": "agent", "id": "cc-wow2"}, "permissions": ["read", "publish", "admin"]}],
@@ -1130,10 +1150,12 @@ def main() -> int:
         finally:
             os.environ.pop("RAFT_ARTIFACTS_PUBLISH_TOKEN", None)
             os.environ.pop("RAFT_ARTIFACTS_USERNAME", None)
+            os.environ.pop("RAFT_ARTIFACTS_EXPECT_PRINCIPAL", None)
 
         # 16g. token multi-match red.
         os.environ["RAFT_ARTIFACTS_PUBLISH_TOKEN"] = "task-token-probe"
         os.environ["RAFT_ARTIFACTS_USERNAME"] = "raft-ci"
+        os.environ["RAFT_ARTIFACTS_EXPECT_PRINCIPAL"] = "cc-wow2"
         try:
             def with_opener(opener):
                 return pub.fetch_token_self_receipt(opener)
@@ -1146,6 +1168,7 @@ def main() -> int:
         finally:
             os.environ.pop("RAFT_ARTIFACTS_PUBLISH_TOKEN", None)
             os.environ.pop("RAFT_ARTIFACTS_USERNAME", None)
+            os.environ.pop("RAFT_ARTIFACTS_EXPECT_PRINCIPAL", None)
 
 
 

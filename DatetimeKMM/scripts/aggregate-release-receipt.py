@@ -92,6 +92,11 @@ def validate_token_receipt(record: object, label: str) -> dict:
     principal = grant.get("principal")
     if not isinstance(principal, dict) or principal.get("kind") != "agent" or not principal.get("id"):
         fail(f"{label}: grant principal is not an agent principal")
+    expected_principal = os.environ.get("RAFT_ARTIFACTS_EXPECT_PRINCIPAL", "")
+    if not expected_principal:
+        fail(f"{label}: RAFT_ARTIFACTS_EXPECT_PRINCIPAL is not set (required)")
+    if principal.get("id") != expected_principal:
+        fail(f"{label}: grant principal is not the expected release principal")
     return record
 
 
@@ -115,18 +120,27 @@ def main(argv: list[str]) -> int:
     root = Path(args.artifacts)
     merged = load_json(root / "datetime-raft-global-plan" / "merged-manifest.json")
     plan = load_json(root / "datetime-raft-global-plan" / "global-plan.json")
+    plan_token = load_json(root / "datetime-raft-global-plan" / "token-receipt.json")
     publish_receipt = load_json(root / "datetime-raft-receipt-publish" / "publish-receipt.json")
     publish_token = load_json(root / "datetime-raft-receipt-publish" / "publish-token-receipt.json")
     token_receipt = load_json(Path(args.terminal_token_receipt))
 
     merged_files = validate_file_entries(merged.get("files"), "merged manifest")
-    validate_file_entries(publish_receipt.get("files"), "publish receipt")
+    publish_files = validate_file_entries(publish_receipt.get("files"), "publish receipt")
+    # Full plan schema: known decision, count match, all binding fields present
+    # and well-formed (owned prefixes, missing list, bundle digest, token prefix).
     if plan.get("decision") not in {"publish", "noop-verified"}:
         fail("plan decision is not a known value")
     if plan.get("fileCount") != len(merged_files):
         fail("plan fileCount does not equal the merged manifest")
-    if not isinstance(plan.get("tokenHashPrefix"), str) or HEX16_RE.fullmatch(plan["tokenHashPrefix"]) is None:
-        fail("plan carries no 16-hex tokenHashPrefix (plan-time token receipt is required)")
+    for key, pattern in (("bundleSha256", SHA256_RE), ("tokenHashPrefix", HEX16_RE)):
+        if not isinstance(plan.get(key), str) or pattern.fullmatch(plan[key]) is None:
+            fail(f"plan carries no valid {key}")
+    if not isinstance(plan.get("ownedPrefixes"), list) or not plan["ownedPrefixes"]:
+        fail("plan carries no ownedPrefixes")
+    if not isinstance(plan.get("missing"), list):
+        fail("plan carries no missing list")
+    validate_token_receipt(plan_token, "plan")
     validate_token_receipt(publish_token, "publish")
     validate_token_receipt(token_receipt, "terminal")
 
@@ -135,8 +149,19 @@ def main(argv: list[str]) -> int:
     for field in ("version", "sourceSha"):
         if publish_receipt.get(field) != merged.get(field):
             fail(f"publish receipt {field} drift")
-    covered = sorted(f["path"] for f in publish_receipt.get("files", []))
-    expected = sorted(f["path"] for f in merged.get("files", []))
+    if publish_receipt.get("fileCount") != merged.get("fileCount"):
+        fail("publish receipt fileCount does not equal the merged manifest")
+    # Per-entry byte binding: path + sha256 + size must be identical between
+    # the publish receipt and the merged manifest -- not just the path set.
+    merged_by_path = {f["path"]: f for f in merged_files}
+    for entry in publish_files:
+        twin = merged_by_path.get(entry["path"])
+        if twin is None:
+            fail(f"publish receipt path outside the manifest: {entry['path']}")
+        if twin["sha256"] != entry["sha256"] or twin["size"] != entry["size"]:
+            fail(f"publish receipt byte binding mismatch for {entry['path']}")
+    covered = sorted(f["path"] for f in publish_files)
+    expected = sorted(merged_by_path)
     if not expected:
         fail("merged manifest carries no files")
     if covered != expected:
@@ -156,6 +181,7 @@ def main(argv: list[str]) -> int:
 
     prefixes = {
         plan.get("tokenHashPrefix"),
+        plan_token.get("hashPrefix"),
         publish_token.get("hashPrefix"),
         token_receipt.get("hashPrefix"),
     }

@@ -31,6 +31,10 @@ on:
         description: "Required exact 40-character source SHA; must equal current landed master"
         required: true
         type: string
+      expected_principal:
+        description: "Required exact agent principal id the task-minted publish token must belong to"
+        required: true
+        type: string
 
 # Serialize publish runs so two dispatches can never double-publish the same
 # immutable coordinate (non-canceling: a running publish is not interrupted).
@@ -44,6 +48,7 @@ permissions:
 env:
   ANDROID_SDK_ZIP: https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip
   DATETIME_SOURCE_SHA: ${{ github.sha }}
+  RAFT_ARTIFACTS_EXPECT_PRINCIPAL: ${{ github.event.inputs.expected_principal }}
 
 jobs:
   admission:

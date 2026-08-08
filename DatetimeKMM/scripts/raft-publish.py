@@ -685,6 +685,17 @@ def command_publish(args: argparse.Namespace) -> int:
         )
 
     client = client_from_env()
+    # The credential introspection runs FIRST, so every mutable-state check
+    # below is as close to the first PUT as this process can make it (review
+    # r4: introspection between the checks left a remote-mutation window).
+    # This job's own token self-receipt: minted from the actual injected
+    # secret that the PUTs below use, and uploaded for the terminal identity
+    # cross-check.
+    token_receipt = fetch_token_self_receipt()
+    Path(args.token_receipt_out).write_text(
+        json.dumps(token_receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+
     # Remote re-probe, complete: the classification happened at plan time, so
     # right here, before the first PUT, re-prove BOTH halves of the publish
     # precondition -- every expected path still absent AND no late unexpected
@@ -720,14 +731,6 @@ def command_publish(args: argparse.Namespace) -> int:
             current == dispatch_sha == manifest["sourceSha"],
             "landed master drifted between admission and the first PUT — stop",
         )
-
-    # This job's own token self-receipt: minted from the actual injected
-    # secret that the PUTs below use, and uploaded for the terminal identity
-    # cross-check.
-    token_receipt = fetch_token_self_receipt()
-    Path(args.token_receipt_out).write_text(
-        json.dumps(token_receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-    )
 
     uploaded = 0
     for entry in manifest["files"]:
@@ -886,6 +889,15 @@ def fetch_token_self_receipt(opener: Optional[urllib.request.OpenerDirector] = N
     require(
         isinstance(principal, dict) and principal.get("kind") == "agent" and bool(principal.get("id")),
         "lane grant principal is not a non-empty agent principal",
+    )
+    # Exact principal identity: the release declares which agent principal the
+    # task token must belong to, and the record must match it exactly -- a
+    # well-shaped record for the WRONG agent is a red, not a pass.
+    expected_principal = os.environ.get("RAFT_ARTIFACTS_EXPECT_PRINCIPAL", "")
+    require(expected_principal != "", "RAFT_ARTIFACTS_EXPECT_PRINCIPAL is not set (required)")
+    require(
+        principal.get("id") == expected_principal,
+        f"lane grant principal is not the expected release principal",
     )
     return {
         "hashPrefix": local_hash[:16],
