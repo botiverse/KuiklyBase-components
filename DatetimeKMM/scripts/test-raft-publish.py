@@ -743,6 +743,113 @@ def main() -> int:
             "expected exactly 1",
         )
 
+        # 16f. aggregate release receipt teeth (drives the extracted script in
+        # a throwaway git repo: offline, no backdoors).
+        import subprocess as _sp
+        agg_spec = importlib.util.spec_from_file_location("agg", HERE / "aggregate-release-receipt.py")
+        agg = importlib.util.module_from_spec(agg_spec)
+        agg_spec.loader.exec_module(agg)
+
+        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False):
+            """One self-contained aggregate-receipt case: temp git repo whose
+            HEAD is the release exact (master == dispatch == fixture sha)."""
+            repo = base / "repo"
+            repo.mkdir(parents=True, exist_ok=True)
+            _sp.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "gradle.properties").write_text(f"mavenVersion={VERSION}\n", encoding="utf-8")
+            _sp.run(["git", "add", "gradle.properties"], cwd=repo, check=True)
+            _sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"], cwd=repo, check=True)
+            sha = _sp.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+            _sp.run(["git", "update-ref", "refs/remotes/origin/master", sha], cwd=repo, check=True)
+
+            artifacts = base / "artifacts"
+            (artifacts / "datetime-raft-global-plan").mkdir(parents=True)
+            (artifacts / "datetime-raft-receipt-publish").mkdir(parents=True)
+            files = [{"path": pth, "sha256": hashlib.sha256(pth.encode()).hexdigest(), "size": 3} for pth in paths]
+            merged = {"schema": 1, "version": VERSION, "sourceSha": sha,
+                      "destination": pub.RAFT_ARTIFACTS_BASE_URL, "fileCount": len(paths), "files": files}
+            json.dump(merged, open(artifacts / "datetime-raft-global-plan" / "merged-manifest.json", "w"))
+            json.dump({"decision": "publish", "fileCount": len(paths), "tokenHashPrefix": plan_prefix},
+                      open(artifacts / "datetime-raft-global-plan" / "global-plan.json", "w"))
+            receipt_files = files[:-1] if drop_last_file else files
+            json.dump({"status": "complete", "version": VERSION, "sourceSha": sha,
+                       "fileCount": len(receipt_files), "files": receipt_files},
+                      open(artifacts / "datetime-raft-receipt-publish" / "publish-receipt.json", "w"))
+            json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=publish_prefix),
+                      open(artifacts / "datetime-raft-receipt-publish" / "publish-token-receipt.json", "w"))
+            json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=terminal_prefix), open(base / "terminal-token.json", "w"))
+
+            argv = ["--artifacts", str(artifacts), "--terminal-token-receipt", str(base / "terminal-token.json"),
+                    "--output", str(base / "agg.json")]
+            old_cwd = os.getcwd()
+            old_sha = os.environ.get("GITHUB_SHA", "")
+            os.environ["GITHUB_SHA"] = sha
+            try:
+                os.chdir(repo)
+                return agg.main(argv)
+            finally:
+                os.chdir(old_cwd)
+                if old_sha == "":
+                    os.environ.pop("GITHUB_SHA", None)
+                else:
+                    os.environ["GITHUB_SHA"] = old_sha
+
+        agg_ok = root / "agg-ok"
+        agg_ok.mkdir()
+        code = run_agg_case(agg_ok)
+        check("aggregate_receipt_green", code == 0)
+        agg_aba = root / "agg-aba"
+        agg_aba.mkdir()
+        try:
+            run_agg_case(agg_aba, publish_prefix="b" * 16)
+            check("aggregate_token_aba_red", False, "(no failure raised)")
+        except SystemExit as e:
+            check("aggregate_token_aba_red", e.code == 1)
+        agg_cov = root / "agg-cov"
+        agg_cov.mkdir()
+        try:
+            run_agg_case(agg_cov, drop_last_file=True)
+            check("aggregate_coverage_red", False, "(no failure raised)")
+        except SystemExit as e:
+            check("aggregate_coverage_red", e.code == 1)
+
+        # 16h. frozen-bytes causal catcher: a FakeClient that rewrites the
+        # bundle file after the first PUT. Under the shipped code the remote
+        # still receives the frozen in-memory bytes; a mutation that re-reads
+        # from the bundle at PUT time turns this red.
+        class BundleTamperClient(FakeClient):
+            def __init__(self, bundle_path: Path) -> None:
+                super().__init__()
+                self.bundle_path = bundle_path
+                self.armed = True
+
+            def request(self, relative, method, body=None):
+                if method == "PUT" and self.armed:
+                    self.armed = False
+                    import tarfile as _tf3, io as _io
+                    with _tf3.open(self.bundle_path) as t0:
+                        members = {m.name: t0.extractfile(m).read() for m in t0.getmembers() if m.isfile()}
+                    victim = sorted(members)[1]
+                    members[victim] = b"x" * len(members[victim])
+                    with _tf3.open(self.bundle_path, "w") as t1:
+                        for name, data in members.items():
+                            info = _tf3.TarInfo(name)
+                            info.size = len(data)
+                            t1.addfile(info, _io.BytesIO(data))
+                return super().request(relative, method, body)
+
+        tamper_client = FakeClient()
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], tamper_client, env)
+        tamper_bundle = freeze_into(staging, plan_path, "tamper-target.tar")
+        hooked = BundleTamperClient(tamper_bundle)
+        run_cmd(["publish", "--manifest", str(manifest_path),
+                 "--plan", str(plan_path), "--bundle", str(tamper_bundle),
+                 "--token-receipt-out", str(root / "tr8.json")], hooked, env)
+        check(
+            "remote_receives_frozen_bytes_even_if_bundle_tampered_mid_publish",
+            all(hooked.store[rel] == content_for(rel) for rel in paths),
+        )
+
         # 17. B4 workflow contract teeth (text-level, causal): the production
         # workflow must never regain a GitHub writer, the aggregate wiring must
         # keep its shape, and the stage jobs must never see the token.
@@ -766,6 +873,15 @@ def main() -> int:
         check("workflow_receipt_environment_pinned", "environment: raft-artifacts-production" in receipt_block)
         check("workflow_has_aggregate_receipt", "token-receipt" in wf)
         check("workflow_no_stale_guard_red_on_noop", "stale-rerun" not in wf)
+        check(
+            "workflow_receipt_needs_plan_and_publish",
+            re.search(r"receipt:[\s\S]*?needs:\s*\[[^\]]*\bplan\b[^\]]*\bpublish\b[^\]]*\]", wf) is not None,
+        )
+        check(
+            "workflow_fresh_master_barrier_before_publish",
+            'git fetch --quiet origin master' in publish_block
+            and publish_block.find("git fetch --quiet origin master") < publish_block.find("raft-publish.py publish"),
+        )
 
         # 18. token self-receipt teeth (fake introspection opener).
         class TokenOpener:
@@ -859,6 +975,24 @@ def main() -> int:
         finally:
             os.environ.pop("RAFT_ARTIFACTS_PUBLISH_TOKEN", None)
             os.environ.pop("RAFT_ARTIFACTS_USERNAME", None)
+
+        # 16g. token multi-match red.
+        os.environ["RAFT_ARTIFACTS_PUBLISH_TOKEN"] = "task-token-probe"
+        os.environ["RAFT_ARTIFACTS_USERNAME"] = "raft-ci"
+        try:
+            def with_opener(opener):
+                return pub.fetch_token_self_receipt(opener)
+            multi = TokenOpener({"tokens": [good_record, dict(good_record)]})
+            expect_raises(
+                "token_receipt_rejects_multi_match",
+                lambda: with_opener(multi),
+                "exactly 1",
+            )
+        finally:
+            os.environ.pop("RAFT_ARTIFACTS_PUBLISH_TOKEN", None)
+            os.environ.pop("RAFT_ARTIFACTS_USERNAME", None)
+
+
 
     print(f"\n{PASS} teeth green, {FAIL} red")
     if FAILURES:

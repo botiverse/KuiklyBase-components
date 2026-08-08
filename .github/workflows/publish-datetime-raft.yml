@@ -527,58 +527,10 @@ jobs:
         run: |
           set -euo pipefail
           cd DatetimeKMM
-          python3 - <<'PY'
-          import json, os, subprocess
-          merged = json.load(open("../artifacts-in/datetime-raft-global-plan/merged-manifest.json"))
-          plan = json.load(open("../artifacts-in/datetime-raft-global-plan/global-plan.json"))
-          publish_receipt = json.load(open("../artifacts-in/datetime-raft-receipt-publish/publish-receipt.json"))
-          publish_token = json.load(open("../artifacts-in/datetime-raft-receipt-publish/publish-token-receipt.json"))
-          token_receipt = json.load(open("token-receipt.json"))
-          # The publish receipt covers the whole merged manifest byte-set.
-          assert publish_receipt["status"] == "complete", "publish receipt incomplete"
-          assert publish_receipt["version"] == merged["version"], "publish receipt version drift"
-          assert publish_receipt["sourceSha"] == merged["sourceSha"], "publish receipt sourceSha drift"
-          covered = sorted(f["path"] for f in publish_receipt["files"])
-          expected = sorted(f["path"] for f in merged["files"])
-          assert covered == expected, "publish receipt does not cover the merged manifest exactly"
-          # Landed-release binding: live current master == dispatch SHA ==
-          # the sourceSha baked into every staged POM == every receipt.
-          live_master = subprocess.run(
-              ["git", "rev-parse", "origin/master"], check=True, capture_output=True, text=True
-          ).stdout.strip()
-          dispatch_sha = os.environ.get("GITHUB_SHA", "")
-          assert live_master == dispatch_sha == merged["sourceSha"], "landed-release binding drift"
-          committed = subprocess.run(
-              ["grep", "^mavenVersion=", "gradle.properties"], check=True, capture_output=True, text=True
-          ).stdout.strip().split("=", 1)[1]
-          assert committed == merged["version"], "manifest version is not the committed mavenVersion"
-          # One token identity must serve plan, publish and this terminal job
-          # alike (A->B->A must go red).
-          prefixes = {
-              plan.get("tokenHashPrefix"),
-              publish_token["hashPrefix"],
-              token_receipt["hashPrefix"],
-          }
-          assert len(prefixes) == 1 and prefixes != {""} and None not in prefixes, \
-              f"token identity drifted across jobs: {sorted(prefixes)}"
-          for r in (publish_token, token_receipt):
-              assert r["fullHashMatchedLocally"] is True
-              assert r["revokedAtAbsent"] is True
-          aggregate = {
-              "status": "complete",
-              "version": merged["version"],
-              "sourceSha": merged["sourceSha"],
-              "destination": merged["destination"],
-              "fileCount": merged["fileCount"],
-              "files": merged["files"],
-              "plan": plan,
-              "tokenIdentities": sorted(prefixes),
-              "receipts": ["plan", "publish", "receipt"],
-          }
-          json.dump(aggregate, open("aggregate-receipt.json", "w"), indent=2, sort_keys=True)
-          open("aggregate-receipt.json", "a").write("\n")
-          print(f"aggregate receipt: {merged['fileCount']} files, version={merged['version']}, source={merged['sourceSha'][:12]}, token={sorted(prefixes)[0]}")
-          PY
+          python3 scripts/aggregate-release-receipt.py \
+            --artifacts ../artifacts-in \
+            --terminal-token-receipt token-receipt.json \
+            --output aggregate-receipt.json
       - name: Upload aggregate receipt
         uses: actions/upload-artifact@v4
         with:
