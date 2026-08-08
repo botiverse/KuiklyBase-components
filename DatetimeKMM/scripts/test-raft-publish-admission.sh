@@ -44,18 +44,17 @@ run_lane() {
 TSTAGING="$(mktemp -d)"
 trap 'rm -rf "$TSTAGING"' EXIT
 
-echo "== missing credentials fail closed before anything =="
+echo "== staging shard needs no credentials (they live only in plan/publish jobs) =="
 set +e
-out="$(run_lane DATETIME_PUBLISH_MODE=android MAVEN_VERSION=9.9.9-raft.9)"; rc=$?
+out="$(run_lane DATETIME_PUBLISH_MODE=android MAVEN_VERSION=9.9.9-raft.9 DATETIME_DRY_RUN=true)"; rc=$?
 set -e
-check_rc "non-zero exit" "1" "$rc"
-check_contains "credential message" "Raft Artifacts credentials are required" "$out"
+check_rc "zero exit" "0" "$rc"
+check_contains "dry-run still works credential-free" "DRY RUN staging tasks" "$out"
 
 echo "== non-empty staging fails closed =="
 touch "$TSTAGING/stray"
 set +e
-out="$(run_lane DATETIME_PUBLISH_MODE=android MAVEN_VERSION=9.9.9-raft.9 \
-  RAFT_ARTIFACTS_USERNAME=raft-ci RAFT_ARTIFACTS_PUBLISH_TOKEN=t)"; rc=$?
+out="$(run_lane DATETIME_PUBLISH_MODE=android MAVEN_VERSION=9.9.9-raft.9 DATETIME_DRY_RUN=true)"; rc=$?
 set -e
 check_rc "non-zero exit" "1" "$rc"
 check_contains "staging message" "staging dir is not empty" "$out"
@@ -63,8 +62,7 @@ rm -f "$TSTAGING/stray"
 
 echo "== unknown mode rejected =="
 set +e
-out="$(run_lane DATETIME_PUBLISH_MODE=bogus MAVEN_VERSION=9.9.9-raft.9 \
-  RAFT_ARTIFACTS_USERNAME=raft-ci RAFT_ARTIFACTS_PUBLISH_TOKEN=t)"; rc=$?
+out="$(run_lane DATETIME_PUBLISH_MODE=bogus MAVEN_VERSION=9.9.9-raft.9 DATETIME_DRY_RUN=true)"; rc=$?
 set -e
 check_rc "exit 2" "2" "$rc"
 check_contains "unknown mode message" "Unknown DATETIME_PUBLISH_MODE" "$out"

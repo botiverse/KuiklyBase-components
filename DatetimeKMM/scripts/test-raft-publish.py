@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import types
@@ -525,6 +526,148 @@ def main() -> int:
             and "authorization" not in cp_headers
             and cp_url.startswith(pub.CONTROL_PLANE_BASE_URL),
         )
+
+        # 16b. REVIEW B2 hardening: a late digest failure issues ZERO PUTs
+        # (two-phase publish revalidates everything before the first PUT),
+        # and a file added to staging after the manifest is caught the same way.
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], FakeClient(), env)
+        late = FakeClient()
+        late_staging = make_staging(root / "late", paths)
+        late_victim = late_staging / paths[3]
+        late_victim.write_bytes(b"late-mutation")
+        expect_raises(
+            "late_digest_failure_issues_zero_puts",
+            lambda: run_direct(["publish", "--manifest", str(manifest_path), "--staging", str(late_staging),
+                                "--plan", str(plan_path)], late, env),
+            "changed after manifest",
+        )
+        check("late_digest_zero_puts", not [c for c in late.calls if c[0] == "PUT"])
+        added = make_staging(root / "added", paths)
+        (added / LANE / "datetime" / VERSION / "datetime-added-primary.jar").write_bytes(b"new")
+        expect_raises(
+            "added_file_after_manifest_issues_zero_puts",
+            lambda: run_direct(["publish", "--manifest", str(manifest_path), "--staging", str(added),
+                                "--plan", str(plan_path)], FakeClient(), env),
+            "gained files after the manifest",
+        )
+
+        # 16c. merge teeth: green union, version/source disagreement red,
+        # path collision red.
+        shard_a = root / "shardA.json"
+        shard_b = root / "shardB.json"
+        m_a = json.loads(manifest_path.read_text())
+        m_b = json.loads(manifest_path.read_text())
+        other_base = f"{LANE}/datetime-android/{VERSION}"
+        m_b["files"] = [
+            {"path": f"{other_base}/datetime-android-{VERSION}.{ext}", "sha256": hashlib.sha256(ext.encode()).hexdigest(), "size": 3}
+            for ext in ("aar", "pom", "module", "sources.jar")
+        ]
+        m_b["fileCount"] = len(m_b["files"])
+        shard_a.write_text(json.dumps(m_a), encoding="utf-8")
+        shard_b.write_text(json.dumps(m_b), encoding="utf-8")
+        merged_out = root / "merged.json"
+        code = run_cmd(["merge", "--manifests", str(shard_a), str(shard_b), "--output", str(merged_out)], FakeClient(), env)
+        merged = json.loads(merged_out.read_text())
+        check("merge_green_union", code == 0 and merged["fileCount"] == 9)
+        m_bad = json.loads(manifest_path.read_text())
+        m_bad["version"] = "0.0.0-drift"
+        bad_shard = root / "shardBad.json"
+        bad_shard.write_text(json.dumps(m_bad), encoding="utf-8")
+        expect_raises(
+            "merge_rejects_version_drift",
+            lambda: run_direct(["merge", "--manifests", str(shard_a), str(bad_shard), "--output", str(root / "mx.json")], FakeClient(), env),
+            "disagree on version",
+        )
+        expect_raises(
+            "merge_rejects_path_collision",
+            lambda: run_direct(["merge", "--manifests", str(shard_a), str(shard_a), "--output", str(root / "my.json")], FakeClient(), env),
+            "owned by two shard manifests",
+        )
+
+        # 17. B4 workflow contract teeth (text-level, causal): the production
+        # workflow must never regain a GitHub writer, the aggregate wiring must
+        # keep its shape, and the stage jobs must never see the token.
+        wf = (HERE.parent.parent / ".github" / "workflows" / "publish-datetime-raft.yml").read_text()
+        check("workflow_no_packages_write", "packages: write" not in wf)
+        check("workflow_no_github_writer_credential", "GITHUB_PACKAGES" not in wf)
+        check("workflow_no_github_packages_host", "maven.pkg.github.com" not in wf)
+        publish_jobs = re.findall(r"\n  (publish-[a-z]+):\n(?:.*\n)*?    environment: raft-artifacts-production", wf)
+        check("workflow_all_publish_jobs_environment_pinned", sorted(publish_jobs) == ["publish-android", "publish-ios", "publish-metadata", "publish-ohos"])
+        plan_job = wf[wf.find("\n  plan:"):]
+        publish_section = wf[wf.find("\n  publish-ohos:"):]
+        check("workflow_plan_before_publish", "\n  plan:" in wf and wf.find("\n  plan:") < wf.find("\n  publish-ohos:"))
+        check("workflow_publish_jobs_need_plan", publish_section.count("needs: [plan,") >= 3 or "needs: [plan, stage-ohos]" in wf)
+        stage_section = wf[wf.find("\n  stage-ohos:"):wf.find("\n  plan:")]
+        check("workflow_stage_jobs_have_no_environment", "environment:" not in stage_section)
+        check("workflow_admission_requires_source_exact", "REQUESTED_SOURCE_SHA" in wf and "origin/master" in wf)
+        check("workflow_has_aggregate_receipt", "\n  receipt:" in wf and "token-receipt" in wf)
+        check("workflow_no_stale_guard_red_on_noop", "stale-rerun" not in wf)
+
+        # 18. token self-receipt teeth (fake introspection opener).
+        class TokenOpener:
+            def __init__(self, payload: dict, status: int = 200) -> None:
+                self.payload = payload
+                self.status = status
+                self.seen_headers: list[dict[str, str]] = []
+
+            def open(self, request, timeout=0):
+                self.seen_headers.append({k.lower(): v for k, v in request.header_items()})
+                return CapResponse(self.status, json.dumps(self.payload).encode())
+
+        raw_token = "task-token-probe"
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        good_record = {
+            "hash": token_hash,
+            "principal": "agents/cc-wow2",
+            "grants": [{"groupIdPrefix": "build.raft.kuiklybase", "permissions": ["read", "publish"]}],
+            "expiresAt": 9999999999999,
+        }
+        os.environ["RAFT_ARTIFACTS_PUBLISH_TOKEN"] = raw_token
+        os.environ["RAFT_ARTIFACTS_USERNAME"] = "raft-ci"
+        try:
+            def with_opener(opener):
+                return pub.fetch_token_self_receipt(opener)
+            r = with_opener(TokenOpener({"tokens": [good_record]}))
+            check("token_receipt_green", r["hashPrefix"] == token_hash[:16] and r["fullHashMatchedLocally"] is True)
+            opener_probe = TokenOpener({"tokens": [good_record]})
+            with_opener(opener_probe)
+            check(
+                "token_introspection_sends_ua_and_basic_auth_to_api_origin_only",
+                opener_probe.seen_headers[0].get("user-agent") == pub.PUBLISH_USER_AGENT
+                and opener_probe.seen_headers[0].get("authorization", "").startswith("Basic "),
+            )
+            expect_raises(
+                "token_receipt_rejects_no_match",
+                lambda: with_opener(TokenOpener({"tokens": [{"hash": "0" * 64, "grants": [], "expiresAt": 1}]})),
+                "exactly 1",
+            )
+            revoked = dict(good_record, revokedAt=123)
+            expect_raises(
+                "token_receipt_rejects_revoked",
+                lambda: with_opener(TokenOpener({"tokens": [revoked]})),
+                "already revoked",
+            )
+            expired = dict(good_record, expiresAt=1)
+            expect_raises(
+                "token_receipt_rejects_expired",
+                lambda: with_opener(TokenOpener({"tokens": [expired]})),
+                "already expired",
+            )
+            no_expiry = dict(good_record, expiresAt=0)
+            expect_raises(
+                "token_receipt_rejects_zero_expiry",
+                lambda: with_opener(TokenOpener({"tokens": [no_expiry]})),
+                "no expiry",
+            )
+            wrong_grants = dict(good_record, grants=[{"groupIdPrefix": "org.other", "permissions": ["read"]}])
+            expect_raises(
+                "token_receipt_rejects_wrong_grants",
+                lambda: with_opener(TokenOpener({"tokens": [wrong_grants]})),
+                "expected scope prefix",
+            )
+        finally:
+            os.environ.pop("RAFT_ARTIFACTS_PUBLISH_TOKEN", None)
+            os.environ.pop("RAFT_ARTIFACTS_USERNAME", None)
 
     print(f"\n{PASS} teeth green, {FAIL} red")
     if FAILURES:

@@ -1,39 +1,30 @@
 #!/usr/bin/env bash
 #
-# Publish DatetimeKMM publications to Raft Artifacts (Raft-only lane, task #106).
+# Stage DatetimeKMM publications for the Raft-only lane (Raft task #106).
 #
-# Flow per mode (state machine frozen by review):
-#   1. stage: Gradle writes the mode's publications into a task-scoped file
-#      Maven repository (DATETIME_STAGING_DIR) that this script requires to
-#      exist and be empty -- never mavenLocal, never a shared dir;
-#   2. manifest: raft-publish.py hashes the staged bytes and asserts the
-#      staging dir contains exactly the expected publication set (no old
-#      versions, no maven-metadata.xml, no sidecars) and that every staged
-#      POM carries the dispatch sourceSha;
-#   3. classify: conflict-first aggregate probe of the Raft side
-#      (owned-prefix enumeration + per-path HEAD/GET);
-#   4. act: ALL_ABSENT -> create-only PUT of the staged bytes (server 409
-#      stops the run, never overwrite); ALL_PRESENT_IDENTICAL -> zero PUTs,
-#      but the run still byte-compares every remote file against the staged
-#      bytes (verified no-op, not a blind skip); anything else -> fail closed;
-#   5. verify: N/N GET+SHA readback plus exact-set re-enumeration, receipt
-#      cross-binding version + source exact + prefix.
+# One shard job runs this per mode: Gradle writes the mode's publications into
+# a task-scoped file Maven repository (DATETIME_STAGING_DIR) that must start
+# empty -- never mavenLocal, never a shared dir -- and raft-publish.py then
+# generates the shard authority manifest from that staging directory only
+# (exact-set equality, local aux excluded, POM sourceSha cross-binding).
 #
-# Credentials: RAFT_ARTIFACTS_USERNAME / RAFT_ARTIFACTS_PUBLISH_TOKEN must be
-# present before any network use; a release dispatch without the task-minted
-# token fails closed here (as proven in run 31252712805).
+# This script NEVER talks to Raft and needs no credentials: the aggregate
+# classification (one global plan over the whole version), the create-only
+# upload, and the byte readback all run as separate workflow jobs on the
+# merged manifest (see publish-datetime-raft.yml), so no global partial state
+# can be repaired by a shard.
 #
 # Env:
 #   DATETIME_PUBLISH_MODE   one of: ohos-tree | android | ios | metadata
 #   DATETIME_SETTINGS_FILE  settings file for the build tree (ohos-tree uses
 #                           settings.ohos.gradle.kts; others use the default)
-#   MAVEN_VERSION           required: the version to publish (admission-checked
+#   MAVEN_VERSION           required: the version being staged (admission-checked
 #                           against gradle.properties by the workflow beforehand)
-#   DATETIME_STAGING_DIR    required: task-scoped empty staging repository dir
+#   DATETIME_STAGING_DIR    required: task-scoped staging repository dir
 #   DATETIME_SOURCE_SHA     required: exact 40-hex dispatch source SHA (POM
 #                           provenance cross-binding)
-#   DATETIME_DRY_RUN        "true" to stage + manifest + print without any
-#                           network use or upload
+#   DATETIME_DRY_RUN        "true" to print the staging task list and stop
+#                           (offline teeth; no Gradle, no staging)
 
 set -euo pipefail
 
@@ -56,18 +47,10 @@ if [ -n "$(ls -A "$STAGING")" ]; then
   exit 1
 fi
 
-if [[ "$DATETIME_DRY_RUN" != "true" ]]; then
-  if [[ -z "${RAFT_ARTIFACTS_USERNAME:-}" || -z "${RAFT_ARTIFACTS_PUBLISH_TOKEN:-}" ]]; then
-    echo "Raft Artifacts credentials are required (task-minted scoped token)." >&2
-    exit 1
-  fi
-fi
-
 # Publications of this mode: <artifact> <version-suffix> <kind> <gradle-task>
 TASKS=()
-PUB_COUNT=0
-expect_file="$(mktemp)"
-trap 'rm -f "$expect_file"' EXIT
+expect_file="$STAGING.expect.txt"
+: > "$expect_file"
 
 add_publication() {
   local artifact="$1" version="$2" kind="$3" task="$4"
@@ -81,7 +64,6 @@ add_publication() {
     printf '%s\n' "$rel" >> "$expect_file"
   done < <(publication_urls "$REPO_BASE" "$artifact" "$version" "$kind")
   TASKS+=("$task")
-  PUB_COUNT=$(( PUB_COUNT + 1 ))
 }
 
 case "$MODE" in
@@ -130,42 +112,13 @@ echo "== staging publications for mode '$MODE' into $STAGING =="
 WORK_DIR="$STAGING.work"
 rm -rf "$WORK_DIR"
 mkdir -p "$WORK_DIR"
-MANIFEST="$WORK_DIR/manifest.json"
-PLAN="$WORK_DIR/plan.json"
-RECEIPT="$WORK_DIR/publish-receipt.json"
+cp "$expect_file" "$WORK_DIR/expect.txt"
+rm -f "$expect_file"
 
 python3 scripts/raft-publish.py manifest \
   --staging "$STAGING" \
-  --expect "$expect_file" \
+  --expect "$WORK_DIR/expect.txt" \
   --version "$VERSION" \
-  --output "$MANIFEST"
+  --output "$WORK_DIR/manifest.json"
 
-python3 scripts/raft-publish.py classify --manifest "$MANIFEST" --output "$PLAN"
-
-decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["decision"])' "$PLAN")"
-published_now=0
-case "$decision" in
-  publish)
-    python3 scripts/raft-publish.py publish --manifest "$MANIFEST" --staging "$STAGING" --plan "$PLAN"
-    published_now="$PUB_COUNT"
-    ;;
-  noop-verified)
-    echo "all ${PUB_COUNT} publication(s) already present with identical bytes; zero PUTs (verified no-op)"
-    ;;
-  *)
-    echo "unexpected plan decision: $decision" >&2
-    exit 1
-    ;;
-esac
-
-# The readback runs on both decisions: it is the terminal proof for a fresh
-# publish AND for a verified no-op.
-python3 scripts/raft-publish.py verify --manifest "$MANIFEST" --output "$RECEIPT"
-
-# Newly-published publication count feeds the workflow's stale-rerun guard:
-# a run where every job was a no-op fails there, forcing a version bump.
-if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
-  echo "published_count=$published_now" >> "$GITHUB_OUTPUT"
-fi
-
-echo "PUBLISH_OK mode=$MODE decision=$decision publications=$PUB_COUNT published_now=$published_now receipt=$RECEIPT"
+echo "STAGE_OK mode=$MODE staged manifest=$WORK_DIR/manifest.json"

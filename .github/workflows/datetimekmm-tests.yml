@@ -5,7 +5,7 @@ on:
     paths:
       - "DatetimeKMM/**"
       - ".github/workflows/datetimekmm-tests.yml"
-      - ".github/workflows/publish-datetime-github-packages.yml"
+      - ".github/workflows/publish-datetime-raft.yml"
   workflow_dispatch:
 
 permissions:

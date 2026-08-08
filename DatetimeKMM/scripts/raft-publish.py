@@ -52,6 +52,7 @@ import json
 import os
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -450,6 +451,36 @@ def command_audit_staging(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_merge(args: argparse.Namespace) -> int:
+    """Merge per-platform shard manifests into the single aggregate release
+    manifest. Every shard must agree on version and dispatch source SHA; file
+    sets must be disjoint (one owner per path)."""
+    manifests = [load_manifest(Path(p)) for p in args.manifests]
+    require(len(manifests) >= 2, "merge needs at least two shard manifests")
+    versions = {m["version"] for m in manifests}
+    shas = {m["sourceSha"] for m in manifests}
+    require(len(versions) == 1, f"shard manifests disagree on version: {sorted(versions)}")
+    require(len(shas) == 1, "shard manifests disagree on dispatch sourceSha")
+    seen: set[str] = set()
+    files: list[dict] = []
+    for manifest in manifests:
+        for entry in manifest["files"]:
+            require(entry["path"] not in seen, f"path owned by two shard manifests: {entry['path']}")
+            seen.add(entry["path"])
+            files.append(entry)
+    merged = {
+        "schema": 1,
+        "version": manifests[0]["version"],
+        "sourceSha": manifests[0]["sourceSha"],
+        "destination": RAFT_ARTIFACTS_BASE_URL,
+        "fileCount": len(files),
+        "files": sorted(files, key=lambda f: f["path"]),
+    }
+    Path(args.output).write_text(json.dumps(merged, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"publish merge: {len(files)} files across {len(manifests)} shards, version={merged['version']}")
+    return 0
+
+
 def command_classify(args: argparse.Namespace) -> int:
     manifest = load_manifest(Path(args.manifest))
     client = client_from_env()
@@ -463,20 +494,43 @@ def command_publish(args: argparse.Namespace) -> int:
     manifest = load_manifest(Path(args.manifest))
     plan = load_plan(Path(args.plan))
     require(plan["decision"] == "publish", "plan decision is not publish — nothing to upload")
+    only = set(load_expected(Path(args.only))) if getattr(args, "only", None) else None
+    selected = [entry for entry in manifest["files"] if only is None or entry["path"] in only]
+    require(selected, "publish selection is empty")
     require(
-        sorted(plan["missing"]) == sorted(entry["path"] for entry in manifest["files"]),
-        "plan missing set does not equal the manifest file set",
+        set(plan["missing"]) >= {entry["path"] for entry in selected},
+        "plan missing set does not cover the publish selection",
     )
     staging = Path(args.staging)
     client = client_from_env()
-    uploaded = 0
-    for entry in manifest["files"]:
+
+    # Phase 1 -- freeze the upload set BEFORE any remote mutation: re-read and
+    # re-hash every selected staged file against the manifest and re-enumerate
+    # the staging repository so a late digest change or an added file means
+    # exactly zero PUTs, never a half-written set (review B2).
+    manifest_paths = {entry["path"] for entry in manifest["files"]}
+    current_staged = {str(p.relative_to(staging)) for p in staging.rglob("*") if p.is_file()}
+    aux = allowed_aux(current_staged, manifest_paths)
+    unexpected_primaries = sorted(p for p in (current_staged - aux) if p not in manifest_paths)
+    require(
+        not unexpected_primaries,
+        f"staging gained files after the manifest: {', '.join(unexpected_primaries[:5])}",
+    )
+    bodies: list[tuple[str, bytes]] = []
+    for entry in selected:
         relative = entry["path"]
-        body = (staging / relative).read_bytes()
+        local = staging / relative
+        require(local.is_file(), f"staged byte missing: {relative}")
+        body = local.read_bytes()
         require(
             sha256_bytes(body) == entry["sha256"],
             f"staged bytes changed after manifest: {relative}",
         )
+        bodies.append((relative, body))
+
+    # Phase 2 -- create-only PUTs of the frozen bytes.
+    uploaded = 0
+    for relative, body in bodies:
         status, _ = client.request(relative, "PUT", body)
         # The server's create-if-absent answers 409 on an occupied release path
         # and keeps the original bytes: a foreign write that landed after the
@@ -488,16 +542,19 @@ def command_publish(args: argparse.Namespace) -> int:
         require(status in {200, 201, 204}, f"PUT failed with HTTP {status} for {relative}")
         uploaded += 1
         print(f"  put {relative}")
-    require(uploaded == manifest["fileCount"], "upload count mismatch")
-    print(f"publish: {uploaded}/{manifest['fileCount']} uploaded")
+    require(uploaded == len(bodies), "upload count mismatch")
+    print(f"publish: {uploaded}/{len(bodies)} uploaded")
     return 0
 
 
 def command_verify(args: argparse.Namespace) -> int:
     manifest = load_manifest(Path(args.manifest))
+    only = set(load_expected(Path(args.only))) if getattr(args, "only", None) else None
+    selected = [entry for entry in manifest["files"] if only is None or entry["path"] in only]
+    require(selected, "verify selection is empty")
     client = client_from_env()
     verified = 0
-    for entry in manifest["files"]:
+    for entry in selected:
         relative = entry["path"]
         status, body = client.request(relative, "GET")
         require(status == 200, f"verify GET HTTP {status} for {relative}")
@@ -506,11 +563,11 @@ def command_verify(args: argparse.Namespace) -> int:
             f"Raft readback digest mismatch for {relative}",
         )
         verified += 1
-    require(verified == manifest["fileCount"], "verify count mismatch")
-    # Terminal aggregate proof: re-enumerate the owned prefixes and require
-    # exact-set equality -- nothing missing, nothing extra.
-    receipt_paths = {entry["path"] for entry in manifest["files"]}
-    prefixes = owned_prefixes(manifest)
+    require(verified == len(selected), "verify count mismatch")
+    # Terminal aggregate proof: re-enumerate the selection's owned prefixes
+    # and require exact-set equality -- nothing missing, nothing extra.
+    receipt_paths = {entry["path"] for entry in selected}
+    prefixes = sorted({entry["path"].rsplit("/", 1)[0] for entry in selected})
     primaries = list_primaries_from_env()
     remote_set = {
         item["key"]
@@ -529,7 +586,7 @@ def command_verify(args: argparse.Namespace) -> int:
             "version": manifest["version"],
             "sourceSha": manifest["sourceSha"],
             "fileCount": verified,
-            "files": sorted(manifest["files"], key=lambda f: f["path"]),
+            "files": sorted(selected, key=lambda f: f["path"]),
             "provenance": {
                 "publishSourceExact": os.environ.get("GITHUB_SHA", ""),
                 "runId": os.environ.get("GITHUB_RUN_ID", ""),
@@ -537,7 +594,7 @@ def command_verify(args: argparse.Namespace) -> int:
             },
         }
         Path(receipt_out).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    print(f"verify: {verified}/{manifest['fileCount']} byte-identical on Raft")
+    print(f"verify: {verified}/{len(selected)} byte-identical on Raft")
     return 0
 
 
@@ -552,6 +609,83 @@ def list_primaries_from_env() -> list[dict]:
     return list_scope_primaries()
 
 
+def fetch_token_self_receipt(opener: Optional[urllib.request.OpenerDirector] = None) -> dict:
+    """Server-side self-receipt for the injected task token (review B3).
+
+    Calls GET /api/tokens on the reviewed API origin WITH the credential --
+    this introspection is the one sanctioned credential use off the Maven
+    wire host, and it is the same reviewed botiverse service. The raw token's
+    SHA-256 must match exactly one server record's full hash; the record must
+    be unrevoked, unexpired, and carry the expected scope/publish cap. The
+    returned receipt carries only the 16-hex hash prefix; the full hash and
+    the token itself never leave the runner's memory."""
+    token = os.environ.get("RAFT_ARTIFACTS_PUBLISH_TOKEN", "")
+    username = os.environ.get("RAFT_ARTIFACTS_USERNAME", "raft-ci") or "raft-ci"
+    require(token != "", "repository credentials are missing")
+    require("\r" not in token and "\n" not in token, "repository credentials are malformed")
+    base = canonical_base_url(CONTROL_PLANE_BASE_URL)
+    url = f"{base}/api/tokens"
+    encoded = base64.b64encode(f"{username}:{token}".encode("utf-8")).decode("ascii")
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "Authorization": f"Basic {encoded}",
+            "User-Agent": PUBLISH_USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
+    opener = opener or urllib.request.build_opener(RejectRedirectHandler())
+    try:
+        with opener.open(request, timeout=60) as response:
+            require(response.status == 200, f"token introspection HTTP {response.status}")
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        raise PublishError(f"token introspection HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise PublishError(f"token introspection transport error: {error.reason}") from error
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PublishError(f"token introspection is not JSON: {error}") from error
+    records = payload.get("tokens") if isinstance(payload, dict) else None
+    if records is None and isinstance(payload, list):
+        records = payload
+    require(isinstance(records, list), "token introspection has no token list")
+
+    local_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    matches = [r for r in records if isinstance(r, dict) and r.get("hash") == local_hash]
+    require(len(matches) == 1, f"token self-identification matched {len(matches)} server records, expected exactly 1")
+    record = matches[0]
+    require(record.get("revokedAt") in {None, 0}, "task token is already revoked")
+    expires_at = record.get("expiresAt")
+    require(isinstance(expires_at, int) and expires_at != 0, "task token has no expiry (expected a short-lived cap)")
+    now_ms = int(time.time() * 1000)
+    require(expires_at > now_ms, "task token is already expired")
+    grants = record.get("grants")
+    require(isinstance(grants, list) and grants, "task token carries no grants")
+    serialized = json.dumps(grants, sort_keys=True)
+    require(
+        "build.raft.kuiklybase" in serialized and "publish" in serialized,
+        "task token grants do not cover the expected scope prefix + publish",
+    )
+    return {
+        "hashPrefix": local_hash[:16],
+        "fullHashMatchedLocally": True,
+        "principal": record.get("principal", ""),
+        "grants": grants,
+        "expiresAt": expires_at,
+        "revokedAtAbsent": True,
+    }
+
+
+def command_token_receipt(args: argparse.Namespace) -> int:
+    receipt = fetch_token_self_receipt()
+    Path(args.output).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"token self-receipt: hashPrefix={receipt['hashPrefix']} expiry bound, grants cover the lane")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -564,6 +698,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_audit = sub.add_parser("audit-staging")
     p_audit.add_argument("--staging", required=True)
     p_audit.set_defaults(func=command_audit_staging)
+    p_merge = sub.add_parser("merge")
+    p_merge.add_argument("--manifests", required=True, nargs="+")
+    p_merge.add_argument("--output", required=True)
+    p_merge.set_defaults(func=command_merge)
     p_classify = sub.add_parser("classify")
     p_classify.add_argument("--manifest", required=True)
     p_classify.add_argument("--output", required=True)
@@ -572,11 +710,16 @@ def build_parser() -> argparse.ArgumentParser:
     p_publish.add_argument("--manifest", required=True)
     p_publish.add_argument("--staging", required=True)
     p_publish.add_argument("--plan", required=True)
+    p_publish.add_argument("--only", default="")
     p_publish.set_defaults(func=command_publish)
     p_verify = sub.add_parser("verify")
     p_verify.add_argument("--manifest", required=True)
     p_verify.add_argument("--output", default="")
+    p_verify.add_argument("--only", default="")
     p_verify.set_defaults(func=command_verify)
+    p_token = sub.add_parser("token-receipt")
+    p_token.add_argument("--output", required=True)
+    p_token.set_defaults(func=command_token_receipt)
     return parser
 
 

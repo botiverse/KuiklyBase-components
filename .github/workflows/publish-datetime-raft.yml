@@ -2,14 +2,22 @@
 #
 # New versions publish ONLY to our own registry (artin's standing rule); no
 # GitHub Packages write exists anywhere in this lane. The Gradle build has no
-# remote repository: publications are staged into a task-scoped file Maven
-# repository, hashed there, and uploaded by scripts/raft-publish.py with
-# create-only semantics and a byte-exact readback.
+# remote repository: each platform stages its publications into a task-scoped
+# file Maven repository; ONE aggregate plan over the whole version is made
+# before any upload; uploads are create-only PUTs of the exact staged bytes;
+# every run ends in a byte-exact readback and an aggregate receipt.
+#
+# Aggregate state machine (frozen by review):
+#   globally ALL_ABSENT            -> create-only publication of every shard
+#   globally ALL_PRESENT_IDENTICAL -> zero PUTs, full byte readback: a
+#                                     verified no-op SUCCESS (never a stale
+#                                     rerun failure)
+#   anything else (cross-shard partial, extra owned key, digest mismatch)
+#                                  -> zero PUTs, fail closed, human decision
 #
 # Credential lifecycle (platform rule): a task-minted short-lived scoped token
 # is injected into the raft-artifacts-production environment before dispatch
-# and revoked right after the verified readback. Without it the write jobs
-# fail closed before any network use.
+# and revoked right after the verified readback. Stage jobs never see it.
 name: Publish DatetimeKMM to Raft Artifacts
 
 on:
@@ -18,6 +26,10 @@ on:
       version:
         description: "Optional; must be empty or byte-equal to committed DatetimeKMM/gradle.properties mavenVersion"
         required: false
+        type: string
+      source_sha:
+        description: "Required exact 40-character source SHA; must equal current landed master"
+        required: true
         type: string
 
 # Serialize publish runs so two dispatches can never double-publish the same
@@ -35,7 +47,7 @@ env:
 
 jobs:
   admission:
-    name: Admission guard (master ref + committed version)
+    name: Admission guard (master ref + committed version + exact source binding)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -43,11 +55,14 @@ jobs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Validate ref and version
+        with:
+          fetch-depth: 0
+      - name: Validate ref, version and source exact
         id: resolve
         shell: bash
         env:
           REQUESTED_VERSION: ${{ github.event.inputs.version }}
+          REQUESTED_SOURCE_SHA: ${{ github.event.inputs.source_sha }}
         run: |
           set -euo pipefail
           if [[ "${GITHUB_REF}" != "refs/heads/master" ]]; then
@@ -60,15 +75,23 @@ jobs:
           if ! printf '%s' "$committed" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
             echo "::error::unsafe mavenVersion format: ${committed}"; exit 1
           fi
-          echo "Publishing version: $committed"
+          # The dispatcher must name the exact source AND that exact must be
+          # the current landed master, so a release can never silently run
+          # from a stale or foreign tree.
+          [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::source_sha is not a 40-hex SHA"; exit 1; }
+          [ "$REQUESTED_SOURCE_SHA" = "$GITHUB_SHA" ] \
+            || { echo "::error::source_sha does not equal the dispatch SHA $GITHUB_SHA"; exit 1; }
+          git fetch --quiet origin master
+          [ "$(git rev-parse origin/master)" = "$REQUESTED_SOURCE_SHA" ] \
+            || { echo "::error::source_sha is not current landed master"; exit 1; }
+          echo "Publishing version: $committed from exact $REQUESTED_SOURCE_SHA"
           echo "version=$committed" >> "$GITHUB_OUTPUT"
 
   # --- Global pre-publish legal preflight barrier ---------------------------
   # Each platform produces an isolated staging publication of the exact
   # committed source and runs the legal byte-equality gate BEFORE any remote
-  # mutation. Every write job depends on the full barrier, so no platform can
-  # start a remote upload while another platform's exact staging/legal gate is
-  # red.
+  # mutation. Every stage job depends on the full barrier.
   preflight-android:
     name: Preflight isolated publication + legal (Android/normal)
     needs: admission
@@ -164,12 +187,11 @@ jobs:
           bash scripts/verify-publication-legal.sh "$staging" ios
           python3 scripts/raft-publish.py audit-staging --staging "$staging"
 
-  # --- Write jobs (depend on the full preflight barrier) --------------------
-  publish-ohos-tree:
-    name: "Publish OHOS tree (ohosArm64 + root, -ohos)"
+  # --- Stage shards (no credentials, no Raft traffic) ------------------------
+  stage-ohos:
+    name: "Stage OHOS shard (ohosArm64 + root, -ohos)"
     needs: [admission, preflight-android, preflight-ohos, preflight-ios]
     runs-on: ubuntu-latest
-    environment: raft-artifacts-production
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     permissions:
@@ -178,8 +200,6 @@ jobs:
       DATETIME_PUBLISH_MODE: ohos-tree
       DATETIME_SETTINGS_FILE: settings.ohos.gradle.kts
       MAVEN_VERSION: ${{ needs.admission.outputs.version }}
-    outputs:
-      published_count: ${{ steps.publish.outputs.published_count }}
     steps:
       - uses: actions/checkout@v4
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -196,30 +216,28 @@ jobs:
           echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)" >> "$GITHUB_ENV"
           echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../.." && pwd)" >> "$GITHUB_ENV"
           echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
-      - name: Stage, classify, publish, verify (fail-closed)
-        id: publish
+      - name: Stage shard + manifest
         shell: bash
         env:
-          RAFT_ARTIFACTS_USERNAME: raft-ci
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
           DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
         run: |
           set -euo pipefail
           cd DatetimeKMM
           bash scripts/publish-raft-artifacts.sh
-      - name: Upload publication receipt
+      - name: Upload shard
         uses: actions/upload-artifact@v4
         with:
-          name: datetime-raft-publish-ohos-tree
-          path: ${{ runner.temp }}/datetime-staging.work/
+          name: datetime-raft-shard-ohos
+          path: |
+            ${{ runner.temp }}/datetime-staging/
+            ${{ runner.temp }}/datetime-staging.work/
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 5
 
-  publish-android:
-    name: Publish Android (normal tree)
+  stage-android:
+    name: Stage Android shard (normal tree)
     needs: [admission, preflight-android, preflight-ohos, preflight-ios]
     runs-on: ubuntu-latest
-    environment: raft-artifacts-production
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     permissions:
@@ -227,36 +245,32 @@ jobs:
     env:
       DATETIME_PUBLISH_MODE: android
       MAVEN_VERSION: ${{ needs.admission.outputs.version }}
-    outputs:
-      published_count: ${{ steps.publish.outputs.published_count }}
     steps:
       - uses: actions/checkout@v4
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
         shell: bash
-      - name: Stage, classify, publish, verify (fail-closed)
-        id: publish
+      - name: Stage shard + manifest
         shell: bash
         env:
-          RAFT_ARTIFACTS_USERNAME: raft-ci
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
           DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
         run: |
           set -euo pipefail
           cd DatetimeKMM
           bash scripts/publish-raft-artifacts.sh
-      - name: Upload publication receipt
+      - name: Upload shard
         uses: actions/upload-artifact@v4
         with:
-          name: datetime-raft-publish-android
-          path: ${{ runner.temp }}/datetime-staging.work/
+          name: datetime-raft-shard-android
+          path: |
+            ${{ runner.temp }}/datetime-staging/
+            ${{ runner.temp }}/datetime-staging.work/
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 5
 
-  publish-ios:
-    name: Publish iOS (normal tree, 3 targets)
+  stage-ios:
+    name: Stage iOS shard (normal tree, 3 targets)
     needs: [admission, preflight-android, preflight-ohos, preflight-ios]
     runs-on: macos-latest
-    environment: raft-artifacts-production
     permissions:
       contents: read
     env:
@@ -264,8 +278,6 @@ jobs:
       ANDROID_SDK_ROOT: /tmp/android-sdk
       DATETIME_PUBLISH_MODE: ios
       MAVEN_VERSION: ${{ needs.admission.outputs.version }}
-    outputs:
-      published_count: ${{ steps.publish.outputs.published_count }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -282,30 +294,28 @@ jobs:
           "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"; echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-      - name: Stage, classify, publish, verify (fail-closed)
-        id: publish
+      - name: Stage shard + manifest
         shell: bash
         env:
-          RAFT_ARTIFACTS_USERNAME: raft-ci
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
           DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
         run: |
           set -euo pipefail
           cd DatetimeKMM
           bash scripts/publish-raft-artifacts.sh
-      - name: Upload publication receipt
+      - name: Upload shard
         uses: actions/upload-artifact@v4
         with:
-          name: datetime-raft-publish-ios
-          path: ${{ runner.temp }}/datetime-staging.work/
+          name: datetime-raft-shard-ios
+          path: |
+            ${{ runner.temp }}/datetime-staging/
+            ${{ runner.temp }}/datetime-staging.work/
           if-no-files-found: error
-          retention-days: 90
+          retention-days: 5
 
-  publish-metadata:
-    name: Publish KMP metadata (normal tree root)
-    needs: [admission, preflight-android, preflight-ohos, preflight-ios, publish-android, publish-ios]
+  stage-metadata:
+    name: Stage KMP metadata shard (normal tree root)
+    needs: [admission, preflight-android, preflight-ohos, preflight-ios]
     runs-on: macos-latest
-    environment: raft-artifacts-production
     permissions:
       contents: read
     env:
@@ -313,8 +323,6 @@ jobs:
       ANDROID_SDK_ROOT: /tmp/android-sdk
       DATETIME_PUBLISH_MODE: metadata
       MAVEN_VERSION: ${{ needs.admission.outputs.version }}
-    outputs:
-      published_count: ${{ steps.publish.outputs.published_count }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -331,54 +339,357 @@ jobs:
           "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"; echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-      - name: Stage, classify, publish, verify (fail-closed)
-        id: publish
+      - name: Stage shard + manifest
         shell: bash
         env:
-          RAFT_ARTIFACTS_USERNAME: raft-ci
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
           DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
         run: |
           set -euo pipefail
           cd DatetimeKMM
           bash scripts/publish-raft-artifacts.sh
-      - name: Upload publication receipt
+      - name: Upload shard
         uses: actions/upload-artifact@v4
         with:
-          name: datetime-raft-publish-metadata
-          path: ${{ runner.temp }}/datetime-staging.work/
+          name: datetime-raft-shard-metadata
+          path: |
+            ${{ runner.temp }}/datetime-staging/
+            ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 5
+
+  # --- THE aggregate plan: exactly one classification over the whole version,
+  # before any remote mutation anywhere --------------------------------------
+  plan:
+    name: Aggregate plan (one decision for the whole version)
+    needs: [stage-ohos, stage-android, stage-ios, stage-metadata]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    permissions:
+      contents: read
+    outputs:
+      decision: ${{ steps.plan.outputs.decision }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: datetime-raft-shard-*
+          path: shards
+      - name: Merge shard manifests + aggregate classification
+        id: plan
+        shell: bash
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          maps=()
+          for work in ../shards/*/datetime-staging.work; do
+            maps+=("$work/manifest.json")
+          done
+          [ "${#maps[@]}" -eq 4 ] || { echo "expected 4 shard manifests, got ${#maps[@]}"; exit 1; }
+          python3 scripts/raft-publish.py merge --manifests "${maps[@]}" --output merged-manifest.json
+          python3 scripts/raft-publish.py classify --manifest merged-manifest.json --output global-plan.json
+          decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["decision"])' global-plan.json)"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+      - name: Upload aggregate plan
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-global-plan
+          path: |
+            DatetimeKMM/merged-manifest.json
+            DatetimeKMM/global-plan.json
           if-no-files-found: error
           retention-days: 90
 
-  # --- Terminal stale-rerun guard -------------------------------------------
-  # Requires every write job to have succeeded and fails a fully-stale rerun
-  # (zero newly-published publications must bump the version). The pre-publish
-  # isolated legal gate above still runs before any write, and every write job
-  # ends in a byte-exact Raft readback.
-  stale-rerun-guard:
-    name: Stale-rerun guard (require at least one newly published publication)
-    needs:
-      - admission
-      - publish-ohos-tree
-      - publish-android
-      - publish-ios
-      - publish-metadata
+  # --- Shard writers: consume the ONE global decision ------------------------
+  publish-ohos:
+    name: "Publish OHOS shard (create-only, then byte readback)"
+    needs: [plan, stage-ohos]
     runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     permissions:
       contents: read
     steps:
-      - name: Stale-rerun guard
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        shell: bash
+      - name: Download global plan and shard
+        uses: actions/download-artifact@v4
+        with:
+          pattern: datetime-raft-*
+          path: artifacts-in
+      - name: Publish + verify shard per global decision
         shell: bash
         env:
-          OHOS_N: ${{ needs.publish-ohos-tree.outputs.published_count }}
-          ANDROID_N: ${{ needs.publish-android.outputs.published_count }}
-          IOS_N: ${{ needs.publish-ios.outputs.published_count }}
-          METADATA_N: ${{ needs.publish-metadata.outputs.published_count }}
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          GLOBAL_DECISION: ${{ needs.plan.outputs.decision }}
         run: |
           set -euo pipefail
-          total=$(( ${OHOS_N:-0} + ${ANDROID_N:-0} + ${IOS_N:-0} + ${METADATA_N:-0} ))
-          echo "newly published publications: ohos=${OHOS_N:-0} android=${ANDROID_N:-0} ios=${IOS_N:-0} metadata=${METADATA_N:-0} total=$total"
-          if [[ "$total" -eq 0 ]]; then
-            echo "::error::Fully stale rerun: every publication already exists and nothing new was published. Raft release coordinates are immutable - bump mavenVersion via a source PR to ship new content."
-            exit 1
-          fi
+          cd DatetimeKMM
+          case "$GLOBAL_DECISION" in
+            publish)
+              python3 scripts/raft-publish.py publish \
+                --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
+                --staging ../artifacts-in/datetime-raft-shard-ohos/datetime-staging \
+                --plan ../artifacts-in/datetime-raft-global-plan/global-plan.json \
+                --only ../artifacts-in/datetime-raft-shard-ohos/datetime-staging.work/expect.txt
+              ;;
+            noop-verified)
+              echo "global decision is noop-verified: zero PUTs for this shard"
+              ;;
+            *)
+              echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
+          esac
+          python3 scripts/raft-publish.py verify \
+            --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
+            --only ../artifacts-in/datetime-raft-shard-ohos/datetime-staging.work/expect.txt \
+            --output shard-receipt.json
+      - name: Upload shard receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-receipt-ohos
+          path: DatetimeKMM/shard-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-android:
+    name: "Publish Android shard (create-only, then byte readback)"
+    needs: [plan, stage-android]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        shell: bash
+      - name: Download global plan and shard
+        uses: actions/download-artifact@v4
+        with:
+          pattern: datetime-raft-*
+          path: artifacts-in
+      - name: Publish + verify shard per global decision
+        shell: bash
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          GLOBAL_DECISION: ${{ needs.plan.outputs.decision }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          case "$GLOBAL_DECISION" in
+            publish)
+              python3 scripts/raft-publish.py publish \
+                --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
+                --staging ../artifacts-in/datetime-raft-shard-android/datetime-staging \
+                --plan ../artifacts-in/datetime-raft-global-plan/global-plan.json \
+                --only ../artifacts-in/datetime-raft-shard-android/datetime-staging.work/expect.txt
+              ;;
+            noop-verified)
+              echo "global decision is noop-verified: zero PUTs for this shard"
+              ;;
+            *)
+              echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
+          esac
+          python3 scripts/raft-publish.py verify \
+            --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
+            --only ../artifacts-in/datetime-raft-shard-android/datetime-staging.work/expect.txt \
+            --output shard-receipt.json
+      - name: Upload shard receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-receipt-android
+          path: DatetimeKMM/shard-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-ios:
+    name: "Publish iOS shard (create-only, then byte readback)"
+    needs: [plan, stage-ios]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download global plan and shard
+        uses: actions/download-artifact@v4
+        with:
+          pattern: datetime-raft-*
+          path: artifacts-in
+      - name: Publish + verify shard per global decision
+        shell: bash
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          GLOBAL_DECISION: ${{ needs.plan.outputs.decision }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          case "$GLOBAL_DECISION" in
+            publish)
+              python3 scripts/raft-publish.py publish \
+                --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
+                --staging ../artifacts-in/datetime-raft-shard-ios/datetime-staging \
+                --plan ../artifacts-in/datetime-raft-global-plan/global-plan.json \
+                --only ../artifacts-in/datetime-raft-shard-ios/datetime-staging.work/expect.txt
+              ;;
+            noop-verified)
+              echo "global decision is noop-verified: zero PUTs for this shard"
+              ;;
+            *)
+              echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
+          esac
+          python3 scripts/raft-publish.py verify \
+            --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
+            --only ../artifacts-in/datetime-raft-shard-ios/datetime-staging.work/expect.txt \
+            --output shard-receipt.json
+      - name: Upload shard receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-receipt-ios
+          path: DatetimeKMM/shard-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  publish-metadata:
+    name: "Publish metadata shard (create-only, then byte readback)"
+    needs: [plan, stage-android, stage-ios]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download global plan and shard
+        uses: actions/download-artifact@v4
+        with:
+          pattern: datetime-raft-*
+          path: artifacts-in
+      - name: Publish + verify shard per global decision
+        shell: bash
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          GLOBAL_DECISION: ${{ needs.plan.outputs.decision }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          case "$GLOBAL_DECISION" in
+            publish)
+              python3 scripts/raft-publish.py publish \
+                --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
+                --staging ../artifacts-in/datetime-raft-shard-metadata/datetime-staging \
+                --plan ../artifacts-in/datetime-raft-global-plan/global-plan.json \
+                --only ../artifacts-in/datetime-raft-shard-metadata/datetime-staging.work/expect.txt
+              ;;
+            noop-verified)
+              echo "global decision is noop-verified: zero PUTs for this shard"
+              ;;
+            *)
+              echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
+          esac
+          python3 scripts/raft-publish.py verify \
+            --manifest ../artifacts-in/datetime-raft-global-plan/merged-manifest.json \
+            --only ../artifacts-in/datetime-raft-shard-metadata/datetime-staging.work/expect.txt \
+            --output shard-receipt.json
+      - name: Upload shard receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-receipt-metadata
+          path: DatetimeKMM/shard-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # --- Terminal aggregate receipt: cross-checks every shard receipt, the
+  # merged manifest, and the (non-secret) token-scope claims ---------------
+  receipt:
+    name: Aggregate publication receipt
+    needs: [plan, publish-ohos, publish-android, publish-ios, publish-metadata]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download plan and receipts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: datetime-raft-*
+          path: artifacts-in
+      - name: Token self-receipt (server-side introspection, non-secret output)
+        shell: bash
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          python3 scripts/raft-publish.py token-receipt --output token-receipt.json
+      - name: Aggregate receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          python3 - <<'PY'
+          import json, subprocess
+          merged = json.load(open("../artifacts-in/datetime-raft-global-plan/merged-manifest.json"))
+          plan = json.load(open("../artifacts-in/datetime-raft-global-plan/global-plan.json"))
+          token_receipt = json.load(open("token-receipt.json"))
+          receipts = []
+          for name in ("ohos", "android", "ios", "metadata"):
+              receipts.append(json.load(open(f"../artifacts-in/datetime-raft-receipt-{name}/shard-receipt.json")))
+          for r in receipts:
+              assert r["status"] == "complete", "shard receipt incomplete"
+              assert r["version"] == merged["version"], "shard receipt version drift"
+              assert r["sourceSha"] == merged["sourceSha"], "shard receipt sourceSha drift"
+          covered = sorted(p for r in receipts for p in (f["path"] for f in r["files"]))
+          expected = sorted(f["path"] for f in merged["files"])
+          assert covered == expected, "shard receipts do not cover the merged manifest exactly"
+          # Landed-release binding: live current master == dispatch SHA ==
+          # the sourceSha baked into every staged POM == the shard receipts.
+          live_master = subprocess.run(
+              ["git", "rev-parse", "origin/master"], check=True, capture_output=True, text=True
+          ).stdout.strip()
+          import os
+          dispatch_sha = os.environ.get("GITHUB_SHA", "")
+          assert live_master == dispatch_sha == merged["sourceSha"], "landed-release binding drift"
+          committed = subprocess.run(
+              ["grep", "^mavenVersion=", "gradle.properties"], check=True, capture_output=True, text=True
+          ).stdout.strip().split("=", 1)[1]
+          assert committed == merged["version"], "manifest version is not the committed mavenVersion"
+          assert token_receipt["fullHashMatchedLocally"] is True
+          assert token_receipt["revokedAtAbsent"] is True
+          aggregate = {
+              "status": "complete",
+              "version": merged["version"],
+              "sourceSha": merged["sourceSha"],
+              "destination": merged["destination"],
+              "fileCount": merged["fileCount"],
+              "files": merged["files"],
+              "plan": plan,
+              "tokenReceipt": token_receipt,
+              "shardReceipts": ["ohos", "android", "ios", "metadata"],
+          }
+          json.dump(aggregate, open("aggregate-receipt.json", "w"), indent=2, sort_keys=True)
+          open("aggregate-receipt.json", "a").write("\n")
+          print(f"aggregate receipt: {merged['fileCount']} files, version={merged['version']}, source={merged['sourceSha'][:12]}, token={token_receipt['hashPrefix']}")
+          PY
+      - name: Upload aggregate receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-aggregate-receipt
+          path: |
+            DatetimeKMM/aggregate-receipt.json
+            DatetimeKMM/token-receipt.json
+          if-no-files-found: error
+          retention-days: 90
