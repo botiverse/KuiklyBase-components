@@ -48,6 +48,21 @@ from pathlib import Path
 from typing import Optional
 
 RAFT_ARTIFACTS_BASE_URL = "https://maven.artifacts.botiverse.dev"
+# Public read-only control plane (no credentials): primary-artifact listing
+# used by the conflict-first aggregate gate. Deliberately a different origin
+# than the Maven wire host; the publish token is never sent here.
+CONTROL_PLANE_BASE_URL = "https://artifacts.botiverse.dev"
+CONTROL_PLANE_LISTING_PATH = "/api/scopes/build.raft.kuiklybase/artifacts"
+
+# Server primitives this design relies on (confirmed by the service owner
+# 2026-08-08, task #104 thread): a non-SNAPSHOT version-directory PUT is a
+# server-side create-if-absent — an occupied path answers 409 and keeps its
+# original bytes. That is per-object atomic, NOT a 34-file transaction: a
+# half-written set is visible to readers, so consumers must wait for the
+# terminal verify + announcement. The listing API folds checksum/signature
+# companions and ignores malformed out-of-band keys, so this mirror proves
+# exact-set equality over PRIMARY artifacts and does not claim a raw-prefix
+# inventory; closing that residual is a server-side follow-up.
 
 # The one authority set this mirror may carry, frozen like the readback's.
 AUTHORITY_VERSION = "0.1.0-raft.0"
@@ -209,9 +224,72 @@ def load_receipt(path: Path) -> list[dict[str, str]]:
     return files
 
 
-def make_plan(client: RepositoryClient, files: list[dict[str, str]]) -> dict:
-    """Classify the Raft side: publish only from all-absent, noop on
-    all-present-with-identical-bytes, fail closed on anything else."""
+def owned_prefixes(files: list[dict[str, str]]) -> list[str]:
+    """The owned exact-version prefixes, derived from the receipt itself: the
+    distinct parent directories of the 34 files (seven for this lane)."""
+    prefixes = sorted({entry["path"].rsplit("/", 1)[0] for entry in files})
+    require(prefixes, "receipt produced no owned prefixes")
+    return prefixes
+
+
+def list_scope_primaries(opener: Optional[urllib.request.OpenerDirector] = None) -> list[dict]:
+    """Public control-plane listing of primary artifacts under the scope.
+
+    Unauthenticated by design: the publish token is never sent to this host.
+    Returns the raw `artifacts` array. See the header note for the folding
+    boundary this surface carries."""
+    base = canonical_base_url(CONTROL_PLANE_BASE_URL)
+    url = f"{base}{CONTROL_PLANE_LISTING_PATH}"
+    request = urllib.request.Request(url, method="GET")
+    opener = opener or urllib.request.build_opener(RejectRedirectHandler())
+    try:
+        with opener.open(request, timeout=60) as response:
+            require(response.status == 200, f"control-plane listing HTTP {response.status}")
+            body = response.read()
+    except urllib.error.HTTPError as error:
+        raise MirrorError(f"control-plane listing HTTP {error.code}") from error
+    except urllib.error.URLError as error:
+        raise MirrorError(f"control-plane listing transport error: {error.reason}") from error
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise MirrorError(f"control-plane listing is not JSON: {error}") from error
+    require(isinstance(payload, dict), "control-plane listing root must be an object")
+    artifacts = payload.get("artifacts")
+    require(isinstance(artifacts, list), "control-plane listing has no artifacts array")
+    for item in artifacts:
+        require(isinstance(item, dict) and isinstance(item.get("key"), str), "invalid listing entry")
+    return artifacts
+
+
+def make_plan(
+    client: RepositoryClient,
+    files: list[dict[str, str]],
+    list_primaries,
+) -> dict:
+    """Classify the Raft side, conflict-first: enumerate every primary under
+    the owned exact-version prefixes before probing expected paths. Publish
+    only from aggregate all-absent, noop on aggregate complete-identical, fail
+    closed on anything else."""
+    receipt_paths = {entry["path"] for entry in files}
+    prefixes = owned_prefixes(files)
+
+    # B3: terminal enumeration of the owned prefixes. Any primary the receipt
+    # does not name -- unexpected classifier, foreign artifact, leftover from
+    # another lane -- is a CONFLICT, never silently carried alongside.
+    primaries = list_primaries()
+    unexpected = sorted(
+        item["key"]
+        for item in primaries
+        if any(item["key"].startswith(prefix + "/") for prefix in prefixes)
+        and item["key"] not in receipt_paths
+    )
+    require(
+        not unexpected,
+        "unexpected carriers under owned exact-version prefixes — stop, human decision: "
+        + ", ".join(unexpected[:5]),
+    )
+
     missing: list[str] = []
     existing: list[str] = []
     for entry in files:
@@ -239,6 +317,7 @@ def make_plan(client: RepositoryClient, files: list[dict[str, str]]) -> dict:
     return {
         "decision": decision,
         "fileCount": EXPECTED_TOTAL,
+        "ownedPrefixes": prefixes,
         "missing": sorted(missing),
         "existingIdentical": sorted(existing),
     }
@@ -258,7 +337,7 @@ def load_plan(path: Path) -> dict:
 def command_plan(args: argparse.Namespace) -> int:
     files = load_receipt(Path(args.receipt))
     client = client_from_env()
-    plan = make_plan(client, files)
+    plan = make_plan(client, files, list_primaries_from_env)
     out = Path(args.output)
     out.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"mirror plan: decision={plan['decision']} files={plan['fileCount']}")
@@ -287,6 +366,13 @@ def command_publish(args: argparse.Namespace) -> int:
             f"staged bytes do not match the verified receipt: {relative}",
         )
         status, _ = client.request(relative, "PUT", body)
+        # The server's create-if-absent makes an occupied path a 409 with the
+        # original bytes preserved. That is the never-overwrite backstop: a
+        # foreign write that landed after the plan stops the run here.
+        require(
+            status != 409,
+            f"conflict: {relative} was occupied after the plan — foreign write, stopping",
+        )
         require(status in {200, 201, 204}, f"PUT failed with HTTP {status} for {relative}")
         uploaded += 1
         print(f"  put {relative}")
@@ -309,6 +395,20 @@ def command_verify(args: argparse.Namespace) -> int:
         )
         verified += 1
     require(verified == EXPECTED_TOTAL, f"verified {verified}, expected {EXPECTED_TOTAL}")
+    # Terminal aggregate proof: after the byte readback, re-enumerate the owned
+    # prefixes and require exact-set equality -- nothing missing, nothing extra.
+    receipt_paths = {entry["path"] for entry in files}
+    prefixes = owned_prefixes(files)
+    primaries = list_primaries_from_env()
+    remote_set = {
+        item["key"]
+        for item in primaries
+        if any(item["key"].startswith(prefix + "/") for prefix in prefixes)
+    }
+    extra = sorted(remote_set - receipt_paths)
+    missing_remote = sorted(receipt_paths - remote_set)
+    require(not extra, f"unexpected carriers present after publish: {', '.join(extra[:5])}")
+    require(not missing_remote, f"primaries missing from listing after publish: {', '.join(missing_remote[:5])}")
     receipt_out = getattr(args, "output", None)
     if receipt_out:
         run_id = os.environ.get("GITHUB_RUN_ID", "")
@@ -337,6 +437,10 @@ def client_from_env() -> RepositoryClient:
     token = os.environ.get("RAFT_ARTIFACTS_PUBLISH_TOKEN", "")
     base_url = os.environ.get("RAFT_ARTIFACTS_URL", RAFT_ARTIFACTS_BASE_URL)
     return RepositoryClient(base_url, username, token)
+
+
+def list_primaries_from_env() -> list[dict]:
+    return list_scope_primaries()
 
 
 def build_parser() -> argparse.ArgumentParser:

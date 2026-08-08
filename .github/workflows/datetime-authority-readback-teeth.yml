@@ -18,8 +18,11 @@ on:
       - DatetimeKMM/scripts/authority-readback.sh
       - DatetimeKMM/scripts/authority-readback-teeth.sh
       - DatetimeKMM/scripts/assert-readback-receipt.py
+      - DatetimeKMM/scripts/raft-mirror.py
+      - DatetimeKMM/scripts/test-raft-mirror.py
       - .github/workflows/datetime-authority-readback.yml
       - .github/workflows/datetime-authority-readback-teeth.yml
+      - .github/workflows/publish-datetime-raft-mirror.yml
   push:
     branches:
       - master
@@ -27,8 +30,11 @@ on:
       - DatetimeKMM/scripts/authority-readback.sh
       - DatetimeKMM/scripts/authority-readback-teeth.sh
       - DatetimeKMM/scripts/assert-readback-receipt.py
+      - DatetimeKMM/scripts/raft-mirror.py
+      - DatetimeKMM/scripts/test-raft-mirror.py
       - .github/workflows/datetime-authority-readback.yml
       - .github/workflows/datetime-authority-readback-teeth.yml
+      - .github/workflows/publish-datetime-raft-mirror.yml
 
 permissions:
   contents: read
@@ -70,3 +76,13 @@ jobs:
           # of them would let that class of bug back in.
           [ "$ran" -ge 2 ] \
             || { echo "expected at least two awk implementations, ran $ran" >&2; exit 1; }
+
+      # The write-side suite: offline fake-transport teeth for the Raft mirror,
+      # including the causal mutations for review B1-B3. This is the only
+      # PR/push execution of these teeth -- the mirror workflow itself is
+      # dispatch-only, so without this step its contract never runs Hosted.
+      - name: Mirror contract teeth (fake transport, offline)
+        run: |
+          set -euo pipefail
+          python3 -m py_compile DatetimeKMM/scripts/raft-mirror.py
+          python3 DatetimeKMM/scripts/test-raft-mirror.py
