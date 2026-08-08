@@ -845,6 +845,35 @@ def main() -> int:
         run_cmd(["publish", "--manifest", str(manifest_path),
                  "--plan", str(plan_path), "--bundle", str(tamper_bundle),
                  "--token-receipt-out", str(root / "tr8.json")], hooked, env)
+        # 16i. bundle member-set tooth: an extra member smuggled into the
+        # bundle (digest re-recorded to match) is a named red before any PUT.
+        import tarfile as _tf4, io as _io2
+        extra_bundle = root / "extra-member.tar"
+        with _tf4.open(e2e_bundle) as t0, _tf4.open(extra_bundle, "w") as t1:
+            for m in t0.getmembers():
+                data = t0.extractfile(m).read()
+                info = _tf4.TarInfo(m.name)
+                info.size = len(data)
+                t1.addfile(info, _io2.BytesIO(data))
+            smuggled = f"{LANE}/datetime/{VERSION}/datetime-{VERSION}-smuggled.jar"
+            payload = b"smuggled"
+            info = _tf4.TarInfo(smuggled)
+            info.size = len(payload)
+            t1.addfile(info, _io2.BytesIO(payload))
+        extra_plan = root / "extra-plan.json"
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(extra_plan)], FakeClient(), env)
+        extra_plan.write_text(json.dumps({**json.loads(extra_plan.read_text()),
+                                          "bundleSha256": hashlib.sha256(extra_bundle.read_bytes()).hexdigest()}), encoding="utf-8")
+        extra_client = FakeClient()
+        expect_raises(
+            "publish_rejects_extra_bundle_member",
+            lambda: run_direct(["publish", "--manifest", str(manifest_path),
+                                "--plan", str(extra_plan), "--bundle", str(extra_bundle),
+                                "--token-receipt-out", str(root / "tr9.json")], extra_client, env),
+            "member set does not equal",
+        )
+        check("extra_member_zero_puts", not [c for c in extra_client.calls if c[0] == "PUT"])
+
         check(
             "remote_receives_frozen_bytes_even_if_bundle_tampered_mid_publish",
             all(hooked.store[rel] == content_for(rel) for rel in paths),
