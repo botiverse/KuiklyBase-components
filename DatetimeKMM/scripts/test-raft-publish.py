@@ -1005,6 +1005,14 @@ def main() -> int:
         receipt_block = wf[wf.find("\n  receipt:"):]
         check("workflow_receipt_environment_pinned", "environment: raft-artifacts-production" in receipt_block)
         check("workflow_has_aggregate_receipt", "token-receipt" in wf)
+        # Sidecar model: no dispatch input may carry the principal; the value
+        # comes only from the protected environment secret on the three
+        # credentialed jobs.
+        check("workflow_no_principal_dispatch_input", "expected_principal" not in wf)
+        check(
+            "workflow_principal_from_protected_secret",
+            wf.count("RAFT_ARTIFACTS_EXPECT_PRINCIPAL: ${{ secrets.RAFT_ARTIFACTS_EXPECT_PRINCIPAL }}") == 3,
+        )
         check("workflow_no_stale_guard_red_on_noop", "stale-rerun" not in wf)
         check(
             "workflow_receipt_needs_plan_and_publish",
