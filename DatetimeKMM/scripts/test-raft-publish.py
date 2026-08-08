@@ -822,7 +822,12 @@ def main() -> int:
             _sp.run(["git", "add", "gradle.properties"], cwd=repo, check=True)
             _sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"], cwd=repo, check=True)
             sha = _sp.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
-            _sp.run(["git", "update-ref", "refs/remotes/origin/master", sha], cwd=repo, check=True)
+            origin_repo = base / "origin-repo"
+            origin_repo.mkdir(exist_ok=True)
+            _sp.run(["git", "init", "-q", "-b", "master", "--bare"], cwd=origin_repo, check=True)
+            _sp.run(["git", "remote", "add", "origin", str(origin_repo)], cwd=repo, check=True)
+            _sp.run(["git", "push", "-q", "origin", "master"], cwd=repo, check=True)
+            _sp.run(["git", "fetch", "--quiet", "origin", "master"], cwd=repo, check=True)
 
             artifacts = base / "artifacts"
             (artifacts / "datetime-raft-global-plan").mkdir(parents=True)
@@ -831,8 +836,17 @@ def main() -> int:
             merged = {"schema": 1, "version": VERSION, "sourceSha": sha,
                       "destination": pub.RAFT_ARTIFACTS_BASE_URL, "fileCount": len(paths), "files": files}
             json.dump(merged, open(artifacts / "datetime-raft-global-plan" / "merged-manifest.json", "w"))
+            import tarfile as _tf5, io as _io3
+            bundle_bytes = base / "bundle.tar"
+            with _tf5.open(bundle_bytes, "w") as _tb:
+                for pth in sorted(paths):
+                    data = content_for(pth)
+                    info = _tf5.TarInfo(pth)
+                    info.size = len(data)
+                    _tb.addfile(info, _io3.BytesIO(data))
+            bundle_digest = hashlib.sha256(bundle_bytes.read_bytes()).hexdigest()
             plan_obj = {"decision": "publish", "fileCount": len(paths), "tokenHashPrefix": plan_prefix,
-                        "bundleSha256": "b" * 64, "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
+                        "bundleSha256": bundle_digest, "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
                         "missing": sorted(paths)}
             if bad_plan_decision:
                 plan_obj["decision"] = "teleport"
@@ -841,6 +855,8 @@ def main() -> int:
             json.dump(plan_obj, open(artifacts / "datetime-raft-global-plan" / "global-plan.json", "w"))
             json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=plan_prefix),
                       open(artifacts / "datetime-raft-global-plan" / "token-receipt.json", "w"))
+            import shutil as _shutil
+            _shutil.copy(bundle_bytes, artifacts / "datetime-raft-global-plan" / "frozen-bundle.tar")
             receipt_files = files[:-1] if drop_last_file else files
             receipt_files = [dict(f) for f in receipt_files]
             if bad_receipt_sha:
@@ -1009,10 +1025,17 @@ def main() -> int:
         # comes only from the protected environment secret on the three
         # credentialed jobs.
         check("workflow_no_principal_dispatch_input", "expected_principal" not in wf)
-        check(
-            "workflow_principal_from_protected_secret",
-            wf.count("RAFT_ARTIFACTS_EXPECT_PRINCIPAL: ${{ secrets.RAFT_ARTIFACTS_EXPECT_PRINCIPAL }}") == 3,
-        )
+        # per-job-block structural assertion (a stray comment or duplicated
+        # line elsewhere cannot satisfy this)
+        for job_name, next_name in (("plan", "publish"), ("publish", "receipt"), ("receipt", None)):
+            start_j = wf.find(f"\n  {job_name}:\n")
+            end_j = wf.find(f"\n  {next_name}:\n") if next_name else len(wf)
+            block = wf[start_j:end_j]
+            check(
+                f"workflow_{job_name}_reads_principal_secret",
+                "RAFT_ARTIFACTS_EXPECT_PRINCIPAL: ${{ secrets.RAFT_ARTIFACTS_EXPECT_PRINCIPAL }}" in block
+                and "environment: raft-artifacts-production" in block,
+            )
         check("workflow_no_stale_guard_red_on_noop", "stale-rerun" not in wf)
         check(
             "workflow_receipt_needs_plan_and_publish",

@@ -696,25 +696,10 @@ def command_publish(args: argparse.Namespace) -> int:
         json.dumps(token_receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    # Remote re-probe, complete: the classification happened at plan time, so
-    # right here, before the first PUT, re-prove BOTH halves of the publish
-    # precondition -- every expected path still absent AND no late unexpected
-    # primary appeared under the owned prefixes.
+    # Remote re-probe: every expected path must still be absent.
     for entry in manifest["files"]:
         status, _ = client.request(entry["path"], "HEAD")
         require(status == 404, f"remote no longer absent before first PUT: {entry['path']} (HTTP {status})")
-    prefixes = sorted({entry["path"].rsplit("/", 1)[0] for entry in manifest["files"]})
-    primaries = list_primaries_from_env()
-    late_extra = sorted(
-        item["key"]
-        for item in primaries
-        if any(item["key"].startswith(prefix + "/") for prefix in prefixes)
-        and item["key"] not in manifest_paths
-    )
-    require(
-        not late_extra,
-        "unexpected carriers appeared under owned prefixes after the plan — stop: " + ", ".join(late_extra[:5]),
-    )
 
     # Landed-master re-fetch inside the command itself (not only a workflow
     # step): a drifted master between admission and the first PUT stops here.
@@ -731,6 +716,21 @@ def command_publish(args: argparse.Namespace) -> int:
             current == dispatch_sha == manifest["sourceSha"],
             "landed master drifted between admission and the first PUT — stop",
         )
+
+    # The owned-prefix re-list is the FINAL check before the first PUT, so no
+    # late unexpected primary can slip in after it and still be uploaded.
+    prefixes = sorted({entry["path"].rsplit("/", 1)[0] for entry in manifest["files"]})
+    primaries = list_primaries_from_env()
+    late_extra = sorted(
+        item["key"]
+        for item in primaries
+        if any(item["key"].startswith(prefix + "/") for prefix in prefixes)
+        and item["key"] not in manifest_paths
+    )
+    require(
+        not late_extra,
+        "unexpected carriers appeared under owned prefixes after the plan — stop: " + ", ".join(late_extra[:5]),
+    )
 
     uploaded = 0
     for entry in manifest["files"]:

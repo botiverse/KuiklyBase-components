@@ -127,6 +127,7 @@ def main(argv: list[str]) -> int:
 
     merged_files = validate_file_entries(merged.get("files"), "merged manifest")
     publish_files = validate_file_entries(publish_receipt.get("files"), "publish receipt")
+
     # Full plan schema: known decision, count match, all binding fields present
     # and well-formed (owned prefixes, missing list, bundle digest, token prefix).
     if plan.get("decision") not in {"publish", "noop-verified"}:
@@ -140,9 +141,16 @@ def main(argv: list[str]) -> int:
         fail("plan carries no ownedPrefixes")
     if not isinstance(plan.get("missing"), list):
         fail("plan carries no missing list")
-    validate_token_receipt(plan_token, "plan")
-    validate_token_receipt(publish_token, "publish")
-    validate_token_receipt(token_receipt, "terminal")
+    # decision/shape coherence: publish means every file was missing;
+    # noop-verified means none was. A contradictory plan is not a plan.
+    if plan["decision"] == "publish" and sorted(plan["missing"]) != sorted(f["path"] for f in merged_files):
+        fail("plan decision=publish but its missing set is not the whole manifest")
+    if plan["decision"] == "noop-verified" and plan["missing"]:
+        fail("plan decision=noop-verified but its missing set is non-empty")
+    if merged.get("fileCount") != len(merged_files):
+        fail("merged manifest fileCount does not equal its file list")
+    if publish_receipt.get("fileCount") != len(publish_files):
+        fail("publish receipt fileCount does not equal its file list")
 
     if publish_receipt.get("status") != "complete":
         fail("publish receipt incomplete")
@@ -167,6 +175,29 @@ def main(argv: list[str]) -> int:
     if covered != expected:
         fail("publish receipt does not cover the merged manifest exactly")
 
+    # The frozen bundle must be present and match the plan digest + manifest set.
+    bundle_path = root / "datetime-raft-global-plan" / "frozen-bundle.tar"
+    if not bundle_path.is_file():
+        fail("frozen bundle artifact is missing")
+    import hashlib
+    bundle_sha = hashlib.sha256(bundle_path.read_bytes()).hexdigest()
+    if bundle_sha != plan["bundleSha256"]:
+        fail("frozen bundle digest does not match the plan")
+    import tarfile
+    with tarfile.open(bundle_path) as _tar:
+        member_names = sorted(m.name for m in _tar.getmembers() if m.isfile())
+    if member_names != sorted(merged_by_path.keys()):
+        fail("frozen bundle members do not equal the manifest primary set")
+
+    validate_token_receipt(plan_token, "plan")
+    validate_token_receipt(publish_token, "publish")
+    validate_token_receipt(token_receipt, "terminal")
+
+    # Landed-release binding: a FRESH fetch, then live current master ==
+    # dispatch SHA == the sourceSha baked into every staged POM == receipts.
+    fetch = subprocess.run(["git", "fetch", "--quiet", "origin", "master"], check=False)
+    if fetch.returncode != 0:
+        fail("cannot fetch origin master for the landed-release binding")
     live_master = subprocess.run(
         ["git", "rev-parse", "origin/master"], check=True, capture_output=True, text=True
     ).stdout.strip()
@@ -179,6 +210,8 @@ def main(argv: list[str]) -> int:
     if committed != merged.get("version"):
         fail("manifest version is not the committed mavenVersion")
 
+    # One token identity must serve plan, publish and this terminal job alike
+    # (A->B->A goes red here).
     prefixes = {
         plan.get("tokenHashPrefix"),
         plan_token.get("hashPrefix"),
@@ -187,11 +220,6 @@ def main(argv: list[str]) -> int:
     }
     if len(prefixes) != 1 or prefixes == {""} or None in prefixes:
         fail(f"token identity drifted across jobs: {sorted(p for p in prefixes if p)}")
-    for label, record in (("publish", publish_token), ("terminal", token_receipt)):
-        if record.get("fullHashMatchedLocally") is not True:
-            fail(f"{label} token receipt lacks a local full-hash match")
-        if record.get("revokedAtAbsent") is not True:
-            fail(f"{label} token was revoked")
 
     aggregate = {
         "status": "complete",
