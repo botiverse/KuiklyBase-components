@@ -695,6 +695,15 @@ def main() -> int:
         drifta = make_staging(root / "drifta", paths)
         for pom_path in drifta.rglob("*.pom"):
             pom_path.write_text(pom_text(SOURCE_SHA).replace("<artifactId>datetime</artifactId>", "<artifactId>wrong-artifact</artifactId>"), encoding="utf-8")
+        evilg = make_staging(root / "evilg", paths)
+        for pom_path in evilg.rglob("*.pom"):
+            pom_path.write_text(pom_text(SOURCE_SHA).replace("<groupId>build.raft.kuiklybase</groupId>", "<groupId>evil.example</groupId>"), encoding="utf-8")
+        expect_raises(
+            "manifest_rejects_pom_groupid_drift",
+            lambda: run_direct(["manifest", "--staging", str(evilg), "--expect", str(expect),
+                                "--version", VERSION, "--output", str(root / "mg.json")], FakeClient(), env),
+            "groupId is not the lane group",
+        )
         expect_raises(
             "manifest_rejects_pom_artifactid_drift",
             lambda: run_direct(["manifest", "--staging", str(drifta), "--expect", str(expect),
