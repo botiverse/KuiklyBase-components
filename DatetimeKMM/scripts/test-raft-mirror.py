@@ -538,10 +538,10 @@ def main() -> int:
             def __init__(self, status: int, body: bytes) -> None:
                 self.status = status
                 self.body = body
-                self.auth_headers: list[str] = []
+                self.headers: dict[str, str] = {}
 
             def open(self, request, timeout=0):
-                self.auth_headers.append(request.get_header("Authorization") or "")
+                self.headers = {k.lower(): v for k, v in request.header_items()}
                 return FakeListingResponse(self.status, self.body)
 
         good_opener = FakeListingOpener(200, json.dumps({"artifacts": [{"key": "a/b"}]}).encode())
@@ -549,7 +549,18 @@ def main() -> int:
         check("listing_parses_artifacts", items == [{"key": "a/b"}])
         check(
             "listing_sends_no_credentials",
-            good_opener.auth_headers == [""],
+            "authorization" not in good_opener.headers,
+        )
+        # The control plane's edge bans library-default user agents, so the
+        # exact client must present its stable non-credential UA (and JSON
+        # Accept) on every call.
+        check(
+            "listing_sends_stable_user_agent",
+            good_opener.headers.get("user-agent") == mirror.CONTROL_PLANE_USER_AGENT,
+        )
+        check(
+            "listing_sends_accept_json",
+            good_opener.headers.get("accept") == "application/json",
         )
         expect_raises(
             "listing_rejects_non_json",

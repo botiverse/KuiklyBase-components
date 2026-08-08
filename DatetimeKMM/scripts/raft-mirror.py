@@ -53,6 +53,10 @@ RAFT_ARTIFACTS_BASE_URL = "https://maven.artifacts.botiverse.dev"
 # than the Maven wire host; the publish token is never sent here.
 CONTROL_PLANE_BASE_URL = "https://artifacts.botiverse.dev"
 CONTROL_PLANE_LISTING_PATH = "/api/scopes/build.raft.kuiklybase/artifacts"
+# The control plane sits behind Cloudflare, which bans library-default user
+# agents (Python-urllib/* answers 403/1010). A stable, non-credential UA is
+# required for the exact client to be dispatchable at all (review finding).
+CONTROL_PLANE_USER_AGENT = "raft-datetime-mirror/1.0"
 
 # Server primitives this design relies on (confirmed by the service owner
 # 2026-08-08, task #104 thread): a non-SNAPSHOT version-directory PUT is a
@@ -240,7 +244,14 @@ def list_scope_primaries(opener: Optional[urllib.request.OpenerDirector] = None)
     boundary this surface carries."""
     base = canonical_base_url(CONTROL_PLANE_BASE_URL)
     url = f"{base}{CONTROL_PLANE_LISTING_PATH}"
-    request = urllib.request.Request(url, method="GET")
+    request = urllib.request.Request(
+        url,
+        method="GET",
+        headers={
+            "User-Agent": CONTROL_PLANE_USER_AGENT,
+            "Accept": "application/json",
+        },
+    )
     opener = opener or urllib.request.build_opener(RejectRedirectHandler())
     try:
         with opener.open(request, timeout=60) as response:
