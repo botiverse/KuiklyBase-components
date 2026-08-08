@@ -487,6 +487,54 @@ def main() -> int:
         check("receipt_has_no_secret", "Authorization" not in blob and "raft-ci:" not in blob)
         del os.environ["GITHUB_RUN_ID"]
 
+        # 12a1. r4 barrier teeth: a late unexpected primary under an owned
+        # prefix appearing after the plan stops publish before any PUT...
+        late_key = FakeClient()
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], late_key, env)
+        late_bundle = freeze_into(staging, plan_path, "late-key.tar")
+        late_key.listing_extra.append(f"{LANE}/datetime/{VERSION}/datetime-{VERSION}-late.bin")
+        expect_raises(
+            "publish_fails_on_late_extra_owned_prefix_key",
+            lambda: run_direct(["publish", "--manifest", str(manifest_path),
+                                "--plan", str(plan_path), "--bundle", str(late_bundle),
+                                "--token-receipt-out", str(root / "tr10.json")], late_key, env),
+            "unexpected carriers appeared",
+        )
+        check("late_extra_zero_puts", not [c for c in late_key.calls if c[0] == "PUT"])
+
+        # 12a2. ...and a drifted landed master (the command re-fetches itself).
+        # Driven in a temp git repo whose origin/master disagrees with GITHUB_SHA.
+        import subprocess as _sp4
+        origin_repo = root / "origin-repo"
+        origin_repo.mkdir()
+        _sp4.run(["git", "init", "-q", "-b", "master"], cwd=origin_repo, check=True)
+        _sp4.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], cwd=origin_repo, check=True)
+        real_head = _sp4.run(["git", "rev-parse", "HEAD"], cwd=origin_repo, check=True, capture_output=True, text=True).stdout.strip()
+        master_repo = root / "master-repo"
+        master_repo.mkdir()
+        _sp4.run(["git", "init", "-q", "-b", "master"], cwd=master_repo, check=True)
+        _sp4.run(["git", "remote", "add", "origin", str(origin_repo)], cwd=master_repo, check=True)
+        _sp4.run(["git", "fetch", "--quiet", "origin", "master"], cwd=master_repo, check=True)
+        drift_client = FakeClient()
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], drift_client, env)
+        drift_bundle = freeze_into(staging, plan_path, "drift.tar")
+        drift_env = dict(env)
+        drift_env["GITHUB_SHA"] = "d" * 40  # dispatch claims a different sha than origin/master
+        assert real_head != "d" * 40
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(master_repo)
+            expect_raises(
+                "publish_fails_on_master_drift_at_barrier",
+                lambda: run_direct(["publish", "--manifest", str(root / "manifest.json"),
+                                    "--plan", str(plan_path), "--bundle", str(drift_bundle),
+                                    "--token-receipt-out", str(root / "tr11.json")], drift_client, drift_env),
+                "drifted between admission and the first PUT",
+            )
+        finally:
+            os.chdir(old_cwd)
+        check("master_drift_zero_puts", not [c for c in drift_client.calls if c[0] == "PUT"])
+
         # 12b. freeze packs ONLY primaries: local aux never enters the bundle.
         aux_bundle = root / "aux.tar"
         aux_digest = root / "aux.sha"
@@ -761,7 +809,7 @@ def main() -> int:
             HEAD is the release exact (master == dispatch == fixture sha)."""
             repo = base / "repo"
             repo.mkdir(parents=True, exist_ok=True)
-            _sp.run(["git", "init", "-q"], cwd=repo, check=True)
+            _sp.run(["git", "init", "-q", "-b", "master"], cwd=repo, check=True)
             (repo / "gradle.properties").write_text(f"mavenVersion={VERSION}\n", encoding="utf-8")
             _sp.run(["git", "add", "gradle.properties"], cwd=repo, check=True)
             _sp.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"], cwd=repo, check=True)
