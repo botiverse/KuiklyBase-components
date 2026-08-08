@@ -692,6 +692,15 @@ def main() -> int:
         driftv = make_staging(root / "driftv", paths)
         for pom_path in driftv.rglob("*.pom"):
             pom_path.write_text(pom_text(SOURCE_SHA, version="0.0.0-drift"), encoding="utf-8")
+        drifta = make_staging(root / "drifta", paths)
+        for pom_path in drifta.rglob("*.pom"):
+            pom_path.write_text(pom_text(SOURCE_SHA).replace("<artifactId>datetime</artifactId>", "<artifactId>wrong-artifact</artifactId>"), encoding="utf-8")
+        expect_raises(
+            "manifest_rejects_pom_artifactid_drift",
+            lambda: run_direct(["manifest", "--staging", str(drifta), "--expect", str(expect),
+                                "--version", VERSION, "--output", str(root / "ma.json")], FakeClient(), env),
+            "artifactId does not match its path",
+        )
         expect_raises(
             "manifest_rejects_pom_version_drift",
             lambda: run_direct(["manifest", "--staging", str(driftv), "--expect", str(expect),
