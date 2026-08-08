@@ -1,4 +1,16 @@
-name: Publish DatetimeKMM to GitHub Packages
+# Publish DatetimeKMM to Raft Artifacts (Raft-only lane, task #106).
+#
+# New versions publish ONLY to our own registry (artin's standing rule); no
+# GitHub Packages write exists anywhere in this lane. The Gradle build has no
+# remote repository: publications are staged into a task-scoped file Maven
+# repository, hashed there, and uploaded by scripts/raft-publish.py with
+# create-only semantics and a byte-exact readback.
+#
+# Credential lifecycle (platform rule): a task-minted short-lived scoped token
+# is injected into the raft-artifacts-production environment before dispatch
+# and revoked right after the verified readback. Without it the write jobs
+# fail closed before any network use.
+name: Publish DatetimeKMM to Raft Artifacts
 
 on:
   workflow_dispatch:
@@ -19,6 +31,7 @@ permissions:
 
 env:
   ANDROID_SDK_ZIP: https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip
+  DATETIME_SOURCE_SHA: ${{ github.sha }}
 
 jobs:
   admission:
@@ -41,7 +54,7 @@ jobs:
             echo "::error::publish is only allowed from refs/heads/master (got ${GITHUB_REF})"; exit 1
           fi
           committed="$(grep '^mavenVersion=' DatetimeKMM/gradle.properties | cut -d= -f2)"
-          if [[ -n "${REQUESTED_VERSION:-}" && "${REQUESTED_VERSION}" != "$committed" ]]; then
+          if [[ -n "${REQUESTED_VERSION:-}" && "$REQUESTED_VERSION" != "$committed" ]]; then
             echo "::error::requested version '${REQUESTED_VERSION}' != committed mavenVersion '${committed}'; bump via a source PR first"; exit 1
           fi
           if ! printf '%s' "$committed" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
@@ -51,10 +64,11 @@ jobs:
           echo "version=$committed" >> "$GITHUB_OUTPUT"
 
   # --- Global pre-publish legal preflight barrier ---------------------------
-  # Each platform produces an isolated local publication of the exact committed
-  # source and runs the legal byte-equality gate BEFORE any remote mutation.
-  # Every write job depends on the full barrier, so no platform can start a
-  # remote upload while another platform's exact staging/legal gate is red.
+  # Each platform produces an isolated staging publication of the exact
+  # committed source and runs the legal byte-equality gate BEFORE any remote
+  # mutation. Every write job depends on the full barrier, so no platform can
+  # start a remote upload while another platform's exact staging/legal gate is
+  # red.
   preflight-android:
     name: Preflight isolated publication + legal (Android/normal)
     needs: admission
@@ -72,10 +86,11 @@ jobs:
         working-directory: DatetimeKMM
         run: |
           set -euo pipefail
-          repo="$RUNNER_TEMP/preflight-m2"; rm -rf "$repo"
-          ./gradlew -PmavenVersion="$MAVEN_VERSION" :datetime:publishToMavenLocal \
-            -Dmaven.repo.local="$repo" --no-daemon --console=plain --stacktrace
-          bash scripts/verify-publication-legal.sh "$repo" normal
+          staging="$RUNNER_TEMP/preflight-staging"; rm -rf "$staging"
+          DATETIME_STAGING_DIR="$staging" ./gradlew -PmavenVersion="$MAVEN_VERSION" :datetime:publish \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$staging" normal
+          python3 scripts/raft-publish.py audit-staging --staging "$staging"
 
   preflight-ohos:
     name: Preflight isolated publication + legal (OHOS)
@@ -98,7 +113,7 @@ jobs:
           ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
           echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
           echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
-          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home/native" >> "$GITHUB_ENV"
           echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
           echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)" >> "$GITHUB_ENV"
           echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../.." && pwd)" >> "$GITHUB_ENV"
@@ -108,10 +123,11 @@ jobs:
         working-directory: DatetimeKMM
         run: |
           set -euo pipefail
-          repo="$RUNNER_TEMP/preflight-m2"; rm -rf "$repo"
-          ./gradlew -c settings.ohos.gradle.kts -PmavenVersion="$MAVEN_VERSION" :datetime:publishToMavenLocal \
-            -Dmaven.repo.local="$repo" --no-daemon --console=plain --stacktrace
-          bash scripts/verify-publication-legal.sh "$repo" ohos
+          staging="$RUNNER_TEMP/preflight-staging"; rm -rf "$staging"
+          DATETIME_STAGING_DIR="$staging" ./gradlew -c settings.ohos.gradle.kts -PmavenVersion="$MAVEN_VERSION" :datetime:publish \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$staging" ohos
+          python3 scripts/raft-publish.py audit-staging --staging "$staging"
 
   preflight-ios:
     name: Preflight isolated publication + legal (iOS)
@@ -142,21 +158,22 @@ jobs:
         working-directory: DatetimeKMM
         run: |
           set -euo pipefail
-          repo="$RUNNER_TEMP/preflight-m2"; rm -rf "$repo"
-          ./gradlew -PmavenVersion="$MAVEN_VERSION" :datetime:publishToMavenLocal \
-            -Dmaven.repo.local="$repo" --no-daemon --console=plain --stacktrace
-          bash scripts/verify-publication-legal.sh "$repo" ios
+          staging="$RUNNER_TEMP/preflight-staging"; rm -rf "$staging"
+          DATETIME_STAGING_DIR="$staging" ./gradlew -PmavenVersion="$MAVEN_VERSION" :datetime:publish \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$staging" ios
+          python3 scripts/raft-publish.py audit-staging --staging "$staging"
 
   # --- Write jobs (depend on the full preflight barrier) --------------------
   publish-ohos-tree:
     name: "Publish OHOS tree (ohosArm64 + root, -ohos)"
     needs: [admission, preflight-android, preflight-ohos, preflight-ios]
     runs-on: ubuntu-latest
+    environment: raft-artifacts-production
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     permissions:
       contents: read
-      packages: write
     env:
       DATETIME_PUBLISH_MODE: ohos-tree
       DATETIME_SETTINGS_FILE: settings.ohos.gradle.kts
@@ -175,30 +192,38 @@ jobs:
           test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found"; exit 1; }
           ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
           echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"; echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
-          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"; echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home/native" >> "$GITHUB_ENV"; echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
           echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)" >> "$GITHUB_ENV"
           echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../.." && pwd)" >> "$GITHUB_ENV"
           echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
-      - name: Publish OHOS publications (fail-closed admission)
+      - name: Stage, classify, publish, verify (fail-closed)
         id: publish
         shell: bash
         env:
-          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
         run: |
           set -euo pipefail
           cd DatetimeKMM
-          bash scripts/publish-github-packages.sh
+          bash scripts/publish-raft-artifacts.sh
+      - name: Upload publication receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-publish-ohos-tree
+          path: ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 90
 
   publish-android:
     name: Publish Android (normal tree)
     needs: [admission, preflight-android, preflight-ohos, preflight-ios]
     runs-on: ubuntu-latest
+    environment: raft-artifacts-production
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     permissions:
       contents: read
-      packages: write
     env:
       DATETIME_PUBLISH_MODE: android
       MAVEN_VERSION: ${{ needs.admission.outputs.version }}
@@ -208,24 +233,32 @@ jobs:
       - uses: actions/checkout@v4
       - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
         shell: bash
-      - name: Publish Android publication (fail-closed admission)
+      - name: Stage, classify, publish, verify (fail-closed)
         id: publish
         shell: bash
         env:
-          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
         run: |
           set -euo pipefail
           cd DatetimeKMM
-          bash scripts/publish-github-packages.sh
+          bash scripts/publish-raft-artifacts.sh
+      - name: Upload publication receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-publish-android
+          path: ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 90
 
   publish-ios:
     name: Publish iOS (normal tree, 3 targets)
     needs: [admission, preflight-android, preflight-ohos, preflight-ios]
     runs-on: macos-latest
+    environment: raft-artifacts-production
     permissions:
       contents: read
-      packages: write
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
@@ -249,24 +282,32 @@ jobs:
           "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"; echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-      - name: Publish iOS publications (fail-closed admission)
+      - name: Stage, classify, publish, verify (fail-closed)
         id: publish
         shell: bash
         env:
-          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
         run: |
           set -euo pipefail
           cd DatetimeKMM
-          bash scripts/publish-github-packages.sh
+          bash scripts/publish-raft-artifacts.sh
+      - name: Upload publication receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-publish-ios
+          path: ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 90
 
   publish-metadata:
     name: Publish KMP metadata (normal tree root)
     needs: [admission, preflight-android, preflight-ohos, preflight-ios, publish-android, publish-ios]
     runs-on: macos-latest
+    environment: raft-artifacts-production
     permissions:
       contents: read
-      packages: write
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
@@ -290,23 +331,30 @@ jobs:
           "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"; echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
-      - name: Publish root metadata publication (fail-closed admission)
+      - name: Stage, classify, publish, verify (fail-closed)
         id: publish
         shell: bash
         env:
-          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
         run: |
           set -euo pipefail
           cd DatetimeKMM
-          bash scripts/publish-github-packages.sh
+          bash scripts/publish-raft-artifacts.sh
+      - name: Upload publication receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-publish-metadata
+          path: ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 90
+
   # --- Terminal stale-rerun guard -------------------------------------------
   # Requires every write job to have succeeded and fails a fully-stale rerun
-  # (zero newly-published publications must bump the version). The custom
-  # terminal/readback-only content verification was removed per owner direction
-  # (real acceptance happens in Mobile Phase 2: consume the published coordinate,
-  # fresh Gradle resolve/build, real three-platform install). The pre-publish
-  # isolated legal gate above still runs before any write.
+  # (zero newly-published publications must bump the version). The pre-publish
+  # isolated legal gate above still runs before any write, and every write job
+  # ends in a byte-exact Raft readback.
   stale-rerun-guard:
     name: Stale-rerun guard (require at least one newly published publication)
     needs:
@@ -331,6 +379,6 @@ jobs:
           total=$(( ${OHOS_N:-0} + ${ANDROID_N:-0} + ${IOS_N:-0} + ${METADATA_N:-0} ))
           echo "newly published publications: ohos=${OHOS_N:-0} android=${ANDROID_N:-0} ios=${IOS_N:-0} metadata=${METADATA_N:-0} total=$total"
           if [[ "$total" -eq 0 ]]; then
-            echo "::error::Fully stale rerun: every publication already exists and nothing new was published. GitHub Packages versions are immutable - bump mavenVersion via a source PR to ship new content."
+            echo "::error::Fully stale rerun: every publication already exists and nothing new was published. Raft release coordinates are immutable - bump mavenVersion via a source PR to ship new content."
             exit 1
           fi
