@@ -897,7 +897,14 @@ def main() -> int:
         check("workflow_needs_tooth_is_causal", re.search(r"needs:\s*\[[^\]]*\bplan\b[^\]]*\]", "needs: [stage-ohos]") is None)
         stage_section = wf[wf.find("\n  stage-ohos:"):wf.find("\n  plan:")]
         check("workflow_stage_jobs_have_no_environment", "environment:" not in stage_section)
-        check("workflow_admission_requires_source_exact", "REQUESTED_SOURCE_SHA" in wf and "origin/master" in wf)
+        admission_block = wf[wf.find("\n  admission:"):wf.find("\n  preflight-android:")]
+        check(
+            "workflow_admission_requires_source_exact",
+            '"$REQUESTED_SOURCE_SHA" = "$GITHUB_SHA"' in admission_block
+            and 'git rev-parse origin/master' in admission_block
+            and '^[0-9a-f]{40}$' in admission_block
+            and 'REQUESTED_SOURCE_SHA: ${{ github.event.inputs.source_sha }}' in admission_block,
+        )
         receipt_block = wf[wf.find("\n  receipt:"):]
         check("workflow_receipt_environment_pinned", "environment: raft-artifacts-production" in receipt_block)
         check("workflow_has_aggregate_receipt", "token-receipt" in wf)
