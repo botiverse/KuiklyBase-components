@@ -53,10 +53,16 @@ RAFT_ARTIFACTS_BASE_URL = "https://maven.artifacts.botiverse.dev"
 # than the Maven wire host; the publish token is never sent here.
 CONTROL_PLANE_BASE_URL = "https://artifacts.botiverse.dev"
 CONTROL_PLANE_LISTING_PATH = "/api/scopes/build.raft.kuiklybase/artifacts"
+# The artifact endpoints sit behind Cloudflare, which bans library-default
+# user agents (Python-urllib/* answers 403/1010 before the request reaches the
+# Worker -- token validation is never even reached). Every request this mirror
+# makes -- Maven wire and control plane alike -- carries a stable,
+# non-credential UA (review finding, twice).
+MIRROR_USER_AGENT = "raft-datetime-mirror/1.0"
 # The control plane sits behind Cloudflare, which bans library-default user
 # agents (Python-urllib/* answers 403/1010). A stable, non-credential UA is
 # required for the exact client to be dispatchable at all (review finding).
-CONTROL_PLANE_USER_AGENT = "raft-datetime-mirror/1.0"
+CONTROL_PLANE_USER_AGENT = MIRROR_USER_AGENT
 
 # Server primitives this design relies on (confirmed by the service owner
 # 2026-08-08, task #104 thread): a non-SNAPSHOT version-directory PUT is a
@@ -159,7 +165,14 @@ class RepositoryClient:
         require(method in {"HEAD", "GET", "PUT"}, f"unsupported repository method: {method}")
         request = urllib.request.Request(
             self._url(relative), method=method, data=body,
-            headers={"Authorization": self.authorization},
+            headers={
+                "Authorization": self.authorization,
+                # The edge bans library-default UAs before the request reaches
+                # the Worker; without this the credential is never even checked.
+                # UA only: the reviewer proved UA-alone reaches the Worker, so
+                # no Accept is added (minimal one-shot tool boundary).
+                "User-Agent": MIRROR_USER_AGENT,
+            },
         )
         try:
             with self.opener.open(request, timeout=60) as response:
