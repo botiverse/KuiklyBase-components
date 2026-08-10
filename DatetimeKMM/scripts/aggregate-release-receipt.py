@@ -124,6 +124,7 @@ def main(argv: list[str]) -> int:
     publish_receipt = load_json(root / "datetime-raft-receipt-publish" / "publish-receipt.json")
     publish_token = load_json(root / "datetime-raft-receipt-publish" / "publish-token-receipt.json")
     token_receipt = load_json(Path(args.terminal_token_receipt))
+    verify_receipt_path = root / "datetime-raft-receipt-publish" / "verify-receipt.json"
 
     merged_files = validate_file_entries(merged.get("files"), "merged manifest")
     publish_files = validate_file_entries(publish_receipt.get("files"), "publish receipt")
@@ -168,16 +169,56 @@ def main(argv: list[str]) -> int:
         for key in ("claimId", "taskId", "manifestDigest"):
             if not isinstance(publish_receipt.get(key), str) or not publish_receipt[key]:
                 fail(f"committed publish receipt carries no {key}")
-        if not isinstance(publish_receipt.get("commitReceipt"), dict) or not publish_receipt["commitReceipt"]:
+        if SHA256_RE.fullmatch(publish_receipt["manifestDigest"]) is None:
+            fail("committed publish receipt manifestDigest is not 64-hex")
+        # Independently recompute the object-manifest digest from the exact
+        # merged {path,sha256,size} set (same algorithm as the release client
+        # and the server). Tar/bundle digest is a different quantity.
+        import atomic_release as ar
+        recomputed_digest = ar.manifest_digest(
+            [{"path": f["path"], "sha256": f["sha256"], "size": f["size"]} for f in merged_files]
+        )
+        if publish_receipt["manifestDigest"] != recomputed_digest:
+            fail("publish receipt manifestDigest does not equal recomputed object-manifest digest")
+        expected_task = os.environ.get("RAFT_RELEASE_TASK_ID", "")
+        if not expected_task:
+            fail("RAFT_RELEASE_TASK_ID is required to bind the publish receipt taskId")
+        if publish_receipt["taskId"] != expected_task:
+            fail("publish receipt taskId does not equal RAFT_RELEASE_TASK_ID")
+        commit_receipt = publish_receipt.get("commitReceipt")
+        if not isinstance(commit_receipt, dict) or not commit_receipt:
             fail("committed publish receipt carries no commitReceipt")
+        if commit_receipt.get("state") != "committed":
+            fail("commitReceipt.state is not committed")
         if not isinstance(publish_receipt.get("ownedPrefixes"), list) or not publish_receipt["ownedPrefixes"]:
             fail("committed publish receipt carries no ownedPrefixes")
         if sorted(publish_receipt["ownedPrefixes"]) != sorted(plan["ownedPrefixes"]):
             fail("committed publish receipt ownedPrefixes do not equal the plan")
-        if publish_receipt.get("manifestDigest") != plan.get("bundleSha256") and False:
-            # manifestDigest is over the object set, not the tar; binding is
-            # checked by the release client itself. Keep claim/task/commit only.
-            pass
+        # Readback proof is mandatory on the publish path: workflow writes
+        # verify-receipt.json separately so it cannot overwrite the committed
+        # atomic receipt, and the aggregate must consume it.
+        if not verify_receipt_path.is_file():
+            fail("publish path requires verify-receipt.json readback proof")
+        verify_receipt = load_json(verify_receipt_path)
+        if verify_receipt.get("status") != "complete":
+            fail("verify receipt status is not complete")
+        for field in ("version", "sourceSha"):
+            if verify_receipt.get(field) != merged.get(field):
+                fail(f"verify receipt {field} drift")
+        verify_files = validate_file_entries(verify_receipt.get("files"), "verify receipt")
+        if verify_receipt.get("fileCount") != len(verify_files):
+            fail("verify receipt fileCount does not equal its file list")
+        if len(verify_files) != len(merged_files):
+            fail("verify receipt fileCount does not equal the merged manifest")
+        verify_by_path = {f["path"]: f for f in verify_files}
+        for entry in merged_files:
+            twin = verify_by_path.get(entry["path"])
+            if twin is None:
+                fail(f"verify receipt missing path: {entry['path']}")
+            if twin["sha256"] != entry["sha256"] or twin["size"] != entry["size"]:
+                fail(f"verify receipt byte binding mismatch for {entry['path']}")
+        if sorted(verify_by_path) != sorted(f["path"] for f in merged_files):
+            fail("verify receipt does not cover the merged manifest exactly")
     elif decision == "noop-verified":
         if status != "complete":
             fail("noop-verified plan requires a complete publish receipt")
@@ -264,13 +305,16 @@ def main(argv: list[str]) -> int:
         "plan": plan,
         "publishReceiptStatus": status,
         "tokenIdentities": sorted(prefixes),
-        "receipts": ["plan", "publish", "receipt"],
+        "receipts": ["plan", "publish", "receipt"]
+        if decision == "noop-verified"
+        else ["plan", "publish", "verify", "receipt"],
     }
     if decision == "publish":
         aggregate["claimId"] = publish_receipt["claimId"]
         aggregate["taskId"] = publish_receipt["taskId"]
         aggregate["manifestDigest"] = publish_receipt["manifestDigest"]
         aggregate["commitReceipt"] = publish_receipt["commitReceipt"]
+        aggregate["verifyReceiptStatus"] = "complete"
     Path(args.output).write_text(json.dumps(aggregate, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
         f"aggregate receipt: {merged['fileCount']} files, version={merged['version']}, "

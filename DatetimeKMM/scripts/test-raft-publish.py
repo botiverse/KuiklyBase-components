@@ -699,9 +699,50 @@ def main() -> int:
         code2 = release_via(retry_server, plan_path, rel_bundle, root / "rel3.json")
         r2 = json.loads((root / "rel2.json").read_text())
         r3 = json.loads((root / "rel3.json").read_text())
-        check("release_retry_same_claim", r2["claimId"] != r3["claimId"] or r2["claimId"] == r3["claimId"])
-        check("release_retry_idempotent_commit", r3["idempotent"] in {True, False})
+        check("release_retry_same_claim", code == 0 and code2 == 0 and r2["claimId"] == r3["claimId"])
+        check(
+            "release_retry_idempotent_commit",
+            r3.get("idempotent") is True and r3["commitReceipt"].get("state") == "committed",
+        )
         check("release_retry_canonical_stable", all(retry_server.canonical[rel] == content_for(rel) for rel in paths))
+
+        # B1: lost commit response after server-side commit must recover receipt
+        # without aborting the already-committed claim.
+        class CommitLossServer(FakeAtomicServer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.lose_next_commit = True
+
+            def commit(self, claim_id: str) -> dict:
+                receipt = super().commit(claim_id)
+                if self.lose_next_commit:
+                    self.lose_next_commit = False
+                    from atomic_release import AtomicReleaseError
+                    raise AtomicReleaseError(
+                        "transport",
+                        "response lost after server commit",
+                        http_status=None,
+                    )
+                return receipt
+
+        loss_server = CommitLossServer()
+        loss_out = root / "rel-commit-loss.json"
+        loss_code = release_via(loss_server, plan_path, rel_bundle, loss_out)
+        loss_receipt = json.loads(loss_out.read_text()) if loss_out.is_file() else {}
+        loss_aborts = [c for c in loss_server.calls if c[0] == "abort"]
+        check("commit_response_loss_recovers_zero_exit", loss_code == 0)
+        check(
+            "commit_response_loss_writes_committed_receipt",
+            loss_receipt.get("status") == "committed"
+            and loss_receipt.get("commitReceipt", {}).get("state") == "committed"
+            and loss_receipt.get("commitReceipt", {}).get("recoveredFrom") == "commit-response-ambiguity",
+        )
+        check("commit_response_loss_no_abort", loss_aborts == [])
+        check(
+            "commit_response_loss_public_objects_stable",
+            len(loss_server.canonical) == len(paths)
+            and all(loss_server.canonical[rel] == content_for(rel) for rel in paths),
+        )
 
         # 11b. claim fences: pre-existing canonical and ordinary writers are
         # conflicts; a mid-claim ordinary writer is refused too
@@ -1024,7 +1065,7 @@ def main() -> int:
         agg = importlib.util.module_from_spec(agg_spec)
         agg_spec.loader.exec_module(agg)
 
-        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False, committed_no_claimid: bool = False, publish_as_complete: bool = False, committed_missing_taskid: bool = False, committed_missing_commit_receipt: bool = False, noop_decision: bool = False, noop_with_claimid: bool = False):
+        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False, committed_no_claimid: bool = False, publish_as_complete: bool = False, committed_missing_taskid: bool = False, committed_missing_commit_receipt: bool = False, noop_decision: bool = False, noop_with_claimid: bool = False, wrong_taskid: bool = False, bad_manifest_digest: bool = False, staged_commit_receipt: bool = False, omit_verify_receipt: bool = False, bad_verify_sha: bool = False, release_task_id: str = "106"):
             """One self-contained aggregate-receipt case: temp git repo whose
             HEAD is the release exact (master == dispatch == fixture sha)."""
             repo = base / "repo"
@@ -1076,13 +1117,23 @@ def main() -> int:
             receipt_files = [dict(f) for f in receipt_files]
             if bad_receipt_sha:
                 receipt_files[0]["sha256"] = "z" * 64
+            import importlib.util as _ilu
+            _ar_spec = _ilu.spec_from_file_location("ar_agg", HERE / "atomic_release.py")
+            _ar = _ilu.module_from_spec(_ar_spec)
+            _ar_spec.loader.exec_module(_ar)
+            object_digest = _ar.manifest_digest(
+                [{"path": f["path"], "sha256": f["sha256"], "size": f["size"]} for f in files]
+            )
             receipt_obj = {
                 "status": "committed",
                 "claimId": "claim-0001",
-                "taskId": "106",
-                "manifestDigest": "b" * 64,
+                "taskId": "wrong-task" if wrong_taskid else "106",
+                "manifestDigest": ("not-a-sha256" if bad_manifest_digest else object_digest),
                 "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
-                "commitReceipt": {"state": "committed", "idempotent": False},
+                "commitReceipt": (
+                    {"state": "staged"} if staged_commit_receipt
+                    else {"state": "committed", "idempotent": False}
+                ),
                 "version": VERSION,
                 "sourceSha": sha,
                 "fileCount": len(receipt_files),
@@ -1111,6 +1162,22 @@ def main() -> int:
                       open(artifacts / "datetime-raft-receipt-publish" / "publish-receipt.json", "w"))
             json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=publish_prefix),
                       open(artifacts / "datetime-raft-receipt-publish" / "publish-token-receipt.json", "w"))
+            # Publish path requires a separate verify-receipt.json (readback proof).
+            # Noop path does not emit it (verify wrote publish-receipt as complete).
+            if not (publish_as_complete or noop_decision or noop_with_claimid or omit_verify_receipt):
+                verify_files = [dict(f) for f in files]
+                if bad_verify_sha:
+                    verify_files[0] = dict(verify_files[0], sha256="c" * 64)
+                verify_obj = {
+                    "status": "complete",
+                    "destination": pub.RAFT_ARTIFACTS_BASE_URL,
+                    "version": VERSION,
+                    "sourceSha": sha,
+                    "fileCount": len(verify_files),
+                    "files": verify_files,
+                }
+                json.dump(verify_obj,
+                          open(artifacts / "datetime-raft-receipt-publish" / "verify-receipt.json", "w"))
             terminal_record = dict(FAKE_TOKEN_RECEIPT, hashPrefix=terminal_prefix)
             if expired_terminal:
                 terminal_record["expiresAt"] = 1
@@ -1121,8 +1188,10 @@ def main() -> int:
             old_cwd = os.getcwd()
             old_sha = os.environ.get("GITHUB_SHA", "")
             old_ep = os.environ.get("RAFT_ARTIFACTS_EXPECT_PRINCIPAL", "")
+            old_task = os.environ.get("RAFT_RELEASE_TASK_ID", "")
             os.environ["GITHUB_SHA"] = sha
             os.environ["RAFT_ARTIFACTS_EXPECT_PRINCIPAL"] = "cc-wow2"
+            os.environ["RAFT_RELEASE_TASK_ID"] = release_task_id
             try:
                 os.chdir(repo)
                 return agg.main(argv)
@@ -1136,6 +1205,10 @@ def main() -> int:
                     os.environ.pop("RAFT_ARTIFACTS_EXPECT_PRINCIPAL", None)
                 else:
                     os.environ["RAFT_ARTIFACTS_EXPECT_PRINCIPAL"] = old_ep
+                if old_task == "":
+                    os.environ.pop("RAFT_RELEASE_TASK_ID", None)
+                else:
+                    os.environ["RAFT_RELEASE_TASK_ID"] = old_task
 
         agg_ok = root / "agg-ok"
         agg_ok.mkdir()
@@ -1171,6 +1244,11 @@ def main() -> int:
             ("aggregate_rejects_committed_without_taskid", {"committed_missing_taskid": True}),
             ("aggregate_rejects_committed_without_commit_receipt", {"committed_missing_commit_receipt": True}),
             ("aggregate_rejects_noop_with_claimid", {"noop_with_claimid": True}),
+            ("aggregate_rejects_wrong_taskid", {"wrong_taskid": True}),
+            ("aggregate_rejects_bad_manifest_digest", {"bad_manifest_digest": True}),
+            ("aggregate_rejects_staged_commit_receipt", {"staged_commit_receipt": True}),
+            ("aggregate_rejects_missing_verify_receipt", {"omit_verify_receipt": True}),
+            ("aggregate_rejects_bad_verify_sha", {"bad_verify_sha": True}),
         ):
             case_dir = root / ("agg-" + name)
             case_dir.mkdir()
@@ -1280,6 +1358,11 @@ def main() -> int:
         check(
             "workflow_publish_binds_release_task_id",
             "RAFT_RELEASE_TASK_ID: ${{ github.event.inputs.release_task_id }}" in publish_block,
+        )
+        receipt_block = wf[wf.find("\n  receipt:"):]
+        check(
+            "workflow_receipt_binds_release_task_id",
+            "RAFT_RELEASE_TASK_ID: ${{ github.event.inputs.release_task_id }}" in receipt_block,
         )
         # B1: release writes publish-receipt.json; verify must target a SEPARATE
         # file on the publish arm so the atomic committed receipt is preserved.

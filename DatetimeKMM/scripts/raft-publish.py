@@ -745,13 +745,19 @@ def command_release(args: argparse.Namespace) -> int:
     require(isinstance(claim_id, str) and claim_id != "", f"claim response carries no claimId: {sorted(claim)}")
     print(f"release claim: id={claim_id} generation={claim.get('generation')} prefixes={len(prefixes)} objects={len(objects)}")
 
+    def _committed_receipt(source: dict | None = None) -> dict:
+        payload = dict(source or {})
+        payload["state"] = "committed"
+        payload.setdefault("idempotent", True)
+        return payload
+
     # Exact retry of a release whose original claim already committed: the
     # ledger returns the ORIGINAL claim id, and staging is closed on a
     # terminal claim — inspect first and short-circuit so the retry mutates
     # nothing. A retry of a still-staged claim falls through and resumes:
     # per-object staging is byte-identical-idempotent, commit is idempotent.
     if client.inspect(claim_id).get("state") == "committed":
-        commit_receipt = {"state": "committed", "idempotent": True}
+        commit_receipt = _committed_receipt({"idempotent": True})
         print(f"release already committed under {claim_id}: exact retry, zero mutations")
     else:
         staged = 0
@@ -768,14 +774,55 @@ def command_release(args: argparse.Namespace) -> int:
             )
             commit_receipt = client.commit(claim_id)
         except (PublishError, ar.AtomicReleaseError) as error:
+            # Commit-response ambiguity: the server may have already committed
+            # when the response is lost. Inspect BEFORE abort. If committed,
+            # recover a server-backed receipt and proceed; only abort when the
+            # claim is still staged (true pre-commit failure).
             reason = f"{type(error).__name__}: {error}"
-            print(f"release failed after claim (staged={staged}); aborting with immutable reason", file=sys.stderr)
             try:
-                client.abort(claim_id, reason)
-                print("release aborted: terminal, zero public mutation", file=sys.stderr)
-            except Exception as abort_error:  # noqa: BLE001 - never mask the original failure
-                print(f"ABORT FAILED (original error stands): {abort_error}", file=sys.stderr)
-            raise
+                recovered = client.inspect(claim_id)
+            except Exception as inspect_error:  # noqa: BLE001
+                print(
+                    f"release failed after claim (staged={staged}); inspect after error also failed: {inspect_error}",
+                    file=sys.stderr,
+                )
+                try:
+                    client.abort(claim_id, reason)
+                    print("release aborted: terminal, zero public mutation", file=sys.stderr)
+                except Exception as abort_error:  # noqa: BLE001
+                    print(f"ABORT FAILED (original error stands): {abort_error}", file=sys.stderr)
+                raise error from inspect_error
+            if recovered.get("state") == "committed":
+                commit_receipt = _committed_receipt(
+                    {
+                        "idempotent": True,
+                        "recoveredFrom": "commit-response-ambiguity",
+                        "originalError": reason,
+                        "inspect": recovered,
+                    }
+                )
+                print(
+                    f"release committed under {claim_id} despite lost commit response; "
+                    "recovered via inspect (no abort)",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"release failed after claim (staged={staged}, state={recovered.get('state')}); "
+                    "aborting with immutable reason",
+                    file=sys.stderr,
+                )
+                try:
+                    client.abort(claim_id, reason)
+                    print("release aborted: terminal, zero public mutation", file=sys.stderr)
+                except Exception as abort_error:  # noqa: BLE001
+                    print(f"ABORT FAILED (original error stands): {abort_error}", file=sys.stderr)
+                raise
+
+    require(
+        isinstance(commit_receipt, dict) and commit_receipt.get("state") == "committed",
+        f"commit receipt is not committed: {commit_receipt!r}",
+    )
 
     receipt = {
         "status": "committed",
