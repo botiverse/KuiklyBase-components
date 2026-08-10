@@ -1,0 +1,133 @@
+# Read-only source/authority contract for task #120.  This workflow never
+# receives a package credential and contains no write-capable command.
+name: Compose 1.7.3-kuikly2 mirror (read-only)
+
+on:
+  pull_request:
+    paths:
+      - OHOSForks/compose-mirror/**
+      - OHOSForks/scripts/compose-mirror.py
+      - OHOSForks/scripts/test-compose-mirror.py
+      - .github/workflows/compose-mirror-readonly.yml
+      - .github/workflows/publish-compose-raft-mirror.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compose-mirror-readonly-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Exact authority, planner, causal teeth, OHOS resolver
+    runs-on: ubuntu-latest
+    env:
+      MIRROR_SOURCE_EXACT: ${{ github.event.pull_request.head.sha || github.sha }}
+      MANIFEST_SHA256: c4922fa162cbeeea3580a481431feb5462be95cac6c407ca637d577bd2c63cf5
+      OUT_DIR: /tmp/compose-mirror-readonly
+    steps:
+      - name: Checkout exact source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.MIRROR_SOURCE_EXACT }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Bind source and immutable manifest
+        run: |
+          set -euo pipefail
+          [[ "$MIRROR_SOURCE_EXACT" =~ ^[0-9a-f]{40}$ ]]
+          [ "$(git rev-parse HEAD)" = "$MIRROR_SOURCE_EXACT" ]
+          printf '%s  %s\n' "$MANIFEST_SHA256" OHOSForks/compose-mirror/authority-manifest.json \
+            | sha256sum -c -
+          [ -z "$(git status --porcelain=v1 --untracked-files=all)" ]
+
+      - name: Set up Java for the empty-cache resolver
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Offline admission and transport teeth
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 OHOSForks/scripts/test-compose-mirror.py
+
+      - name: Fetch and validate 32 Tencent authority bytes
+        run: |
+          set -euo pipefail
+          python3 OHOSForks/scripts/compose-mirror.py fetch \
+            --manifest OHOSForks/compose-mirror/authority-manifest.json \
+            --bytes-dir "$OUT_DIR/bytes" \
+            --receipt "$OUT_DIR/authority-receipt.json"
+
+      - name: Causal mutations against exact authority bytes
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          python3 OHOSForks/scripts/test-compose-mirror.py \
+            --authority-bytes "$OUT_DIR/bytes"
+
+      - name: Anonymous Raft all-state plan
+        run: |
+          set -euo pipefail
+          python3 OHOSForks/scripts/compose-mirror.py plan \
+            --manifest OHOSForks/compose-mirror/authority-manifest.json \
+            --output "$OUT_DIR/raft-plan.json"
+          decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["remote"]["decision"])' "$OUT_DIR/raft-plan.json")"
+          case "$decision" in
+            publish-all-absent|noop-complete-identical) ;;
+            *) echo "non-terminal Raft plan: $decision" >&2; exit 1 ;;
+          esac
+
+      # The Compose groups come only from the frozen local authority tree;
+      # every dependency comes from Tencent.  The real combined graph requests
+      # KBA-002 beside the Compose roots and proves it wins over the historical
+      # .001 edge without silently rewriting any metadata.
+      - name: Empty-cache OHOS resolution against exact bytes
+        env:
+          COMPOSE_MIRROR_REPOSITORY_URL: https://mirrors.tencent.com/repository/maven-tencent
+          GRADLE_USER_HOME: ${{ runner.temp }}/compose-smoke-gradle
+        run: |
+          set -euo pipefail
+          authority_url="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' "$OUT_DIR/bytes")"
+          export COMPOSE_AUTHORITY_REPOSITORY_URL="$authority_url"
+          DatetimeKMM/gradlew \
+            -Dmaven.repo.local="$RUNNER_TEMP/compose-smoke-m2" \
+            --no-daemon --console=plain --refresh-dependencies \
+            -p OHOSForks/compose-mirror/consumer-smoke resolveOhosArm64
+          [ "$(wc -l < OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-resolution.tsv)" -eq 8 ]
+
+      - name: Bind receipt tuple
+        run: |
+          set -euo pipefail
+          python3 - "$OUT_DIR" "$MANIFEST_SHA256" "$MIRROR_SOURCE_EXACT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          root = pathlib.Path(sys.argv[1])
+          digest = sys.argv[2]
+          source = sys.argv[3]
+          for name in ("authority-receipt.json", "raft-plan.json"):
+              value = json.loads((root / name).read_text())
+              assert value["manifestSha256"] == digest, name
+              assert value["provenance"]["sourceExact"] == source, name
+              assert value["provenance"]["runId"] == "${{ github.run_id }}", name
+              assert value["provenance"]["runAttempt"] == "${{ github.run_attempt }}", name
+          PY
+
+      - name: Upload non-secret review packet
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-mirror-readonly-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            OHOSForks/compose-mirror/authority-manifest.json
+            ${{ env.OUT_DIR }}/authority-receipt.json
+            ${{ env.OUT_DIR }}/raft-plan.json
+            OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-components.tsv
+            OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-resolution.tsv
+          if-no-files-found: error
+          retention-days: 90

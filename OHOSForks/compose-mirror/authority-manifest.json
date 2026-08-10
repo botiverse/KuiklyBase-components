@@ -1,0 +1,289 @@
+{
+  "schema": 1,
+  "task": 120,
+  "authority": {
+    "kind": "public-maven-exact-byte",
+    "baseUrl": "https://mirrors.tencent.com/repository/maven-tencent",
+    "repository": "maven-tencent",
+    "artifactPublicationProvenance": {
+      "status": "not-publicly-auditable",
+      "caveat": "The public Maven bytes are canonical authority. No public source commit or publication run for these exact bytes was found; POM SCM fields point to upstream AndroidX/JetBrains source and are not exact Tencent publication provenance."
+    },
+    "publicConsumerSelection": {
+      "repository": "https://github.com/Tencent-TDS/KuiklyUI",
+      "pullRequest": 1525,
+      "pullRequestHead": "93d1ae7351294baa21abb040c619b22cb17fd99c",
+      "mergeCommit": "388f639bcf79a3e675ed33eb005b3a594dedf243",
+      "meaning": "Consumer pin and Tencent-repository resolution evidence only; not the artifact publish source or run."
+    }
+  },
+  "inventory": {
+    "version": "1.7.3-kuikly2",
+    "gavCount": 8,
+    "fileCount": 32,
+    "boundary": "Primary immutable Maven files only: POM, Gradle module metadata, main JAR/KLIB, and sources JAR. Mutable maven-metadata.xml and checksum/signature sidecars are outside this one-shot mirror."
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "evidence": "All eight canonical POMs name The Apache Software License, Version 2.0 with http://www.apache.org/licenses/LICENSE-2.0.txt."
+  },
+  "gavs": [
+    {
+      "groupId": "com.tencent.kuikly-open.compose.runtime",
+      "artifactId": "runtime",
+      "version": "1.7.3-kuikly2",
+      "role": "root",
+      "binaryExtension": "jar",
+      "ohosArm64PhysicalArtifactId": "runtime-ohosarm64"
+    },
+    {
+      "groupId": "com.tencent.kuikly-open.compose.runtime",
+      "artifactId": "runtime-ohosarm64",
+      "version": "1.7.3-kuikly2",
+      "role": "ohosArm64Physical",
+      "binaryExtension": "klib"
+    },
+    {
+      "groupId": "com.tencent.kuikly-open.compose.runtime",
+      "artifactId": "runtime-saveable",
+      "version": "1.7.3-kuikly2",
+      "role": "root",
+      "binaryExtension": "jar",
+      "ohosArm64PhysicalArtifactId": "runtime-saveable-ohosarm64"
+    },
+    {
+      "groupId": "com.tencent.kuikly-open.compose.runtime",
+      "artifactId": "runtime-saveable-ohosarm64",
+      "version": "1.7.3-kuikly2",
+      "role": "ohosArm64Physical",
+      "binaryExtension": "klib"
+    },
+    {
+      "groupId": "com.tencent.kuikly-open.compose.annotation-internal",
+      "artifactId": "annotation",
+      "version": "1.7.3-kuikly2",
+      "role": "root",
+      "binaryExtension": "jar",
+      "ohosArm64PhysicalArtifactId": "annotation-ohosarm64"
+    },
+    {
+      "groupId": "com.tencent.kuikly-open.compose.annotation-internal",
+      "artifactId": "annotation-ohosarm64",
+      "version": "1.7.3-kuikly2",
+      "role": "ohosArm64Physical",
+      "binaryExtension": "klib"
+    },
+    {
+      "groupId": "com.tencent.kuikly-open.compose.collection-internal",
+      "artifactId": "collection",
+      "version": "1.7.3-kuikly2",
+      "role": "root",
+      "binaryExtension": "jar",
+      "ohosArm64PhysicalArtifactId": "collection-ohosarm64"
+    },
+    {
+      "groupId": "com.tencent.kuikly-open.compose.collection-internal",
+      "artifactId": "collection-ohosarm64",
+      "version": "1.7.3-kuikly2",
+      "role": "ohosArm64Physical",
+      "binaryExtension": "klib"
+    }
+  ],
+  "closure": {
+    "kotlinCompilerVersion": "2.0.21-KBA-003",
+    "kotlin210Kba010InGraph": false,
+    "ohosArm64ExternalCoordinates": [
+      "org.jetbrains.kotlin:kotlin-stdlib:2.0.21-KBA-003",
+      "org.jetbrains.kotlin:kotlin-stdlib-common:2.0.21-KBA-003",
+      "org.jetbrains.kotlinx:atomicfu:0.23.2-KBA-001",
+      "org.jetbrains.kotlinx:atomicfu-ohosarm64:0.23.2-KBA-001",
+      "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0-KBA-001",
+      "org.jetbrains.kotlinx:kotlinx-coroutines-core-ohosarm64:1.8.0-KBA-001"
+    ],
+    "rootToOhosArm64": [
+      {
+        "root": "com.tencent.kuikly-open.compose.runtime:runtime:1.7.3-kuikly2",
+        "physical": "com.tencent.kuikly-open.compose.runtime:runtime-ohosarm64:1.7.3-kuikly2",
+        "availableAtUrl": "../../runtime-ohosarm64/1.7.3-kuikly2/runtime-ohosarm64-1.7.3-kuikly2.module"
+      },
+      {
+        "root": "com.tencent.kuikly-open.compose.runtime:runtime-saveable:1.7.3-kuikly2",
+        "physical": "com.tencent.kuikly-open.compose.runtime:runtime-saveable-ohosarm64:1.7.3-kuikly2",
+        "availableAtUrl": "../../runtime-saveable-ohosarm64/1.7.3-kuikly2/runtime-saveable-ohosarm64-1.7.3-kuikly2.module"
+      },
+      {
+        "root": "com.tencent.kuikly-open.compose.annotation-internal:annotation:1.7.3-kuikly2",
+        "physical": "com.tencent.kuikly-open.compose.annotation-internal:annotation-ohosarm64:1.7.3-kuikly2",
+        "availableAtUrl": "../../annotation-ohosarm64/1.7.3-kuikly2/annotation-ohosarm64-1.7.3-kuikly2.module"
+      },
+      {
+        "root": "com.tencent.kuikly-open.compose.collection-internal:collection:1.7.3-kuikly2",
+        "physical": "com.tencent.kuikly-open.compose.collection-internal:collection-ohosarm64:1.7.3-kuikly2",
+        "availableAtUrl": "../../collection-ohosarm64/1.7.4-ohos/collection-ohosarm64-1.7.4-ohos.module",
+        "caveat": "Canonical root metadata carries this stale URL string while the available-at group/module/version fields and canonical physical GAV are 1.7.3-kuikly2. The mirror preserves the byte and must not rewrite it."
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": "com/tencent/kuikly-open/compose/annotation-internal/annotation/1.7.3-kuikly2/annotation-1.7.3-kuikly2-sources.jar",
+      "size": 25046,
+      "sha256": "706eb1c09bbc2ad74bf0f173e1fe77ac46fd7945efd9b6409053fb3f8763eff2"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/annotation-internal/annotation/1.7.3-kuikly2/annotation-1.7.3-kuikly2.jar",
+      "size": 16920,
+      "sha256": "32995d62c0d62ee74ecb55aefb2e69c23a5fd41030e8ec0f248ccc5f78cf54f5"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/annotation-internal/annotation/1.7.3-kuikly2/annotation-1.7.3-kuikly2.module",
+      "size": 31386,
+      "sha256": "cbab3f8124de088ea3d8bc789256590db22c9a244d5db97ffc5c0bd791e156b4"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/annotation-internal/annotation/1.7.3-kuikly2/annotation-1.7.3-kuikly2.pom",
+      "size": 1935,
+      "sha256": "e26115b7335e567cbf446c63d71ca7f6cc8bdd2eadf77094e0f702956eac95ae"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/annotation-internal/annotation-ohosarm64/1.7.3-kuikly2/annotation-ohosarm64-1.7.3-kuikly2-sources.jar",
+      "size": 25046,
+      "sha256": "768b81005ebd26d9441a064ef52c02dc98df7490585701af8d81e8e15828510f"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/annotation-internal/annotation-ohosarm64/1.7.3-kuikly2/annotation-ohosarm64-1.7.3-kuikly2.klib",
+      "size": 29208,
+      "sha256": "c5b9dfe1a6f8a458f91d7fd2668e1d257d0c5aeed964a71bd875df087ce51811"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/annotation-internal/annotation-ohosarm64/1.7.3-kuikly2/annotation-ohosarm64-1.7.3-kuikly2.module",
+      "size": 2537,
+      "sha256": "039d049a4facab8b6b270bd18c2ae816bb050dfbc54eb45431f12296ab9fa92a"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/annotation-internal/annotation-ohosarm64/1.7.3-kuikly2/annotation-ohosarm64-1.7.3-kuikly2.pom",
+      "size": 1793,
+      "sha256": "e5f8663c2e9fcaf941963fc13dbbdf6b25e1260c10e2073661c2bbb0cf813809"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/collection-internal/collection/1.7.3-kuikly2/collection-1.7.3-kuikly2-sources.jar",
+      "size": 226839,
+      "sha256": "ee5d9576e305ee9039ed1045d8d281865524a2fd54221340b8229aca8273cbce"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/collection-internal/collection/1.7.3-kuikly2/collection-1.7.3-kuikly2.jar",
+      "size": 66819,
+      "sha256": "d2784f8c406bbb3f38ae7aa8d0ea7f72929efb73fef9f3b568d5d7d8956ef42c"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/collection-internal/collection/1.7.3-kuikly2/collection-1.7.3-kuikly2.module",
+      "size": 34209,
+      "sha256": "df78d1be05bff82c29baf3a8cb3b6f536023d329130e5de20d8a4a2d7b05f52b"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/collection-internal/collection/1.7.3-kuikly2/collection-1.7.3-kuikly2.pom",
+      "size": 2326,
+      "sha256": "3ac3fe8968285bb10dbd096ce6fa1ce63a0745bc1525be021a685cb76f380025"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/collection-internal/collection-ohosarm64/1.7.3-kuikly2/collection-ohosarm64-1.7.3-kuikly2-sources.jar",
+      "size": 226839,
+      "sha256": "aa95d1cfb71fadde9208188ce83c33e0f810deb4ad841d06123ba1b06436955f"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/collection-internal/collection-ohosarm64/1.7.3-kuikly2/collection-ohosarm64-1.7.3-kuikly2.klib",
+      "size": 778260,
+      "sha256": "629f55097be6ac7e0ffb27144f126d11ee6913798680716b3e983a051aecef59"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/collection-internal/collection-ohosarm64/1.7.3-kuikly2/collection-ohosarm64-1.7.3-kuikly2.module",
+      "size": 2916,
+      "sha256": "4584f6c33ac863ac544218a06ee89af946b9402d4b15ce622482376f5d018c5e"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/collection-internal/collection-ohosarm64/1.7.3-kuikly2/collection-ohosarm64-1.7.3-kuikly2.pom",
+      "size": 2204,
+      "sha256": "67d92cf29c7495323573e1862962c9ad44db19526bf942ec243c01a4d61c8b8e"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime/1.7.3-kuikly2/runtime-1.7.3-kuikly2-sources.jar",
+      "size": 378520,
+      "sha256": "dd8553ff42d8be89f5321ecf503588dbe0ea7f79ce8ca8436d48c7a1c76063bb"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime/1.7.3-kuikly2/runtime-1.7.3-kuikly2.jar",
+      "size": 163324,
+      "sha256": "e6ffd7c54297654c82aebfbbcec5d69f83d79bae4a6082884204076d80ad8f64"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime/1.7.3-kuikly2/runtime-1.7.3-kuikly2.module",
+      "size": 37909,
+      "sha256": "0ededb71a40957d645769f8065c8c4f8d2ff6a214cb08e2c4bb425d36d417cc5"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime/1.7.3-kuikly2/runtime-1.7.3-kuikly2.pom",
+      "size": 2415,
+      "sha256": "91c0382081e87f01a4ed5b2e7f532cce7cb211655a5726d45e106a7ff0632411"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-ohosarm64/1.7.3-kuikly2/runtime-ohosarm64-1.7.3-kuikly2-sources.jar",
+      "size": 375020,
+      "sha256": "a80a791d256fa0603bdf95c74593d38cbfac93f3425cfe37f3915693ec354d80"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-ohosarm64/1.7.3-kuikly2/runtime-ohosarm64-1.7.3-kuikly2.klib",
+      "size": 1537183,
+      "sha256": "d165fc1ea5e67fb04c85d64d93ac3f16e743c833f2e17108a78473f88f365c54"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-ohosarm64/1.7.3-kuikly2/runtime-ohosarm64-1.7.3-kuikly2.module",
+      "size": 3078,
+      "sha256": "4e14c53b659f49f70a6780bce84b316ee35e691ab99a1ce65c7380588c54598d"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-ohosarm64/1.7.3-kuikly2/runtime-ohosarm64-1.7.3-kuikly2.pom",
+      "size": 2485,
+      "sha256": "7b03bf56ffd8be74f835290077bc575435d02d5665246633499860fe20cebcb5"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-saveable/1.7.3-kuikly2/runtime-saveable-1.7.3-kuikly2-sources.jar",
+      "size": 11727,
+      "sha256": "909185ecf261fa573b8b3b8819df240da4ee6cc1b09e41fcde715a5150c25f71"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-saveable/1.7.3-kuikly2/runtime-saveable-1.7.3-kuikly2.jar",
+      "size": 6815,
+      "sha256": "44b7c85b6ee26d5b9aca6e9e24b4286edb30a61d4b4c787ba1a562f0b249385c"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-saveable/1.7.3-kuikly2/runtime-saveable-1.7.3-kuikly2.module",
+      "size": 38327,
+      "sha256": "660f662a9e8899e5d09a5ac3a9d39e2ad102b8b09da6fe9ddbf79d9b2529bc5e"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-saveable/1.7.3-kuikly2/runtime-saveable-1.7.3-kuikly2.pom",
+      "size": 1982,
+      "sha256": "49c5e8ba0b6a3f39556203de5d16f4070cc88efc1c4e904049add4d5d0bbb9f3"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-saveable-ohosarm64/1.7.3-kuikly2/runtime-saveable-ohosarm64-1.7.3-kuikly2-sources.jar",
+      "size": 11727,
+      "sha256": "909185ecf261fa573b8b3b8819df240da4ee6cc1b09e41fcde715a5150c25f71"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-saveable-ohosarm64/1.7.3-kuikly2/runtime-saveable-ohosarm64-1.7.3-kuikly2.klib",
+      "size": 42970,
+      "sha256": "21a64cb6ba7f08a9631fbaf62e5aeeb0de920d6bee0e1a7c32ce0f6ccd84a324"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-saveable-ohosarm64/1.7.3-kuikly2/runtime-saveable-ohosarm64-1.7.3-kuikly2.module",
+      "size": 2763,
+      "sha256": "287fca5ed94596c07b75549103732b690dbd9c23815a273a21438a52b2cda9d7"
+    },
+    {
+      "path": "com/tencent/kuikly-open/compose/runtime/runtime-saveable-ohosarm64/1.7.3-kuikly2/runtime-saveable-ohosarm64-1.7.3-kuikly2.pom",
+      "size": 2032,
+      "sha256": "9b802e1c0a9e0a81df13eff5b66241d2366f0cdb43ccab39c75b8af2597f8d92"
+    }
+  ]
+}
