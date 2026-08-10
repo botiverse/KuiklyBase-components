@@ -495,15 +495,32 @@ jobs:
                 --output verify-receipt.json
               ;;
             noop-verified)
-              # Verified no-op: zero staged objects. Token receipt is still
-              # minted so the terminal identity check sees this job's
-              # credential shape. Verify produces the complete publish receipt
-              # (byte-identical re-read of already-present carriers).
+              # All-present: first attempt exact-claim recovery so a prior
+              # exhausted-unknown commit still yields the original atomic
+              # receipt (claimId/commitReceipt). Only when recover exits 2
+              # (no committed claim for this identity) fall through to a
+              # generic complete verify receipt.
               python3 scripts/raft-publish.py token-receipt --output publish-token-receipt.json
-              python3 scripts/raft-publish.py verify \
+              set +e
+              python3 scripts/raft-publish.py recover-claim \
                 --manifest ../artifacts-in/merged-manifest.json \
                 --output publish-receipt.json
-              echo "global decision is noop-verified: zero staged objects"
+              recover_rc=$?
+              set -e
+              if [ "$recover_rc" -eq 0 ]; then
+                echo "noop-verified recovered committed atomic receipt for exact claim"
+                python3 scripts/raft-publish.py verify \
+                  --manifest ../artifacts-in/merged-manifest.json \
+                  --output verify-receipt.json
+              elif [ "$recover_rc" -eq 2 ]; then
+                python3 scripts/raft-publish.py verify \
+                  --manifest ../artifacts-in/merged-manifest.json \
+                  --output publish-receipt.json
+                echo "global decision is noop-verified: zero staged objects (no recoverable claim)"
+              else
+                echo "recover-claim failed hard (rc=$recover_rc)" >&2
+                exit "$recover_rc"
+              fi
               ;;
             *)
               echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;

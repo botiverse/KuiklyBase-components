@@ -224,12 +224,68 @@ def main(argv: list[str]) -> int:
                 if sorted(verify_by_path) != sorted(f["path"] for f in merged_files):
                     fail("verify receipt does not cover the merged manifest exactly")
     elif decision == "noop-verified":
-        if status != "complete":
-            fail("noop-verified plan requires a complete publish receipt")
-        # A complete receipt must not pretend to be atomic.
-        for key in ("claimId", "taskId", "manifestDigest", "commitReceipt"):
-            if key in publish_receipt and publish_receipt[key] not in (None, "", {}, []):
-                fail(f"complete publish receipt must not carry atomic field {key}")
+        # All-present may still carry a recovered atomic receipt when a prior
+        # publish committed without durable receipt (exhausted unknown). Treat
+        # status=committed with full identity as the recovered publish path.
+        if status == "committed":
+            require_publish_committed = True
+            if require_publish_committed:
+                for key in ("claimId", "taskId", "manifestDigest"):
+                    if not isinstance(publish_receipt.get(key), str) or not publish_receipt[key]:
+                        fail(f"recovered committed receipt carries no {key}")
+                if SHA256_RE.fullmatch(publish_receipt["manifestDigest"]) is None:
+                    fail("recovered committed receipt manifestDigest is not 64-hex")
+                import atomic_release as ar
+                recomputed_digest = ar.manifest_digest(
+                    [{"path": f["path"], "sha256": f["sha256"], "size": f["size"]} for f in merged_files]
+                )
+                if publish_receipt["manifestDigest"] != recomputed_digest:
+                    fail("recovered receipt manifestDigest does not equal recomputed object-manifest digest")
+                expected_task = os.environ.get("RAFT_RELEASE_TASK_ID", "")
+                if not expected_task:
+                    fail("RAFT_RELEASE_TASK_ID is required to bind the recovered publish receipt taskId")
+                if publish_receipt["taskId"] != expected_task:
+                    fail("recovered publish receipt taskId does not equal RAFT_RELEASE_TASK_ID")
+                commit_receipt = publish_receipt.get("commitReceipt")
+                if not isinstance(commit_receipt, dict) or not commit_receipt:
+                    fail("recovered committed receipt carries no commitReceipt")
+                if commit_receipt.get("state") != "committed":
+                    fail("recovered commitReceipt.state is not committed")
+                if not isinstance(publish_receipt.get("ownedPrefixes"), list) or not publish_receipt["ownedPrefixes"]:
+                    fail("recovered committed receipt carries no ownedPrefixes")
+                if sorted(publish_receipt["ownedPrefixes"]) != sorted(plan["ownedPrefixes"]):
+                    fail("recovered committed receipt ownedPrefixes do not equal the plan")
+                require_verify_readback = True
+                if require_verify_readback:
+                    if not verify_receipt_path.is_file():
+                        fail("recovered committed path requires verify-receipt.json readback proof")
+                    verify_receipt = load_json(verify_receipt_path)
+                    if verify_receipt.get("status") != "complete":
+                        fail("verify receipt status is not complete")
+                    for field in ("version", "sourceSha"):
+                        if verify_receipt.get(field) != merged.get(field):
+                            fail(f"verify receipt {field} drift")
+                    verify_files = validate_file_entries(verify_receipt.get("files"), "verify receipt")
+                    if verify_receipt.get("fileCount") != len(verify_files):
+                        fail("verify receipt fileCount does not equal its file list")
+                    if len(verify_files) != len(merged_files):
+                        fail("verify receipt fileCount does not equal the merged manifest")
+                    verify_by_path = {f["path"]: f for f in verify_files}
+                    for entry in merged_files:
+                        twin = verify_by_path.get(entry["path"])
+                        if twin is None:
+                            fail(f"verify receipt missing path: {entry['path']}")
+                        if twin["sha256"] != entry["sha256"] or twin["size"] != entry["size"]:
+                            fail(f"verify receipt byte binding mismatch for {entry['path']}")
+                    if sorted(verify_by_path) != sorted(f["path"] for f in merged_files):
+                        fail("verify receipt does not cover the merged manifest exactly")
+        elif status == "complete":
+            # A complete receipt must not pretend to be atomic.
+            for key in ("claimId", "taskId", "manifestDigest", "commitReceipt"):
+                if key in publish_receipt and publish_receipt[key] not in (None, "", {}, []):
+                    fail(f"complete publish receipt must not carry atomic field {key}")
+        else:
+            fail("noop-verified plan requires a complete or recovered-committed publish receipt")
     else:
         fail("plan decision is not a known value")
     for field in ("version", "sourceSha"):
@@ -303,8 +359,13 @@ def main(argv: list[str]) -> int:
     # have been enforced. A fail-open regression that skips publish→committed
     # binding would still emit status=committed here — the negative teeth catch
     # that by requiring SystemExit before this point.
+    # Recovered atomic receipt on an all-present (noop-verified) plan is still
+    # terminal status=committed (original claim provenance).
+    recovered_atomic = (
+        decision == "noop-verified" and publish_receipt.get("status") == "committed"
+    )
     aggregate = {
-        "status": "complete" if decision == "noop-verified" else "committed",
+        "status": "complete" if (decision == "noop-verified" and not recovered_atomic) else "committed",
         "version": merged["version"],
         "sourceSha": merged["sourceSha"],
         "destination": merged.get("destination", ""),
@@ -313,11 +374,11 @@ def main(argv: list[str]) -> int:
         "plan": plan,
         "publishReceiptStatus": status,
         "tokenIdentities": sorted(prefixes),
-        "receipts": ["plan", "publish", "receipt"]
-        if decision == "noop-verified"
-        else ["plan", "publish", "verify", "receipt"],
+        "receipts": ["plan", "publish", "verify", "receipt"]
+        if (decision == "publish" or recovered_atomic)
+        else ["plan", "publish", "receipt"],
     }
-    if decision == "publish" and status == "committed" and all(
+    if (decision == "publish" or recovered_atomic) and status == "committed" and all(
         isinstance(publish_receipt.get(k), str) and publish_receipt.get(k)
         for k in ("claimId", "taskId", "manifestDigest")
     ) and isinstance(publish_receipt.get("commitReceipt"), dict):

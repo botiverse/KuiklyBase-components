@@ -735,6 +735,85 @@ def _reconcile_claim_after_commit_ambiguity(
     ) from original_error
 
 
+
+def _claim_intent_path(output: str | Path) -> Path:
+    """Sidecar next to the terminal publish receipt; survives exhausted-unknown
+    so a later run can recover the exact claim without guessing."""
+    out = Path(output)
+    return out.with_name(out.stem + ".claim-intent.json")
+
+
+def _write_claim_intent(path: Path, payload: dict) -> None:
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _load_claim_intent(path: Path) -> dict | None:
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _build_release_identity(manifest: dict, task_id: str) -> tuple[list[dict], list[str], str, dict]:
+    import atomic_release as ar
+
+    objects = [
+        {"path": entry["path"], "sha256": entry["sha256"], "size": entry["size"]}
+        for entry in sorted(manifest["files"], key=lambda f: f["path"].encode("utf-8"))
+    ]
+    prefixes = ar.owned_prefixes_from_paths([entry["path"] for entry in objects])
+    digest = ar.manifest_digest(objects)
+    claim_payload = {
+        "repository": "maven",
+        "taskId": task_id,
+        "version": manifest["version"],
+        "sourceSha": manifest["sourceSha"],
+        "ownedPrefixes": prefixes,
+        "manifestDigest": digest,
+        "objects": objects,
+        "leaseSeconds": 600,
+    }
+    return objects, prefixes, digest, claim_payload
+
+
+def _write_atomic_publish_receipt(
+    *,
+    output: Path,
+    claim_id: str,
+    claim: dict,
+    task_id: str,
+    manifest: dict,
+    prefixes: list[str],
+    digest: str,
+    objects: list[dict],
+    commit_receipt: dict,
+) -> dict:
+    receipt = {
+        "status": "committed",
+        "claimId": claim_id,
+        "generation": claim.get("generation"),
+        "idempotent": commit_receipt.get("idempotent", claim.get("idempotent")),
+        "taskId": task_id,
+        "version": manifest["version"],
+        "sourceSha": manifest["sourceSha"],
+        "ownedPrefixes": prefixes,
+        "manifestDigest": digest,
+        "fileCount": len(objects),
+        "files": objects,
+        "commitReceipt": commit_receipt,
+        "provenance": {
+            "publishSourceExact": os.environ.get("GITHUB_SHA", ""),
+            "runId": os.environ.get("GITHUB_RUN_ID", ""),
+            "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+        },
+    }
+    output.write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return receipt
+
+
 def command_release(args: argparse.Namespace) -> int:
     """Single-writer ATOMIC release via the deployed v1 ledger (task #106).
 
@@ -816,28 +895,32 @@ def command_release(args: argparse.Namespace) -> int:
     # Build the exact release identity the ledger will verify server-side.
     task_id = os.environ.get("RAFT_RELEASE_TASK_ID", "")
     require(task_id != "", "RAFT_RELEASE_TASK_ID is required for the release claim")
-    objects = [
-        {"path": entry["path"], "sha256": entry["sha256"], "size": entry["size"]}
-        for entry in sorted(manifest["files"], key=lambda f: f["path"].encode("utf-8"))
-    ]
-    prefixes = ar.owned_prefixes_from_paths([entry["path"] for entry in objects])
-    digest = ar.manifest_digest(objects)
+    objects, prefixes, digest, claim_payload = _build_release_identity(manifest, task_id)
     client = release_client_from_env()
-    claim_payload = {
-        "repository": "maven",
-        "taskId": task_id,
-        "version": manifest["version"],
-        "sourceSha": manifest["sourceSha"],
-        "ownedPrefixes": prefixes,
-        "manifestDigest": digest,
-        "objects": objects,
-        "leaseSeconds": 600,
-    }
+    intent_path = _claim_intent_path(args.output)
 
     claim = client.claim(claim_payload)
     claim_id = claim.get("claimId")
     require(isinstance(claim_id, str) and claim_id != "", f"claim response carries no claimId: {sorted(claim)}")
+    # Persist recoverable identity BEFORE any stage/commit so exhausted-unknown
+    # and a later all-present run can rebind the original claim.
+    _write_claim_intent(
+        intent_path,
+        {
+            "claimId": claim_id,
+            "generation": claim.get("generation"),
+            "taskId": task_id,
+            "version": manifest["version"],
+            "sourceSha": manifest["sourceSha"],
+            "ownedPrefixes": prefixes,
+            "manifestDigest": digest,
+            "fileCount": len(objects),
+            "objects": objects,
+            "claimPayload": claim_payload,
+        },
+    )
     print(f"release claim: id={claim_id} generation={claim.get('generation')} prefixes={len(prefixes)} objects={len(objects)}")
+    print(f"release claim intent written: {intent_path}")
 
     def _committed_receipt(source: dict | None = None) -> dict:
         payload = dict(source or {})
@@ -893,28 +976,123 @@ def command_release(args: argparse.Namespace) -> int:
         f"commit receipt is not committed: {commit_receipt!r}",
     )
 
-    receipt = {
-        "status": "committed",
-        "claimId": claim_id,
-        "generation": claim.get("generation"),
-        "idempotent": commit_receipt.get("idempotent", claim.get("idempotent")),
-        "taskId": task_id,
-        "version": manifest["version"],
-        "sourceSha": manifest["sourceSha"],
-        "ownedPrefixes": prefixes,
-        "manifestDigest": digest,
-        "fileCount": len(objects),
-        "files": objects,
-        "commitReceipt": commit_receipt,
-        "provenance": {
-            "publishSourceExact": os.environ.get("GITHUB_SHA", ""),
-            "runId": os.environ.get("GITHUB_RUN_ID", ""),
-            "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
-        },
-    }
-    Path(args.output).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    _write_atomic_publish_receipt(
+        output=Path(args.output),
+        claim_id=claim_id,
+        claim=claim,
+        task_id=task_id,
+        manifest=manifest,
+        prefixes=prefixes,
+        digest=digest,
+        objects=objects,
+        commit_receipt=commit_receipt,
+    )
     print(f"release committed: {len(objects)}/{len(objects)} objects visible atomically, receipt {args.output}")
     return 0
+
+def command_recover_claim(args: argparse.Namespace) -> int:
+    """All-present / cross-run recovery of a committed atomic claim.
+
+    When a prior release committed publicly but left no publish-receipt (e.g.
+    exhausted unknown inspect after ambiguous commit), the next workflow classifies
+    all-present as noop-verified. Before accepting a generic complete receipt,
+    re-bind the exact release identity via idempotent claim + inspect:
+
+    - committed → write durable atomic publish-receipt (original claimId)
+    - not committed / unknown → exit 2 so the caller may fall through only when
+      policy allows a non-atomic complete path (workflow currently fails closed
+      unless recovery succeeds, or uses verify only when recover exits 3)
+
+    Exit codes:
+      0 = recovered committed receipt written
+      2 = no recoverable committed claim for this identity
+      1 = hard error
+    """
+    import atomic_release as ar
+
+    manifest = load_manifest(Path(args.manifest))
+    task_id = os.environ.get("RAFT_RELEASE_TASK_ID", "")
+    require(task_id != "", "RAFT_RELEASE_TASK_ID is required for claim recovery")
+    objects, prefixes, digest, claim_payload = _build_release_identity(manifest, task_id)
+    client = release_client_from_env()
+    intent_path = _claim_intent_path(args.output)
+    intent = _load_claim_intent(intent_path)
+
+    claim_id = None
+    claim: dict = {}
+    # Prefer durable intent from a prior ambiguous run, then idempotent claim.
+    if intent and isinstance(intent.get("claimId"), str) and intent.get("claimId"):
+        if intent.get("manifestDigest") == digest and intent.get("taskId") == task_id:
+            claim_id = intent["claimId"]
+            claim = {"claimId": claim_id, "generation": intent.get("generation"), "idempotent": True}
+            print(f"recover: using claim intent {claim_id} from {intent_path}")
+    if claim_id is None:
+        try:
+            claim = client.claim(claim_payload)
+        except ar.AtomicReleaseError as error:
+            print(f"recover: claim failed ({error}); no recoverable identity", file=sys.stderr)
+            return 2
+        claim_id = claim.get("claimId")
+        if not isinstance(claim_id, str) or not claim_id:
+            print(f"recover: claim response carries no claimId: {sorted(claim)}", file=sys.stderr)
+            return 2
+        _write_claim_intent(
+            intent_path,
+            {
+                "claimId": claim_id,
+                "generation": claim.get("generation"),
+                "taskId": task_id,
+                "version": manifest["version"],
+                "sourceSha": manifest["sourceSha"],
+                "ownedPrefixes": prefixes,
+                "manifestDigest": digest,
+                "fileCount": len(objects),
+                "objects": objects,
+                "claimPayload": claim_payload,
+            },
+        )
+
+    # Bounded inspect for committed (same unknown-safe rules as post-commit reconcile).
+    last = None
+    for attempt in range(1, 6):
+        try:
+            last = client.inspect(claim_id)
+        except Exception as inspect_error:  # noqa: BLE001
+            print(f"recover inspect attempt {attempt}/5 raised: {inspect_error}", file=sys.stderr)
+            continue
+        state = _well_formed_claim_state(last)
+        if state == "committed":
+            commit_receipt = {
+                "state": "committed",
+                "idempotent": True,
+                "recoveredFrom": "all-present-claim-reconcile",
+                "inspect": last,
+                "reconcileAttempts": attempt,
+            }
+            _write_atomic_publish_receipt(
+                output=Path(args.output),
+                claim_id=claim_id,
+                claim=claim,
+                task_id=task_id,
+                manifest=manifest,
+                prefixes=prefixes,
+                digest=digest,
+                objects=objects,
+                commit_receipt=commit_receipt,
+            )
+            print(
+                f"recover: committed receipt for claim {claim_id} written to {args.output}",
+                file=sys.stderr,
+            )
+            return 0
+        if state is not None:
+            print(f"recover: claim {claim_id} state={state} (not committed)", file=sys.stderr)
+            return 2
+        print(f"recover inspect attempt {attempt}/5: unknown body {last!r}", file=sys.stderr)
+    print(f"recover: claim {claim_id} state unresolved after 5 inspects", file=sys.stderr)
+    return 2
+
+
 def command_verify(args: argparse.Namespace) -> int:
     manifest = load_manifest(Path(args.manifest))
     only = set(load_expected(Path(args.only))) if getattr(args, "only", None) else None
@@ -1124,6 +1302,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_release.add_argument("--token-receipt-out", required=True)
     p_release.add_argument("--output", required=True)
     p_release.set_defaults(func=command_release)
+    p_recover = sub.add_parser(
+        "recover-claim",
+        help="idempotent claim+inspect to recover a committed atomic receipt on all-present path",
+    )
+    p_recover.add_argument("--manifest", required=True)
+    p_recover.add_argument("--output", required=True)
+    p_recover.set_defaults(func=command_recover_claim)
     p_verify = sub.add_parser("verify")
     p_verify.add_argument("--manifest", required=True)
     p_verify.add_argument("--output", default="")

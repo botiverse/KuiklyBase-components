@@ -867,6 +867,98 @@ def main() -> int:
             len(unk_server.canonical) == len(paths)
             and all(unk_server.canonical[rel] == content_for(rel) for rel in paths),
         )
+        # Pre-commit claim intent must exist after exhausted unknown so a later
+        # all-present run can rebind the original claim.
+        unk_intent = root / "rel-inspect-unknown.claim-intent.json"
+        # release_via wrote next to mal/loss outs under root; map from unk_out stem
+        unk_intent = Path(str(unk_out).replace(".json", ".claim-intent.json"))
+        check(
+            "commit_inspect_unknown_writes_claim_intent",
+            unk_intent.is_file()
+            and json.loads(unk_intent.read_text()).get("claimId")
+            and json.loads(unk_intent.read_text()).get("manifestDigest"),
+        )
+
+        # Cross-run recovery: after exhausted unknown (public objects present,
+        # no receipt), restore inspect, then recover-claim must emit the original
+        # claim's durable committed receipt (not a generic complete).
+        class RecoverableAfterUnknownServer(AlwaysMalformedInspectServer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.malform_until = 0  # after first release, allow inspect
+
+            def inspect(self, claim_id: str) -> dict:
+                body = FakeAtomicServer.inspect(self, claim_id)
+                if self.after_commit and self.malform_until > 0:
+                    self.malform_until -= 1
+                    return {}
+                return body
+
+        # Re-run release against a server that exhausts unknown, then heal.
+        xrun_server = AlwaysMalformedInspectServer()
+        xrun_out = root / "rel-cross-run.json"
+        if xrun_out.is_file():
+            xrun_out.unlink()
+        try:
+            xrun_code = release_via(xrun_server, plan_path, rel_bundle, xrun_out)
+        except Exception as _xerr:  # noqa: BLE001
+            print(f"cross-run first release error: {_xerr}", file=sys.stderr)
+            xrun_code = 1
+        check("cross_run_first_release_nonzero", xrun_code != 0)
+        check("cross_run_first_release_no_receipt", not xrun_out.is_file())
+        xrun_intent = Path(str(xrun_out).replace(".json", ".claim-intent.json"))
+        check("cross_run_writes_claim_intent", xrun_intent.is_file())
+        intent_obj = json.loads(xrun_intent.read_text())
+        # Heal control plane: subsequent inspects return committed.
+        xrun_server.after_commit = True
+        # Force inspect to return well-formed committed (objects already public).
+        def _healed_inspect(claim_id: str) -> dict:
+            xrun_server.calls.append(("inspect", claim_id))
+            return {"state": "committed", "stagedCount": 0}
+
+        xrun_server.inspect = _healed_inspect  # type: ignore[method-assign]
+        # recover-claim via CLI-shaped call
+        rec_args = pub.build_parser().parse_args(
+            ["recover-claim", "--manifest", str(manifest_path), "--output", str(xrun_out)]
+        )
+        # stub release client
+        class RecClient:
+            def claim(self, payload):
+                return xrun_server.claim(payload)
+            def inspect(self, claim_id):
+                return xrun_server.inspect(claim_id)
+            def stage_object(self, *a, **k):
+                raise AssertionError("recover must not stage")
+            def commit(self, *a):
+                raise AssertionError("recover must not commit")
+            def abort(self, *a, **k):
+                raise AssertionError("recover must not abort")
+        orig_rel = pub.release_client_from_env
+        pub.release_client_from_env = lambda: RecClient()
+        task_was = os.environ.get("RAFT_RELEASE_TASK_ID")
+        os.environ["RAFT_RELEASE_TASK_ID"] = "106"
+        try:
+            rec_code = rec_args.func(rec_args)
+        finally:
+            pub.release_client_from_env = orig_rel
+            if task_was is None:
+                os.environ.pop("RAFT_RELEASE_TASK_ID", None)
+            else:
+                os.environ["RAFT_RELEASE_TASK_ID"] = task_was
+        rec_receipt = json.loads(xrun_out.read_text()) if xrun_out.is_file() else {}
+        check("cross_run_recover_zero_exit", rec_code == 0)
+        check(
+            "cross_run_recover_writes_original_claim_receipt",
+            rec_receipt.get("status") == "committed"
+            and rec_receipt.get("claimId") == intent_obj.get("claimId")
+            and rec_receipt.get("commitReceipt", {}).get("state") == "committed"
+            and rec_receipt.get("commitReceipt", {}).get("recoveredFrom")
+            == "all-present-claim-reconcile",
+        )
+        check(
+            "cross_run_recover_no_abort",
+            not [c for c in xrun_server.calls if c[0] == "abort"],
+        )
 
         # B2 end-to-end: classifier plan.ownedPrefixes must equal the atomic
         # release receipt.ownedPrefixes (both trailing-slash canonical).
@@ -1532,6 +1624,16 @@ def main() -> int:
             "workflow_publish_verify_does_not_overwrite_committed_receipt",
             "--output verify-receipt.json" in publish_block
             and publish_block.find("raft-publish.py release") < publish_block.find("verify-receipt.json"),
+        )
+        check(
+            "workflow_noop_attempts_recover_claim",
+            "recover-claim" in wf and "noop-verified" in wf,
+        )
+        check(
+            "workflow_noop_recover_writes_atomic_or_complete",
+            "recover-claim" in wf
+            and "verify-receipt.json" in wf
+            and "recover_rc" in wf,
         )
         # After the case/esac there must be no `raft-publish.py verify ... --output publish-receipt.json`.
         after_case = publish_block.split("esac", 1)[-1] if "esac" in publish_block else ""
