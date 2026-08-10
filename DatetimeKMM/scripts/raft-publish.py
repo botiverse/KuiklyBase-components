@@ -4,16 +4,18 @@
 The Gradle build has no remote repository. It stages each publication into a
 task-scoped file Maven repository that the workflow creates empty; this script
 generates the authority manifest from that staging directory (and only from
-it), classifies the Raft side conflict-first, uploads the staged bytes with
-create-only semantics, and reads every file back byte-compared.
+it), classifies the Raft side conflict-first, and the single writer publishes
+the plan-frozen bundle through the server-side atomic release ledger, then
+reads every file back byte-compared.
 
 State machine (frozen by review):
   stage first -> exhaustive classify ->
-    ALL_ABSENT            -> PUT staged bytes, then N/N GET+SHA readback
-    ALL_PRESENT_IDENTICAL -> 0 PUT, but still GET+SHA against the staged
-                             bytes: a verified no-op, not a blind skip
+    ALL_ABSENT            -> atomic claim/stage/commit of the frozen bundle,
+                             then N/N GET+SHA readback
+    ALL_PRESENT_IDENTICAL -> 0 staged objects, but still GET+SHA against the
+                             staged bytes: a verified no-op, not a blind skip
     anything else (partial set, extra owned key, different remote bytes)
-                          -> 0 PUT, fail closed, human decision
+                          -> 0 staged objects, fail closed, human decision
 
 Contract:
   - the manifest is generated only from the freshly staged directory: every
@@ -21,26 +23,32 @@ Contract:
     old versions, maven-metadata.xml and sidecars turn the run red here;
   - POM cross-binding: every staged POM must carry dev.raft.sourceSha and the
     scm tag equal to DATETIME_SOURCE_SHA, which must equal the dispatch SHA;
-  - never overwrite: the server answers 409 (create-if-absent) on an occupied
-    release path and keeps the original bytes; a 409 stops the run;
+  - never overwrite: the release claim binds the exact object set and its
+    manifest digest; the ledger refuses any pre-existing canonical object
+    below the owned prefixes, overlapping active claims and ordinary
+    writers, staging is create-only and invisible, commit is the only
+    visibility linearization point, and any post-claim failure aborts
+    terminally with zero public mutation;
   - transport discipline as reviewed in task #104: HTTPS only, exact Raft
-    origin pin, redirects rejected before another request, HEAD/GET/PUT only,
-    a stable non-credential User-Agent on every request (the edge bans
-    library defaults with 403/1010 before the request reaches the Worker),
-    credentials from the environment and never logged;
+    origin pin, redirects rejected before another request, HEAD/GET/PUT only
+    on the Maven lane (the ledger client speaks claim/stage/commit with
+    Bearer auth), a stable non-credential User-Agent on every request (the
+    edge bans library defaults with 403/1010 before the request reaches the
+    Worker), credentials from the environment and never logged;
   - the control-plane listing (public, unauthenticated) enumerates primary
     artifacts for the aggregate conflict check; it folds checksum/signature
     companions and skips malformed raw keys, so this lane proves exact-set
     equality over primaries and does not claim a raw-prefix inventory.
 
 Env: RAFT_ARTIFACTS_USERNAME / RAFT_ARTIFACTS_PUBLISH_TOKEN (required),
-     DATETIME_SOURCE_SHA (required for manifest), GITHUB_RUN_ID /
-     GITHUB_RUN_ATTEMPT / GITHUB_SHA (optional, receipt only).
+     RAFT_RELEASE_TASK_ID (required for release), DATETIME_SOURCE_SHA
+     (required for manifest), GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT /
+     GITHUB_SHA (optional, receipt only).
 
 Subcommands:
   manifest --staging DIR --expect FILE --version V --output m.json
   classify --manifest m.json --output plan.json
-  publish  --manifest m.json --staging DIR --plan plan.json
+  release  --manifest m.json --plan plan.json --bundle B --token-receipt-out T --output R
   verify   --manifest m.json [--output receipt.json]
 """
 from __future__ import annotations
