@@ -1620,14 +1620,19 @@ def main() -> int:
         # file on the publish arm so the atomic committed receipt is preserved.
         # The unconditional `verify --output publish-receipt.json` after the
         # case is the exact fail-open shape.
+        # Publish arm (before noop-verified branch) must verify to a separate file.
+        publish_arm = publish_block.split("noop-verified)")[0]
         check(
             "workflow_publish_verify_does_not_overwrite_committed_receipt",
-            "--output verify-receipt.json" in publish_block
-            and publish_block.find("raft-publish.py release") < publish_block.find("verify-receipt.json"),
+            "raft-publish.py release" in publish_arm
+            and "--output verify-receipt.json" in publish_arm
+            and publish_arm.find("raft-publish.py release")
+            < publish_arm.find("--output verify-receipt.json")
+            and "--output publish-receipt.json" in publish_arm,
         )
         check(
             "workflow_noop_attempts_recover_claim",
-            "recover-claim" in wf and "noop-verified" in wf,
+            "raft-publish.py recover-claim" in wf and "noop-verified" in wf,
         )
         check(
             "workflow_noop_recover_writes_atomic_or_complete",
