@@ -785,6 +785,89 @@ def main() -> int:
             and all(mal_server.canonical[rel] == content_for(rel) for rel in paths),
         )
 
+        # Composite: commit HTTP-success {} AND first recovery inspect(s) also
+        # HTTP-success {}. Must NOT treat unknown as staged, must NOT abort,
+        # must recover on a later well-formed committed inspect (bounded reconcile).
+        class MalformedCommitAndInspectServer(FakeAtomicServer):
+            def __init__(self, malform_inspects: int = 2) -> None:
+                super().__init__()
+                self.after_commit = False
+                self.malform_inspects_left = malform_inspects
+
+            def commit(self, claim_id: str) -> dict:
+                super().commit(claim_id)
+                self.after_commit = True
+                return {}
+
+            def inspect(self, claim_id: str) -> dict:
+                body = super().inspect(claim_id)
+                if self.after_commit and self.malform_inspects_left > 0:
+                    self.malform_inspects_left -= 1
+                    return {}
+                return body
+
+        both_server = MalformedCommitAndInspectServer(malform_inspects=2)
+        both_out = root / "rel-commit-inspect-malformed.json"
+        if both_out.is_file():
+            both_out.unlink()
+        try:
+            both_code = release_via(both_server, plan_path, rel_bundle, both_out)
+        except Exception as _both_err:  # noqa: BLE001
+            print(f"commit+inspect malformed release error: {_both_err}", file=sys.stderr)
+            both_code = 1
+        both_receipt = json.loads(both_out.read_text()) if both_out.is_file() else {}
+        both_aborts = [c for c in both_server.calls if c[0] == "abort"]
+        check("commit_and_inspect_malformed_recovers_zero_exit", both_code == 0)
+        check(
+            "commit_and_inspect_malformed_writes_committed_receipt",
+            both_receipt.get("status") == "committed"
+            and both_receipt.get("commitReceipt", {}).get("state") == "committed"
+            and both_receipt.get("commitReceipt", {}).get("recoveredFrom")
+            == "commit-response-ambiguity",
+        )
+        check("commit_and_inspect_malformed_no_abort", both_aborts == [])
+        check(
+            "commit_and_inspect_malformed_public_objects_stable",
+            len(both_server.canonical) == len(paths)
+            and all(both_server.canonical[rel] == content_for(rel) for rel in paths),
+        )
+
+        # Exhausted unknown inspect: never abort an unresolved claim.
+        class AlwaysMalformedInspectServer(FakeAtomicServer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.after_commit = False
+
+            def commit(self, claim_id: str) -> dict:
+                super().commit(claim_id)
+                self.after_commit = True
+                return {}
+
+            def inspect(self, claim_id: str) -> dict:
+                body = super().inspect(claim_id)
+                if self.after_commit:
+                    return {}
+                return body
+
+        unk_server = AlwaysMalformedInspectServer()
+        unk_out = root / "rel-inspect-unknown.json"
+        if unk_out.is_file():
+            unk_out.unlink()
+        try:
+            unk_code = release_via(unk_server, plan_path, rel_bundle, unk_out)
+        except Exception as _unk_err:  # noqa: BLE001
+            print(f"unknown inspect release error: {_unk_err}", file=sys.stderr)
+            unk_code = 1
+        unk_aborts = [c for c in unk_server.calls if c[0] == "abort"]
+        check("commit_inspect_unknown_nonzero_exit", unk_code != 0)
+        check("commit_inspect_unknown_no_abort", unk_aborts == [])
+        check("commit_inspect_unknown_no_receipt", not unk_out.is_file())
+        check(
+            "commit_inspect_unknown_public_objects_stable",
+            len(unk_server.canonical) == len(paths)
+            and all(unk_server.canonical[rel] == content_for(rel) for rel in paths),
+        )
+
         # B2 end-to-end: classifier plan.ownedPrefixes must equal the atomic
         # release receipt.ownedPrefixes (both trailing-slash canonical).
         e2e_plan = root / "e2e-plan.json"

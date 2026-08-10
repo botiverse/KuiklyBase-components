@@ -643,6 +643,98 @@ def command_classify(args: argparse.Namespace) -> int:
     return 0
 
 
+
+def _well_formed_claim_state(receipt) -> str | None:
+    """Return claim state only when the inspect body is a well-formed dict
+    with a non-empty string state. Empty/malformed bodies ({}) from
+    AtomicReleaseClient._json map to None (unknown) — never "not committed".
+    """
+    if not isinstance(receipt, dict):
+        return None
+    state = receipt.get("state")
+    if isinstance(state, str) and state:
+        return state
+    return None
+
+
+def _reconcile_claim_after_commit_ambiguity(
+    client,
+    claim_id: str,
+    reason: str,
+    *,
+    staged: int,
+    original_error: Exception,
+    attempts: int = 5,
+):
+    """Bounded exact-claim reconcile after an ambiguous commit response.
+
+    - committed (well-formed) → durable recovered receipt, no abort
+    - non-committed (well-formed) → abort allowed, re-raise original
+    - unknown/malformed/raised inspect → retry; never abort on unknown
+    - exhausted unknown → fail without abort (do not misclassify terminal state)
+    """
+    last_inspect = None
+    last_inspect_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            last_inspect = client.inspect(claim_id)
+            last_inspect_error = None
+        except Exception as inspect_error:  # noqa: BLE001
+            last_inspect = None
+            last_inspect_error = inspect_error
+            print(
+                f"release reconcile inspect attempt {attempt}/{attempts} raised: {inspect_error}",
+                file=sys.stderr,
+            )
+            continue
+        state = _well_formed_claim_state(last_inspect)
+        if state == "committed":
+            print(
+                f"release committed under {claim_id} despite ambiguous commit response; "
+                f"recovered via inspect attempt {attempt}/{attempts} (no abort)",
+                file=sys.stderr,
+            )
+            return {
+                "state": "committed",
+                "idempotent": True,
+                "recoveredFrom": "commit-response-ambiguity",
+                "originalError": reason,
+                "inspect": last_inspect,
+                "reconcileAttempts": attempt,
+            }
+        if state is not None:
+            print(
+                f"release failed after claim (staged={staged}, state={state}); "
+                "aborting with immutable reason",
+                file=sys.stderr,
+            )
+            try:
+                client.abort(claim_id, reason)
+                print("release aborted: terminal, zero public mutation", file=sys.stderr)
+            except Exception as abort_error:  # noqa: BLE001
+                print(f"ABORT FAILED (original error stands): {abort_error}", file=sys.stderr)
+            raise original_error
+        print(
+            f"release reconcile inspect attempt {attempt}/{attempts}: "
+            f"unknown/malformed body {last_inspect!r} (not treated as staged)",
+            file=sys.stderr,
+        )
+    detail = (
+        f"inspect error: {last_inspect_error}"
+        if last_inspect_error is not None
+        else f"last inspect body: {last_inspect!r}"
+    )
+    print(
+        f"release failed after claim (staged={staged}); claim state unresolved "
+        f"after {attempts} inspect attempts; no abort attempted ({detail})",
+        file=sys.stderr,
+    )
+    raise PublishError(
+        f"claim state unresolved after ambiguous commit under {claim_id}; "
+        f"no abort attempted ({detail})"
+    ) from original_error
+
+
 def command_release(args: argparse.Namespace) -> int:
     """Single-writer ATOMIC release via the deployed v1 ledger (task #106).
 
@@ -785,49 +877,16 @@ def command_release(args: argparse.Namespace) -> int:
                 )
         except (PublishError, ar.AtomicReleaseError) as error:
             # Commit-response ambiguity: the server may have already committed
-            # when the response is lost or unparseable. Inspect BEFORE abort.
-            # If committed, recover a server-backed receipt and proceed; only
-            # abort when the claim is still staged (true pre-commit failure).
+            # when the response is lost or unparseable. Reconcile via bounded
+            # exact-claim inspect BEFORE any abort. Malformed/empty inspect
+            # bodies ({} from AtomicReleaseClient._json) and raised inspect
+            # errors are UNKNOWN — never treat them as staged, never abort.
+            # Abort is allowed only when a well-formed inspect proves a
+            # non-committed state.
             reason = f"{type(error).__name__}: {error}"
-            try:
-                recovered = client.inspect(claim_id)
-            except Exception as inspect_error:  # noqa: BLE001
-                print(
-                    f"release failed after claim (staged={staged}); inspect after error also failed: {inspect_error}",
-                    file=sys.stderr,
-                )
-                try:
-                    client.abort(claim_id, reason)
-                    print("release aborted: terminal, zero public mutation", file=sys.stderr)
-                except Exception as abort_error:  # noqa: BLE001
-                    print(f"ABORT FAILED (original error stands): {abort_error}", file=sys.stderr)
-                raise error from inspect_error
-            if recovered.get("state") == "committed":
-                commit_receipt = _committed_receipt(
-                    {
-                        "idempotent": True,
-                        "recoveredFrom": "commit-response-ambiguity",
-                        "originalError": reason,
-                        "inspect": recovered,
-                    }
-                )
-                print(
-                    f"release committed under {claim_id} despite ambiguous commit response; "
-                    "recovered via inspect (no abort)",
-                    file=sys.stderr,
-                )
-            else:
-                print(
-                    f"release failed after claim (staged={staged}, state={recovered.get('state')}); "
-                    "aborting with immutable reason",
-                    file=sys.stderr,
-                )
-                try:
-                    client.abort(claim_id, reason)
-                    print("release aborted: terminal, zero public mutation", file=sys.stderr)
-                except Exception as abort_error:  # noqa: BLE001
-                    print(f"ABORT FAILED (original error stands): {abort_error}", file=sys.stderr)
-                raise
+            commit_receipt = _reconcile_claim_after_commit_ambiguity(
+                client, claim_id, reason, staged=staged, original_error=error
+            )
 
     require(
         isinstance(commit_receipt, dict) and commit_receipt.get("state") == "committed",
