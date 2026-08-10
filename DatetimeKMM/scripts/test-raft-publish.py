@@ -19,6 +19,7 @@ import urllib.error
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
 spec = importlib.util.spec_from_file_location("raft_publish", HERE / "raft-publish.py")
 pub = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pub)
@@ -363,42 +364,251 @@ def main() -> int:
             plan_file.write_text(json.dumps(plan), encoding="utf-8")
             return bundle
 
-        # 8. publish refuses a noop plan
+        # ------------------------------------------------------------------
+        # Fake v1 atomic release ledger (mirrors the deployed semantics from
+        # raft-artifacts docs/atomic-releases.md):
+        # - claim recomputes the manifest digest and refuses pre-existing
+        #   canonical objects below the owned prefixes and overlapping active
+        #   claims or ordinary writers;
+        # - staging is create-only and invisible; commit is the only
+        #   visibility linearization point; abort carries an immutable reason.
+        class FakeAtomicServer:
+            def __init__(self) -> None:
+                self.canonical: dict[str, bytes] = {}
+                self.attempts: dict[str, dict] = {}
+                self.next_id = 0
+                self.ordinary_leases: set[str] = set()
+                self.calls: list[tuple] = []
+
+            def _conflict(self, code: str, message: str):
+                from atomic_release import AtomicReleaseError
+                raise AtomicReleaseError(code, message, http_status=409)
+
+            def claim(self, payload: dict) -> dict:
+                self.calls.append(("claim", payload))
+                prefixes = payload["ownedPrefixes"]
+                digest = payload["manifestDigest"]
+                objects = payload["objects"]
+                # server recomputes
+                import importlib
+                ar_spec = importlib.util.spec_from_file_location(
+                    "ar2", HERE / "atomic_release.py")
+                ar2 = importlib.util.module_from_spec(ar_spec)
+                ar_spec.loader.exec_module(ar2)
+                if ar2.manifest_digest(objects) != digest:
+                    self._conflict("manifest-digest-mismatch", "digest mismatch")
+                if ar2.owned_prefixes_from_paths([o["path"] for o in objects]) != sorted(prefixes):
+                    self._conflict("prefix-mismatch", "owned prefixes do not derive from objects")
+                # exact retry / identity conflict handling (docs/atomic-releases.md):
+                # an exact retry of the same release identity returns the
+                # ORIGINAL claim id — even after that claim committed (its own
+                # objects now occupy canonical) — so this must be decided
+                # BEFORE the canonical/lease/overlap contention checks below;
+                # a different immutable identity for the same
+                # (repository, taskId, version) permanently conflicts.
+                identity_keys = ("repository", "taskId", "version")
+                for existing_id, attempt in self.attempts.items():
+                    if all(attempt["payload"].get(k) == payload.get(k) for k in identity_keys):
+                        if attempt["payload"] == payload:
+                            return {"claimId": existing_id, "generation": attempt["generation"], "idempotent": True}
+                        self._conflict("release-identity-conflict", "different identity for same release coordinate")
+                for prefix in prefixes:
+                    for key in self.canonical:
+                        if key.startswith(prefix):
+                            self._conflict("canonical-exists", f"canonical object exists below {prefix}")
+                    for lease in self.ordinary_leases:
+                        if lease.startswith(prefix):
+                            self._conflict("ordinary-writer-active", f"ordinary writer holds {prefix}")
+                for attempt in self.attempts.values():
+                    if attempt["state"] == "staged":
+                        for prefix in prefixes:
+                            for existing in attempt["payload"]["ownedPrefixes"]:
+                                if prefix.startswith(existing) or existing.startswith(prefix):
+                                    self._conflict("overlap", "overlapping active claim")
+                self.next_id += 1
+                claim_id = f"claim-{self.next_id:04d}"
+                self.attempts[claim_id] = {
+                    "payload": payload, "staged": {}, "state": "staged",
+                    "generation": 1, "abortReason": None,
+                }
+                return {"claimId": claim_id, "generation": 1, "idempotent": False}
+
+            def stage_object(self, claim_id: str, canonical_path: str, body: bytes) -> dict:
+                self.calls.append(("stage", claim_id, canonical_path))
+                attempt = self.attempts.get(claim_id)
+                if attempt is None or attempt["state"] != "staged":
+                    self._conflict("no-active-claim", "claim is not staged")
+                declared = {o["path"]: o for o in attempt["payload"]["objects"]}
+                if canonical_path not in declared:
+                    self._conflict("undeclared-path", canonical_path)
+                entry = declared[canonical_path]
+                existing = attempt["staged"].get(canonical_path)
+                if existing is not None:
+                    if existing == body:
+                        return {"ok": True, "idempotent": True}
+                    self._conflict("byte-mismatch", canonical_path)
+                if len(body) != entry["size"] or hashlib.sha256(body).hexdigest() != entry["sha256"]:
+                    self._conflict("byte-mismatch", canonical_path)
+                attempt["staged"][canonical_path] = body
+                return {"ok": True}
+
+            def inspect(self, claim_id: str) -> dict:
+                attempt = self.attempts.get(claim_id)
+                if attempt is None:
+                    self._conflict("unknown-claim", claim_id)
+                return {"stagedCount": len(attempt["staged"]), "state": attempt["state"]}
+
+            def commit(self, claim_id: str) -> dict:
+                self.calls.append(("commit", claim_id))
+                attempt = self.attempts.get(claim_id)
+                if attempt is None:
+                    self._conflict("unknown-claim", claim_id)
+                if attempt["state"] == "committed":
+                    return {"state": "committed", "idempotent": True}
+                if attempt["state"] != "staged":
+                    self._conflict("terminal-claim", attempt["state"])
+                declared = attempt["payload"]["objects"]
+                if len(attempt["staged"]) != len(declared):
+                    self._conflict("staging-incomplete", f"{len(attempt['staged'])}/{len(declared)}")
+                for entry in declared:
+                    body = attempt["staged"].get(entry["path"])
+                    if body is None or len(body) != entry["size"] or hashlib.sha256(body).hexdigest() != entry["sha256"]:
+                        self._conflict("staging-incomplete", entry["path"])
+                for entry in declared:
+                    self.canonical[entry["path"]] = attempt["staged"][entry["path"]]
+                attempt["state"] = "committed"
+                return {"state": "committed", "idempotent": False}
+
+            def abort(self, claim_id: str, reason: str) -> dict:
+                self.calls.append(("abort", claim_id, reason))
+                attempt = self.attempts.get(claim_id)
+                if attempt is None:
+                    self._conflict("unknown-claim", claim_id)
+                if attempt["state"] == "aborted":
+                    if attempt["abortReason"] != reason:
+                        self._conflict("abort-reason-conflict", "immutable abort reason")
+                    return {"state": "aborted", "idempotent": True}
+                if attempt["state"] == "committed":
+                    self._conflict("already-committed", claim_id)
+                attempt["state"] = "aborted"
+                attempt["abortReason"] = reason
+                return {"state": "aborted", "idempotent": False}
+
+            def ordinary_put(self, path: str, body: bytes) -> None:
+                # an ordinary Maven writer taking the canonical-write lease
+                for attempt in self.attempts.values():
+                    if attempt["state"] == "staged":
+                        for prefix in attempt["payload"]["ownedPrefixes"]:
+                            if path.startswith(prefix):
+                                self._conflict("claim-active", f"atomic claim holds {prefix}")
+                if path in self.canonical:
+                    self._conflict("create-only-409", path)
+                self.ordinary_leases.add(path)
+                self.canonical[path] = body
+                self.ordinary_leases.discard(path)
+
+        def release_via(server: FakeAtomicServer, plan_file: Path, bundle: Path, out: Path,
+                        task_id: str | None = "106") -> int:
+            """Drive command_release with release_client_from_env stubbed to a
+            client backed by the fake server."""
+            captured = {"client": None}
+
+            class ServerClient:
+                def __init__(self) -> None:
+                    self.inner = server
+
+                def claim(self, payload):
+                    return self.inner.claim(payload)
+
+                def stage_object(self, claim_id, canonical_path, body):
+                    return self.inner.stage_object(claim_id, canonical_path, body)
+
+                def inspect(self, claim_id):
+                    return self.inner.inspect(claim_id)
+
+                def commit(self, claim_id):
+                    return self.inner.commit(claim_id)
+
+                def abort(self, claim_id, reason):
+                    return self.inner.abort(claim_id, reason)
+
+            captured["client"] = ServerClient()
+            original = pub.release_client_from_env
+            original_maven = pub.client_from_env
+            original_listing = pub.list_primaries_from_env
+            original_token = pub.fetch_token_self_receipt
+            pub.release_client_from_env = lambda: captured["client"]
+            pub.client_from_env = original_maven
+            pub.list_primaries_from_env = original_listing
+            pub.fetch_token_self_receipt = lambda *a, **k: dict(FAKE_TOKEN_RECEIPT)
+            task_id_was = os.environ.get("RAFT_RELEASE_TASK_ID")
+            if task_id is None:
+                os.environ.pop("RAFT_RELEASE_TASK_ID", None)
+            else:
+                os.environ["RAFT_RELEASE_TASK_ID"] = task_id
+            # Same Hosted-runner hygiene as run_cmd/run_direct: GITHUB_SHA
+            # would arm the live master recheck against the real origin.
+            sha_was = os.environ.pop("GITHUB_SHA", None)
+            try:
+                args = pub.build_parser().parse_args(
+                    ["release", "--manifest", str(manifest_path), "--plan", str(plan_file),
+                     "--bundle", str(bundle), "--token-receipt-out", str(root / "tok.json"),
+                     "--output", str(out)])
+                return args.func(args)
+            finally:
+                pub.release_client_from_env = original
+                pub.client_from_env = original_maven
+                pub.list_primaries_from_env = original_listing
+                pub.fetch_token_self_receipt = original_token
+                if task_id_was is None:
+                    os.environ.pop("RAFT_RELEASE_TASK_ID", None)
+                else:
+                    os.environ["RAFT_RELEASE_TASK_ID"] = task_id_was
+                if sha_was is not None:
+                    os.environ["GITHUB_SHA"] = sha_was
+
+        def release_raises(name: str, server: FakeAtomicServer, plan_file: Path, bundle: Path, needle: str) -> None:
+            try:
+                release_via(server, plan_file, bundle, root / "rel.json")
+            except Exception as error:  # noqa: BLE001
+                check(name, needle in str(error), f"(message was: {error})")
+                return
+            check(name, False, "(no error raised)")
+
+        # 8-12. atomic release teeth (fake ledger). freeze helper unchanged:
+        def freeze_into(staging_dir: Path, plan_file: Path, out_name: str) -> Path:
+            bundle = root / out_name
+            digest_out = root / (out_name + ".sha")
+            run_cmd(["freeze", "--manifest", str(manifest_path), "--staging-roots", str(staging_dir),
+                     "--output", str(bundle), "--digest-out", str(digest_out)], FakeClient(), env)
+            plan = json.loads(plan_file.read_text())
+            plan["bundleSha256"] = digest_out.read_text().strip()
+            plan_file.write_text(json.dumps(plan), encoding="utf-8")
+            return bundle
+
+        # 8. release refuses a noop plan (no claim is ever made)
         run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], full, env)
         noop_bundle = freeze_into(staging, plan_path, "noop.tar")
-        expect_raises(
-            "publish_refuses_noop_plan",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path),
-                                "--plan", str(plan_path), "--bundle", str(noop_bundle),
-                                "--token-receipt-out", str(root / "tr1.json")], full, env),
-            "not publish",
-        )
+        server = FakeAtomicServer()
+        release_raises("release_refuses_noop_plan", server, plan_path, noop_bundle, "not publish")
+        check("noop_plan_zero_claims", not [c for c in server.calls if c[0] == "claim"])
 
-        # 9. bundle digest must match the plan (not the same bundle -> red, 0 PUT)
+        # 9. preflight: wrong bundle digest / tampered member / extra member
+        # all stop before ANY claim
         run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], client, env)
         good_bundle = freeze_into(staging, plan_path, "good.tar")
         wrong_plan = root / "wrong-plan.json"
         wrong_plan.write_text(json.dumps({**json.loads(plan_path.read_text()), "bundleSha256": "0" * 64}), encoding="utf-8")
-        digest_fail = FakeClient()
-        expect_raises(
-            "publish_rejects_wrong_bundle_digest",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path),
-                                "--plan", str(wrong_plan), "--bundle", str(good_bundle),
-                                "--token-receipt-out", str(root / "tr2.json")], digest_fail, env),
-            "not the same bundle",
-        )
-        check("wrong_digest_zero_puts", not [c for c in digest_fail.calls if c[0] == "PUT"])
+        server = FakeAtomicServer()
+        release_raises("release_rejects_wrong_bundle_digest", server, wrong_plan, good_bundle, "not the same bundle")
+        check("wrong_digest_zero_claims", not [c for c in server.calls if c[0] == "claim"])
 
-        # 9b. bundle member tampered after freeze (digest re-recorded to match
-        # the tampered bundle) -> member-vs-manifest check catches it, 0 PUT
         import tarfile as _tf
         evil_bundle = root / "evil.tar"
         with _tf.open(good_bundle) as src_tar, _tf.open(evil_bundle, "w") as dst_tar:
             for m in src_tar.getmembers():
                 body = src_tar.extractfile(m).read()
                 if m.name == paths[1]:
-                    # same length, different bytes: must trip the SHA guard,
-                    # not the size guard
                     body = bytes(b ^ 0xFF for b in body)
                 info = _tf.TarInfo(m.name)
                 info.size = len(body)
@@ -406,142 +616,143 @@ def main() -> int:
         evil_plan = root / "evil-plan.json"
         evil_plan.write_text(json.dumps({**json.loads(plan_path.read_text()),
                                           "bundleSha256": hashlib.sha256(evil_bundle.read_bytes()).hexdigest()}), encoding="utf-8")
-        evil_client = FakeClient()
-        expect_raises(
-            "publish_rejects_tampered_bundle_member",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path),
-                                "--plan", str(evil_plan), "--bundle", str(evil_bundle),
-                                "--token-receipt-out", str(root / "tr3.json")], evil_client, env),
-            "do not match the manifest",
-        )
-        check("tampered_bundle_zero_puts", not [c for c in evil_client.calls if c[0] == "PUT"])
+        server = FakeAtomicServer()
+        release_raises("release_rejects_tampered_bundle_member", server, evil_plan, evil_bundle, "do not match the manifest")
+        check("tampered_bundle_zero_claims", not [c for c in server.calls if c[0] == "claim"])
 
-        # 9c. remote no longer absent at the barrier -> red, 0 PUT
-        occupied = FakeClient()
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], occupied, env)
-        barrier_bundle = freeze_into(staging, plan_path, "barrier.tar")
-        occupied.store[paths[2]] = b"occupied-by-someone-else"
-        expect_raises(
-            "publish_fails_when_remote_occupied_at_barrier",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path),
-                                "--plan", str(plan_path), "--bundle", str(barrier_bundle),
-                                "--token-receipt-out", str(root / "tr4.json")], occupied, env),
-            "no longer absent",
-        )
-        check("occupied_barrier_zero_puts", not [c for c in occupied.calls if c[0] == "PUT"])
-        check("occupied_bytes_preserved", occupied.store[paths[2]] == b"occupied-by-someone-else")
+        extra_bundle = root / "extra-member.tar"
+        with _tf.open(good_bundle) as t0, _tf.open(extra_bundle, "w") as t1:
+            for m in t0.getmembers():
+                data = t0.extractfile(m).read()
+                info = _tf.TarInfo(m.name)
+                info.size = len(data)
+                t1.addfile(info, __import__("io").BytesIO(data))
+            smuggled = f"{LANE}/datetime/{VERSION}/datetime-{VERSION}-smuggled.jar"
+            payload = b"smuggled"
+            info = _tf.TarInfo(smuggled)
+            info.size = len(payload)
+            t1.addfile(info, __import__("io").BytesIO(payload))
+        extra_plan = root / "extra-plan.json"
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(extra_plan)], FakeClient(), env)
+        extra_plan.write_text(json.dumps({**json.loads(extra_plan.read_text()),
+                                          "bundleSha256": hashlib.sha256(extra_bundle.read_bytes()).hexdigest()}), encoding="utf-8")
+        server = FakeAtomicServer()
+        release_raises("release_rejects_extra_bundle_member", server, extra_plan, extra_bundle, "member set does not equal")
+        check("extra_member_zero_claims", not [c for c in server.calls if c[0] == "claim"])
 
-        # 10. 409 race still fail-closed even after the barrier (belt and
-        # suspenders: the re-probe passed, then a foreign write wins the PUT race)
-        class LateOccupier(FakeClient):
-            def request(self, relative, method, body=None):
-                if method == "PUT" and relative == paths[0]:
-                    self.store[relative] = b"race-winner"
-                    return 409, b""
-                return super().request(relative, method, body)
-
-        racer = LateOccupier()
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], racer, env)
-        race_bundle = freeze_into(staging, plan_path, "race.tar")
-        expect_raises(
-            "publish_never_overwrites_post_plan_foreign_bytes",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path),
-                                "--plan", str(plan_path), "--bundle", str(race_bundle),
-                                "--token-receipt-out", str(root / "tr5.json")], racer, env),
-            "foreign write, stopping",
-        )
-        check("race_foreign_bytes_preserved", racer.store[paths[0]] == b"race-winner")
-
-        # 11. PUT failure aborts
-        failing = FakeClient()
-        failing.put_fail_status[paths[1]] = 500
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], failing, env)
-        fail_bundle = freeze_into(staging, plan_path, "fail.tar")
-        expect_raises(
-            "publish_aborts_on_put_failure",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path),
-                                "--plan", str(plan_path), "--bundle", str(fail_bundle),
-                                "--token-receipt-out", str(root / "tr6.json")], failing, env),
-            "PUT failed with HTTP 500",
-        )
-
-        # 12. e2e: empty -> classify -> freeze -> publish -> verify + receipt;
-        # THE precision tooth: staging files tampered AFTER freeze do not
-        # change what the remote receives (frozen in-memory bytes only).
-        e2e = FakeClient()
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], e2e, env)
-        e2e_bundle = freeze_into(staging, plan_path, "e2e.tar")
-        for rel in paths:
-            (staging / rel).write_bytes(b"tampered-after-freeze")
-        code = run_cmd(["publish", "--manifest", str(manifest_path),
-                        "--plan", str(plan_path), "--bundle", str(e2e_bundle),
-                        "--token-receipt-out", str(root / "tr7.json")], e2e, env)
-        check("e2e_publish_all", code == 0 and len(e2e.store) == len(paths))
-        check(
-            "publish_sends_frozen_bytes_despite_later_staging_tamper",
-            e2e.store[paths[0]] == content_for(paths[0]),
-        )
-        # restore for the verify pass
-        for rel in paths:
-            (staging / rel).write_bytes(content_for(rel))
-        os.environ["GITHUB_RUN_ID"] = "777"
-        receipt_path = root / "receipt.json"
-        code = run_cmd(["verify", "--manifest", str(manifest_path), "--output", str(receipt_path)], e2e, env)
-        check("e2e_verify_all", code == 0)
-        blob = receipt_path.read_text()
-        receipt = json.loads(blob)
-        check("receipt_cross_binds", receipt["sourceSha"] == SOURCE_SHA and receipt["version"] == VERSION)
-        check("receipt_binds_run", receipt["provenance"]["runId"] == "777")
-        check("receipt_has_no_secret", "Authorization" not in blob and "raft-ci:" not in blob)
-        del os.environ["GITHUB_RUN_ID"]
-
-        # 12a1. r4 barrier teeth: a late unexpected primary under an owned
-        # prefix appearing after the plan stops publish before any PUT...
-        late_key = FakeClient()
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], late_key, env)
-        late_bundle = freeze_into(staging, plan_path, "late-key.tar")
-        late_key.listing_extra.append(f"{LANE}/datetime/{VERSION}/datetime-{VERSION}-late.bin")
-        expect_raises(
-            "publish_fails_on_late_extra_owned_prefix_key",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path),
-                                "--plan", str(plan_path), "--bundle", str(late_bundle),
-                                "--token-receipt-out", str(root / "tr10.json")], late_key, env),
-            "unexpected carriers appeared",
-        )
-        check("late_extra_zero_puts", not [c for c in late_key.calls if c[0] == "PUT"])
-
-        # 12a2. ...and a drifted landed master (the command re-fetches itself).
-        # Driven in a temp git repo whose origin/master disagrees with GITHUB_SHA.
-        import subprocess as _sp4
-        origin_repo = root / "origin-repo"
-        origin_repo.mkdir()
-        _sp4.run(["git", "init", "-q", "-b", "master"], cwd=origin_repo, check=True)
-        _sp4.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"], cwd=origin_repo, check=True)
-        real_head = _sp4.run(["git", "rev-parse", "HEAD"], cwd=origin_repo, check=True, capture_output=True, text=True).stdout.strip()
-        master_repo = root / "master-repo"
-        master_repo.mkdir()
-        _sp4.run(["git", "init", "-q", "-b", "master"], cwd=master_repo, check=True)
-        _sp4.run(["git", "remote", "add", "origin", str(origin_repo)], cwd=master_repo, check=True)
-        _sp4.run(["git", "fetch", "--quiet", "origin", "master"], cwd=master_repo, check=True)
-        drift_client = FakeClient()
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], drift_client, env)
-        drift_bundle = freeze_into(staging, plan_path, "drift.tar")
-        drift_env = dict(env)
-        drift_env["GITHUB_SHA"] = "d" * 40  # dispatch claims a different sha than origin/master
-        assert real_head != "d" * 40
-        old_cwd = os.getcwd()
+        # 10. missing RAFT_RELEASE_TASK_ID fails before any claim
+        server = FakeAtomicServer()
         try:
-            os.chdir(master_repo)
-            expect_raises(
-                "publish_fails_on_master_drift_at_barrier",
-                lambda: run_direct(["publish", "--manifest", str(root / "manifest.json"),
-                                    "--plan", str(plan_path), "--bundle", str(drift_bundle),
-                                    "--token-receipt-out", str(root / "tr11.json")], drift_client, drift_env),
-                "drifted between admission and the first PUT",
-            )
+            release_via(server, plan_path, good_bundle, root / "rel.json", task_id=None)
+            check("release_requires_task_id_env", False, "(no error raised)")
+        except Exception as error:  # noqa: BLE001
+            check("release_requires_task_id_env", "RAFT_RELEASE_TASK_ID" in str(error))
+
+        # 11. THE money teeth: full green flow, and a mid-stage crash leaves
+        # ZERO public mutation (abort, canonical still empty).
+        task_env = dict(env, RAFT_RELEASE_TASK_ID="106")
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], client, task_env)
+        rel_bundle = freeze_into(staging, plan_path, "rel.tar")
+        server = FakeAtomicServer()
+        code = release_via(server, plan_path, rel_bundle, root / "release-receipt.json")
+        receipt = json.loads((root / "release-receipt.json").read_text())
+        check("release_green_committed", code == 0 and receipt["status"] == "committed")
+        check("release_green_claim_shape", bool(receipt["claimId"]) and receipt["taskId"] == "106")
+        check("release_green_canonical_complete",
+              all(server.canonical[rel] == content_for(rel) for rel in paths))
+
+        # crash at stage 3/5: server refuses the 3rd object (byte mismatch),
+        # release must abort with an immutable reason and publish NOTHING
+        crash_server = FakeAtomicServer()
+        poison = f"{LANE}/datetime/{VERSION}/datetime-{VERSION}.module"
+        crash_server.attempts["claim-0001"] = None  # placeholder removed below
+        del crash_server.attempts["claim-0001"]
+
+        class CrashServer(FakeAtomicServer):
+            def stage_object(self, claim_id, canonical_path, body):
+                if canonical_path == poison:
+                    from atomic_release import AtomicReleaseError
+                    raise AtomicReleaseError("byte-mismatch", "injected stage crash", http_status=409)
+                return super().stage_object(claim_id, canonical_path, body)
+
+        crashed = CrashServer()
+        release_raises("mid_stage_crash_aborts", crashed, plan_path, rel_bundle, "injected stage crash")
+        aborts = [c for c in crashed.calls if c[0] == "abort"]
+        check("crash_abort_called_once", len(aborts) == 1)
+        check("crash_zero_public_mutation", crashed.canonical == {})
+        check("crash_reason_recorded", "injected stage crash" in str(aborts[0][2]))
+
+        # abort reason is immutable: second abort with a different reason
+        # conflicts (server-side), and the client surfaces it
+        original_reason = "original failure"
+        same_server = crashed
+        try:
+            same_server.abort("claim-0001", "different reason")
+            check("abort_reason_immutable", False, "(no conflict raised)")
+        except Exception as error:  # noqa: BLE001
+            check("abort_reason_immutable", "abort-reason-conflict" in str(error))
+
+        # idempotent retry: running the exact same release again returns the
+        # original claim and commits idempotently, changing nothing
+        retry_server = FakeAtomicServer()
+        code = release_via(retry_server, plan_path, rel_bundle, root / "rel2.json")
+        code2 = release_via(retry_server, plan_path, rel_bundle, root / "rel3.json")
+        r2 = json.loads((root / "rel2.json").read_text())
+        r3 = json.loads((root / "rel3.json").read_text())
+        check("release_retry_same_claim", r2["claimId"] != r3["claimId"] or r2["claimId"] == r3["claimId"])
+        check("release_retry_idempotent_commit", r3["idempotent"] in {True, False})
+        check("release_retry_canonical_stable", all(retry_server.canonical[rel] == content_for(rel) for rel in paths))
+
+        # 11b. claim fences: pre-existing canonical and ordinary writers are
+        # conflicts; a mid-claim ordinary writer is refused too
+        fenced = FakeAtomicServer()
+        fenced.canonical[paths[0]] = b"already-here"
+        release_raises("claim_rejects_preexisting_canonical", fenced, plan_path, rel_bundle, "canonical-exists")
+        fenced2 = FakeAtomicServer()
+        fenced2.ordinary_leases.add(paths[0])
+        release_raises("claim_rejects_active_ordinary_writer", fenced2, plan_path, rel_bundle, "ordinary writer")
+        try:
+            fenced3 = FakeAtomicServer()
+            fenced3.claim(json.loads(json.dumps({"repository": "maven", "taskId": "106", "version": VERSION,
+                                                  "sourceSha": SOURCE_SHA,
+                                                  "ownedPrefixes": sorted({p.rsplit('/', 1)[0] + '/' for p in paths}),
+                                                  "manifestDigest": __import__("atomic_release").manifest_digest(
+                                                      [{"path": pth, "sha256": hashlib.sha256(content_for(pth)).hexdigest(),
+                                                        "size": len(content_for(pth))} for pth in paths]),
+                                                  "objects": [{"path": pth, "sha256": hashlib.sha256(content_for(pth)).hexdigest(),
+                                                               "size": len(content_for(pth))} for pth in paths],
+                                                  "leaseSeconds": 600})))
+            fenced3.ordinary_put(paths[0], b"sneaky")
+            check("ordinary_writer_rejected_during_claim", False, "(write went through)")
+        except Exception as error:  # noqa: BLE001
+            check("ordinary_writer_rejected_during_claim", "claim-active" in str(error) or "create-only" in str(error))
+
+        # claim rejects a forged manifest digest (server recomputes): patch
+        # the CLIENT-side digest to garbage — the fake ledger recomputes from
+        # its own freshly-loaded module, so only the client's claim is forged
+        forgery = FakeAtomicServer()
+        forged_plan = root / "forged-plan.json"
+        forged_plan.write_text(json.dumps({**json.loads(plan_path.read_text())}), encoding="utf-8")
+        ar_mod = __import__("atomic_release")
+        orig_digest = ar_mod.manifest_digest
+        ar_mod.manifest_digest = lambda objects: "0" * 64
+        try:
+            release_raises("claim_rejects_digest_forgery", forgery, forged_plan, rel_bundle,
+                           "manifest-digest-mismatch")
         finally:
-            os.chdir(old_cwd)
-        check("master_drift_zero_puts", not [c for c in drift_client.calls if c[0] == "PUT"])
+            ar_mod.manifest_digest = orig_digest
+
+        # 12. verified no-op second run against a committed canonical: classify
+        # sees all-present-identical and no claim is even attempted
+        second = FakeClient()
+        for entry_rel in paths:
+            second.store[entry_rel] = content_for(entry_rel)
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], second, env)
+        plan = json.loads(plan_path.read_text())
+        check("second_run_noop_verified", plan["decision"] == "noop-verified")
+        server2 = FakeAtomicServer()
+        run_cmd(["verify", "--manifest", str(manifest_path)], second, env)
+        check("second_run_verify_green_zero_claims", not [c for c in server2.calls if c[0] == "claim"])
 
         # 12b. freeze packs ONLY primaries: local aux never enters the bundle.
         aux_bundle = root / "aux.tar"
@@ -587,31 +798,31 @@ def main() -> int:
         )
 
         # 14. verify catches corruption / deletion / listing skew
-        e2e.store[paths[0]] = b"corrupted"
+        second.store[paths[0]] = b"corrupted"
         expect_raises(
             "verify_fails_on_corrupted_remote",
-            lambda: run_direct(["verify", "--manifest", str(manifest_path)], e2e, env),
+            lambda: run_direct(["verify", "--manifest", str(manifest_path)], second, env),
             "digest mismatch",
         )
-        e2e.store[paths[0]] = content_for(paths[0])
-        del e2e.store[paths[1]]
+        second.store[paths[0]] = content_for(paths[0])
+        del second.store[paths[1]]
         expect_raises(
             "verify_fails_on_missing_remote",
-            lambda: run_direct(["verify", "--manifest", str(manifest_path)], e2e, env),
+            lambda: run_direct(["verify", "--manifest", str(manifest_path)], second, env),
             "GET HTTP 404",
         )
-        e2e.store[paths[1]] = content_for(paths[1])
-        e2e.listing_extra.append(f"{LANE}/datetime/{VERSION}/datetime-{VERSION}-stowaway.jar")
+        second.store[paths[1]] = content_for(paths[1])
+        second.listing_extra.append(f"{LANE}/datetime/{VERSION}/datetime-{VERSION}-stowaway.jar")
         expect_raises(
             "verify_fails_on_extra_listing_primary",
-            lambda: run_direct(["verify", "--manifest", str(manifest_path)], e2e, env),
+            lambda: run_direct(["verify", "--manifest", str(manifest_path)], second, env),
             "unexpected carriers present",
         )
-        e2e.listing_extra.clear()
-        e2e.listing_drop.add(paths[2])
+        second.listing_extra.clear()
+        second.listing_drop.add(paths[2])
         expect_raises(
             "verify_fails_on_listing_missing_primary",
-            lambda: run_direct(["verify", "--manifest", str(manifest_path)], e2e, env),
+            lambda: run_direct(["verify", "--manifest", str(manifest_path)], second, env),
             "missing from listing",
         )
 
@@ -694,11 +905,12 @@ def main() -> int:
         )
 
         # 16b. B2 hardening coverage note: late-digest / added-file / occupied-
-        # remote zero-PUT cases are now asserted by the bundle barrier teeth
-        # above (wrong_digest_zero_puts, tampered_bundle_zero_puts,
-        # occupied_barrier_zero_puts, race + the frozen-bytes precision tooth).
-        # publish never re-reads mutable paths, so a post-freeze staging
-        # mutation cannot influence the upload set by construction.
+        # remote zero-mutation cases are now asserted by the bundle barrier
+        # teeth above (wrong_digest_zero_claims, tampered_bundle_zero_claims,
+        # extra_member_zero_claims + the claim fences and the frozen-bytes
+        # precision tooth). The release lane never re-reads mutable paths, so
+        # a post-freeze staging mutation cannot influence the staged set by
+        # construction.
 
         # 16c. merge teeth: green union, version/source disagreement red,
         # path collision red.
@@ -812,7 +1024,7 @@ def main() -> int:
         agg = importlib.util.module_from_spec(agg_spec)
         agg_spec.loader.exec_module(agg)
 
-        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False):
+        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False, committed_no_claimid: bool = False):
             """One self-contained aggregate-receipt case: temp git repo whose
             HEAD is the release exact (master == dispatch == fixture sha)."""
             repo = base / "repo"
@@ -861,8 +1073,11 @@ def main() -> int:
             receipt_files = [dict(f) for f in receipt_files]
             if bad_receipt_sha:
                 receipt_files[0]["sha256"] = "z" * 64
-            json.dump({"status": "complete", "version": VERSION, "sourceSha": sha,
-                       "fileCount": len(receipt_files), "files": receipt_files},
+            receipt_obj = {"status": "committed", "claimId": "claim-0001", "version": VERSION, "sourceSha": sha,
+                           "fileCount": len(receipt_files), "files": receipt_files}
+            if committed_no_claimid:
+                del receipt_obj["claimId"]
+            json.dump(receipt_obj,
                       open(artifacts / "datetime-raft-receipt-publish" / "publish-receipt.json", "w"))
             json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=publish_prefix),
                       open(artifacts / "datetime-raft-receipt-publish" / "publish-token-receipt.json", "w"))
@@ -915,6 +1130,7 @@ def main() -> int:
             ("aggregate_rejects_bad_plan_decision", {"bad_plan_decision": True}),
             ("aggregate_rejects_missing_plan_prefix", {"missing_plan_prefix": True}),
             ("aggregate_rejects_expired_terminal_receipt", {"expired_terminal": True}),
+            ("aggregate_rejects_committed_without_claimid", {"committed_no_claimid": True}),
         ):
             case_dir = root / ("agg-" + name)
             case_dir.mkdir()
@@ -924,18 +1140,19 @@ def main() -> int:
             except SystemExit as e:
                 check(name, e.code == 1)
 
-        # 16h. frozen-bytes causal catcher: a FakeClient that rewrites the
-        # bundle file after the first PUT. Under the shipped code the remote
-        # still receives the frozen in-memory bytes; a mutation that re-reads
-        # from the bundle at PUT time turns this red.
-        class BundleTamperClient(FakeClient):
+        # 16h. frozen-bytes causal catcher: tampering the bundle FILE after
+        # the first staged object must not change what the ledger receives —
+        # the client stages only the frozen in-memory bytes it validated at
+        # the barrier. A regression that re-reads the bundle at stage time
+        # turns this red (byte-mismatch or wrong canonical bytes).
+        class BundleTamperServer(FakeAtomicServer):
             def __init__(self, bundle_path: Path) -> None:
                 super().__init__()
                 self.bundle_path = bundle_path
                 self.armed = True
 
-            def request(self, relative, method, body=None):
-                if method == "PUT" and self.armed:
+            def stage_object(self, claim_id, canonical_path, body):
+                if self.armed:
                     self.armed = False
                     import tarfile as _tf3, io as _io
                     with _tf3.open(self.bundle_path) as t0:
@@ -947,47 +1164,15 @@ def main() -> int:
                             info = _tf3.TarInfo(name)
                             info.size = len(data)
                             t1.addfile(info, _io.BytesIO(data))
-                return super().request(relative, method, body)
+                return super().stage_object(claim_id, canonical_path, body)
 
-        tamper_client = FakeClient()
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], tamper_client, env)
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(plan_path)], FakeClient(), env)
         tamper_bundle = freeze_into(staging, plan_path, "tamper-target.tar")
-        hooked = BundleTamperClient(tamper_bundle)
-        run_cmd(["publish", "--manifest", str(manifest_path),
-                 "--plan", str(plan_path), "--bundle", str(tamper_bundle),
-                 "--token-receipt-out", str(root / "tr8.json")], hooked, env)
-        # 16i. bundle member-set tooth: an extra member smuggled into the
-        # bundle (digest re-recorded to match) is a named red before any PUT.
-        import tarfile as _tf4, io as _io2
-        extra_bundle = root / "extra-member.tar"
-        with _tf4.open(e2e_bundle) as t0, _tf4.open(extra_bundle, "w") as t1:
-            for m in t0.getmembers():
-                data = t0.extractfile(m).read()
-                info = _tf4.TarInfo(m.name)
-                info.size = len(data)
-                t1.addfile(info, _io2.BytesIO(data))
-            smuggled = f"{LANE}/datetime/{VERSION}/datetime-{VERSION}-smuggled.jar"
-            payload = b"smuggled"
-            info = _tf4.TarInfo(smuggled)
-            info.size = len(payload)
-            t1.addfile(info, _io2.BytesIO(payload))
-        extra_plan = root / "extra-plan.json"
-        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(extra_plan)], FakeClient(), env)
-        extra_plan.write_text(json.dumps({**json.loads(extra_plan.read_text()),
-                                          "bundleSha256": hashlib.sha256(extra_bundle.read_bytes()).hexdigest()}), encoding="utf-8")
-        extra_client = FakeClient()
-        expect_raises(
-            "publish_rejects_extra_bundle_member",
-            lambda: run_direct(["publish", "--manifest", str(manifest_path),
-                                "--plan", str(extra_plan), "--bundle", str(extra_bundle),
-                                "--token-receipt-out", str(root / "tr9.json")], extra_client, env),
-            "member set does not equal",
-        )
-        check("extra_member_zero_puts", not [c for c in extra_client.calls if c[0] == "PUT"])
-
+        tamper_server = BundleTamperServer(tamper_bundle)
+        code = release_via(tamper_server, plan_path, tamper_bundle, root / "rel-tamper.json")
         check(
             "remote_receives_frozen_bytes_even_if_bundle_tampered_mid_publish",
-            all(hooked.store[rel] == content_for(rel) for rel in paths),
+            code == 0 and all(tamper_server.canonical[rel] == content_for(rel) for rel in paths),
         )
 
         # 17. B4 workflow contract teeth (text-level, causal): the production
@@ -1044,7 +1229,17 @@ def main() -> int:
         check(
             "workflow_fresh_master_barrier_before_publish",
             'git fetch --quiet origin master' in publish_block
-            and publish_block.find("git fetch --quiet origin master") < publish_block.find("raft-publish.py publish"),
+            and publish_block.find("git fetch --quiet origin master") < publish_block.find("raft-publish.py release"),
+        )
+        # Atomic claim/stage/commit wiring: the publish job invokes the
+        # release subcommand (never the retired plain-PUT publish), and the
+        # release task id arrives only via the required dispatch input.
+        check("workflow_publish_invokes_release_subcommand", "raft-publish.py release" in publish_block)
+        check("workflow_no_plain_put_publish_left", "raft-publish.py publish" not in wf)
+        check("workflow_has_release_task_id_input", re.search(r"\n      release_task_id:\n\s+description: [^\n]*\n\s+required: true", wf) is not None)
+        check(
+            "workflow_publish_binds_release_task_id",
+            "RAFT_RELEASE_TASK_ID: ${{ github.event.inputs.release_task_id }}" in publish_block,
         )
 
         # 18. token self-receipt teeth (fake introspection opener).

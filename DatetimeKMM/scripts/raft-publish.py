@@ -633,19 +633,25 @@ def command_classify(args: argparse.Namespace) -> int:
     return 0
 
 
-def command_publish(args: argparse.Namespace) -> int:
-    """Single-writer publish: consumes ONLY the plan-frozen bundle.
+def command_release(args: argparse.Namespace) -> int:
+    """Single-writer ATOMIC release via the deployed v1 ledger (task #106).
 
-    First-PUT barrier (all before any remote mutation): bundle digest must
-    equal the global plan's recorded digest; every member is read into memory
-    and validated against the manifest (exact path set, size, SHA); the remote
-    is re-probed (a publish decision requires every path still absent); the
-    job's own token self-receipt is minted; and the still-landed master is
-    re-fetched and re-bound. PUTs then send only those in-memory bytes -- a
-    tampered file after this point cannot change what is sent."""
+    Shape: the plan-frozen bundle is the only byte source. The claim binds the
+    exact release identity (task/version/sourceSha/prefixes/manifest digest)
+    against the actual stored constrained token server-side; every object is
+    staged invisibly; ONE CAS commit is the only visibility linearization
+    point. Any failure after a successful claim aborts with an immutable
+    reason, so a failed release leaves zero public mutation by construction --
+    not by client checks.
+
+    Client preflight (early-fail only, never the closure): bundle digest ==
+    global plan digest; every member to memory, exact path set + size + SHA;
+    token introspection receipt; landed master re-fetch."""
+    import atomic_release as ar
+
     manifest = load_manifest(Path(args.manifest))
     plan = load_plan(Path(args.plan))
-    require(plan["decision"] == "publish", "plan decision is not publish — nothing to upload")
+    require(plan["decision"] == "publish", "plan decision is not publish — nothing to release")
 
     bundle = Path(args.bundle)
     require(bundle.is_file(), f"frozen bundle missing: {bundle}")
@@ -684,25 +690,13 @@ def command_publish(args: argparse.Namespace) -> int:
             f"bundle bytes do not match the manifest: {entry['path']}",
         )
 
-    client = client_from_env()
-    # The credential introspection runs FIRST, so every mutable-state check
-    # below is as close to the first PUT as this process can make it (review
-    # r4: introspection between the checks left a remote-mutation window).
-    # This job's own token self-receipt: minted from the actual injected
-    # secret that the PUTs below use, and uploaded for the terminal identity
-    # cross-check.
+    # Token self-receipt (identity continuity into the terminal aggregate).
     token_receipt = fetch_token_self_receipt()
     Path(args.token_receipt_out).write_text(
         json.dumps(token_receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
 
-    # Remote re-probe: every expected path must still be absent.
-    for entry in manifest["files"]:
-        status, _ = client.request(entry["path"], "HEAD")
-        require(status == 404, f"remote no longer absent before first PUT: {entry['path']} (HTTP {status})")
-
-    # Landed-master re-fetch inside the command itself (not only a workflow
-    # step): a drifted master between admission and the first PUT stops here.
+    # Landed-master re-fetch inside the command itself.
     dispatch_sha = os.environ.get("GITHUB_SHA", "")
     if dispatch_sha:
         import subprocess
@@ -714,42 +708,89 @@ def command_publish(args: argparse.Namespace) -> int:
         ).stdout.strip()
         require(
             current == dispatch_sha == manifest["sourceSha"],
-            "landed master drifted between admission and the first PUT — stop",
+            "landed master drifted between admission and the first stage — stop",
         )
 
-    # The owned-prefix re-list is the FINAL check before the first PUT, so no
-    # late unexpected primary can slip in after it and still be uploaded.
-    prefixes = sorted({entry["path"].rsplit("/", 1)[0] for entry in manifest["files"]})
-    primaries = list_primaries_from_env()
-    late_extra = sorted(
-        item["key"]
-        for item in primaries
-        if any(item["key"].startswith(prefix + "/") for prefix in prefixes)
-        and item["key"] not in manifest_paths
-    )
-    require(
-        not late_extra,
-        "unexpected carriers appeared under owned prefixes after the plan — stop: " + ", ".join(late_extra[:5]),
-    )
+    # Build the exact release identity the ledger will verify server-side.
+    task_id = os.environ.get("RAFT_RELEASE_TASK_ID", "")
+    require(task_id != "", "RAFT_RELEASE_TASK_ID is required for the release claim")
+    objects = [
+        {"path": entry["path"], "sha256": entry["sha256"], "size": entry["size"]}
+        for entry in sorted(manifest["files"], key=lambda f: f["path"].encode("utf-8"))
+    ]
+    prefixes = ar.owned_prefixes_from_paths([entry["path"] for entry in objects])
+    digest = ar.manifest_digest(objects)
+    client = release_client_from_env()
+    claim_payload = {
+        "repository": "maven",
+        "taskId": task_id,
+        "version": manifest["version"],
+        "sourceSha": manifest["sourceSha"],
+        "ownedPrefixes": prefixes,
+        "manifestDigest": digest,
+        "objects": objects,
+        "leaseSeconds": 600,
+    }
 
-    uploaded = 0
-    for entry in manifest["files"]:
-        relative = entry["path"]
-        status, _ = client.request(relative, "PUT", bodies[relative])
-        # The server's create-if-absent answers 409 on an occupied release path
-        # and keeps the original bytes: a foreign write that landed after the
-        # barrier stops the run here instead of being overwritten.
-        require(
-            status != 409,
-            f"conflict: {relative} was occupied after the barrier — foreign write, stopping",
-        )
-        require(status in {200, 201, 204}, f"PUT failed with HTTP {status} for {relative}")
-        uploaded += 1
-        print(f"  put {relative}")
-    require(uploaded == manifest["fileCount"], "upload count mismatch")
-    print(f"publish: {uploaded}/{manifest['fileCount']} uploaded from the frozen bundle")
+    claim = client.claim(claim_payload)
+    claim_id = claim.get("claimId")
+    require(isinstance(claim_id, str) and claim_id != "", f"claim response carries no claimId: {sorted(claim)}")
+    print(f"release claim: id={claim_id} generation={claim.get('generation')} prefixes={len(prefixes)} objects={len(objects)}")
+
+    # Exact retry of a release whose original claim already committed: the
+    # ledger returns the ORIGINAL claim id, and staging is closed on a
+    # terminal claim — inspect first and short-circuit so the retry mutates
+    # nothing. A retry of a still-staged claim falls through and resumes:
+    # per-object staging is byte-identical-idempotent, commit is idempotent.
+    if client.inspect(claim_id).get("state") == "committed":
+        commit_receipt = {"state": "committed", "idempotent": True}
+        print(f"release already committed under {claim_id}: exact retry, zero mutations")
+    else:
+        staged = 0
+        try:
+            for entry in objects:
+                client.stage_object(claim_id, entry["path"], bodies[entry["path"]])
+                staged += 1
+                print(f"  staged {entry['path']}")
+            inspection = client.inspect(claim_id)
+            staged_count = inspection.get("stagedCount", inspection.get("staged"))
+            require(
+                staged_count == len(objects) or staged_count is None,
+                f"server inspect reports staged={staged_count}, expected {len(objects)}",
+            )
+            commit_receipt = client.commit(claim_id)
+        except (PublishError, ar.AtomicReleaseError) as error:
+            reason = f"{type(error).__name__}: {error}"
+            print(f"release failed after claim (staged={staged}); aborting with immutable reason", file=sys.stderr)
+            try:
+                client.abort(claim_id, reason)
+                print("release aborted: terminal, zero public mutation", file=sys.stderr)
+            except Exception as abort_error:  # noqa: BLE001 - never mask the original failure
+                print(f"ABORT FAILED (original error stands): {abort_error}", file=sys.stderr)
+            raise
+
+    receipt = {
+        "status": "committed",
+        "claimId": claim_id,
+        "generation": claim.get("generation"),
+        "idempotent": commit_receipt.get("idempotent", claim.get("idempotent")),
+        "taskId": task_id,
+        "version": manifest["version"],
+        "sourceSha": manifest["sourceSha"],
+        "ownedPrefixes": prefixes,
+        "manifestDigest": digest,
+        "fileCount": len(objects),
+        "files": objects,
+        "commitReceipt": commit_receipt,
+        "provenance": {
+            "publishSourceExact": os.environ.get("GITHUB_SHA", ""),
+            "runId": os.environ.get("GITHUB_RUN_ID", ""),
+            "runAttempt": os.environ.get("GITHUB_RUN_ATTEMPT", ""),
+        },
+    }
+    Path(args.output).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    print(f"release committed: {len(objects)}/{len(objects)} objects visible atomically, receipt {args.output}")
     return 0
-
 def command_verify(args: argparse.Namespace) -> int:
     manifest = load_manifest(Path(args.manifest))
     only = set(load_expected(Path(args.only))) if getattr(args, "only", None) else None
@@ -799,6 +840,12 @@ def command_verify(args: argparse.Namespace) -> int:
         Path(receipt_out).write_text(json.dumps(receipt, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(f"verify: {verified}/{len(selected)} byte-identical on Raft")
     return 0
+
+
+def release_client_from_env():
+    import atomic_release as ar
+
+    return ar.AtomicReleaseClient()
 
 
 def client_from_env() -> RepositoryClient:
@@ -946,12 +993,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_classify.add_argument("--manifest", required=True)
     p_classify.add_argument("--output", required=True)
     p_classify.set_defaults(func=command_classify)
-    p_publish = sub.add_parser("publish")
-    p_publish.add_argument("--manifest", required=True)
-    p_publish.add_argument("--plan", required=True)
-    p_publish.add_argument("--bundle", required=True)
-    p_publish.add_argument("--token-receipt-out", required=True)
-    p_publish.set_defaults(func=command_publish)
+    p_release = sub.add_parser("release")
+    p_release.add_argument("--manifest", required=True)
+    p_release.add_argument("--plan", required=True)
+    p_release.add_argument("--bundle", required=True)
+    p_release.add_argument("--token-receipt-out", required=True)
+    p_release.add_argument("--output", required=True)
+    p_release.set_defaults(func=command_release)
     p_verify = sub.add_parser("verify")
     p_verify.add_argument("--manifest", required=True)
     p_verify.add_argument("--output", default="")

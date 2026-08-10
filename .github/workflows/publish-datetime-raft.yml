@@ -4,16 +4,20 @@
 # GitHub Packages write exists anywhere in this lane. The Gradle build has no
 # remote repository: each platform stages its publications into a task-scoped
 # file Maven repository; ONE aggregate plan over the whole version is made
-# before any upload; uploads are create-only PUTs of the exact staged bytes;
+# before any upload; the single writer then publishes the frozen bundle
+# through the server-side atomic release ledger — one claim bound to the
+# dispatch-provided release task id, invisible staging, one commit as the
+# only visibility linearization point, abort on any mid-release failure;
 # every run ends in a byte-exact readback and an aggregate receipt.
 #
 # Aggregate state machine (frozen by review):
-#   globally ALL_ABSENT            -> create-only publication of every shard
-#   globally ALL_PRESENT_IDENTICAL -> zero PUTs, full byte readback: a
-#                                     verified no-op SUCCESS (never a stale
-#                                     rerun failure)
+#   globally ALL_ABSENT            -> atomic claim/stage/commit of every shard
+#   globally ALL_PRESENT_IDENTICAL -> zero staged objects, full byte
+#                                     readback: a verified no-op SUCCESS
+#                                     (never a stale rerun failure)
 #   anything else (cross-shard partial, extra owned key, digest mismatch)
-#                                  -> zero PUTs, fail closed, human decision
+#                                  -> zero staged objects, fail closed, human
+#                                     decision
 #
 # Credential lifecycle (platform rule): a task-minted short-lived scoped token
 # is injected into the raft-artifacts-production environment before dispatch
@@ -29,6 +33,10 @@ on:
         type: string
       source_sha:
         description: "Required exact 40-character source SHA; must equal current landed master"
+        required: true
+        type: string
+      release_task_id:
+        description: "Required release task id bound into the server-side release claim ledger"
         required: true
         type: string
 
@@ -395,9 +403,10 @@ jobs:
           done
           [ "${#maps[@]}" -eq 4 ] || { echo "expected 4 shard manifests, got ${#maps[@]}"; exit 1; }
           python3 scripts/raft-publish.py merge --manifests "${maps[@]}" --output merged-manifest.json
-          # Release-wide zero-PUT barrier: every staged byte of the whole
-          # version is re-hashed and every shard staging re-enumerated BEFORE
-          # classification, so no writer job can ever start from drifted bytes.
+          # Release-wide zero-mutation barrier: every staged byte of the
+          # whole version is re-hashed and every shard staging re-enumerated
+          # BEFORE classification, so no writer job can ever start from
+          # drifted bytes.
           python3 scripts/raft-publish.py revalidate \
             --manifest merged-manifest.json \
             --staging-roots "${roots[@]}"
@@ -439,7 +448,7 @@ jobs:
 
   # --- THE single writer: consumes only the plan-frozen bundle --------------
   publish:
-    name: "Publish whole release (single writer, frozen bundle, create-only)"
+    name: "Publish whole release (single writer, atomic claim/stage/commit)"
     needs: [plan]
     runs-on: ubuntu-latest
     environment: raft-artifacts-production
@@ -447,6 +456,7 @@ jobs:
       contents: read
     env:
       RAFT_ARTIFACTS_EXPECT_PRINCIPAL: ${{ secrets.RAFT_ARTIFACTS_EXPECT_PRINCIPAL }}
+      RAFT_RELEASE_TASK_ID: ${{ github.event.inputs.release_task_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -471,17 +481,19 @@ jobs:
           [ "$(git rev-parse origin/master)" = "${GITHUB_SHA}" ]             || { echo "landed master drifted before publish — stop" >&2; exit 1; }
           case "$GLOBAL_DECISION" in
             publish)
-              python3 scripts/raft-publish.py publish \
+              python3 scripts/raft-publish.py release \
                 --manifest ../artifacts-in/merged-manifest.json \
                 --plan ../artifacts-in/global-plan.json \
                 --bundle ../artifacts-in/frozen-bundle.tar \
-                --token-receipt-out publish-token-receipt.json
+                --token-receipt-out publish-token-receipt.json \
+                --output publish-receipt.json
               ;;
             noop-verified)
-              # Verified no-op: zero PUTs. The token receipt is still minted so
-              # the terminal identity check sees this job's credential shape.
+              # Verified no-op: zero staged objects. The token receipt is still
+              # minted so the terminal identity check sees this job's
+              # credential shape.
               python3 scripts/raft-publish.py token-receipt --output publish-token-receipt.json
-              echo "global decision is noop-verified: zero PUTs"
+              echo "global decision is noop-verified: zero staged objects"
               ;;
             *)
               echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;

@@ -139,6 +139,9 @@ def main(argv: list[str]) -> int:
             fail(f"plan carries no valid {key}")
     if not isinstance(plan.get("ownedPrefixes"), list) or not plan["ownedPrefixes"]:
         fail("plan carries no ownedPrefixes")
+    manifest_prefixes = sorted({f["path"].rsplit("/", 1)[0] for f in merged_files})
+    if sorted(plan["ownedPrefixes"]) != manifest_prefixes:
+        fail("plan ownedPrefixes do not equal the manifest-derived prefixes")
     if not isinstance(plan.get("missing"), list):
         fail("plan carries no missing list")
     # decision/shape coherence: publish means every file was missing;
@@ -152,8 +155,11 @@ def main(argv: list[str]) -> int:
     if publish_receipt.get("fileCount") != len(publish_files):
         fail("publish receipt fileCount does not equal its file list")
 
-    if publish_receipt.get("status") != "complete":
+    if publish_receipt.get("status") not in {"complete", "committed"}:
         fail("publish receipt incomplete")
+    if publish_receipt.get("status") == "committed":
+        if not isinstance(publish_receipt.get("claimId"), str) or not publish_receipt["claimId"]:
+            fail("committed publish receipt carries no claimId")
     for field in ("version", "sourceSha"):
         if publish_receipt.get(field) != merged.get(field):
             fail(f"publish receipt {field} drift")
