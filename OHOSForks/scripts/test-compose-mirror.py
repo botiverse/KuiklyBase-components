@@ -270,8 +270,18 @@ def test_consumer_closure_receipt() -> None:
             "consumer closure lost the terminal publication receipt binding",
         )
         require(
-            success["externalPredecessor"]["task"] == 121
-            and len(success["externalPredecessor"]["coordinates"]) == 5,
+            success["externalPredecessor"]["task"] == 121,
+            "consumer closure lost the task #121 predecessor task identity",
+        )
+        require(
+            success["externalPredecessor"]["coordinates"] == [
+                "org.jetbrains.kotlin:kotlin-stdlib:2.0.21-KBA-003",
+                "org.jetbrains.kotlin:kotlin-stdlib-common:2.0.21-KBA-003",
+                "org.jetbrains.kotlinx:atomicfu:0.23.2-KBA-001",
+                "org.jetbrains.kotlinx:atomicfu-ohosarm64:0.23.2-KBA-001",
+                "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0-KBA-002",
+                "org.jetbrains.kotlinx:kotlinx-coroutines-core-ohosarm64:1.8.0-KBA-002",
+            ],
             "consumer closure lost the exact task #121 predecessor identity",
         )
 

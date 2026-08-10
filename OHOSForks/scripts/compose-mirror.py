@@ -87,6 +87,7 @@ EXPECTED_KBA_COORDINATES = {
 
 EXPECTED_CURRENT_PREDECESSOR_COORDINATES = (
     "org.jetbrains.kotlin:kotlin-stdlib:2.0.21-KBA-003",
+    "org.jetbrains.kotlin:kotlin-stdlib-common:2.0.21-KBA-003",
     "org.jetbrains.kotlinx:atomicfu:0.23.2-KBA-001",
     "org.jetbrains.kotlinx:atomicfu-ohosarm64:0.23.2-KBA-001",
     "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0-KBA-002",
