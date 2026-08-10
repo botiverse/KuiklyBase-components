@@ -1,0 +1,38 @@
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        def authorityRepositoryUrl = System.getenv("COMPOSE_AUTHORITY_REPOSITORY_URL")
+        if (authorityRepositoryUrl) {
+            exclusiveContent {
+                forRepository {
+                    maven {
+                        name = "composeExactAuthority"
+                        url = uri(authorityRepositoryUrl)
+                        metadataSources {
+                            gradleMetadata()
+                            mavenPom()
+                            artifact()
+                        }
+                    }
+                }
+                filter {
+                    includeGroup("com.tencent.kuikly-open.compose.runtime")
+                    includeGroup("com.tencent.kuikly-open.compose.annotation-internal")
+                    includeGroup("com.tencent.kuikly-open.compose.collection-internal")
+                }
+            }
+        }
+        maven {
+            name = "mirrorUnderTest"
+            url = uri(providers.environmentVariable("COMPOSE_MIRROR_REPOSITORY_URL")
+                .getOrElse("https://maven.artifacts.botiverse.dev"))
+            metadataSources {
+                gradleMetadata()
+                mavenPom()
+                artifact()
+            }
+        }
+    }
+}
+
+rootProject.name = "compose-1.7.3-kuikly2-ohos-smoke"

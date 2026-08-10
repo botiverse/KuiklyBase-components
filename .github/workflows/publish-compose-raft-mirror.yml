@@ -1,0 +1,248 @@
+# Resumable exact-byte mirror for task #120.  The preflight job is entirely
+# anonymous.  The protected job exposes the repository/group-scoped credential
+# only to PUT steps; planning, byte comparison and Gradle resolution stay public.
+# This workflow never publishes authority-manifest.json or another completion
+# coordinate.  Task #93 alone writes the Kuikly release manifest after this
+# task's anonymous 32/32 receipt and the other predecessors have closed.
+name: Compose 1.7.3-kuikly2 Raft mirror (publish + verify)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character landed master SHA to execute
+        required: true
+        type: string
+      confirmation:
+        description: Type "mirror Compose 1.7.3-kuikly2 to Raft"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compose-1.7.3-kuikly2-raft-mirror
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Anonymous exact-byte and dependency-closure preflight
+    runs-on: ubuntu-latest
+    env:
+      MIRROR_SOURCE_EXACT: ${{ inputs.source_sha }}
+      MANIFEST_SHA256: c4922fa162cbeeea3580a481431feb5462be95cac6c407ca637d577bd2c63cf5
+      OUT_DIR: /tmp/compose-mirror-preflight
+    steps:
+      - name: Admission before checkout
+        env:
+          EVENT_REPOSITORY: ${{ github.repository }}
+          EVENT_REF: ${{ github.ref }}
+          REQUESTED_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT_REPOSITORY" = "botiverse/KuiklyBase-components" ]
+          [ "$EVENT_REF" = "refs/heads/master" ]
+          [[ "$MIRROR_SOURCE_EXACT" =~ ^[0-9a-f]{40}$ ]]
+          [ "$REQUESTED_CONFIRMATION" = "mirror Compose 1.7.3-kuikly2 to Raft" ]
+
+      - name: Checkout requested landed exact
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind dispatch to current landed master and manifest
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$MIRROR_SOURCE_EXACT" ]
+          git fetch --quiet origin master
+          [ "$(git rev-parse origin/master)" = "$MIRROR_SOURCE_EXACT" ]
+          printf '%s  %s\n' "$MANIFEST_SHA256" OHOSForks/compose-mirror/authority-manifest.json \
+            | sha256sum -c -
+          [ -z "$(git status --porcelain=v1 --untracked-files=all)" ]
+
+      - name: Set up Java for dependency closure
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Offline causal teeth
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: python3 OHOSForks/scripts/test-compose-mirror.py
+
+      - name: Fetch exact Tencent authority bytes
+        run: |
+          set -euo pipefail
+          python3 OHOSForks/scripts/compose-mirror.py fetch \
+            --manifest OHOSForks/compose-mirror/authority-manifest.json \
+            --bytes-dir "$OUT_DIR/bytes" \
+            --receipt "$OUT_DIR/authority-receipt.json"
+          PYTHONDONTWRITEBYTECODE=1 python3 OHOSForks/scripts/test-compose-mirror.py \
+            --authority-bytes "$OUT_DIR/bytes"
+
+      - name: Fresh anonymous Raft plan
+        run: |
+          set -euo pipefail
+          python3 OHOSForks/scripts/compose-mirror.py plan \
+            --manifest OHOSForks/compose-mirror/authority-manifest.json \
+            --output "$OUT_DIR/raft-plan.json"
+
+      # This is the task #121 machine gate: task #120 Compose bytes are served
+      # only from the local frozen tree while the actual combined graph must
+      # select KBA-002 + hyphen atomicfu + KBA-003 from Raft and select no
+      # historical .001/dotted component.  Any gap stops before credentials.
+      - name: Hybrid empty-cache dependency-closure gate
+        env:
+          COMPOSE_MIRROR_REPOSITORY_URL: https://maven.artifacts.botiverse.dev
+          GRADLE_USER_HOME: ${{ runner.temp }}/compose-preflight-gradle
+        run: |
+          set -euo pipefail
+          authority_url="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' "$OUT_DIR/bytes")"
+          export COMPOSE_AUTHORITY_REPOSITORY_URL="$authority_url"
+          DatetimeKMM/gradlew \
+            -Dmaven.repo.local="$RUNNER_TEMP/compose-preflight-m2" \
+            --no-daemon --console=plain --refresh-dependencies \
+            -p OHOSForks/compose-mirror/consumer-smoke resolveOhosArm64
+          [ "$(wc -l < OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-resolution.tsv)" -eq 8 ]
+
+      - name: Upload anonymous preflight packet
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-mirror-preflight-${{ inputs.source_sha }}
+          path: |
+            OHOSForks/compose-mirror/authority-manifest.json
+            ${{ env.OUT_DIR }}/authority-receipt.json
+            ${{ env.OUT_DIR }}/raft-plan.json
+            OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-components.tsv
+            OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-resolution.tsv
+          if-no-files-found: error
+          retention-days: 90
+
+  publish:
+    name: Protected resumable PUT and anonymous terminal proof
+    needs: preflight
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    env:
+      MIRROR_SOURCE_EXACT: ${{ inputs.source_sha }}
+      MANIFEST_SHA256: c4922fa162cbeeea3580a481431feb5462be95cac6c407ca637d577bd2c63cf5
+      OUT_DIR: /tmp/compose-mirror-publish
+    steps:
+      - name: Checkout requested landed exact
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Rebind current landed master and manifest
+        env:
+          EVENT_REPOSITORY: ${{ github.repository }}
+          EVENT_REF: ${{ github.ref }}
+          REQUESTED_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT_REPOSITORY" = "botiverse/KuiklyBase-components" ]
+          [ "$EVENT_REF" = "refs/heads/master" ]
+          [ "$REQUESTED_CONFIRMATION" = "mirror Compose 1.7.3-kuikly2 to Raft" ]
+          [ "$(git rev-parse HEAD)" = "$MIRROR_SOURCE_EXACT" ]
+          git fetch --quiet origin master
+          [ "$(git rev-parse origin/master)" = "$MIRROR_SOURCE_EXACT" ]
+          printf '%s  %s\n' "$MANIFEST_SHA256" OHOSForks/compose-mirror/authority-manifest.json \
+            | sha256sum -c -
+          [ -z "$(git status --porcelain=v1 --untracked-files=all)" ]
+
+      - name: Set up Java for terminal Raft-only resolution
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Refetch and causally validate authority bytes
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
+        run: |
+          set -euo pipefail
+          python3 OHOSForks/scripts/compose-mirror.py fetch \
+            --manifest OHOSForks/compose-mirror/authority-manifest.json \
+            --bytes-dir "$OUT_DIR/bytes" \
+            --receipt "$OUT_DIR/authority-receipt.json"
+          python3 OHOSForks/scripts/test-compose-mirror.py \
+            --authority-bytes "$OUT_DIR/bytes"
+
+      - name: Recheck live dependency closure before writer
+        env:
+          COMPOSE_MIRROR_REPOSITORY_URL: https://maven.artifacts.botiverse.dev
+          GRADLE_USER_HOME: ${{ runner.temp }}/compose-writer-preflight-gradle
+        run: |
+          set -euo pipefail
+          authority_url="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().as_uri())' "$OUT_DIR/bytes")"
+          export COMPOSE_AUTHORITY_REPOSITORY_URL="$authority_url"
+          DatetimeKMM/gradlew \
+            -Dmaven.repo.local="$RUNNER_TEMP/compose-writer-preflight-m2" \
+            --no-daemon --console=plain --refresh-dependencies \
+            -p OHOSForks/compose-mirror/consumer-smoke resolveOhosArm64
+          [ "$(wc -l < OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-resolution.tsv)" -eq 8 ]
+
+      - name: Fresh anonymous plan immediately before writer
+        id: plan
+        run: |
+          set -euo pipefail
+          python3 OHOSForks/scripts/compose-mirror.py plan \
+            --manifest OHOSForks/compose-mirror/authority-manifest.json \
+            --output "$OUT_DIR/raft-plan.json"
+          decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["remote"]["decision"])' "$OUT_DIR/raft-plan.json")"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+
+      # The only primary-byte step with the repository's one long-lived
+      # publish-only secret.  Existing identical files are skipped by the
+      # fresh anonymous plan; only missing files receive conditional PUTs.
+      - name: PUT only missing immutable primaries
+        if: steps.plan.outputs.decision != 'noop-complete-identical'
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          python3 OHOSForks/scripts/compose-mirror.py publish \
+            --manifest OHOSForks/compose-mirror/authority-manifest.json \
+            --bytes-dir "$OUT_DIR/bytes" \
+            --plan "$OUT_DIR/raft-plan.json" \
+            --output "$OUT_DIR/writer-receipt.json"
+
+      - name: Anonymous terminal byte and inventory verification
+        run: |
+          set -euo pipefail
+          python3 OHOSForks/scripts/compose-mirror.py verify \
+            --manifest OHOSForks/compose-mirror/authority-manifest.json \
+            --output "$OUT_DIR/terminal-receipt.json"
+
+      - name: Fresh Raft-only OHOS consumer resolution
+        env:
+          COMPOSE_MIRROR_REPOSITORY_URL: https://maven.artifacts.botiverse.dev
+          GRADLE_USER_HOME: ${{ runner.temp }}/compose-terminal-gradle
+        run: |
+          set -euo pipefail
+          [ -z "${COMPOSE_AUTHORITY_REPOSITORY_URL:-}" ]
+          DatetimeKMM/gradlew \
+            -Dmaven.repo.local="$RUNNER_TEMP/compose-terminal-m2" \
+            --no-daemon --console=plain --refresh-dependencies \
+            -p OHOSForks/compose-mirror/consumer-smoke resolveOhosArm64
+          [ "$(wc -l < OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-resolution.tsv)" -eq 8 ]
+
+      - name: Upload terminal non-secret receipts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-mirror-terminal-${{ inputs.source_sha }}
+          path: |
+            OHOSForks/compose-mirror/authority-manifest.json
+            ${{ env.OUT_DIR }}/*.json
+            OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-components.tsv
+            OHOSForks/compose-mirror/consumer-smoke/build/compose-ohos-resolution.tsv
+          if-no-files-found: warn
+          retention-days: 90

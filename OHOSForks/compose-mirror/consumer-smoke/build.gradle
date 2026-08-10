@@ -1,0 +1,94 @@
+import org.gradle.api.attributes.Attribute
+import org.gradle.api.attributes.Category
+import org.gradle.api.attributes.Usage
+import org.gradle.api.artifacts.component.ModuleComponentIdentifier
+
+def version = "1.7.3-kuikly2"
+def createOhosArm64Configuration = { String name ->
+    configurations.create(name) {
+        canBeConsumed = false
+        canBeResolved = true
+        attributes {
+            attribute(Category.CATEGORY_ATTRIBUTE, objects.named(Category, Category.LIBRARY))
+            attribute(Usage.USAGE_ATTRIBUTE, objects.named(Usage, "kotlin-api"))
+            attribute(Attribute.of("artifactType", String), "org.jetbrains.kotlin.klib")
+            attribute(Attribute.of("org.gradle.jvm.environment", String), "non-jvm")
+            attribute(Attribute.of("org.jetbrains.kotlin.native.target", String), "ohos_arm64")
+            attribute(Attribute.of("org.jetbrains.kotlin.platform.type", String), "native")
+        }
+    }
+}
+def composeOhosArm64 = createOhosArm64Configuration("composeOhosArm64")
+
+dependencies {
+    add("composeOhosArm64", "com.tencent.kuikly-open.compose.runtime:runtime:${version}")
+    add("composeOhosArm64", "com.tencent.kuikly-open.compose.runtime:runtime-saveable:${version}")
+    add("composeOhosArm64", "com.tencent.kuikly-open.compose.annotation-internal:annotation:${version}")
+    add("composeOhosArm64", "com.tencent.kuikly-open.compose.collection-internal:collection:${version}")
+    // Kuikly's real OHOS graph requests this alongside the Compose roots.
+    // It must win over the historical .001 edge carried by the Compose bytes.
+    add("composeOhosArm64", "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0-KBA-002")
+}
+
+tasks.register("resolveOhosArm64") {
+    doLast {
+        def artifactCollection = composeOhosArm64.incoming.artifacts
+        def artifacts = artifactCollection.artifacts
+        def failures = artifactCollection.failures
+        if (!failures.empty) {
+            throw new GradleException("composeOhosArm64 resolution failures: " + failures*.message.join(" | "))
+        }
+        def selected = artifacts.collect { artifact ->
+            def id = artifact.id.componentIdentifier
+            def coordinate = (id instanceof ModuleComponentIdentifier
+                ? "${id.group}:${id.module}:${id.version}"
+                : id.displayName).toString()
+            [coordinate: coordinate, file: artifact.file]
+        }
+        def requiredArtifacts = [
+            "com.tencent.kuikly-open.compose.runtime:runtime-ohosarm64:${version}",
+            "com.tencent.kuikly-open.compose.runtime:runtime-saveable-ohosarm64:${version}",
+            "com.tencent.kuikly-open.compose.annotation-internal:annotation-ohosarm64:${version}",
+            "com.tencent.kuikly-open.compose.collection-internal:collection-ohosarm64:${version}",
+            "org.jetbrains.kotlinx:atomicfu-ohosarm64:0.23.2-KBA-001",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core-ohosarm64:1.8.0-KBA-002",
+        ].collect { it.toString() }.toSet()
+        def artifactCoordinates = selected*.coordinate.toSet()
+        if (!artifactCoordinates.containsAll(requiredArtifacts)) {
+            throw new GradleException("missing exact combined OHOS artifacts: " + (requiredArtifacts - artifactCoordinates) + "; resolved=" + artifactCoordinates.sort())
+        }
+
+        def componentCoordinates = composeOhosArm64.incoming.resolutionResult.allComponents.collect { component ->
+            def id = component.id
+            id instanceof ModuleComponentIdentifier
+                ? "${id.group}:${id.module}:${id.version}".toString()
+                : id.displayName.toString()
+        }.toSet()
+        def requiredComponents = [
+            "org.jetbrains.kotlin:kotlin-stdlib:2.0.21-KBA-003",
+            "org.jetbrains.kotlin:kotlin-stdlib-common:2.0.21-KBA-003",
+            "org.jetbrains.kotlinx:atomicfu:0.23.2-KBA-001",
+            "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0-KBA-002",
+        ] as Set
+        if (!componentCoordinates.containsAll(requiredComponents)) {
+            throw new GradleException("missing exact combined OHOS components: " + (requiredComponents - componentCoordinates) + "; resolved=" + componentCoordinates.sort())
+        }
+        def forbidden = componentCoordinates.findAll { coordinate ->
+            coordinate.contains(":1.8.0-KBA-001") || coordinate.contains(":0.23.2.KBA-001")
+        }
+        if (!forbidden.empty) {
+            throw new GradleException("historical .001/dotted components entered the combined graph: " + forbidden.sort())
+        }
+
+        def receiptLines = selected.collect {
+            "${it.coordinate}\t${it.file.name}\t${it.file.length()}"
+        }.sort()
+        def componentLines = componentCoordinates.sort()
+        def buildDirectory = layout.buildDirectory.get().asFile
+        buildDirectory.mkdirs()
+        new File(buildDirectory, "compose-ohos-components.tsv").text = componentLines.join("\n") + "\n"
+        def receipt = new File(buildDirectory, "compose-ohos-resolution.tsv")
+        receipt.text = receiptLines.join("\n") + "\n"
+        println("compose-mirror-consumer: resolved ${receiptLines.size()} artifacts; combined graph selects KBA-002 + hyphen atomicfu + KBA-003")
+    }
+}
