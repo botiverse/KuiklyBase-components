@@ -1065,7 +1065,7 @@ def main() -> int:
         agg = importlib.util.module_from_spec(agg_spec)
         agg_spec.loader.exec_module(agg)
 
-        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False, committed_no_claimid: bool = False, publish_as_complete: bool = False, committed_missing_taskid: bool = False, committed_missing_commit_receipt: bool = False, noop_decision: bool = False, noop_with_claimid: bool = False, wrong_taskid: bool = False, bad_manifest_digest: bool = False, staged_commit_receipt: bool = False, omit_verify_receipt: bool = False, bad_verify_sha: bool = False, release_task_id: str = "106"):
+        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False, committed_no_claimid: bool = False, publish_as_complete: bool = False, committed_missing_taskid: bool = False, committed_missing_commit_receipt: bool = False, noop_decision: bool = False, noop_with_claimid: bool = False, wrong_taskid: bool = False, bad_manifest_digest: bool = False, bad_manifest_digest_nonhex: bool = False, staged_commit_receipt: bool = False, omit_verify_receipt: bool = False, bad_verify_sha: bool = False, release_task_id: str = "106"):
             """One self-contained aggregate-receipt case: temp git repo whose
             HEAD is the release exact (master == dispatch == fixture sha)."""
             repo = base / "repo"
@@ -1128,7 +1128,7 @@ def main() -> int:
                 "status": "committed",
                 "claimId": "claim-0001",
                 "taskId": "wrong-task" if wrong_taskid else "106",
-                "manifestDigest": ("not-a-sha256" if bad_manifest_digest else object_digest),
+                "manifestDigest": (("not-a-sha256" if bad_manifest_digest_nonhex else (("0" * 64) if bad_manifest_digest else object_digest))),
                 "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
                 "commitReceipt": (
                     {"state": "staged"} if staged_commit_receipt
@@ -1246,6 +1246,7 @@ def main() -> int:
             ("aggregate_rejects_noop_with_claimid", {"noop_with_claimid": True}),
             ("aggregate_rejects_wrong_taskid", {"wrong_taskid": True}),
             ("aggregate_rejects_bad_manifest_digest", {"bad_manifest_digest": True}),
+            ("aggregate_rejects_nonhex_manifest_digest", {"bad_manifest_digest_nonhex": True}),
             ("aggregate_rejects_staged_commit_receipt", {"staged_commit_receipt": True}),
             ("aggregate_rejects_missing_verify_receipt", {"omit_verify_receipt": True}),
             ("aggregate_rejects_bad_verify_sha", {"bad_verify_sha": True}),

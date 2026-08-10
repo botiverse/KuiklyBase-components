@@ -197,28 +197,30 @@ def main(argv: list[str]) -> int:
         # Readback proof is mandatory on the publish path: workflow writes
         # verify-receipt.json separately so it cannot overwrite the committed
         # atomic receipt, and the aggregate must consume it.
-        if not verify_receipt_path.is_file():
-            fail("publish path requires verify-receipt.json readback proof")
-        verify_receipt = load_json(verify_receipt_path)
-        if verify_receipt.get("status") != "complete":
-            fail("verify receipt status is not complete")
-        for field in ("version", "sourceSha"):
-            if verify_receipt.get(field) != merged.get(field):
-                fail(f"verify receipt {field} drift")
-        verify_files = validate_file_entries(verify_receipt.get("files"), "verify receipt")
-        if verify_receipt.get("fileCount") != len(verify_files):
-            fail("verify receipt fileCount does not equal its file list")
-        if len(verify_files) != len(merged_files):
-            fail("verify receipt fileCount does not equal the merged manifest")
-        verify_by_path = {f["path"]: f for f in verify_files}
-        for entry in merged_files:
-            twin = verify_by_path.get(entry["path"])
-            if twin is None:
-                fail(f"verify receipt missing path: {entry['path']}")
-            if twin["sha256"] != entry["sha256"] or twin["size"] != entry["size"]:
-                fail(f"verify receipt byte binding mismatch for {entry['path']}")
-        if sorted(verify_by_path) != sorted(f["path"] for f in merged_files):
-            fail("verify receipt does not cover the merged manifest exactly")
+        require_verify_readback = True
+        if require_verify_readback:
+            if not verify_receipt_path.is_file():
+                fail("publish path requires verify-receipt.json readback proof")
+            verify_receipt = load_json(verify_receipt_path)
+            if verify_receipt.get("status") != "complete":
+                fail("verify receipt status is not complete")
+            for field in ("version", "sourceSha"):
+                if verify_receipt.get(field) != merged.get(field):
+                    fail(f"verify receipt {field} drift")
+            verify_files = validate_file_entries(verify_receipt.get("files"), "verify receipt")
+            if verify_receipt.get("fileCount") != len(verify_files):
+                fail("verify receipt fileCount does not equal its file list")
+            if len(verify_files) != len(merged_files):
+                fail("verify receipt fileCount does not equal the merged manifest")
+            verify_by_path = {f["path"]: f for f in verify_files}
+            for entry in merged_files:
+                twin = verify_by_path.get(entry["path"])
+                if twin is None:
+                    fail(f"verify receipt missing path: {entry['path']}")
+                if twin["sha256"] != entry["sha256"] or twin["size"] != entry["size"]:
+                    fail(f"verify receipt byte binding mismatch for {entry['path']}")
+            if sorted(verify_by_path) != sorted(f["path"] for f in merged_files):
+                fail("verify receipt does not cover the merged manifest exactly")
     elif decision == "noop-verified":
         if status != "complete":
             fail("noop-verified plan requires a complete publish receipt")
