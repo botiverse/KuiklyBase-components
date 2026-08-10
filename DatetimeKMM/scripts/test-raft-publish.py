@@ -744,6 +744,61 @@ def main() -> int:
             and all(loss_server.canonical[rel] == content_for(rel) for rel in paths),
         )
 
+        # B1: HTTP-success commit with malformed/empty body ({}) must also
+        # recover via inspect — not fail outer require without re-inspect.
+        class MalformedCommitServer(FakeAtomicServer):
+            def __init__(self) -> None:
+                super().__init__()
+                self.malform_next = True
+
+            def commit(self, claim_id: str) -> dict:
+                super().commit(claim_id)  # server commits
+                if self.malform_next:
+                    self.malform_next = False
+                    return {}  # HTTP success unparseable body
+                return {"state": "committed", "idempotent": True}
+
+        mal_server = MalformedCommitServer()
+        mal_out = root / "rel-commit-malformed.json"
+        mal_code = release_via(mal_server, plan_path, rel_bundle, mal_out)
+        mal_receipt = json.loads(mal_out.read_text()) if mal_out.is_file() else {}
+        mal_aborts = [c for c in mal_server.calls if c[0] == "abort"]
+        check("commit_malformed_success_recovers_zero_exit", mal_code == 0)
+        check(
+            "commit_malformed_success_writes_committed_receipt",
+            mal_receipt.get("status") == "committed"
+            and mal_receipt.get("commitReceipt", {}).get("state") == "committed"
+            and mal_receipt.get("commitReceipt", {}).get("recoveredFrom") == "commit-response-ambiguity",
+        )
+        check("commit_malformed_success_no_abort", mal_aborts == [])
+        check(
+            "commit_malformed_success_public_objects_stable",
+            len(mal_server.canonical) == len(paths)
+            and all(mal_server.canonical[rel] == content_for(rel) for rel in paths),
+        )
+
+        # B2 end-to-end: classifier plan.ownedPrefixes must equal the atomic
+        # release receipt.ownedPrefixes (both trailing-slash canonical).
+        e2e_plan = root / "e2e-plan.json"
+        e2e_receipt = root / "e2e-publish-receipt.json"
+        run_cmd(["classify", "--manifest", str(manifest_path), "--output", str(e2e_plan)], FakeClient(), env)
+        plan_obj = json.loads(e2e_plan.read_text())
+        e2e_bundle = freeze_into(staging, e2e_plan, "e2e-bundle.tar")
+        e2e_server = FakeAtomicServer()
+        e2e_code = release_via(e2e_server, e2e_plan, e2e_bundle, e2e_receipt)
+        pub_obj = json.loads(e2e_receipt.read_text()) if e2e_receipt.is_file() else {}
+        check("e2e_release_green", e2e_code == 0 and pub_obj.get("status") == "committed")
+        check(
+            "e2e_plan_receipt_owned_prefixes_equal",
+            plan_obj.get("ownedPrefixes") == pub_obj.get("ownedPrefixes"),
+        )
+        check(
+            "e2e_owned_prefixes_trailing_slash",
+            isinstance(plan_obj.get("ownedPrefixes"), list)
+            and all(isinstance(p, str) and p.endswith("/") for p in plan_obj["ownedPrefixes"])
+            and all(isinstance(p, str) and p.endswith("/") for p in pub_obj.get("ownedPrefixes", [])),
+        )
+
         # 11b. claim fences: pre-existing canonical and ordinary writers are
         # conflicts; a mid-claim ordinary writer is refused too
         fenced = FakeAtomicServer()
@@ -1099,7 +1154,7 @@ def main() -> int:
                     _tb.addfile(info, _io3.BytesIO(data))
             bundle_digest = hashlib.sha256(bundle_bytes.read_bytes()).hexdigest()
             plan_obj = {"decision": "publish", "fileCount": len(paths), "tokenHashPrefix": plan_prefix,
-                        "bundleSha256": bundle_digest, "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
+                        "bundleSha256": bundle_digest, "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] + "/" for pth in paths}),
                         "missing": sorted(paths)}
             if noop_decision or noop_with_claimid:
                 plan_obj["decision"] = "noop-verified"
@@ -1129,7 +1184,7 @@ def main() -> int:
                 "claimId": "claim-0001",
                 "taskId": "wrong-task" if wrong_taskid else "106",
                 "manifestDigest": (("not-a-sha256" if bad_manifest_digest_nonhex else (("0" * 64) if bad_manifest_digest else object_digest))),
-                "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
+                "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] + "/" for pth in paths}),
                 "commitReceipt": (
                     {"state": "staged"} if staged_commit_receipt
                     else {"state": "committed", "idempotent": False}
@@ -1214,6 +1269,19 @@ def main() -> int:
         agg_ok.mkdir()
         code = run_agg_case(agg_ok)
         check("aggregate_receipt_green", code == 0)
+
+        # B2 production pipeline: classifier-owned prefixes (with trailing /)
+        # must equal command_release receipt prefixes and pass aggregate.
+        pipe = root / "pipeline-prefix"
+        pipe.mkdir()
+        # Build plan via make_plan semantics using pub.owned_prefixes
+        plan_prefixes = pub.owned_prefixes({"files": [{"path": p, "sha256": "a"*64, "size": 1} for p in paths]})
+        claim_prefixes = __import__("atomic_release").owned_prefixes_from_paths(paths)
+        check("owned_prefixes_plan_matches_atomic_client", plan_prefixes == claim_prefixes)
+        check(
+            "owned_prefixes_trailing_slash_canonical",
+            all(p.endswith("/") for p in plan_prefixes) and all(p.endswith("/") for p in claim_prefixes),
+        )
         agg_noop = root / "agg-noop"
         agg_noop.mkdir()
         code = run_agg_case(agg_noop, noop_decision=True)

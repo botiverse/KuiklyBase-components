@@ -140,7 +140,7 @@ def main(argv: list[str]) -> int:
             fail(f"plan carries no valid {key}")
     if not isinstance(plan.get("ownedPrefixes"), list) or not plan["ownedPrefixes"]:
         fail("plan carries no ownedPrefixes")
-    manifest_prefixes = sorted({f["path"].rsplit("/", 1)[0] for f in merged_files})
+    manifest_prefixes = sorted({f["path"].rsplit("/", 1)[0] + "/" for f in merged_files})
     if sorted(plan["ownedPrefixes"]) != manifest_prefixes:
         fail("plan ownedPrefixes do not equal the manifest-derived prefixes")
     if not isinstance(plan.get("missing"), list):

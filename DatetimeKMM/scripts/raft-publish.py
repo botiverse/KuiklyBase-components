@@ -422,7 +422,9 @@ def load_manifest(path: Path) -> dict:
 
 
 def owned_prefixes(manifest: dict) -> list[str]:
-    return sorted({entry["path"].rsplit("/", 1)[0] for entry in manifest["files"]})
+    """Canonical version-directory prefixes WITH trailing slash — same form as
+    atomic_release.owned_prefixes_from_paths and the server ledger."""
+    return sorted({entry["path"].rsplit("/", 1)[0] + "/" for entry in manifest["files"]})
 
 
 # --- classify / publish / verify ----------------------------------------------
@@ -437,7 +439,7 @@ def make_plan(client: RepositoryClient, manifest: dict, list_primaries) -> dict:
     unexpected = sorted(
         item["key"]
         for item in primaries
-        if any(item["key"].startswith(prefix + "/") for prefix in prefixes)
+        if any(item["key"].startswith(prefix) for prefix in prefixes)
         and item["key"] not in receipt_paths
     )
     require(
@@ -773,11 +775,19 @@ def command_release(args: argparse.Namespace) -> int:
                 f"server inspect reports staged={staged_count}, expected {len(objects)}",
             )
             commit_receipt = client.commit(claim_id)
+            # HTTP success with empty/malformed JSON becomes {} from the client.
+            # Treat any non-committed success body as the same ambiguity class
+            # as a raised transport error: re-inspect before aborting.
+            if not (isinstance(commit_receipt, dict) and commit_receipt.get("state") == "committed"):
+                raise ar.AtomicReleaseError(
+                    "commit-response-malformed",
+                    f"commit returned non-committed body: {commit_receipt!r}",
+                )
         except (PublishError, ar.AtomicReleaseError) as error:
             # Commit-response ambiguity: the server may have already committed
-            # when the response is lost. Inspect BEFORE abort. If committed,
-            # recover a server-backed receipt and proceed; only abort when the
-            # claim is still staged (true pre-commit failure).
+            # when the response is lost or unparseable. Inspect BEFORE abort.
+            # If committed, recover a server-backed receipt and proceed; only
+            # abort when the claim is still staged (true pre-commit failure).
             reason = f"{type(error).__name__}: {error}"
             try:
                 recovered = client.inspect(claim_id)
@@ -802,7 +812,7 @@ def command_release(args: argparse.Namespace) -> int:
                     }
                 )
                 print(
-                    f"release committed under {claim_id} despite lost commit response; "
+                    f"release committed under {claim_id} despite ambiguous commit response; "
                     "recovered via inspect (no abort)",
                     file=sys.stderr,
                 )
@@ -866,12 +876,12 @@ def command_verify(args: argparse.Namespace) -> int:
     # Terminal aggregate proof: re-enumerate the selection's owned prefixes
     # and require exact-set equality -- nothing missing, nothing extra.
     receipt_paths = {entry["path"] for entry in selected}
-    prefixes = sorted({entry["path"].rsplit("/", 1)[0] for entry in selected})
+    prefixes = sorted({entry["path"].rsplit("/", 1)[0] + "/" for entry in selected})
     primaries = list_primaries_from_env()
     remote_set = {
         item["key"]
         for item in primaries
-        if any(item["key"].startswith(prefix + "/") for prefix in prefixes)
+        if any(item["key"].startswith(prefix) for prefix in prefixes)
     }
     extra = sorted(remote_set - receipt_paths)
     missing_remote = sorted(receipt_paths - remote_set)
