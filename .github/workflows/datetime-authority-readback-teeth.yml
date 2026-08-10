@@ -21,6 +21,7 @@ on:
       - DatetimeKMM/scripts/publish-lib.sh
       - DatetimeKMM/scripts/publish-raft-artifacts.sh
       - DatetimeKMM/scripts/raft-publish.py
+      - DatetimeKMM/scripts/atomic_release.py
       - DatetimeKMM/scripts/aggregate-release-receipt.py
       - DatetimeKMM/scripts/test-raft-publish.py
       - DatetimeKMM/scripts/test-raft-publish-admission.sh
@@ -38,6 +39,7 @@ on:
       - DatetimeKMM/scripts/publish-lib.sh
       - DatetimeKMM/scripts/publish-raft-artifacts.sh
       - DatetimeKMM/scripts/raft-publish.py
+      - DatetimeKMM/scripts/atomic_release.py
       - DatetimeKMM/scripts/aggregate-release-receipt.py
       - DatetimeKMM/scripts/test-raft-publish.py
       - DatetimeKMM/scripts/test-raft-publish-admission.sh

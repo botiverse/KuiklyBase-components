@@ -481,26 +481,33 @@ jobs:
           [ "$(git rev-parse origin/master)" = "${GITHUB_SHA}" ]             || { echo "landed master drifted before publish — stop" >&2; exit 1; }
           case "$GLOBAL_DECISION" in
             publish)
+              # Atomic release writes the terminal publish receipt (status=committed
+              # + claimId/taskId/manifestDigest/commitReceipt). Verify must NOT
+              # overwrite it — readback goes to a separate artifact.
               python3 scripts/raft-publish.py release \
                 --manifest ../artifacts-in/merged-manifest.json \
                 --plan ../artifacts-in/global-plan.json \
                 --bundle ../artifacts-in/frozen-bundle.tar \
                 --token-receipt-out publish-token-receipt.json \
                 --output publish-receipt.json
+              python3 scripts/raft-publish.py verify \
+                --manifest ../artifacts-in/merged-manifest.json \
+                --output verify-receipt.json
               ;;
             noop-verified)
-              # Verified no-op: zero staged objects. The token receipt is still
+              # Verified no-op: zero staged objects. Token receipt is still
               # minted so the terminal identity check sees this job's
-              # credential shape.
+              # credential shape. Verify produces the complete publish receipt
+              # (byte-identical re-read of already-present carriers).
               python3 scripts/raft-publish.py token-receipt --output publish-token-receipt.json
+              python3 scripts/raft-publish.py verify \
+                --manifest ../artifacts-in/merged-manifest.json \
+                --output publish-receipt.json
               echo "global decision is noop-verified: zero staged objects"
               ;;
             *)
               echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
           esac
-          python3 scripts/raft-publish.py verify \
-            --manifest ../artifacts-in/merged-manifest.json \
-            --output publish-receipt.json
       - name: Upload publish receipts
         uses: actions/upload-artifact@v4
         with:
@@ -508,6 +515,7 @@ jobs:
           path: |
             DatetimeKMM/publish-receipt.json
             DatetimeKMM/publish-token-receipt.json
+            DatetimeKMM/verify-receipt.json
           if-no-files-found: error
           retention-days: 90
 

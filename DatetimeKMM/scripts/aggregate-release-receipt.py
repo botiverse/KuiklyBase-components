@@ -155,11 +155,38 @@ def main(argv: list[str]) -> int:
     if publish_receipt.get("fileCount") != len(publish_files):
         fail("publish receipt fileCount does not equal its file list")
 
-    if publish_receipt.get("status") not in {"complete", "committed"}:
-        fail("publish receipt incomplete")
-    if publish_receipt.get("status") == "committed":
-        if not isinstance(publish_receipt.get("claimId"), str) or not publish_receipt["claimId"]:
-            fail("committed publish receipt carries no claimId")
+    # Decision ↔ receipt status is a hard binding, not a soft option set:
+    #   publish        → status=committed + full atomic identity
+    #   noop-verified  → status=complete  (byte re-read of already-present set)
+    # Accepting "complete" for a publish plan would green-light a path that
+    # never claimed/staged/committed (the exact fail-open B1 closed).
+    decision = plan["decision"]
+    status = publish_receipt.get("status")
+    if decision == "publish":
+        if status != "committed":
+            fail("publish plan requires a committed publish receipt")
+        for key in ("claimId", "taskId", "manifestDigest"):
+            if not isinstance(publish_receipt.get(key), str) or not publish_receipt[key]:
+                fail(f"committed publish receipt carries no {key}")
+        if not isinstance(publish_receipt.get("commitReceipt"), dict) or not publish_receipt["commitReceipt"]:
+            fail("committed publish receipt carries no commitReceipt")
+        if not isinstance(publish_receipt.get("ownedPrefixes"), list) or not publish_receipt["ownedPrefixes"]:
+            fail("committed publish receipt carries no ownedPrefixes")
+        if sorted(publish_receipt["ownedPrefixes"]) != sorted(plan["ownedPrefixes"]):
+            fail("committed publish receipt ownedPrefixes do not equal the plan")
+        if publish_receipt.get("manifestDigest") != plan.get("bundleSha256") and False:
+            # manifestDigest is over the object set, not the tar; binding is
+            # checked by the release client itself. Keep claim/task/commit only.
+            pass
+    elif decision == "noop-verified":
+        if status != "complete":
+            fail("noop-verified plan requires a complete publish receipt")
+        # A complete receipt must not pretend to be atomic.
+        for key in ("claimId", "taskId", "manifestDigest", "commitReceipt"):
+            if key in publish_receipt and publish_receipt[key] not in (None, "", {}, []):
+                fail(f"complete publish receipt must not carry atomic field {key}")
+    else:
+        fail("plan decision is not a known value")
     for field in ("version", "sourceSha"):
         if publish_receipt.get(field) != merged.get(field):
             fail(f"publish receipt {field} drift")
@@ -228,16 +255,22 @@ def main(argv: list[str]) -> int:
         fail(f"token identity drifted across jobs: {sorted(p for p in prefixes if p)}")
 
     aggregate = {
-        "status": "complete",
+        "status": "complete" if decision == "noop-verified" else "committed",
         "version": merged["version"],
         "sourceSha": merged["sourceSha"],
         "destination": merged.get("destination", ""),
         "fileCount": merged.get("fileCount"),
         "files": merged["files"],
         "plan": plan,
+        "publishReceiptStatus": status,
         "tokenIdentities": sorted(prefixes),
         "receipts": ["plan", "publish", "receipt"],
     }
+    if decision == "publish":
+        aggregate["claimId"] = publish_receipt["claimId"]
+        aggregate["taskId"] = publish_receipt["taskId"]
+        aggregate["manifestDigest"] = publish_receipt["manifestDigest"]
+        aggregate["commitReceipt"] = publish_receipt["commitReceipt"]
     Path(args.output).write_text(json.dumps(aggregate, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(
         f"aggregate receipt: {merged['fileCount']} files, version={merged['version']}, "

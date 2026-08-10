@@ -456,6 +456,10 @@ else
     "DatetimeKMM/scripts/authority-readback.sh" \
     "DatetimeKMM/scripts/authority-readback-teeth.sh" \
     "DatetimeKMM/scripts/assert-readback-receipt.py" \
+    "DatetimeKMM/scripts/raft-publish.py" \
+    "DatetimeKMM/scripts/atomic_release.py" \
+    "DatetimeKMM/scripts/aggregate-release-receipt.py" \
+    "DatetimeKMM/scripts/test-raft-publish.py" \
     ".github/workflows/datetime-authority-readback.yml" \
     ".github/workflows/datetime-authority-readback-teeth.yml"
   do

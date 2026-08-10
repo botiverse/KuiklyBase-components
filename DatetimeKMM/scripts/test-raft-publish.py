@@ -1024,7 +1024,7 @@ def main() -> int:
         agg = importlib.util.module_from_spec(agg_spec)
         agg_spec.loader.exec_module(agg)
 
-        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False, committed_no_claimid: bool = False):
+        def run_agg_case(base: Path, plan_prefix="a" * 16, publish_prefix="a" * 16, terminal_prefix="a" * 16, drop_last_file: bool = False, bad_receipt_sha: bool = False, bad_plan_decision: bool = False, missing_plan_prefix: bool = False, expired_terminal: bool = False, committed_no_claimid: bool = False, publish_as_complete: bool = False, committed_missing_taskid: bool = False, committed_missing_commit_receipt: bool = False, noop_decision: bool = False, noop_with_claimid: bool = False):
             """One self-contained aggregate-receipt case: temp git repo whose
             HEAD is the release exact (master == dispatch == fixture sha)."""
             repo = base / "repo"
@@ -1060,6 +1060,9 @@ def main() -> int:
             plan_obj = {"decision": "publish", "fileCount": len(paths), "tokenHashPrefix": plan_prefix,
                         "bundleSha256": bundle_digest, "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
                         "missing": sorted(paths)}
+            if noop_decision or noop_with_claimid:
+                plan_obj["decision"] = "noop-verified"
+                plan_obj["missing"] = []
             if bad_plan_decision:
                 plan_obj["decision"] = "teleport"
             if missing_plan_prefix:
@@ -1073,10 +1076,37 @@ def main() -> int:
             receipt_files = [dict(f) for f in receipt_files]
             if bad_receipt_sha:
                 receipt_files[0]["sha256"] = "z" * 64
-            receipt_obj = {"status": "committed", "claimId": "claim-0001", "version": VERSION, "sourceSha": sha,
-                           "fileCount": len(receipt_files), "files": receipt_files}
+            receipt_obj = {
+                "status": "committed",
+                "claimId": "claim-0001",
+                "taskId": "106",
+                "manifestDigest": "b" * 64,
+                "ownedPrefixes": sorted({pth.rsplit("/", 1)[0] for pth in paths}),
+                "commitReceipt": {"state": "committed", "idempotent": False},
+                "version": VERSION,
+                "sourceSha": sha,
+                "fileCount": len(receipt_files),
+                "files": receipt_files,
+            }
+            if publish_as_complete or noop_decision or noop_with_claimid:
+                # Real verify-shape complete receipt (what overwrote committed
+                # before B1 was closed). No atomic identity fields.
+                receipt_obj = {
+                    "status": "complete",
+                    "version": VERSION,
+                    "sourceSha": sha,
+                    "fileCount": len(receipt_files),
+                    "files": receipt_files,
+                    "destination": pub.RAFT_ARTIFACTS_BASE_URL,
+                }
+                if noop_with_claimid:
+                    receipt_obj["claimId"] = "claim-should-not-be-here"
             if committed_no_claimid:
-                del receipt_obj["claimId"]
+                receipt_obj.pop("claimId", None)
+            if committed_missing_taskid:
+                receipt_obj.pop("taskId", None)
+            if committed_missing_commit_receipt:
+                receipt_obj.pop("commitReceipt", None)
             json.dump(receipt_obj,
                       open(artifacts / "datetime-raft-receipt-publish" / "publish-receipt.json", "w"))
             json.dump(dict(FAKE_TOKEN_RECEIPT, hashPrefix=publish_prefix),
@@ -1111,6 +1141,10 @@ def main() -> int:
         agg_ok.mkdir()
         code = run_agg_case(agg_ok)
         check("aggregate_receipt_green", code == 0)
+        agg_noop = root / "agg-noop"
+        agg_noop.mkdir()
+        code = run_agg_case(agg_noop, noop_decision=True)
+        check("aggregate_noop_complete_green", code == 0)
         agg_aba = root / "agg-aba"
         agg_aba.mkdir()
         try:
@@ -1131,6 +1165,12 @@ def main() -> int:
             ("aggregate_rejects_missing_plan_prefix", {"missing_plan_prefix": True}),
             ("aggregate_rejects_expired_terminal_receipt", {"expired_terminal": True}),
             ("aggregate_rejects_committed_without_claimid", {"committed_no_claimid": True}),
+            # B1 real-shape arms: publish + complete (no claimId) must RED;
+            # committed missing taskId / commitReceipt must RED; noop+claimId must RED.
+            ("aggregate_rejects_publish_with_complete_receipt", {"publish_as_complete": True}),
+            ("aggregate_rejects_committed_without_taskid", {"committed_missing_taskid": True}),
+            ("aggregate_rejects_committed_without_commit_receipt", {"committed_missing_commit_receipt": True}),
+            ("aggregate_rejects_noop_with_claimid", {"noop_with_claimid": True}),
         ):
             case_dir = root / ("agg-" + name)
             case_dir.mkdir()
@@ -1240,6 +1280,21 @@ def main() -> int:
         check(
             "workflow_publish_binds_release_task_id",
             "RAFT_RELEASE_TASK_ID: ${{ github.event.inputs.release_task_id }}" in publish_block,
+        )
+        # B1: release writes publish-receipt.json; verify must target a SEPARATE
+        # file on the publish arm so the atomic committed receipt is preserved.
+        # The unconditional `verify --output publish-receipt.json` after the
+        # case is the exact fail-open shape.
+        check(
+            "workflow_publish_verify_does_not_overwrite_committed_receipt",
+            "--output verify-receipt.json" in publish_block
+            and publish_block.find("raft-publish.py release") < publish_block.find("verify-receipt.json"),
+        )
+        # After the case/esac there must be no `raft-publish.py verify ... --output publish-receipt.json`.
+        after_case = publish_block.split("esac", 1)[-1] if "esac" in publish_block else ""
+        check(
+            "workflow_no_post_case_verify_overwrite",
+            re.search(r"raft-publish\.py\s+verify[\s\S]*?--output\s+publish-receipt\.json", after_case) is None,
         )
 
         # 18. token self-receipt teeth (fake introspection opener).
