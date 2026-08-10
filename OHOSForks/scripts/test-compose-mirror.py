@@ -252,6 +252,75 @@ def test_writer_order() -> None:
     print("test-compose-mirror: PASS payload -> physical metadata -> root metadata ordering")
 
 
+def test_consumer_closure_receipt() -> None:
+    terminal_digest = "a" * 64
+    with tempfile.TemporaryDirectory(prefix="compose-consumer-closure.") as temporary:
+        root = Path(temporary)
+        success_path = root / "success.json"
+        mirror.write_consumer_closure_receipt(
+            MANIFEST_PATH,
+            terminal_digest,
+            "success",
+            success_path,
+        )
+        success = json.loads(success_path.read_text())
+        require(success["status"] == "complete", "successful consumer closure was not complete")
+        require(
+            success["publicationTerminalReceiptSha256"] == terminal_digest,
+            "consumer closure lost the terminal publication receipt binding",
+        )
+        require(
+            success["externalPredecessor"]["task"] == 121,
+            "consumer closure lost the task #121 predecessor task identity",
+        )
+        require(
+            success["externalPredecessor"]["coordinates"] == [
+                "org.jetbrains.kotlin:kotlin-stdlib:2.0.21-KBA-003",
+                "org.jetbrains.kotlin:kotlin-stdlib-common:2.0.21-KBA-003",
+                "org.jetbrains.kotlinx:atomicfu:0.23.2-KBA-001",
+                "org.jetbrains.kotlinx:atomicfu-ohosarm64:0.23.2-KBA-001",
+                "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0-KBA-002",
+                "org.jetbrains.kotlinx:kotlinx-coroutines-core-ohosarm64:1.8.0-KBA-002",
+            ],
+            "consumer closure lost the exact task #121 predecessor identity",
+        )
+
+        pending_path = root / "pending.json"
+        mirror.write_consumer_closure_receipt(
+            MANIFEST_PATH,
+            terminal_digest,
+            "failure",
+            pending_path,
+        )
+        pending = json.loads(pending_path.read_text())
+        require(
+            pending["status"] == "not-closed" and pending["resolutionOutcome"] == "failure",
+            "failed consumer closure was promoted to complete",
+        )
+
+        expect_failure(
+            lambda: mirror.write_consumer_closure_receipt(
+                MANIFEST_PATH,
+                "not-a-digest",
+                "success",
+                root / "invalid-digest.json",
+            ),
+            "terminal receipt SHA-256 is invalid",
+            "invalid terminal publication receipt binding",
+        )
+        expect_failure(
+            lambda: mirror.write_consumer_closure_receipt(
+                MANIFEST_PATH,
+                terminal_digest,
+                "skipped",
+                root / "invalid-outcome.json",
+            ),
+            "outcome must be success or failure",
+            "skipped consumer closure outcome",
+        )
+    print("test-compose-mirror: PASS terminal publication to consumer-closure receipt binding")
+
+
 def update_entry(manifest: dict[str, Any], relative: str, path: Path) -> None:
     entry = next(item for item in manifest["files"] if item["path"] == relative)
     body = path.read_bytes()
@@ -481,6 +550,7 @@ def main() -> int:
     test_transports()
     test_planner_states()
     test_writer_order()
+    test_consumer_closure_receipt()
     if arguments.authority_bytes is not None:
         semantic_mutations(arguments.authority_bytes.resolve())
     print("test-compose-mirror: PASS all contract teeth")

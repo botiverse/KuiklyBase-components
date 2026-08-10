@@ -17,6 +17,8 @@ Commands:
   plan    --manifest M --output P
   publish --manifest M --bytes-dir B --plan P --output W
   verify  --manifest M --output R
+  consumer-status --manifest M --terminal-receipt-sha256 H
+                  --resolution-outcome O --output R
 """
 from __future__ import annotations
 
@@ -82,6 +84,15 @@ EXPECTED_KBA_COORDINATES = {
     "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0-KBA-001",
     "org.jetbrains.kotlinx:kotlinx-coroutines-core-ohosarm64:1.8.0-KBA-001",
 }
+
+EXPECTED_CURRENT_PREDECESSOR_COORDINATES = (
+    "org.jetbrains.kotlin:kotlin-stdlib:2.0.21-KBA-003",
+    "org.jetbrains.kotlin:kotlin-stdlib-common:2.0.21-KBA-003",
+    "org.jetbrains.kotlinx:atomicfu:0.23.2-KBA-001",
+    "org.jetbrains.kotlinx:atomicfu-ohosarm64:0.23.2-KBA-001",
+    "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.0-KBA-002",
+    "org.jetbrains.kotlinx:kotlinx-coroutines-core-ohosarm64:1.8.0-KBA-002",
+)
 
 
 class MirrorError(RuntimeError):
@@ -796,6 +807,38 @@ def verify(manifest_path: Path, output: Path, *, attempts: int = 6) -> None:
     write_json_exclusive(output, receipt)
 
 
+def write_consumer_closure_receipt(
+    manifest_path: Path,
+    terminal_receipt_sha256: str,
+    resolution_outcome: str,
+    output: Path,
+) -> None:
+    load_manifest(manifest_path)
+    require(
+        SHA256_RE.fullmatch(terminal_receipt_sha256) is not None,
+        "publication terminal receipt SHA-256 is invalid",
+    )
+    require(
+        resolution_outcome in {"success", "failure"},
+        "consumer resolution outcome must be success or failure",
+    )
+    receipt = {
+        "schema": 1,
+        "task": EXPECTED_TASK,
+        "status": "complete" if resolution_outcome == "success" else "not-closed",
+        "resolutionOutcome": resolution_outcome,
+        "manifestSha256": sha256_file(manifest_path),
+        "publicationTerminalReceiptSha256": terminal_receipt_sha256,
+        "publicationBoundary": "32-maven-primaries-verified-before-consumer-closure",
+        "provenance": runner_provenance(),
+        "externalPredecessor": {
+            "task": 121,
+            "coordinates": list(EXPECTED_CURRENT_PREDECESSOR_COORDINATES),
+        },
+    }
+    write_json_exclusive(output, receipt)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -814,6 +857,11 @@ def main() -> int:
     verify_parser = subparsers.add_parser("verify")
     verify_parser.add_argument("--manifest", type=Path, required=True)
     verify_parser.add_argument("--output", type=Path, required=True)
+    consumer_parser = subparsers.add_parser("consumer-status")
+    consumer_parser.add_argument("--manifest", type=Path, required=True)
+    consumer_parser.add_argument("--terminal-receipt-sha256", required=True)
+    consumer_parser.add_argument("--resolution-outcome", required=True)
+    consumer_parser.add_argument("--output", type=Path, required=True)
     arguments = parser.parse_args()
     try:
         if arguments.command == "fetch":
@@ -833,8 +881,20 @@ def main() -> int:
             )
             print(f"compose-mirror: resumable immutable Maven PUT complete: {arguments.output}")
             return 0
-        verify(arguments.manifest.resolve(), arguments.output.resolve())
-        print(f"compose-mirror: anonymous terminal readback 32/32 complete: {arguments.output}")
+        if arguments.command == "verify":
+            verify(arguments.manifest.resolve(), arguments.output.resolve())
+            print(f"compose-mirror: anonymous terminal readback 32/32 complete: {arguments.output}")
+            return 0
+        write_consumer_closure_receipt(
+            arguments.manifest.resolve(),
+            arguments.terminal_receipt_sha256,
+            arguments.resolution_outcome,
+            arguments.output.resolve(),
+        )
+        print(
+            "compose-mirror: combined consumer closure "
+            f"status recorded for outcome={arguments.resolution_outcome}: {arguments.output}"
+        )
         return 0
     except MirrorError as error:
         print(f"compose-mirror: {error}", file=sys.stderr)
