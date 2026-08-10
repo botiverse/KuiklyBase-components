@@ -205,7 +205,7 @@ def test_planner_states() -> None:
         fetcher(subset),
         positive_control=False,
     )
-    require(partial["decision"] == "hold-partial-exact", "partial exact state did not hold")
+    require(partial["decision"] == "resume-partial-exact", "partial exact state is not resumable")
 
     divergent_store = dict(payloads)
     first = sorted(payloads)[0]
@@ -234,7 +234,7 @@ def test_planner_states() -> None:
         positive_control=False,
     )
     require(listing_mismatch["decision"] == "hold-conflict" and len(listing_mismatch["listingMismatch"]) == 32, "listing/GET mismatch did not conflict")
-    print("test-compose-mirror: PASS all-absent/complete/partial/divergent/unexpected/listing-mismatch planner teeth")
+    print("test-compose-mirror: PASS all-absent/complete/resumable-partial/divergent/unexpected/listing-mismatch planner teeth")
 
 
 def test_writer_order() -> None:
@@ -302,7 +302,73 @@ def publication_contract_teeth(manifest: dict[str, Any], authority_bytes: Path, 
     )
     expected_order = sorted(mirror.manifest_entries(manifest), key=mirror.publication_priority)
     require([path for path, _body in writer.calls] == expected_order, "PUT-only writer order changed")
-    require(json.loads(receipt.read_text())["fileCount"] == 32, "writer receipt count changed")
+    require(
+        len(writer.calls) == 32 and all("authority-manifest" not in path for path, _body in writer.calls),
+        "task #120 wrote a completion marker or non-primary path",
+    )
+    receipt_value = json.loads(receipt.read_text())
+    require(receipt_value["existingCount"] == 0 and receipt_value["uploadedCount"] == 32, "writer receipt count changed")
+    require(receipt_value["uploadedPaths"] == expected_order, "writer receipt path order changed")
+    require(
+        receipt_value["publicationBoundary"] == "32-maven-primaries-only-no-completion-marker",
+        "writer receipt lost the task #120 publication boundary",
+    )
+
+    existing = expected_order[:9]
+    changed = copy.deepcopy(plan)
+    changed["remote"]["decision"] = "resume-partial-exact"
+    changed["remote"]["existing"] = existing
+    changed["remote"]["missing"] = [path for path in expected_order if path not in existing]
+    changed_path = root / "partial-plan.json"
+    changed_path.write_text(json.dumps(changed), encoding="utf-8")
+    resume_writer = RecordingWriter()
+    resume_receipt = root / "resume-writer-receipt.json"
+    mirror.publish(
+        MANIFEST_PATH,
+        authority_bytes,
+        changed_path,
+        resume_receipt,
+        writer_factory=lambda _base, _username, _token: resume_writer,
+    )
+    require(
+        [path for path, _body in resume_writer.calls]
+        == sorted(changed["remote"]["missing"], key=mirror.publication_priority),
+        "resumable writer did not PUT only planned missing paths",
+    )
+    resume_value = json.loads(resume_receipt.read_text())
+    require(resume_value["existingCount"] == 9 and resume_value["uploadedCount"] == 23, "resume receipt count changed")
+    require(set(resume_value["existingPaths"]) == set(existing), "resume receipt lost identical existing paths")
+
+    changed = copy.deepcopy(plan)
+    first = changed["remote"]["missing"].pop(0)
+    changed["remote"]["divergent"] = [{"path": first, "remoteSize": 1, "remoteSha256": "0" * 64}]
+    changed_path = root / "divergent-plan.json"
+    changed_path.write_text(json.dumps(changed), encoding="utf-8")
+    divergent_writer = RecordingWriter()
+    expect_failure(
+        lambda: mirror.publish(
+            MANIFEST_PATH,
+            authority_bytes,
+            changed_path,
+            root / "divergent-receipt.json",
+            writer_factory=lambda _base, _username, _token: divergent_writer,
+        ),
+        "writer plan contains conflicts",
+        "divergent remote bytes stop before PUT",
+    )
+    require(divergent_writer.calls == [], "divergent plan reached the writer")
+
+    changed = copy.deepcopy(plan)
+    changed["remote"]["decision"] = "noop-complete-identical"
+    changed["remote"]["existing"] = list(changed["remote"]["missing"])
+    changed["remote"]["missing"] = []
+    changed_path = root / "complete-plan.json"
+    changed_path.write_text(json.dumps(changed), encoding="utf-8")
+    expect_failure(
+        lambda: mirror.load_publish_contract(MANIFEST_PATH, authority_bytes, changed_path),
+        "writer plan is not publishable",
+        "complete-identical state skips the writer",
+    )
 
     conflict_writer = RecordingWriter([409])
     expect_failure(
@@ -344,10 +410,10 @@ def publication_contract_teeth(manifest: dict[str, Any], authority_bytes: Path, 
     changed_path.write_text(json.dumps(changed), encoding="utf-8")
     expect_failure(
         lambda: mirror.load_publish_contract(MANIFEST_PATH, authority_bytes, changed_path),
-        "does not cover all 32 missing paths",
+        "does not cover the exact 32 paths",
         "incomplete writer plan",
     )
-    print("test-compose-mirror: PASS manifest/plan/staging binding and create-only writer teeth")
+    print("test-compose-mirror: PASS manifest/plan/staging binding and resumable immutable Maven writer teeth")
 
 
 def semantic_mutations(authority_bytes: Path) -> None:

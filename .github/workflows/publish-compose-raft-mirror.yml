@@ -1,6 +1,9 @@
-# One-shot exact-byte mirror for task #120.  The preflight job is entirely
-# anonymous.  The protected job exposes the scoped credential to one PUT-only
-# step; planning, terminal byte comparison and Gradle resolution stay public.
+# Resumable exact-byte mirror for task #120.  The preflight job is entirely
+# anonymous.  The protected job exposes the repository/group-scoped credential
+# only to PUT steps; planning, byte comparison and Gradle resolution stay public.
+# This workflow never publishes authority-manifest.json or another completion
+# coordinate.  Task #93 alone writes the Kuikly release manifest after this
+# task's anonymous 32/32 receipt and the other predecessors have closed.
 name: Compose 1.7.3-kuikly2 Raft mirror (publish + verify)
 
 on:
@@ -120,7 +123,7 @@ jobs:
           retention-days: 90
 
   publish:
-    name: Protected create-only PUT and anonymous terminal proof
+    name: Protected resumable PUT and anonymous terminal proof
     needs: preflight
     runs-on: ubuntu-latest
     environment: raft-artifacts-production
@@ -195,11 +198,11 @@ jobs:
           decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["remote"]["decision"])' "$OUT_DIR/raft-plan.json")"
           echo "decision=$decision" >> "$GITHUB_OUTPUT"
 
-      # The only step with a secret.  compose-mirror.py exposes only PUT,
-      # sends If-None-Match: *, never retries an ambiguous write, and accepts
-      # only the all-32-absent plan from this same source/run tuple.
-      - name: Create 32 immutable primaries
-        if: steps.plan.outputs.decision == 'publish-all-absent'
+      # The only primary-byte step with the repository's one long-lived
+      # publish-only secret.  Existing identical files are skipped by the
+      # fresh anonymous plan; only missing files receive conditional PUTs.
+      - name: PUT only missing immutable primaries
+        if: steps.plan.outputs.decision != 'noop-complete-identical'
         env:
           RAFT_ARTIFACTS_USERNAME: raft-ci
           RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}

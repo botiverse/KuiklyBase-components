@@ -78,7 +78,7 @@ jobs:
             --output "$OUT_DIR/raft-plan.json"
           decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["remote"]["decision"])' "$OUT_DIR/raft-plan.json")"
           case "$decision" in
-            publish-all-absent|noop-complete-identical) ;;
+            publish-all-absent|resume-partial-exact|noop-complete-identical) ;;
             *) echo "non-terminal Raft plan: $decision" >&2; exit 1 ;;
           esac
 

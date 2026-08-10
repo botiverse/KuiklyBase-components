@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Exact-byte Tencent Compose authority reader and one-shot Raft mirror.
+"""Exact-byte Tencent Compose authority reader and resumable Raft mirror.
 
 Raft task #120 owns exactly eight 1.7.3-kuikly2 GAVs (32 primary files).
 The immutable manifest is the sole admission authority.  This program never
 rebuilds or rewrites a Maven byte.  Public authority fetch, Raft planning and
-terminal verification are anonymous; the publish credential exists only in
-the PUT-only writer process.
+terminal verification are anonymous; the repository-scoped publish credential
+exists only in the PUT-only writer process.  Identical partial state is a
+normal resumable Maven publication state; divergent bytes always stop.
+
+This task publishes only the 32 Maven primaries.  The authority manifest stays
+an audit/admission input and is never PUT to Maven.  The sole public Kuikly
+release marker is owned by task #93 after all predecessor receipts are closed.
 
 Commands:
   fetch   --manifest M --bytes-dir B --receipt R
@@ -199,7 +204,7 @@ class PublicRepositoryClient:
 
 
 class CreateOnlyWriter:
-    """PUT-only transport.  It deliberately has no read method."""
+    """Immutable Maven PUT-only transport.  It deliberately has no read method."""
 
     def __init__(
         self,
@@ -659,7 +664,7 @@ def classify_remote(
     elif len(existing) == EXPECTED_FILE_COUNT and not missing:
         decision = "noop-complete-identical"
     else:
-        decision = "hold-partial-exact"
+        decision = "resume-partial-exact"
     return {
         "decision": decision,
         "existing": existing,
@@ -702,11 +707,18 @@ def load_publish_contract(
     require(plan.get("provenance") == runner_provenance(), "publication plan is not bound to this source/run tuple")
     remote = plan.get("remote")
     require(isinstance(remote, dict), "publication plan has no remote state")
-    require(remote.get("decision") == "publish-all-absent", "writer requires an all-absent plan")
-    require(remote.get("existing") == [], "writer plan already contains existing paths")
+    decision = remote.get("decision")
+    require(decision in {"publish-all-absent", "resume-partial-exact"}, "writer plan is not publishable")
     require(remote.get("divergent") == [] and remote.get("unexpected") == [], "writer plan contains conflicts")
     require(remote.get("listingMismatch") == [], "writer plan has listing/GET disagreement")
-    require(set(remote.get("missing", [])) == set(manifest_entries(manifest)), "writer plan does not cover all 32 missing paths")
+    existing = remote.get("existing")
+    missing = remote.get("missing")
+    require(isinstance(existing, list) and isinstance(missing, list), "writer plan path sets are invalid")
+    require(len(existing) == len(set(existing)) and len(missing) == len(set(missing)), "writer plan contains duplicate paths")
+    require(set(existing).isdisjoint(missing), "writer plan overlaps existing and missing paths")
+    require(set(existing) | set(missing) == set(manifest_entries(manifest)), "writer plan does not cover the exact 32 paths")
+    expected_decision = "publish-all-absent" if not existing else "resume-partial-exact"
+    require(decision == expected_decision and missing, "writer plan decision does not match its exact remote state")
     return manifest, plan
 
 
@@ -729,12 +741,14 @@ def publish(
     output: Path,
     writer_factory: Callable[[str, str, str], CreateOnlyWriter] = CreateOnlyWriter,
 ) -> None:
-    manifest, _plan = load_publish_contract(manifest_path, bytes_dir, plan_path)
+    manifest, plan = load_publish_contract(manifest_path, bytes_dir, plan_path)
     username = os.environ.get("RAFT_ARTIFACTS_USERNAME", "raft-ci")
     token = os.environ.get("RAFT_ARTIFACTS_PUBLISH_TOKEN", "")
     writer = writer_factory(os.environ.get("RAFT_ARTIFACTS_URL", RAFT_BASE_URL), username, token)
+    existing = plan["remote"]["existing"]
+    missing = plan["remote"]["missing"]
     uploaded: list[str] = []
-    for relative in sorted(manifest_entries(manifest), key=publication_priority):
+    for relative in sorted(missing, key=publication_priority):
         body = (bytes_dir / relative).read_bytes()
         status = writer.put(relative, body)
         require(
@@ -745,10 +759,14 @@ def publish(
     receipt = {
         "schema": 1,
         "status": "put-complete-awaiting-anonymous-verification",
+        "publicationBoundary": "32-maven-primaries-only-no-completion-marker",
         "manifestSha256": sha256_file(manifest_path),
-        "fileCount": len(uploaded),
+        "existingCount": len(existing),
+        "uploadedCount": len(uploaded),
+        "targetFileCount": EXPECTED_FILE_COUNT,
         "provenance": runner_provenance(),
-        "paths": uploaded,
+        "existingPaths": existing,
+        "uploadedPaths": uploaded,
     }
     write_json_exclusive(output, receipt)
 
@@ -760,7 +778,7 @@ def verify(manifest_path: Path, output: Path, *, attempts: int = 6) -> None:
         remote = classify_remote(manifest, live_list_scope, live_fetch_raft)
         if remote["decision"] == "noop-complete-identical":
             break
-        if attempt + 1 < attempts and remote["decision"] in {"hold-partial-exact", "hold-conflict"}:
+        if attempt + 1 < attempts and remote["decision"] in {"resume-partial-exact", "hold-conflict"}:
             time.sleep(5)
             continue
         break
@@ -805,7 +823,7 @@ def main() -> int:
         if arguments.command == "plan":
             decision = make_plan(arguments.manifest.resolve(), arguments.output.resolve())
             print(f"compose-mirror: anonymous Raft plan decision={decision}")
-            return 0 if decision in {"publish-all-absent", "noop-complete-identical"} else 2
+            return 0 if decision in {"publish-all-absent", "resume-partial-exact", "noop-complete-identical"} else 2
         if arguments.command == "publish":
             publish(
                 arguments.manifest.resolve(),
@@ -813,7 +831,7 @@ def main() -> int:
                 arguments.plan.resolve(),
                 arguments.output.resolve(),
             )
-            print(f"compose-mirror: create-only PUT 32/32 complete: {arguments.output}")
+            print(f"compose-mirror: resumable immutable Maven PUT complete: {arguments.output}")
             return 0
         verify(arguments.manifest.resolve(), arguments.output.resolve())
         print(f"compose-mirror: anonymous terminal readback 32/32 complete: {arguments.output}")
