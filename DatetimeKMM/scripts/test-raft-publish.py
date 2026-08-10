@@ -727,7 +727,11 @@ def main() -> int:
 
         loss_server = CommitLossServer()
         loss_out = root / "rel-commit-loss.json"
-        loss_code = release_via(loss_server, plan_path, rel_bundle, loss_out)
+        try:
+            loss_code = release_via(loss_server, plan_path, rel_bundle, loss_out)
+        except Exception as _loss_err:  # noqa: BLE001
+            print(f"loss release error: {_loss_err}", file=sys.stderr)
+            loss_code = 1
         loss_receipt = json.loads(loss_out.read_text()) if loss_out.is_file() else {}
         loss_aborts = [c for c in loss_server.calls if c[0] == "abort"]
         check("commit_response_loss_recovers_zero_exit", loss_code == 0)
@@ -760,7 +764,11 @@ def main() -> int:
 
         mal_server = MalformedCommitServer()
         mal_out = root / "rel-commit-malformed.json"
-        mal_code = release_via(mal_server, plan_path, rel_bundle, mal_out)
+        try:
+            mal_code = release_via(mal_server, plan_path, rel_bundle, mal_out)
+        except Exception as _mal_err:  # noqa: BLE001
+            print(f"malformed release error: {_mal_err}", file=sys.stderr)
+            mal_code = 1
         mal_receipt = json.loads(mal_out.read_text()) if mal_out.is_file() else {}
         mal_aborts = [c for c in mal_server.calls if c[0] == "abort"]
         check("commit_malformed_success_recovers_zero_exit", mal_code == 0)
