@@ -1,5 +1,20 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.33 / 0.1.0-raft.33-ohos (proxy-incompatible HTTP/3 recovery)
+
+- Detect only the explicit curl proxy/HTTP3 incompatibility failure and latch
+  HTTP/2 for the current runtime configuration and network/proxy identity.
+  A configuration or environment change clears the latch so the new identity
+  can probe HTTP/3 independently.
+- Retry at most once with a fresh HTTP/2 curl connection, and only for
+  replay-safe, bodyless GET or HEAD requests. Mutating methods, bodyful
+  requests, generic TLS failures, and proxy authentication failures are never
+  replayed by this recovery path.
+- Fence the failure, latch, and retry decision to one atomic runtime epoch so
+  a request started under an old configuration cannot downgrade or replay
+  into a newer configuration. This is Kotlin-only behavior and carries the
+  unchanged `.32` native payloads and ABI.
+
 ## 0.1.0-raft.32 / 0.1.0-raft.32-ohos (canonical curl completion diagnostics release)
 
 - Carry the same reviewed product source and deterministic Android, iOS, and
