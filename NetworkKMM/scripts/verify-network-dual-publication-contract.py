@@ -88,6 +88,11 @@ def validate(files: Mapping[str, str]) -> None:
         "every publication lane must use the fail-closed dual publisher",
     )
     require(
+        "sys.dont_write_bytecode = True" in files["mirror_test"],
+        "mirror-test-clean-tree",
+        "mirror tests must not dirty the checkout before publication provenance checks",
+    )
+    require(
         "needs.publish-ohos-tree.result" in workflow
         and "needs.publish-ios.result" in workflow
         and "needs.publish-android.result" in workflow

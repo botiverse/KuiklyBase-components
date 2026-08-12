@@ -6,10 +6,12 @@ import hashlib
 import importlib.util
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.dont_write_bytecode = True
 SPEC = importlib.util.spec_from_file_location("network_raft_mirror", HERE / "network-raft-mirror.py")
 mirror = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
