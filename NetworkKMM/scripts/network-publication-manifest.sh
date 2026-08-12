@@ -81,6 +81,7 @@ network_required_paths_for() {
         "com/tencent/kuiklybase/network-iosx64/$version/network-iosx64-$version-cinterop-iosCurl.klib" \
         "com/tencent/kuiklybase/network-iosx64/$version/network-iosx64-$version.pom" \
         "com/tencent/kuiklybase/network-iosx64/$version/network-iosx64-$version-sources.jar" \
+        "com/tencent/kuiklybase/network-iosx64/$version/network-iosx64-$version-metadata.jar" \
         "com/tencent/kuiklybase/network-iosx64/$version/network-iosx64-$version.module"
       ;;
     :network:publishIosArm64PublicationToGithubPackagesRepository)
@@ -89,6 +90,7 @@ network_required_paths_for() {
         "com/tencent/kuiklybase/network-iosarm64/$version/network-iosarm64-$version-cinterop-iosCurl.klib" \
         "com/tencent/kuiklybase/network-iosarm64/$version/network-iosarm64-$version.pom" \
         "com/tencent/kuiklybase/network-iosarm64/$version/network-iosarm64-$version-sources.jar" \
+        "com/tencent/kuiklybase/network-iosarm64/$version/network-iosarm64-$version-metadata.jar" \
         "com/tencent/kuiklybase/network-iosarm64/$version/network-iosarm64-$version.module"
       ;;
     :network:publishIosSimulatorArm64PublicationToGithubPackagesRepository)
@@ -97,6 +99,7 @@ network_required_paths_for() {
         "com/tencent/kuiklybase/network-iossimulatorarm64/$version/network-iossimulatorarm64-$version-cinterop-iosCurl.klib" \
         "com/tencent/kuiklybase/network-iossimulatorarm64/$version/network-iossimulatorarm64-$version.pom" \
         "com/tencent/kuiklybase/network-iossimulatorarm64/$version/network-iossimulatorarm64-$version-sources.jar" \
+        "com/tencent/kuiklybase/network-iossimulatorarm64/$version/network-iossimulatorarm64-$version-metadata.jar" \
         "com/tencent/kuiklybase/network-iossimulatorarm64/$version/network-iossimulatorarm64-$version.module"
       ;;
     :network:publishOhosArm64PublicationToGithubPackagesRepository)
