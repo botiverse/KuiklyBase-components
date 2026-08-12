@@ -104,6 +104,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           [[ "$NETWORK_ARTIFACT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           if [[ "$NETWORK_ARTIFACT_SOURCE_SHA" == "$GITHUB_SHA" ]]; then
             echo "NETWORK_PROJECT_DIR=$GITHUB_WORKSPACE/NetworkKMM" >> "$GITHUB_ENV"
@@ -220,6 +221,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           [[ "$NETWORK_ARTIFACT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           if [[ "$NETWORK_ARTIFACT_SOURCE_SHA" == "$GITHUB_SHA" ]]; then
             echo "NETWORK_PROJECT_DIR=$GITHUB_WORKSPACE/NetworkKMM" >> "$GITHUB_ENV"
@@ -318,6 +320,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           [[ "$NETWORK_ARTIFACT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           if [[ "$NETWORK_ARTIFACT_SOURCE_SHA" == "$GITHUB_SHA" ]]; then
             echo "NETWORK_PROJECT_DIR=$GITHUB_WORKSPACE/NetworkKMM" >> "$GITHUB_ENV"
@@ -433,6 +436,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
           [[ "$NETWORK_ARTIFACT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
           if [[ "$NETWORK_ARTIFACT_SOURCE_SHA" == "$GITHUB_SHA" ]]; then
             echo "NETWORK_PROJECT_DIR=$GITHUB_WORKSPACE/NetworkKMM" >> "$GITHUB_ENV"

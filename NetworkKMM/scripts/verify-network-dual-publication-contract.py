@@ -88,6 +88,16 @@ def validate(files: Mapping[str, str]) -> None:
         "every publication lane must use the fail-closed dual publisher",
     )
     require(
+        workflow.count('git config --global --add safe.directory "$GITHUB_WORKSPACE"') == 4,
+        "artifact-source-safe-directory",
+        "every publication lane must permit container Git access before preparing an old source",
+    )
+    require(
+        files["manifest"].count('$version-metadata.jar"') == 3,
+        "ios-metadata-primary-count",
+        "all three iOS publications must include their Gradle metadata JAR primary",
+    )
+    require(
         "sys.dont_write_bytecode = True" in files["mirror_test"],
         "mirror-test-clean-tree",
         "mirror tests must not dirty the checkout before publication provenance checks",
