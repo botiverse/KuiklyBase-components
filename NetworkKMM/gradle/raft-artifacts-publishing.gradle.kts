@@ -1,18 +1,9 @@
 import org.gradle.api.publish.PublishingExtension
 import org.gradle.api.publish.maven.MavenPublication
 
-// Additive publication destination for Raft Artifacts. GitHub Packages and
-// Maven Central remain configured by each producer module; this convention
-// only adds the second repository and exact source provenance to every Maven
-// publication in the NetworkKMM build tree.
-val raftArtifactsUrl = providers.gradleProperty("raftArtifactsUrl")
-    .orElse(providers.environmentVariable("RAFT_ARTIFACTS_URL"))
-    .orElse("https://maven.artifacts.botiverse.dev")
-val raftArtifactsUsername = providers.gradleProperty("raftArtifactsUsername")
-    .orElse(providers.environmentVariable("RAFT_ARTIFACTS_USERNAME"))
-    .orElse("raft-ci")
-val raftArtifactsToken = providers.gradleProperty("raftArtifactsToken")
-    .orElse(providers.environmentVariable("RAFT_ARTIFACTS_PUBLISH_TOKEN"))
+// Exact source provenance for every NetworkKMM Maven publication. Raft is
+// mirrored from the authenticated GitHub Packages authority by a separate
+// create-only primary-file writer; Gradle must never write Raft sidecars.
 val networkSourceSha = providers.gradleProperty("networkSourceSha")
     .orElse(providers.environmentVariable("NETWORK_SOURCE_SHA"))
     .map { value ->
@@ -23,17 +14,6 @@ val networkSourceSha = providers.gradleProperty("networkSourceSha")
     }
 
 extensions.configure<PublishingExtension> {
-    repositories {
-        maven {
-            name = "raftArtifacts"
-            url = uri(raftArtifactsUrl)
-            credentials {
-                username = raftArtifactsUsername.orNull.orEmpty()
-                password = raftArtifactsToken.orNull.orEmpty()
-            }
-        }
-    }
-
     publications.withType<MavenPublication>().configureEach {
         pom {
             // Both fields are intentionally provider-backed. Generating a POM

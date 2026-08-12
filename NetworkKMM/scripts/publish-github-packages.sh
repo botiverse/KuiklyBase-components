@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+PROJECT_DIR="${NETWORK_PROJECT_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
+PROJECT_DIR="$(cd "$PROJECT_DIR" && pwd)"
 REPOSITORY_DIR="$(cd "$PROJECT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/network-publication-manifest.sh"
 
@@ -10,11 +11,7 @@ cd "$PROJECT_DIR"
 
 GITHUB_PACKAGES_USERNAME="${GITHUB_PACKAGES_USERNAME:-${GITHUB_ACTOR:-}}"
 GITHUB_PACKAGES_TOKEN="${GITHUB_PACKAGES_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}"
-RAFT_ARTIFACTS_USERNAME="${RAFT_ARTIFACTS_USERNAME:-raft-ci}"
-RAFT_ARTIFACTS_PUBLISH_TOKEN="${RAFT_ARTIFACTS_PUBLISH_TOKEN:-}"
-RAFT_ARTIFACTS_URL="${RAFT_ARTIFACTS_URL:-https://maven.artifacts.botiverse.dev}"
 export GITHUB_PACKAGES_USERNAME GITHUB_PACKAGES_TOKEN
-export RAFT_ARTIFACTS_USERNAME RAFT_ARTIFACTS_PUBLISH_TOKEN RAFT_ARTIFACTS_URL
 
 if [[ -z "$GITHUB_PACKAGES_USERNAME" ]]; then
   echo "GITHUB_PACKAGES_USERNAME or GITHUB_ACTOR is required." >&2
@@ -22,10 +19,6 @@ if [[ -z "$GITHUB_PACKAGES_USERNAME" ]]; then
 fi
 if [[ -z "$GITHUB_PACKAGES_TOKEN" ]]; then
   echo "GITHUB_PACKAGES_TOKEN, GITHUB_TOKEN, or GH_TOKEN is required." >&2
-  exit 1
-fi
-if [[ -z "$RAFT_ARTIFACTS_PUBLISH_TOKEN" ]]; then
-  echo "RAFT_ARTIFACTS_PUBLISH_TOKEN is required; dual publication fails closed." >&2
   exit 1
 fi
 
@@ -55,9 +48,13 @@ if [[ -n "$(publication_git status --porcelain=v1 --untracked-files=all)" ]]; th
   echo "NetworkKMM publication requires a clean git checkout." >&2
   exit 1
 fi
-resolved_source_sha="$(publication_git rev-parse HEAD)"
+resolved_source_sha="$(publication_git -C "$PROJECT_DIR" rev-parse HEAD)"
 if [[ ! "$resolved_source_sha" =~ ^[0-9a-f]{40}$ ]]; then
   echo "git rev-parse HEAD did not return an exact lowercase commit SHA." >&2
+  exit 1
+fi
+if [[ -n "${NETWORK_ARTIFACT_SOURCE_SHA:-}" && "$NETWORK_ARTIFACT_SOURCE_SHA" != "$resolved_source_sha" ]]; then
+  echo "Caller-provided NETWORK_ARTIFACT_SOURCE_SHA does not match the artifact-source checkout." >&2
   exit 1
 fi
 if [[ -n "${NETWORK_SOURCE_SHA:-}" && "$NETWORK_SOURCE_SHA" != "$resolved_source_sha" ]]; then
@@ -123,12 +120,6 @@ if [[ "${NETWORK_GITHUB_PUBLISH_TASKS+x}" == "x" ]]; then
 else
   github_publish_tasks=("${required_tasks[@]}")
 fi
-if [[ "${NETWORK_RAFT_PUBLISH_TASKS+x}" == "x" ]]; then
-  IFS=' ' read -r -a raft_base_tasks <<< "$NETWORK_RAFT_PUBLISH_TASKS"
-else
-  raft_base_tasks=("${required_tasks[@]}")
-fi
-
 selected_publish_tasks=()
 for task in ${github_publish_tasks[@]+"${github_publish_tasks[@]}"}; do
   [[ -n "$task" ]] || continue
@@ -139,16 +130,6 @@ for task in ${github_publish_tasks[@]+"${github_publish_tasks[@]}"}; do
   fi
   selected_publish_tasks+=("$task")
 done
-for task in ${raft_base_tasks[@]+"${raft_base_tasks[@]}"}; do
-  [[ -n "$task" ]] || continue
-  network_assert_known_publication_task "$task"
-  if ! array_contains "$task" "${required_tasks[@]}"; then
-    echo "Raft publication task is outside the required lane: $task" >&2
-    exit 1
-  fi
-  selected_publish_tasks+=("$(network_raft_task_for "$task")")
-done
-
 if (( ${#selected_publish_tasks[@]} == 0 )); then
   echo "The immutable-state plan selected no publication tasks." >&2
   exit 1
@@ -229,13 +210,13 @@ if (( ${#available_publish_tasks[@]} == 0 )); then
   exit 1
 fi
 
-echo "Publishing NetworkKMM publications to the immutable-state plan:"
+echo "Publishing NetworkKMM authority publications to GitHub Packages:"
 printf '  %s\n' "${available_publish_tasks[@]}"
 
 verify_android_curl_runtime=false
 for publish_task in "${available_publish_tasks[@]}"; do
   if [[ "$publish_task" == ":network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository" \
-    || "$publish_task" == ":network-android-curl-runtime:publishAndroidCurlRuntimePublicationToRaftArtifactsRepository" ]]; then
+    ]]; then
     verify_android_curl_runtime=true
     break
   fi

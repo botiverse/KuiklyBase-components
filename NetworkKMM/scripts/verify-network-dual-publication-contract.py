@@ -27,6 +27,8 @@ FILES = {
     "curl_compat": "NetworkKMM/scripts/network-curl-compat.sh",
     "curl_compat_test": "NetworkKMM/scripts/test-network-curl-compat.sh",
     "manifest": "NetworkKMM/scripts/network-publication-manifest.sh",
+    "mirror": "NetworkKMM/scripts/network-raft-mirror.py",
+    "mirror_test": "NetworkKMM/scripts/test-network-raft-mirror.py",
     "convention": "NetworkKMM/gradle/raft-artifacts-publishing.gradle.kts",
     "normal_root": "NetworkKMM/build.gradle.kts",
     "ohos_root": "NetworkKMM/build.ohos.gradle.kts",
@@ -76,9 +78,9 @@ def validate(files: Mapping[str, str]) -> None:
         "every publication lane must plan immutable state",
     )
     require(
-        workflow.count("network-publication-state.sh verify") == 4,
+        workflow.count("network-raft-mirror.py verify") == 4,
         "verifier-count",
-        "every publication lane must verify post-publish convergence",
+        "every publication lane must anonymously verify Raft convergence",
     )
     require(
         workflow.count("NetworkKMM/scripts/publish-github-packages.sh") == 4,
@@ -107,7 +109,7 @@ def validate(files: Mapping[str, str]) -> None:
         "publisher must reject dirty tracked and untracked state",
     )
     require(
-        'resolved_source_sha="$(publication_git rev-parse HEAD)"' in publisher,
+        'resolved_source_sha="$(publication_git -C "$PROJECT_DIR" rev-parse HEAD)"' in publisher,
         "source-sha-resolution",
         "source SHA must come from the publication checkout",
     )
@@ -122,16 +124,13 @@ def validate(files: Mapping[str, str]) -> None:
         "publisher": (
             "validated_required_tasks",
             "github_publish_tasks",
-            "raft_base_tasks",
             "selected_publish_tasks",
         ),
         "state": (
             "validated_required_tasks",
             "auth_args",
             "github_missing",
-            "raft_missing",
             "requested_lane_tasks",
-            "missing_union",
         ),
     }
     guarded_empty_arrays = True
@@ -147,9 +146,8 @@ def validate(files: Mapping[str, str]) -> None:
             )
     guarded_empty_arrays = (
         guarded_empty_arrays
-        and 'github_missing_text=""\nraft_missing_text=""' in state
+        and 'github_missing_text=""' in state
         and state.count('github_missing_text="${github_missing[*]}"') == 1
-        and state.count('raft_missing_text="${raft_missing[*]}"') == 1
     )
     require(
         "declare -A" not in publisher
@@ -166,14 +164,14 @@ def validate(files: Mapping[str, str]) -> None:
         "event metadata must not provide publication provenance",
     )
     require(
-        "RAFT_ARTIFACTS_PUBLISH_TOKEN is required; dual publication fails closed." in publisher,
-        "raft-token-required",
-        "missing Raft credentials must fail before Gradle",
+        "RAFT_ARTIFACTS_PUBLISH_TOKEN" not in publisher,
+        "gradle-no-raft-token",
+        "Gradle publisher must never receive the Raft credential",
     )
     require(
-        'selected_publish_tasks+=("$(network_raft_task_for "$task")")' in publisher,
-        "paired-task-derivation",
-        "Raft task graph must derive from each selected GitHub publication",
+        "RaftArtifactsRepository" not in publisher,
+        "gradle-no-raft-task",
+        "Gradle publisher must never select Raft repository tasks",
     )
     require(
         '"-PnetworkSourceSha=$NETWORK_SOURCE_SHA"' in publisher,
@@ -187,10 +185,9 @@ def validate(files: Mapping[str, str]) -> None:
     )
 
     require(
-        "GitHub Packages positive control failed" in state
-        and "Raft Artifacts scope positive control failed" in state,
+        "GitHub Packages positive control failed" in state,
         "state-positive-controls",
-        "absence probes require destination-specific positive controls",
+        "GitHub authority absence probes require a positive control",
     )
     require(
         "partial immutable publication" in state and "refusing an unsafe overwrite retry" in state,
@@ -228,11 +225,11 @@ def validate(files: Mapping[str, str]) -> None:
     require(
         'source "$SCRIPT_DIR/network-curl-compat.sh"' in state
         and state.count("network_resolve_curl_retry_args") == 1
-        and state.count("network_curl --") == 2
+        and state.count("network_curl --") == 1
         and "--retry-all-errors" not in state
         and "--retry 2" not in state,
         "state-curl-wrapper",
-        "both immutable-state probes must use the one resolved compatibility wrapper",
+        "the GitHub authority probe must use the resolved compatibility wrapper",
     )
 
     curl_compat_test = files["curl_compat_test"]
@@ -248,11 +245,6 @@ def validate(files: Mapping[str, str]) -> None:
 
     manifest = files["manifest"]
     require(
-        '${github_task/GithubPackagesRepository/RaftArtifactsRepository}' in manifest,
-        "raft-task-mapping",
-        "repository task mapping must preserve the exact publication name",
-    )
-    require(
         manifest.count("-sources.jar") >= 8,
         "manifest-sources",
         "every artifact-bearing publication must verify a sources artifact",
@@ -260,19 +252,29 @@ def validate(files: Mapping[str, str]) -> None:
 
     convention = files["convention"]
     require(
-        'name = "raftArtifacts"' in convention,
-        "raft-repository",
-        "Gradle convention must create RaftArtifactsRepository tasks",
+        'name = "raftArtifacts"' not in convention,
+        "no-raft-repository",
+        "Gradle must not expose a Raft repository",
     )
     require(
-        'orElse("https://maven.artifacts.botiverse.dev")' in convention,
-        "raft-url",
-        "Raft Maven URL must be the production registry",
+        "RAFT_ARTIFACTS_PUBLISH_TOKEN" not in convention,
+        "no-raft-gradle-token",
+        "Gradle must not consume the Raft writer credential",
+    )
+    mirror = files["mirror"]
+    require(
+        '"If-None-Match": "*"' in mirror
+        and 'status == 409' in mirror
+        and 'decision = "resume-partial-exact"' in mirror
+        and "network-publication-manifest.sh" in mirror,
+        "resumable-primary-mirror",
+        "Raft mirror must be create-only, partial-resumable and manifest-bound",
     )
     require(
-        'providers.environmentVariable("RAFT_ARTIFACTS_PUBLISH_TOKEN")' in convention,
-        "raft-gradle-token",
-        "Gradle repository credentials must consume the protected secret",
+        "RAFT_ARTIFACTS_PUBLISH_TOKEN" in mirror
+        and workflow.count("NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json") == 12,
+        "mirror-credential-boundary",
+        "the mirror must own writer credentials and exact path snapshots",
     )
     require(
         'properties.put("dev.raft.sourceSha", networkSourceSha)' in convention
@@ -342,7 +344,7 @@ def run_mutations(files: Mapping[str, str]) -> None:
         ("drop-environment", mutate_once(files, "workflow", "    environment: raft-artifacts-production\n"), "environment-count"),
         ("drop-raft-secret", mutate_once(files, "workflow", "          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}\n"), "secret-count"),
         ("drop-required-task", mutate_once(files, "workflow", f"        {first_task}\n"), f"task-count:{first_task}"),
-        ("event-sha", mutate_once(files, "publisher", 'resolved_source_sha="$(publication_git rev-parse HEAD)"', 'resolved_source_sha="${GITHUB_SHA}"'), "source-sha-resolution"),
+        ("event-sha", mutate_once(files, "publisher", 'resolved_source_sha="$(publication_git -C "$PROJECT_DIR" rev-parse HEAD)"', 'resolved_source_sha="${GITHUB_SHA}"'), "source-sha-resolution"),
         ("bash4-only", mutate_once(files, "publisher", "#!/usr/bin/env bash\n", "#!/usr/bin/env bash\ndeclare -A bash4_only=()\n"), "bash32-portability"),
         (
             "bash32-empty-array",
@@ -354,10 +356,9 @@ def run_mutations(files: Mapping[str, str]) -> None:
             ),
             "bash32-portability",
         ),
-        ("drop-task-pair", mutate_once(files, "publisher", 'selected_publish_tasks+=("$(network_raft_task_for "$task")")'), "paired-task-derivation"),
         ("drop-normal-convention", mutate_once(files, "normal_root", '        apply(from = rootProject.file("gradle/raft-artifacts-publishing.gradle.kts"))\n'), "normal-convention"),
         ("drop-android-sources", mutate_once(files, "android_runtime", "            withSourcesJar()\n"), "android-sources"),
-        ("drop-post-verify", mutate_once(files, "workflow", "        run: NetworkKMM/scripts/network-publication-state.sh verify\n"), "verifier-count"),
+        ("drop-post-verify", mutate_once(files, "workflow", "        run: python3 NetworkKMM/scripts/network-raft-mirror.py verify --receipt /tmp/network-authority.json --output /tmp/network-terminal.json\n"), "verifier-count"),
         (
             "drop-curl-feature-probe",
             mutate_once(

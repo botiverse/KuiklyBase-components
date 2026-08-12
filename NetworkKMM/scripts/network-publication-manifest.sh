@@ -66,7 +66,6 @@ network_required_paths_for() {
         "com/tencent/kuiklybase/network-android/$version/network-android-$version-debug.aar" \
         "com/tencent/kuiklybase/network-android/$version/network-android-$version.pom" \
         "com/tencent/kuiklybase/network-android/$version/network-android-$version-sources.jar" \
-        "com/tencent/kuiklybase/network-android/$version/network-android-$version-debug-sources.jar" \
         "com/tencent/kuiklybase/network-android/$version/network-android-$version.module"
       ;;
     :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToGithubPackagesRepository)

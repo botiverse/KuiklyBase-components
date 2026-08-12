@@ -57,10 +57,6 @@ fi
 github_repository="${GITHUB_REPOSITORY:-}"
 github_username="${GITHUB_PACKAGES_USERNAME:-${GITHUB_ACTOR:-}}"
 github_token="${GITHUB_PACKAGES_TOKEN:-${GITHUB_TOKEN:-}}"
-raft_base_url="${RAFT_ARTIFACTS_URL:-https://maven.artifacts.botiverse.dev}"
-raft_base_url="${raft_base_url%/}"
-raft_browser_url="${RAFT_ARTIFACTS_BROWSER_URL:-https://artifacts.botiverse.dev}"
-raft_browser_url="${raft_browser_url%/}"
 if [[ -z "$github_repository" || -z "$github_username" || -z "$github_token" ]]; then
   echo "GITHUB_REPOSITORY and GitHub Packages credentials are required for immutable-state planning." >&2
   exit 1
@@ -91,9 +87,6 @@ curl_code() {
       base_url="$github_base_url"
       auth_args=(--netrc-file "$github_netrc")
       ;;
-    raft)
-      base_url="$raft_base_url"
-      ;;
     *)
       echo "Unknown publication destination: $destination" >&2
       return 1
@@ -105,16 +98,10 @@ curl_code() {
 
 assert_positive_controls() {
   local github_control="${NETWORK_GITHUB_POSITIVE_CONTROL_PATH:-com/tencent/kuiklybase/network-android/0.1.0-raft.29/network-android-0.1.0-raft.29.aar}"
-  local github_code raft_code
+  local github_code
   github_code="$(curl_code github "$github_control")"
   if [[ "$github_code" != "200" ]]; then
     echo "GitHub Packages positive control failed with HTTP $github_code; publication absence results are void." >&2
-    exit 1
-  fi
-  raft_code="$(network_curl --output /dev/null --write-out '%{http_code}' \
-    "$raft_browser_url/scopes/com.tencent.kuiklybase")"
-  if [[ "$raft_code" != "200" ]]; then
-    echo "Raft Artifacts scope positive control failed with HTTP $raft_code; publication absence results are void." >&2
     exit 1
   fi
 }
@@ -157,35 +144,22 @@ classify_task() {
 assert_positive_controls
 
 github_missing=()
-raft_missing=()
 for task in "${required_tasks[@]}"; do
   github_state="$(classify_task github "$task")"
-  raft_state="$(classify_task raft "$task")"
-  echo "$task: github=$github_state raft=$raft_state"
+  echo "$task: github=$github_state"
   if [[ "$github_state" == "absent" ]]; then
     github_missing+=("$task")
-  fi
-  if [[ "$raft_state" == "absent" ]]; then
-    raft_missing+=("$task")
   fi
 done
 
 if [[ "$mode" == "verify" ]]; then
-  if (( ${#github_missing[@]} > 0 || ${#raft_missing[@]} > 0 )); then
-    echo "Dual publication did not converge: github_missing=${#github_missing[@]} raft_missing=${#raft_missing[@]}." >&2
+  if (( ${#github_missing[@]} > 0 )); then
+    echo "GitHub Packages publication did not converge: github_missing=${#github_missing[@]}." >&2
     exit 1
   fi
-  echo "All required NetworkKMM publication files exist in both repositories."
+  echo "All required NetworkKMM authority files exist in GitHub Packages."
   exit 0
 fi
-
-missing_union=()
-for task in "${required_tasks[@]}"; do
-  if array_contains "$task" ${github_missing[@]+"${github_missing[@]}"} \
-    || array_contains "$task" ${raft_missing[@]+"${raft_missing[@]}"}; then
-    missing_union+=("$task")
-  fi
-done
 
 # The legacy workflow inputs remain available for a deliberate partial retry,
 # but they are an exact allowlist, not a way to omit a missing publication.
@@ -204,11 +178,11 @@ if [[ -n "${NETWORK_PUBLISH_TASKS:-}" ]]; then
       requested_lane_tasks+=("$task")
     fi
   done
-  if (( ${#requested_lane_tasks[@]} != ${#missing_union[@]} )); then
+  if (( ${#requested_lane_tasks[@]} != ${#github_missing[@]} )); then
     echo "Requested retry tasks must exactly match all missing publications in this lane." >&2
     exit 1
   fi
-  for task in ${missing_union[@]+"${missing_union[@]}"}; do
+  for task in ${github_missing[@]+"${github_missing[@]}"}; do
     if ! array_contains "$task" ${requested_lane_tasks[@]+"${requested_lane_tasks[@]}"}; then
       echo "Requested retry omits missing publication task: $task" >&2
       exit 1
@@ -217,25 +191,20 @@ if [[ -n "${NETWORK_PUBLISH_TASKS:-}" ]]; then
 fi
 
 github_missing_text=""
-raft_missing_text=""
 if (( ${#github_missing[@]} > 0 )); then
   github_missing_text="${github_missing[*]}"
 fi
-if (( ${#raft_missing[@]} > 0 )); then
-  raft_missing_text="${raft_missing[*]}"
-fi
 skip_publish=false
-if (( ${#missing_union[@]} == 0 )); then
+if (( ${#github_missing[@]} == 0 )); then
   skip_publish=true
 fi
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   printf 'NETWORK_GITHUB_PUBLISH_TASKS=%s\n' "$github_missing_text" >> "$GITHUB_ENV"
-  printf 'NETWORK_RAFT_PUBLISH_TASKS=%s\n' "$raft_missing_text" >> "$GITHUB_ENV"
-  printf 'NETWORK_SKIP_PUBLISH=%s\n' "$skip_publish" >> "$GITHUB_ENV"
+  printf 'NETWORK_GITHUB_SKIP_PUBLISH=%s\n' "$skip_publish" >> "$GITHUB_ENV"
 fi
 if [[ -n "${GITHUB_OUTPUT:-}" ]]; then
   printf 'skipped=%s\n' "$skip_publish" >> "$GITHUB_OUTPUT"
 fi
 
-echo "Immutable plan: github_missing=${#github_missing[@]} raft_missing=${#raft_missing[@]} skipped=$skip_publish."
+echo "GitHub authority plan: github_missing=${#github_missing[@]} skipped=$skip_publish."
