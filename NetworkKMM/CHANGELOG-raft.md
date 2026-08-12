@@ -1,5 +1,16 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.34 / 0.1.0-raft.34-ohos (canonical proxy-incompatible HTTP/3 recovery)
+
+- Carry the reviewed proxy-incompatible HTTP/3 recovery from `.33`: latch
+  HTTP/2 only for the current configuration and network/proxy identity, clear
+  the latch when that identity changes, and retry at most once only for
+  replay-safe bodyless GET or HEAD requests.
+- `.33` is a failed partial publication. Android and OHOS primaries converged,
+  but one iOS x64 metadata JAR diverged byte-for-byte from the GitHub Packages
+  authority and the root KMP publication was never completed. Preserve `.33`
+  for audit only; do not consume it. `.34` is the canonical complete release.
+
 ## 0.1.0-raft.33 / 0.1.0-raft.33-ohos (proxy-incompatible HTTP/3 recovery)
 
 - Detect only the explicit curl proxy/HTTP3 incompatibility failure and latch
