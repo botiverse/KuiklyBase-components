@@ -7,6 +7,10 @@ on:
         description: "Override Maven version, for example 0.1.0-raft.32"
         required: false
         type: string
+      artifact_source_sha:
+        description: "Exact landed source that produced an interrupted immutable version"
+        required: false
+        type: string
       android_ohos_publish_tasks:
         description: "Exact missing-task allowlist for an Android/OHOS immutable retry"
         required: false
@@ -27,6 +31,9 @@ permissions:
   contents: read
   packages: write
 
+env:
+  NETWORK_ARTIFACT_SOURCE_SHA: ${{ github.event.inputs.artifact_source_sha || github.sha }}
+
 jobs:
   publish-ohos-tree:
     name: "Publish OHOS tree (GitHub Packages + Raft Artifacts)"
@@ -35,7 +42,7 @@ jobs:
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     outputs:
-      skipped: ${{ steps.publication_state.outputs.skipped }}
+      skipped: ${{ steps.raft_plan.outputs.skipped }}
     env:
       NETWORK_REQUIRE_TASKS: "true"
       NETWORK_SETTINGS_FILE: settings.ohos.gradle.kts
@@ -58,12 +65,14 @@ jobs:
           ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
           deveco_sdk_home="${DEVECO_SDK_HOME:-$(cd "$ohos_sdk_home/../.." && pwd)}"
           deveco_studio_home="${DEVECO_STUDIO_HOME:-$(cd "$deveco_sdk_home/.." && pwd)}"
-          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
-          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
-          echo "OHOS_NDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
-          echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
-          echo "DEVECO_SDK_HOME=$deveco_sdk_home" >> "$GITHUB_ENV"
-          echo "DEVECO_STUDIO_HOME=$deveco_studio_home" >> "$GITHUB_ENV"
+          {
+            echo "OHOS_SDK_HOME=$ohos_sdk_home"
+            echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home"
+            echo "OHOS_NDK_HOME=$ohos_sdk_home"
+            echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm"
+            echo "DEVECO_SDK_HOME=$deveco_sdk_home"
+            echo "DEVECO_STUDIO_HOME=$deveco_studio_home"
+          } >> "$GITHUB_ENV"
           echo "$ohos_sdk_home/toolchains" >> "$GITHUB_PATH"
           echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
 
@@ -88,7 +97,23 @@ jobs:
           fi
           printf 'MAVEN_VERSION=%s\n' "$resolved_version" >> "$GITHUB_ENV"
 
-      - name: Plan immutable dual publication
+      - name: Snapshot exact required primaries
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py snapshot-required --output /tmp/network-required.json
+
+      - name: Prepare exact artifact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$NETWORK_ARTIFACT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$NETWORK_ARTIFACT_SOURCE_SHA" == "$GITHUB_SHA" ]]; then
+            echo "NETWORK_PROJECT_DIR=$GITHUB_WORKSPACE/NetworkKMM" >> "$GITHUB_ENV"
+          else
+            git fetch --no-tags --depth=1 origin "$NETWORK_ARTIFACT_SOURCE_SHA"
+            git worktree add --detach /tmp/network-artifact-source "$NETWORK_ARTIFACT_SOURCE_SHA"
+            echo "NETWORK_PROJECT_DIR=/tmp/network-artifact-source/NetworkKMM" >> "$GITHUB_ENV"
+          fi
+
+      - name: Plan GitHub Packages authority
         id: publication_state
         shell: bash
         env:
@@ -97,35 +122,47 @@ jobs:
           NETWORK_PUBLISH_TASKS: ${{ github.event.inputs.android_ohos_publish_tasks }}
         run: NetworkKMM/scripts/network-publication-state.sh plan
 
-      - name: Skip complete immutable lane
-        if: env.NETWORK_SKIP_PUBLISH == 'true'
-        shell: bash
-        run: echo "The OHOS lane already exists completely in both repositories."
-
-      - name: Publish missing OHOS files to both repositories
-        if: env.NETWORK_SKIP_PUBLISH != 'true'
+      - name: Publish missing GitHub Packages authority files
+        if: env.NETWORK_GITHUB_SKIP_PUBLISH != 'true'
         shell: bash
         env:
           GITHUB_PACKAGES_OWNER: ${{ github.repository_owner }}
           GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
         run: NetworkKMM/scripts/publish-github-packages.sh
 
-      - name: Verify OHOS convergence in both repositories
-        shell: bash
+      - name: Read GitHub authority and plan Raft primaries
+        id: raft_plan
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: NetworkKMM/scripts/network-publication-state.sh verify
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: |
+          python3 NetworkKMM/scripts/network-raft-mirror.py authority --bytes-dir /tmp/network-authority --receipt /tmp/network-authority.json
+          python3 NetworkKMM/scripts/network-raft-mirror.py plan --receipt /tmp/network-authority.json --output /tmp/network-raft-plan.json
+          decision="$(python3 -c 'import json; print(json.load(open("/tmp/network-raft-plan.json"))["remote"]["decision"])')"
+          test "$decision" != hold-conflict
+          test "$decision" = noop-complete-identical && echo 'skipped=true' >> "$GITHUB_OUTPUT" || echo 'skipped=false' >> "$GITHUB_OUTPUT"
+
+      - name: Mirror only missing Raft primaries
+        if: steps.raft_plan.outputs.skipped != 'true'
+        env:
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py publish --receipt /tmp/network-authority.json --bytes-dir /tmp/network-authority --plan /tmp/network-raft-plan.json --output /tmp/network-writer.json
+
+      - name: Verify anonymous Raft convergence
+        env:
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py verify --receipt /tmp/network-authority.json --output /tmp/network-terminal.json
 
   publish-ios:
     name: Publish iOS (GitHub Packages + Raft Artifacts)
     runs-on: macos-latest
     environment: raft-artifacts-production
     outputs:
-      skipped: ${{ steps.publication_state.outputs.skipped }}
+      skipped: ${{ steps.raft_plan.outputs.skipped }}
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
@@ -176,7 +213,23 @@ jobs:
           fi
           printf 'MAVEN_VERSION=%s\n' "$resolved_version" >> "$GITHUB_ENV"
 
-      - name: Plan immutable dual publication
+      - name: Snapshot exact required primaries
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py snapshot-required --output /tmp/network-required.json
+
+      - name: Prepare exact artifact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$NETWORK_ARTIFACT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$NETWORK_ARTIFACT_SOURCE_SHA" == "$GITHUB_SHA" ]]; then
+            echo "NETWORK_PROJECT_DIR=$GITHUB_WORKSPACE/NetworkKMM" >> "$GITHUB_ENV"
+          else
+            git fetch --no-tags --depth=1 origin "$NETWORK_ARTIFACT_SOURCE_SHA"
+            git worktree add --detach /tmp/network-artifact-source "$NETWORK_ARTIFACT_SOURCE_SHA"
+            echo "NETWORK_PROJECT_DIR=/tmp/network-artifact-source/NetworkKMM" >> "$GITHUB_ENV"
+          fi
+
+      - name: Plan GitHub Packages authority
         id: publication_state
         shell: bash
         env:
@@ -185,28 +238,40 @@ jobs:
           NETWORK_PUBLISH_TASKS: ${{ github.event.inputs.ios_publish_tasks }}
         run: NetworkKMM/scripts/network-publication-state.sh plan
 
-      - name: Skip complete immutable lane
-        if: env.NETWORK_SKIP_PUBLISH == 'true'
-        shell: bash
-        run: echo "The iOS lane already exists completely in both repositories."
-
-      - name: Publish missing iOS files to both repositories
-        if: env.NETWORK_SKIP_PUBLISH != 'true'
+      - name: Publish missing GitHub Packages authority files
+        if: env.NETWORK_GITHUB_SKIP_PUBLISH != 'true'
         shell: bash
         env:
           GITHUB_PACKAGES_OWNER: ${{ github.repository_owner }}
           GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
         run: NetworkKMM/scripts/publish-github-packages.sh
 
-      - name: Verify iOS convergence in both repositories
-        shell: bash
+      - name: Read GitHub authority and plan Raft primaries
+        id: raft_plan
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: NetworkKMM/scripts/network-publication-state.sh verify
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: |
+          python3 NetworkKMM/scripts/network-raft-mirror.py authority --bytes-dir /tmp/network-authority --receipt /tmp/network-authority.json
+          python3 NetworkKMM/scripts/network-raft-mirror.py plan --receipt /tmp/network-authority.json --output /tmp/network-raft-plan.json
+          decision="$(python3 -c 'import json; print(json.load(open("/tmp/network-raft-plan.json"))["remote"]["decision"])')"
+          test "$decision" != hold-conflict
+          test "$decision" = noop-complete-identical && echo 'skipped=true' >> "$GITHUB_OUTPUT" || echo 'skipped=false' >> "$GITHUB_OUTPUT"
+
+      - name: Mirror only missing Raft primaries
+        if: steps.raft_plan.outputs.skipped != 'true'
+        env:
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py publish --receipt /tmp/network-authority.json --bytes-dir /tmp/network-authority --plan /tmp/network-raft-plan.json --output /tmp/network-writer.json
+
+      - name: Verify anonymous Raft convergence
+        env:
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py verify --receipt /tmp/network-authority.json --output /tmp/network-terminal.json
 
   publish-android:
     name: Publish Android (GitHub Packages + Raft Artifacts)
@@ -215,7 +280,7 @@ jobs:
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
     outputs:
-      skipped: ${{ steps.publication_state.outputs.skipped }}
+      skipped: ${{ steps.raft_plan.outputs.skipped }}
     env:
       NETWORK_REQUIRE_TASKS: "true"
       NETWORK_REQUIRED_TASKS: >-
@@ -246,7 +311,23 @@ jobs:
           fi
           printf 'MAVEN_VERSION=%s\n' "$resolved_version" >> "$GITHUB_ENV"
 
-      - name: Plan immutable dual publication
+      - name: Snapshot exact required primaries
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py snapshot-required --output /tmp/network-required.json
+
+      - name: Prepare exact artifact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$NETWORK_ARTIFACT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$NETWORK_ARTIFACT_SOURCE_SHA" == "$GITHUB_SHA" ]]; then
+            echo "NETWORK_PROJECT_DIR=$GITHUB_WORKSPACE/NetworkKMM" >> "$GITHUB_ENV"
+          else
+            git fetch --no-tags --depth=1 origin "$NETWORK_ARTIFACT_SOURCE_SHA"
+            git worktree add --detach /tmp/network-artifact-source "$NETWORK_ARTIFACT_SOURCE_SHA"
+            echo "NETWORK_PROJECT_DIR=/tmp/network-artifact-source/NetworkKMM" >> "$GITHUB_ENV"
+          fi
+
+      - name: Plan GitHub Packages authority
         id: publication_state
         shell: bash
         env:
@@ -255,26 +336,38 @@ jobs:
           NETWORK_PUBLISH_TASKS: ${{ github.event.inputs.android_ohos_publish_tasks }}
         run: NetworkKMM/scripts/network-publication-state.sh plan
 
-      - name: Skip complete immutable lane
-        if: env.NETWORK_SKIP_PUBLISH == 'true'
-        shell: bash
-        run: echo "The Android lane already exists completely in both repositories."
-
-      - name: Publish missing Android files to both repositories
-        if: env.NETWORK_SKIP_PUBLISH != 'true'
+      - name: Publish missing GitHub Packages authority files
+        if: env.NETWORK_GITHUB_SKIP_PUBLISH != 'true'
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
         run: NetworkKMM/scripts/publish-github-packages.sh
 
-      - name: Verify Android convergence in both repositories
-        shell: bash
+      - name: Read GitHub authority and plan Raft primaries
+        id: raft_plan
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: NetworkKMM/scripts/network-publication-state.sh verify
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: |
+          python3 NetworkKMM/scripts/network-raft-mirror.py authority --bytes-dir /tmp/network-authority --receipt /tmp/network-authority.json
+          python3 NetworkKMM/scripts/network-raft-mirror.py plan --receipt /tmp/network-authority.json --output /tmp/network-raft-plan.json
+          decision="$(python3 -c 'import json; print(json.load(open("/tmp/network-raft-plan.json"))["remote"]["decision"])')"
+          test "$decision" != hold-conflict
+          test "$decision" = noop-complete-identical && echo 'skipped=true' >> "$GITHUB_OUTPUT" || echo 'skipped=false' >> "$GITHUB_OUTPUT"
+
+      - name: Mirror only missing Raft primaries
+        if: steps.raft_plan.outputs.skipped != 'true'
+        env:
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py publish --receipt /tmp/network-authority.json --bytes-dir /tmp/network-authority --plan /tmp/network-raft-plan.json --output /tmp/network-writer.json
+
+      - name: Verify anonymous Raft convergence
+        env:
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py verify --receipt /tmp/network-authority.json --output /tmp/network-terminal.json
 
   publish-kmp-metadata:
     name: Publish KMP metadata (GitHub Packages + Raft Artifacts)
@@ -284,7 +377,7 @@ jobs:
     runs-on: macos-latest
     environment: raft-artifacts-production
     outputs:
-      skipped: ${{ steps.publication_state.outputs.skipped }}
+      skipped: ${{ steps.raft_plan.outputs.skipped }}
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
@@ -333,7 +426,23 @@ jobs:
           fi
           printf 'MAVEN_VERSION=%s\n' "$resolved_version" >> "$GITHUB_ENV"
 
-      - name: Plan immutable dual publication
+      - name: Snapshot exact required primaries
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py snapshot-required --output /tmp/network-required.json
+
+      - name: Prepare exact artifact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$NETWORK_ARTIFACT_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          if [[ "$NETWORK_ARTIFACT_SOURCE_SHA" == "$GITHUB_SHA" ]]; then
+            echo "NETWORK_PROJECT_DIR=$GITHUB_WORKSPACE/NetworkKMM" >> "$GITHUB_ENV"
+          else
+            git fetch --no-tags --depth=1 origin "$NETWORK_ARTIFACT_SOURCE_SHA"
+            git worktree add --detach /tmp/network-artifact-source "$NETWORK_ARTIFACT_SOURCE_SHA"
+            echo "NETWORK_PROJECT_DIR=/tmp/network-artifact-source/NetworkKMM" >> "$GITHUB_ENV"
+          fi
+
+      - name: Plan GitHub Packages authority
         id: publication_state
         shell: bash
         env:
@@ -342,28 +451,40 @@ jobs:
           NETWORK_PUBLISH_TASKS: ${{ github.event.inputs.metadata_publish_tasks }}
         run: NetworkKMM/scripts/network-publication-state.sh plan
 
-      - name: Skip complete immutable lane
-        if: env.NETWORK_SKIP_PUBLISH == 'true'
-        shell: bash
-        run: echo "The metadata lane already exists completely in both repositories."
-
-      - name: Publish missing metadata files to both repositories
-        if: env.NETWORK_SKIP_PUBLISH != 'true'
+      - name: Publish missing GitHub Packages authority files
+        if: env.NETWORK_GITHUB_SKIP_PUBLISH != 'true'
         shell: bash
         env:
           GITHUB_PACKAGES_OWNER: ${{ github.repository_owner }}
           GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
         run: NetworkKMM/scripts/publish-github-packages.sh
 
-      - name: Verify metadata convergence in both repositories
-        shell: bash
+      - name: Read GitHub authority and plan Raft primaries
+        id: raft_plan
         env:
           GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
           GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: NetworkKMM/scripts/network-publication-state.sh verify
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: |
+          python3 NetworkKMM/scripts/network-raft-mirror.py authority --bytes-dir /tmp/network-authority --receipt /tmp/network-authority.json
+          python3 NetworkKMM/scripts/network-raft-mirror.py plan --receipt /tmp/network-authority.json --output /tmp/network-raft-plan.json
+          decision="$(python3 -c 'import json; print(json.load(open("/tmp/network-raft-plan.json"))["remote"]["decision"])')"
+          test "$decision" != hold-conflict
+          test "$decision" = noop-complete-identical && echo 'skipped=true' >> "$GITHUB_OUTPUT" || echo 'skipped=false' >> "$GITHUB_OUTPUT"
+
+      - name: Mirror only missing Raft primaries
+        if: steps.raft_plan.outputs.skipped != 'true'
+        env:
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py publish --receipt /tmp/network-authority.json --bytes-dir /tmp/network-authority --plan /tmp/network-raft-plan.json --output /tmp/network-writer.json
+
+      - name: Verify anonymous Raft convergence
+        env:
+          NETWORK_REQUIRED_PATHS_FILE: /tmp/network-required.json
+        run: python3 NetworkKMM/scripts/network-raft-mirror.py verify --receipt /tmp/network-authority.json --output /tmp/network-terminal.json
 
   verify-published:
     name: Verify dual publication changed or converged

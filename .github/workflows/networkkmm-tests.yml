@@ -41,6 +41,10 @@ jobs:
         shell: bash
         run: python3 NetworkKMM/scripts/verify-network-dual-publication-contract.py
 
+      - name: Run resumable Raft primary mirror teeth
+        shell: bash
+        run: python3 NetworkKMM/scripts/test-network-raft-mirror.py
+
       - name: Verify old and modern curl publication compatibility
         shell: bash
         run: NetworkKMM/scripts/test-network-curl-compat.sh
@@ -49,12 +53,11 @@ jobs:
         shell: bash
         run: python3 NetworkKMM/scripts/verify-native-source-date-workflow-contract.py
 
-      - name: Discover and dry-run both normal-tree repositories
+      - name: Discover and dry-run normal-tree GitHub publications
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: contract-user
           GITHUB_PACKAGES_TOKEN: contract-token
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: contract-token
           NETWORK_DRY_RUN: "true"
           NETWORK_REQUIRE_TASKS: "true"
           NETWORK_REQUIRED_TASKS: >-
@@ -63,12 +66,11 @@ jobs:
             :network:publishKotlinMultiplatformPublicationToGithubPackagesRepository
         run: NetworkKMM/scripts/publish-github-packages.sh
 
-      - name: Discover and dry-run both OHOS-tree repositories
+      - name: Discover and dry-run OHOS-tree GitHub publications
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: contract-user
           GITHUB_PACKAGES_TOKEN: contract-token
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: contract-token
           NETWORK_DRY_RUN: "true"
           NETWORK_REQUIRE_TASKS: "true"
           NETWORK_SETTINGS_FILE: settings.ohos.gradle.kts
@@ -108,12 +110,11 @@ jobs:
           echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
 
-      - name: Discover and dry-run both iOS repositories
+      - name: Discover and dry-run iOS GitHub publications
         shell: bash
         env:
           GITHUB_PACKAGES_USERNAME: contract-user
           GITHUB_PACKAGES_TOKEN: contract-token
-          RAFT_ARTIFACTS_PUBLISH_TOKEN: contract-token
           NETWORK_DRY_RUN: "true"
           NETWORK_REQUIRE_TASKS: "true"
           NETWORK_REQUIRED_TASKS: >-
