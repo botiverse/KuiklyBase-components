@@ -13,12 +13,12 @@ package com.tencent.kmm.network.curl
 import com.tencent.kmm.network.export.VBTransportMethod
 
 /**
- * Matches only libcurl's explicit proxy/H3 incompatibility terminal. Curl 35
- * and 56 are otherwise broad TLS/receive failures, so the code alone must never
- * trigger a protocol downgrade.
+ * Matches only libcurl's explicit proxy/H3 incompatibility terminal. Curl 28,
+ * 35, and 56 are otherwise broad timeout/TLS/receive failures, so the code
+ * alone must never trigger a protocol downgrade.
  */
 internal fun isCurlProxyHttp3Incompatibility(code: Int, message: String): Boolean {
-    if (code != 35 && code != 56) return false
+    if (code != 28 && code != 35 && code != 56) return false
     val normalized = message.lowercase()
     return normalized.contains("http/3") &&
         normalized.contains("not supported") &&
