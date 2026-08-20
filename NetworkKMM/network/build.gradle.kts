@@ -120,6 +120,9 @@ kotlin {
         }
 
         val commonMain by getting {
+            kotlin.srcDir(
+                layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
+            )
             dependencies {
                 // 协程
                 implementation(libs.kotlinx.coroutines.core)
@@ -384,5 +387,33 @@ extensions.configure<SigningExtension> {
     }
 }
 
+/**
+ * Generates the library version constant from the single published version.
+ *
+ * Hand-maintaining it meant a release bump could update `mavenVersion` alone
+ * and ship a constant reporting the previous version, with nothing failing.
+ * Generating removes the second place to update rather than guarding it.
+ */
+val generateNetworkKmmVersion by tasks.registering {
+    val outputDir = layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
+    val versionValue = providers.provider { project.version.toString().removeSuffix("-ohos") }
+    inputs.property("version", versionValue)
+    outputs.dir(outputDir)
 
-apply(from = rootProject.file("gradle/user-agent-version-gate.gradle.kts"))
+    doLast {
+        val target = outputDir.get().asFile.resolve("com/tencent/kmm/network/export")
+        target.mkdirs()
+        target.resolve("NetworkKmmVersion.kt").writeText(
+            """
+            package com.tencent.kmm.network.export
+
+            /** Generated from the published version; do not edit. */
+            internal const val NETWORK_KMM_VERSION: String = "${versionValue.get()}"
+            """.trimIndent() + "\n"
+        )
+    }
+}
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask<*>>().configureEach {
+    dependsOn(generateNetworkKmmVersion)
+}

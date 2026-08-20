@@ -49,6 +49,9 @@ kotlin {
 
     sourceSets {
         val commonMain by getting {
+            kotlin.srcDir(
+                layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
+            )
             dependencies {
                 // KBA forks, declared plainly: this tree's graph and its
                 // published metadata are the same statement.
@@ -234,4 +237,31 @@ extensions.configure<SigningExtension> {
     }
 }
 
-apply(from = rootProject.file("gradle/user-agent-version-gate.gradle.kts"))
+/**
+ * Same generated version constant as the normal tree. Both trees derive from
+ * the one `mavenVersion` property; this tree only adds the `-ohos` coordinate
+ * suffix, which is stripped so the reported library version matches.
+ */
+val generateNetworkKmmVersion by tasks.registering {
+    val outputDir = layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
+    val versionValue = providers.provider { project.version.toString().removeSuffix("-ohos") }
+    inputs.property("version", versionValue)
+    outputs.dir(outputDir)
+
+    doLast {
+        val target = outputDir.get().asFile.resolve("com/tencent/kmm/network/export")
+        target.mkdirs()
+        target.resolve("NetworkKmmVersion.kt").writeText(
+            """
+            package com.tencent.kmm.network.export
+
+            /** Generated from the published version; do not edit. */
+            internal const val NETWORK_KMM_VERSION: String = "${versionValue.get()}"
+            """.trimIndent() + "\n"
+        )
+    }
+}
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask<*>>().configureEach {
+    dependsOn(generateNetworkKmmVersion)
+}

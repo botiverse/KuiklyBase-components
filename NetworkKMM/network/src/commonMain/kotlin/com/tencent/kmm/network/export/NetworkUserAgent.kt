@@ -53,12 +53,13 @@ object NetworkUserAgent {
     /**
      * Version of this library, reported so a server can tell transports apart.
      *
-     * Kept in step with `NetworkKMM/gradle.properties: mavenVersion` by the
-     * `checkUserAgentLibraryVersion` build gate, which fails when the two
-     * drift. A constant that silently lags a release would put a wrong version
-     * into every request and into every server log line that reads it.
+     * Generated from the published `mavenVersion` at build time rather than
+     * hand-maintained: a release bump that updated only the property would
+     * otherwise ship a constant reporting the previous version, and nothing
+     * would fail. Both build trees derive from the same property, so this
+     * value is identical on all platforms.
      */
-    const val LIBRARY_VERSION: String = "0.1.0-raft.35"
+    const val LIBRARY_VERSION: String = NETWORK_KMM_VERSION
 
     /** Header this object populates. HTTP header names are case-insensitive. */
     const val HEADER_NAME: String = "User-Agent"
