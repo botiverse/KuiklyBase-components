@@ -1,5 +1,25 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.35 / 0.1.0-raft.35-ohos (default User-Agent)
+
+- Send a default `User-Agent` when the caller sets none. The library
+  previously set one at no layer, and the default transport is curl, which
+  sends none unless asked, so servers received no `User-Agent` at all and
+  could not tell which client build produced a request.
+- The header is filled only when absent, matched case-insensitively so a
+  caller using `user-agent` does not end up with two on the wire. An explicit
+  caller value always wins.
+- Hosts supply application identity through `NetworkUserAgent.appIdentity`.
+  Without it the header still goes out with an `unknown` application segment
+  rather than being omitted: a missing header and an unidentified client are
+  different facts and server logs should distinguish them.
+- Host-supplied strings are sanitised so a CR/LF cannot append further
+  headers; control characters are replaced rather than dropped so the value
+  stays readable in logs.
+- `NetworkUserAgent.LIBRARY_VERSION` is bound to `mavenVersion` by a test, so
+  a release bump that forgets it fails instead of shipping a constant that
+  reports the previous version.
+
 ## 0.1.0-raft.34 / 0.1.0-raft.34-ohos (canonical proxy-incompatible HTTP/3 recovery)
 
 - Carry the reviewed proxy-incompatible HTTP/3 recovery from `.33`: latch

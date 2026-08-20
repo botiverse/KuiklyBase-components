@@ -58,7 +58,7 @@ object NetworkUserAgent {
      * that silently lags a release would put a wrong version into every request
      * and into every server log line that reads it.
      */
-    const val LIBRARY_VERSION: String = "0.1.0-raft.34"
+    const val LIBRARY_VERSION: String = "0.1.0-raft.35"
 
     /** Header this object populates. HTTP header names are case-insensitive. */
     const val HEADER_NAME: String = "User-Agent"
@@ -71,7 +71,7 @@ object NetworkUserAgent {
 
     /**
      * Builds the default header value, e.g.
-     * `Raft/1.10.0+1100004 (Android 34; production) NetworkKMM/0.1.0-raft.34`.
+     * `Raft/1.10.0+1100004 (Android 34; production) NetworkKMM/0.1.0-raft.35`.
      */
     fun headerValue(): String {
         val identity = appIdentity
