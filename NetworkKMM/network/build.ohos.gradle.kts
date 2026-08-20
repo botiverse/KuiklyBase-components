@@ -19,6 +19,31 @@ plugins {
 }
 
 @OptIn(org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi::class)
+/**
+ * Same generated version constant as the normal tree. Both trees derive from
+ * the one `mavenVersion` property; this tree only adds the `-ohos` coordinate
+ * suffix, which is stripped so the reported library version matches.
+ */
+val generateNetworkKmmVersion by tasks.registering {
+    val outputDir = layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
+    val versionValue = providers.provider { project.version.toString().removeSuffix("-ohos") }
+    inputs.property("version", versionValue)
+    outputs.dir(outputDir)
+
+    doLast {
+        val target = outputDir.get().asFile.resolve("com/tencent/kmm/network/export")
+        target.mkdirs()
+        target.resolve("NetworkKmmVersion.kt").writeText(
+            """
+            package com.tencent.kmm.network.export
+
+            /** Generated from the published version; do not edit. */
+            internal const val NETWORK_KMM_VERSION: String = "${versionValue.get()}"
+            """.trimIndent() + "\n"
+        )
+    }
+}
+
 kotlin {
     KotlinHierarchyTemplate.default
 
@@ -53,7 +78,7 @@ kotlin {
             // (compile, sourcesJar, publication) inherits the dependency. A
             // bare path made sourcesJar read the output without declaring it,
             // which Gradle rejects.
-            kotlin.srcDir(tasks.named("generateNetworkKmmVersion"))
+            kotlin.srcDir(generateNetworkKmmVersion)
             dependencies {
                 // KBA forks, declared plainly: this tree's graph and its
                 // published metadata are the same statement.
@@ -236,30 +261,5 @@ publishing {
 extensions.configure<SigningExtension> {
     if (shouldSignPublications) {
         sign(publishing.publications)
-    }
-}
-
-/**
- * Same generated version constant as the normal tree. Both trees derive from
- * the one `mavenVersion` property; this tree only adds the `-ohos` coordinate
- * suffix, which is stripped so the reported library version matches.
- */
-val generateNetworkKmmVersion by tasks.registering {
-    val outputDir = layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
-    val versionValue = providers.provider { project.version.toString().removeSuffix("-ohos") }
-    inputs.property("version", versionValue)
-    outputs.dir(outputDir)
-
-    doLast {
-        val target = outputDir.get().asFile.resolve("com/tencent/kmm/network/export")
-        target.mkdirs()
-        target.resolve("NetworkKmmVersion.kt").writeText(
-            """
-            package com.tencent.kmm.network.export
-
-            /** Generated from the published version; do not edit. */
-            internal const val NETWORK_KMM_VERSION: String = "${versionValue.get()}"
-            """.trimIndent() + "\n"
-        )
     }
 }
