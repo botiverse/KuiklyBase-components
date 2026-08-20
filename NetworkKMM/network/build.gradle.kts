@@ -120,9 +120,11 @@ kotlin {
         }
 
         val commonMain by getting {
-            kotlin.srcDir(
-                layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
-            )
+            // Pass the task provider, not a bare directory, so every consumer
+            // (compile, sourcesJar, publication) inherits the dependency. A
+            // bare path made sourcesJar read the output without declaring it,
+            // which Gradle rejects.
+            kotlin.srcDir(tasks.named("generateNetworkKmmVersion"))
             dependencies {
                 // 协程
                 implementation(libs.kotlinx.coroutines.core)
@@ -412,8 +414,4 @@ val generateNetworkKmmVersion by tasks.registering {
             """.trimIndent() + "\n"
         )
     }
-}
-
-tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask<*>>().configureEach {
-    dependsOn(generateNetworkKmmVersion)
 }

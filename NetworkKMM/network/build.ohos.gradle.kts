@@ -49,9 +49,11 @@ kotlin {
 
     sourceSets {
         val commonMain by getting {
-            kotlin.srcDir(
-                layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
-            )
+            // Pass the task provider, not a bare directory, so every consumer
+            // (compile, sourcesJar, publication) inherits the dependency. A
+            // bare path made sourcesJar read the output without declaring it,
+            // which Gradle rejects.
+            kotlin.srcDir(tasks.named("generateNetworkKmmVersion"))
             dependencies {
                 // KBA forks, declared plainly: this tree's graph and its
                 // published metadata are the same statement.
@@ -260,8 +262,4 @@ val generateNetworkKmmVersion by tasks.registering {
             """.trimIndent() + "\n"
         )
     }
-}
-
-tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask<*>>().configureEach {
-    dependsOn(generateNetworkKmmVersion)
 }
