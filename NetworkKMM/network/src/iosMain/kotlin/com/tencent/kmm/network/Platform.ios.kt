@@ -19,6 +19,6 @@ package com.tencent.kmm.network
 actual fun getPlatform(): Platform {
     return object : Platform {
         override val name: String
-            get() = "iosMain"
+            get() = "iOS"
     }
 }
