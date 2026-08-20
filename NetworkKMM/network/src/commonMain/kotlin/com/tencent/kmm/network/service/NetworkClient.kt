@@ -566,7 +566,6 @@ class NetworkClient(
         call.gateProgressCallbacks(prepared)
         prepared.policy = policy
         applyCurrentAuthToken(prepared)
-        applyDefaultUserAgent(prepared)
         call.markRequestPrepared(preparationStartedAt)
 
         var attempt = 0
@@ -1112,6 +1111,10 @@ private class RealNetworkInterceptorChain(
             val engineRequest = request.copyMutable()
             call.gateProgressCallbacks(engineRequest)
             call.ownBody(engineRequest.body)
+            // Last point before the wire, so an interceptor that set its own
+            // User-Agent still wins. Injecting earlier let a canonical default
+            // and an interceptor's lowercase key both reach the engine.
+            NetworkUserAgent.applyTo(engineRequest.headers)
             if (call.isCancelled) return cancelledResponse(engineRequest)
             return engine.execute(engineRequest, call).also {
                 outcomes.bindEngine(it, engineRequest.body)
