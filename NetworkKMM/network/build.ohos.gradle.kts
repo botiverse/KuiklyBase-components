@@ -44,6 +44,44 @@ val generateNetworkKmmVersion by tasks.registering {
     }
 }
 
+/**
+ * Verifies the generated constant equals the version this tree publishes.
+ *
+ * Generating the value removed the risk of a hand-written copy going stale,
+ * but nothing then checked that the generator wrote the *right* value. The
+ * runtime test cannot: it compares the header against the same generated
+ * constant, so it is self-referential and passes for any value.
+ */
+val checkGeneratedNetworkKmmVersion by tasks.registering {
+    dependsOn(generateNetworkKmmVersion)
+    val generated = generateNetworkKmmVersion.map {
+        it.outputs.files.singleFile.resolve("com/tencent/kmm/network/export/NetworkKmmVersion.kt")
+    }
+    val expected = providers.provider { project.version.toString().removeSuffix("-ohos") }
+    inputs.file(generated)
+    inputs.property("expected", expected)
+
+    doLast {
+        val text = generated.get().readText()
+        val match = Regex("""NETWORK_KMM_VERSION:\s*String\s*=\s*"([^"]+)"""").find(text)
+            ?: throw GradleException(
+                "generated NetworkKmmVersion.kt has no NETWORK_KMM_VERSION; the check must " +
+                    "fail rather than pass because it could not read the value"
+            )
+        val actual = match.groupValues[1]
+        if (actual != expected.get()) {
+            throw GradleException(
+                "generated version \"$actual\" does not match this tree's published version " +
+                    "\"${expected.get()}\""
+            )
+        }
+    }
+}
+
+tasks.matching { it.name == "check" || it.name.startsWith("publish") }.configureEach {
+    dependsOn(checkGeneratedNetworkKmmVersion)
+}
+
 kotlin {
     KotlinHierarchyTemplate.default
 

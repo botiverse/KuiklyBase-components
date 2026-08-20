@@ -16,9 +16,11 @@
 - Host-supplied strings are sanitised so a CR/LF cannot append further
   headers; control characters are replaced rather than dropped so the value
   stays readable in logs.
-- `NetworkUserAgent.LIBRARY_VERSION` is bound to `mavenVersion` by a test, so
-  a release bump that forgets it fails instead of shipping a constant that
-  reports the previous version.
+- `NetworkUserAgent.LIBRARY_VERSION` is generated at build time from
+  `mavenVersion`, so a release bump cannot leave a hand-written copy behind.
+  A build check reads the generated constant back and compares it with the
+  version each tree publishes, because generation alone does not prove the
+  generated value is right.
 
 ## 0.1.0-raft.34 / 0.1.0-raft.34-ohos (canonical proxy-incompatible HTTP/3 recovery)
 
