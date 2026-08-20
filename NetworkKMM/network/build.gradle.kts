@@ -384,39 +384,5 @@ extensions.configure<SigningExtension> {
     }
 }
 
-/**
- * Static gate: the User-Agent library version must equal the published Maven
- * version.
- *
- * This is a build assertion rather than a unit test on purpose. It compares
- * source text, which does not belong in the test source sets — those hold real
- * public-contract runtime assertions. A release bump that updates
- * `mavenVersion` alone would otherwise ship a constant that reports the
- * previous version in every request, with nothing failing.
- */
-val checkUserAgentLibraryVersion by tasks.registering {
-    val userAgentSource = layout.projectDirectory
-        .file("src/commonMain/kotlin/com/tencent/kmm/network/export/NetworkUserAgent.kt")
-    val declaredVersion = providers.provider { project.version.toString() }
-    inputs.file(userAgentSource)
-    inputs.property("mavenVersion", declaredVersion)
 
-    doLast {
-        val expected = declaredVersion.get()
-        val text = userAgentSource.asFile.readText()
-        val match = Regex("""LIBRARY_VERSION:\s*String\s*=\s*"([^"]+)"""").find(text)
-            ?: throw GradleException(
-                "LIBRARY_VERSION not found in ${userAgentSource.asFile.name}; " +
-                    "the gate cannot pass silently when it cannot read the constant"
-            )
-        val actual = match.groupValues[1]
-        if (actual != expected) {
-            throw GradleException(
-                "NetworkUserAgent.LIBRARY_VERSION is \"$actual\" but the published version is " +
-                    "\"$expected\"; update the constant with the release bump"
-            )
-        }
-    }
-}
-
-tasks.named("check") { dependsOn(checkUserAgentLibraryVersion) }
+apply(from = rootProject.file("gradle/user-agent-version-gate.gradle.kts"))

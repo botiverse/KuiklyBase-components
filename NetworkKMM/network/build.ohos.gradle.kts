@@ -233,3 +233,5 @@ extensions.configure<SigningExtension> {
         sign(publishing.publications)
     }
 }
+
+apply(from = rootProject.file("gradle/user-agent-version-gate.gradle.kts"))
