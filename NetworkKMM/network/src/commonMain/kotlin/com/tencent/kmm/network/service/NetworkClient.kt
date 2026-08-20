@@ -513,6 +513,7 @@ class NetworkClient(
                 call.gateProgressCallbacks(prepared)
                 prepared.policy = policy
                 applyCurrentAuthToken(prepared)
+                applyDefaultUserAgent(prepared)
                 if (call.isCancelled) {
                     cancelledResponse(prepared)
                 } else {
