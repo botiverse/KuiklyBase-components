@@ -24,6 +24,7 @@ import com.tencent.kmm.network.export.streamingUploadStreamOrNull
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkDispatcher
+import com.tencent.kmm.network.export.NetworkUserAgent
 import com.tencent.kmm.network.export.NetworkError
 import com.tencent.kmm.network.export.NetworkErrorKind
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
@@ -564,6 +565,7 @@ class NetworkClient(
         call.gateProgressCallbacks(prepared)
         prepared.policy = policy
         applyCurrentAuthToken(prepared)
+        applyDefaultUserAgent(prepared)
         call.markRequestPrepared(preparationStartedAt)
 
         var attempt = 0
@@ -611,6 +613,10 @@ class NetworkClient(
         }
         val token = auth.tokenProvider.currentToken(request) ?: return
         request.headers[auth.headerName] = auth.formatToken(token)
+    }
+
+    private fun applyDefaultUserAgent(request: NetworkRequest) {
+        NetworkUserAgent.applyTo(request.headers)
     }
 
     private suspend fun maybeRefreshAuth(
