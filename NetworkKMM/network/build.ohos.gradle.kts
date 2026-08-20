@@ -78,7 +78,15 @@ val checkGeneratedNetworkKmmVersion by tasks.registering {
     }
 }
 
-tasks.matching { it.name == "check" || it.name.startsWith("publish") }.configureEach {
+// The OHOS PR lane runs compile and metadata directly, not `check` or
+// `publish`, so wiring only those let a bad generator compile green and fail
+// for the first time at publish. Cover what this lane actually executes.
+tasks.matching {
+    it.name == "check" ||
+        it.name.startsWith("publish") ||
+        it.name.startsWith("generateMetadataFileFor") ||
+        it.name == "compileKotlinOhosArm64"
+}.configureEach {
     dependsOn(checkGeneratedNetworkKmmVersion)
 }
 
