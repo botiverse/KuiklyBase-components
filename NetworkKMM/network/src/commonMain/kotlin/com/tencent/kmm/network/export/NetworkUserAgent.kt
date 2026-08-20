@@ -108,11 +108,20 @@ object NetworkUserAgent {
     }
 
     /**
-     * Header values may not contain CR/LF: a newline reaching the wire would let
-     * a host-supplied string inject additional headers. Control characters are
-     * replaced rather than dropped so the value stays recognisable in logs.
+     * Header values may not contain control characters.
+     *
+     * CR/LF is the dangerous case — a newline reaching the wire would let a
+     * host-supplied string inject additional headers — but C1 (0x80..0x9F) is
+     * excluded too: intermediaries and log pipelines handle it inconsistently,
+     * and an earlier version of this method covered only C0 and DEL.
+     *
+     * Characters are replaced rather than dropped so the value stays
+     * recognisable in logs instead of silently losing content.
      */
     private fun String.sanitized(): String = map { character ->
-        if (character.code < 0x20 || character.code == 0x7F) '_' else character
+        val code = character.code
+        val isC0OrDelete = code < 0x20 || code == 0x7F
+        val isC1 = code in 0x80..0x9F
+        if (isC0OrDelete || isC1) '_' else character
     }.joinToString("")
 }
