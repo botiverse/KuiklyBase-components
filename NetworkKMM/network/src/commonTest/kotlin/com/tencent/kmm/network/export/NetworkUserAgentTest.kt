@@ -134,6 +134,28 @@ class NetworkUserAgentTest {
     }
 
     @Test
+    fun stripsC1ControlCharactersToo() {
+        // An earlier version covered only C0 and DEL. C1 cannot inject
+        // headers, but intermediaries and log pipelines treat it
+        // inconsistently, so it does not belong on the wire either.
+        val nel = "\u0085"
+        val paddingCharacter = "\u0080"
+        val applicationProgramCommand = "\u009F"
+        NetworkUserAgent.appIdentity = NetworkAppIdentity(
+            name = "Raft" + nel + "next",
+            version = "1.10.0" + applicationProgramCommand,
+            buildType = "prod" + paddingCharacter + "uction"
+        )
+
+        val value = NetworkUserAgent.headerValue()
+
+        (0x80..0x9F).forEach { code ->
+            assertFalse(value.contains(code.toChar()), "a C1 character survived: " + value)
+        }
+        assertTrue(value.contains("Raft_next"), value)
+    }
+
+    @Test
     fun headerNameIsTheCanonicalSpelling() {
         assertEquals("User-Agent", NetworkUserAgent.HEADER_NAME)
     }

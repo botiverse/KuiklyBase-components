@@ -53,12 +53,13 @@ object NetworkUserAgent {
     /**
      * Version of this library, reported so a server can tell transports apart.
      *
-     * Kept in step with `NetworkKMM/gradle.properties: mavenVersion` by
-     * [NetworkUserAgentVersionTest], which fails when the two drift. A constant
-     * that silently lags a release would put a wrong version into every request
-     * and into every server log line that reads it.
+     * Generated from the published `mavenVersion` at build time rather than
+     * hand-maintained: a release bump that updated only the property would
+     * otherwise ship a constant reporting the previous version, and nothing
+     * would fail. Both build trees derive from the same property, so this
+     * value is identical on all platforms.
      */
-    const val LIBRARY_VERSION: String = "0.1.0-raft.34"
+    const val LIBRARY_VERSION: String = NETWORK_KMM_VERSION
 
     /** Header this object populates. HTTP header names are case-insensitive. */
     const val HEADER_NAME: String = "User-Agent"
@@ -71,7 +72,7 @@ object NetworkUserAgent {
 
     /**
      * Builds the default header value, e.g.
-     * `Raft/1.10.0+1100004 (Android 34; production) NetworkKMM/0.1.0-raft.34`.
+     * `Raft/1.10.0+1100004 (Android 34; production) NetworkKMM/0.1.0-raft.35`.
      */
     fun headerValue(): String {
         val identity = appIdentity
@@ -108,11 +109,20 @@ object NetworkUserAgent {
     }
 
     /**
-     * Header values may not contain CR/LF: a newline reaching the wire would let
-     * a host-supplied string inject additional headers. Control characters are
-     * replaced rather than dropped so the value stays recognisable in logs.
+     * Header values may not contain control characters.
+     *
+     * CR/LF is the dangerous case — a newline reaching the wire would let a
+     * host-supplied string inject additional headers — but C1 (0x80..0x9F) is
+     * excluded too: intermediaries and log pipelines handle it inconsistently,
+     * and an earlier version of this method covered only C0 and DEL.
+     *
+     * Characters are replaced rather than dropped so the value stays
+     * recognisable in logs instead of silently losing content.
      */
     private fun String.sanitized(): String = map { character ->
-        if (character.code < 0x20 || character.code == 0x7F) '_' else character
+        val code = character.code
+        val isC0OrDelete = code < 0x20 || code == 0x7F
+        val isC1 = code in 0x80..0x9F
+        if (isC0OrDelete || isC1) '_' else character
     }.joinToString("")
 }

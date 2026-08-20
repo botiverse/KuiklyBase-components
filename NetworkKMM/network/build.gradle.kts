@@ -16,6 +16,71 @@ plugins {
 }
 
 @OptIn(org.jetbrains.kotlin.gradle.ExperimentalKotlinGradlePluginApi::class)
+/**
+ * Generates the library version constant from the single published version.
+ *
+ * Hand-maintaining it meant a release bump could update `mavenVersion` alone
+ * and ship a constant reporting the previous version, with nothing failing.
+ * Generating removes the second place to update rather than guarding it.
+ */
+val generateNetworkKmmVersion by tasks.registering {
+    val outputDir = layout.buildDirectory.dir("generated/networkKmmVersion/commonMain/kotlin")
+    val versionValue = providers.provider { project.version.toString().removeSuffix("-ohos") }
+    inputs.property("version", versionValue)
+    outputs.dir(outputDir)
+
+    doLast {
+        val target = outputDir.get().asFile.resolve("com/tencent/kmm/network/export")
+        target.mkdirs()
+        target.resolve("NetworkKmmVersion.kt").writeText(
+            """
+            package com.tencent.kmm.network.export
+
+            /** Generated from the published version; do not edit. */
+            internal const val NETWORK_KMM_VERSION: String = "${versionValue.get()}"
+            """.trimIndent() + "\n"
+        )
+    }
+}
+
+/**
+ * Verifies the generated constant equals the version this tree publishes.
+ *
+ * Generating the value removed the risk of a hand-written copy going stale,
+ * but nothing then checked that the generator wrote the *right* value. The
+ * runtime test cannot: it compares the header against the same generated
+ * constant, so it is self-referential and passes for any value.
+ */
+val checkGeneratedNetworkKmmVersion by tasks.registering {
+    dependsOn(generateNetworkKmmVersion)
+    val generated = generateNetworkKmmVersion.map {
+        it.outputs.files.singleFile.resolve("com/tencent/kmm/network/export/NetworkKmmVersion.kt")
+    }
+    val expected = providers.provider { project.version.toString().removeSuffix("-ohos") }
+    inputs.file(generated)
+    inputs.property("expected", expected)
+
+    doLast {
+        val text = generated.get().readText()
+        val match = Regex("""NETWORK_KMM_VERSION:\s*String\s*=\s*"([^"]+)"""").find(text)
+            ?: throw GradleException(
+                "generated NetworkKmmVersion.kt has no NETWORK_KMM_VERSION; the check must " +
+                    "fail rather than pass because it could not read the value"
+            )
+        val actual = match.groupValues[1]
+        if (actual != expected.get()) {
+            throw GradleException(
+                "generated version \"$actual\" does not match this tree's published version " +
+                    "\"${expected.get()}\""
+            )
+        }
+    }
+}
+
+tasks.matching { it.name == "check" || it.name.startsWith("publish") }.configureEach {
+    dependsOn(checkGeneratedNetworkKmmVersion)
+}
+
 kotlin {
     val iosCurlSpikeEnabled = providers.gradleProperty("iosCurlSpike").isPresent
     val iosCurlDefinition = project.file("src/iosMain/c_interop/ios_curl.def")
@@ -120,6 +185,11 @@ kotlin {
         }
 
         val commonMain by getting {
+            // Pass the task provider, not a bare directory, so every consumer
+            // (compile, sourcesJar, publication) inherits the dependency. A
+            // bare path made sourcesJar read the output without declaring it,
+            // which Gradle rejects.
+            kotlin.srcDir(generateNetworkKmmVersion)
             dependencies {
                 // 协程
                 implementation(libs.kotlinx.coroutines.core)

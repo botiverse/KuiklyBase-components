@@ -483,6 +483,7 @@ jobs:
         shell: bash
         working-directory: NetworkKMM
         run: |
+          ./gradlew -c settings.ohos.gradle.kts :network:checkGeneratedNetworkKmmVersion --no-daemon --console=plain --stacktrace
           ./gradlew -c settings.ohos.gradle.kts :network:compileKotlinOhosArm64 --no-daemon --console=plain --stacktrace
           ./gradlew -c settings.ohos.gradle.kts :network:generateMetadataFileForOhosArm64Publication --no-daemon --console=plain
           MODULE_JSON=$(find network/build/publications -ipath "*ohosarm64*" -name "module.json" | head -1)
