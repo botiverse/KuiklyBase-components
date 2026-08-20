@@ -53,10 +53,10 @@ object NetworkUserAgent {
     /**
      * Version of this library, reported so a server can tell transports apart.
      *
-     * Kept in step with `NetworkKMM/gradle.properties: mavenVersion` by
-     * [NetworkUserAgentVersionTest], which fails when the two drift. A constant
-     * that silently lags a release would put a wrong version into every request
-     * and into every server log line that reads it.
+     * Kept in step with `NetworkKMM/gradle.properties: mavenVersion` by the
+     * `checkUserAgentLibraryVersion` build gate, which fails when the two
+     * drift. A constant that silently lags a release would put a wrong version
+     * into every request and into every server log line that reads it.
      */
     const val LIBRARY_VERSION: String = "0.1.0-raft.35"
 
