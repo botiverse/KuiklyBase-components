@@ -16,10 +16,12 @@ class CurlProxyHttp3RecoveryTest {
     @Test
     fun classifierRequiresBothObservedCodeAndExplicitProxyHttp3Message() {
         val message = "HTTP/3 is not supported over an HTTP proxy"
+        assertTrue(isCurlProxyHttp3Incompatibility(28, message))
         assertTrue(isCurlProxyHttp3Incompatibility(35, message))
         assertTrue(isCurlProxyHttp3Incompatibility(56, "[connection_lost] CURLcode:56 $message"))
 
         assertFalse(isCurlProxyHttp3Incompatibility(7, message))
+        assertFalse(isCurlProxyHttp3Incompatibility(28, "Operation timed out after 30000 milliseconds"))
         assertFalse(isCurlProxyHttp3Incompatibility(35, "TLS certificate verify failed"))
         assertFalse(isCurlProxyHttp3Incompatibility(56, "HTTP/3 peer reset"))
         assertFalse(isCurlProxyHttp3Incompatibility(35, "proxy authentication required"))

@@ -323,7 +323,7 @@ class AndroidCurlNetworkEngineTest {
         VBTransportCurl.updateNetworkEnvironment("android-network-1|vpn=true|proxy=127.0.0.1:8888")
         val bridge = FakeBridge(supportsHttp3 = true).apply {
             executeResponse = CurlNativeResponse(
-                code = 35,
+                code = 28,
                 errorMsg = "HTTP/3 is not supported over an HTTP proxy"
             )
             freshExecuteResponse = CurlNativeResponse(
@@ -371,7 +371,7 @@ class AndroidCurlNetworkEngineTest {
 
         VBTransportCurl.updateNetworkEnvironment("post-environment")
         val postBridge = FakeBridge(supportsHttp3 = true).apply {
-            executeResponse = CurlNativeResponse(code = 35, errorMsg = message)
+            executeResponse = CurlNativeResponse(code = 28, errorMsg = message)
         }
         val post = NetworkRequest(
             method = VBTransportMethod.POST,
@@ -399,6 +399,14 @@ class AndroidCurlNetworkEngineTest {
         }
         val tls = NetworkRequest(url = "https://example.test/tls")
         AndroidCurlNetworkEngine(bridge).execute(tls, NetworkCall(tls))
+        assertEquals(0, bridge.freshExecuteRequests.size)
+
+        bridge.executeResponse = CurlNativeResponse(
+            code = 28,
+            errorMsg = "Operation timed out after 30000 milliseconds"
+        )
+        val timeout = NetworkRequest(url = "https://example.test/timeout")
+        AndroidCurlNetworkEngine(bridge).execute(timeout, NetworkCall(timeout))
         assertEquals(0, bridge.freshExecuteRequests.size)
 
         bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 407)
