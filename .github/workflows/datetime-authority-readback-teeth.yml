@@ -18,11 +18,17 @@ on:
       - DatetimeKMM/scripts/authority-readback.sh
       - DatetimeKMM/scripts/authority-readback-teeth.sh
       - DatetimeKMM/scripts/assert-readback-receipt.py
-      - DatetimeKMM/scripts/raft-mirror.py
-      - DatetimeKMM/scripts/test-raft-mirror.py
+      - DatetimeKMM/scripts/publish-lib.sh
+      - DatetimeKMM/scripts/publish-raft-artifacts.sh
+      - DatetimeKMM/scripts/raft-publish.py
+      - DatetimeKMM/scripts/atomic_release.py
+      - DatetimeKMM/scripts/aggregate-release-receipt.py
+      - DatetimeKMM/scripts/test-raft-publish.py
+      - DatetimeKMM/scripts/test-raft-publish-admission.sh
+      - DatetimeKMM/scripts/check-publish-tasks.sh
       - .github/workflows/datetime-authority-readback.yml
       - .github/workflows/datetime-authority-readback-teeth.yml
-      - .github/workflows/publish-datetime-raft-mirror.yml
+      - .github/workflows/publish-datetime-raft.yml
   push:
     branches:
       - master
@@ -30,11 +36,17 @@ on:
       - DatetimeKMM/scripts/authority-readback.sh
       - DatetimeKMM/scripts/authority-readback-teeth.sh
       - DatetimeKMM/scripts/assert-readback-receipt.py
-      - DatetimeKMM/scripts/raft-mirror.py
-      - DatetimeKMM/scripts/test-raft-mirror.py
+      - DatetimeKMM/scripts/publish-lib.sh
+      - DatetimeKMM/scripts/publish-raft-artifacts.sh
+      - DatetimeKMM/scripts/raft-publish.py
+      - DatetimeKMM/scripts/atomic_release.py
+      - DatetimeKMM/scripts/aggregate-release-receipt.py
+      - DatetimeKMM/scripts/test-raft-publish.py
+      - DatetimeKMM/scripts/test-raft-publish-admission.sh
+      - DatetimeKMM/scripts/check-publish-tasks.sh
       - .github/workflows/datetime-authority-readback.yml
       - .github/workflows/datetime-authority-readback-teeth.yml
-      - .github/workflows/publish-datetime-raft-mirror.yml
+      - .github/workflows/publish-datetime-raft.yml
 
 permissions:
   contents: read
@@ -77,12 +89,14 @@ jobs:
           [ "$ran" -ge 2 ] \
             || { echo "expected at least two awk implementations, ran $ran" >&2; exit 1; }
 
-      # The write-side suite: offline fake-transport teeth for the Raft mirror,
-      # including the causal mutations for review B1-B3. This is the only
-      # PR/push execution of these teeth -- the mirror workflow itself is
-      # dispatch-only, so without this step its contract never runs Hosted.
-      - name: Mirror contract teeth (fake transport, offline)
+      # The write-side suite: offline fake-transport teeth for the Raft-only
+      # publish lane (state machine, staging contamination, 409 race, UA and
+      # credential confinement, receipt cross-binding) plus the bash admission
+      # teeth. The publish workflow is dispatch-only, so without this step its
+      # contract never runs Hosted.
+      - name: Raft publish contract teeth (fake transport, offline)
         run: |
           set -euo pipefail
-          python3 -m py_compile DatetimeKMM/scripts/raft-mirror.py
-          python3 DatetimeKMM/scripts/test-raft-mirror.py
+          python3 -m py_compile DatetimeKMM/scripts/raft-publish.py
+          python3 DatetimeKMM/scripts/test-raft-publish.py
+          bash DatetimeKMM/scripts/test-raft-publish-admission.sh

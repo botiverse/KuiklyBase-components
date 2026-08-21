@@ -1,6 +1,5 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.gradle.api.publish.maven.MavenPublication
-import java.util.Locale
 
 plugins {
     kotlin("multiplatform")
@@ -79,23 +78,37 @@ android.packagingOptions.resources.excludes.removeAll {
 }
 android.sourceSets.getByName("main").resources.srcDir(legalDir)
 
-val githubRepository = System.getenv("GITHUB_REPOSITORY") ?: "bytemain/KuiklyBase-components"
-val githubOwner = githubRepository.substringBefore('/').lowercase(Locale.US)
-val githubRepositoryName = githubRepository.substringAfter('/', "KuiklyBase-components")
+// Raft Artifacts is the only publish destination for new versions (artin's
+// standing rule: new publishes go to our own registry, never GitHub Packages).
+// The build itself has NO remote repository: publications are staged into a
+// task-scoped file repository below, and the reviewed uploader carries those
+// exact staged bytes to Raft (scripts/raft-publish.py), so what is uploaded
+// is byte-identical to what was hashed at staging by construction.
+//
+// The staging repository is intentionally NOT mavenLocal: DATETIME_STAGING_DIR
+// points at a per-job directory that the workflow creates empty and the lane
+// asserts exhaustively before use, so no old version, maven-metadata.xml or
+// sidecar can leak into the authority manifest.
+val stagingDir = System.getenv("DATETIME_STAGING_DIR")
+    ?: rootProject.layout.buildDirectory.dir("publication-staging").get().asFile.absolutePath
+
+// Source provenance for the POM (PR #120 contract: source reverse-lookupable).
+// Provider-backed and lazy: POM generation fails closed at publish time when
+// the release entrypoint did not bind the exact 40-hex source SHA, while
+// non-publish builds never read it.
+val datetimeSourceSha = providers.environmentVariable("DATETIME_SOURCE_SHA")
+    .map { value ->
+        require(value.matches(Regex("[0-9a-f]{40}"))) {
+            "DATETIME_SOURCE_SHA must be the exact 40-character lowercase commit SHA"
+        }
+        value
+    }
 
 publishing {
     repositories {
         maven {
-            name = "githubPackages"
-            url = uri("https://maven.pkg.github.com/$githubOwner/$githubRepositoryName")
-            credentials {
-                username = System.getenv("GITHUB_PACKAGES_USERNAME")
-                    ?: System.getenv("GITHUB_ACTOR")
-                    ?: ""
-                password = System.getenv("GITHUB_PACKAGES_TOKEN")
-                    ?: System.getenv("GITHUB_TOKEN")
-                    ?: ""
-            }
+            name = "staging"
+            url = uri(stagingDir)
         }
     }
 
@@ -123,7 +136,9 @@ publishing {
                 connection.set("scm:git:https://github.com/bytemain/KuiklyBase-components.git")
                 developerConnection.set("scm:git:ssh://git@github.com/bytemain/KuiklyBase-components.git")
                 url.set("https://github.com/bytemain/KuiklyBase-components")
+                tag.set(datetimeSourceSha)
             }
+            properties.put("dev.raft.sourceSha", datetimeSourceSha)
         }
     }
 }

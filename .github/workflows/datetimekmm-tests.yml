@@ -5,7 +5,7 @@ on:
     paths:
       - "DatetimeKMM/**"
       - ".github/workflows/datetimekmm-tests.yml"
-      - ".github/workflows/publish-datetime-github-packages.yml"
+      - ".github/workflows/publish-datetime-raft.yml"
   workflow_dispatch:
 
 permissions:
@@ -40,10 +40,9 @@ jobs:
         shell: bash
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      # Classifier + admission self-tests run against a local mock HTTP server;
-      # they exercise the fail-closed probe (404=ABSENT, 2xx=EXISTS, 401/403/5xx
-      # fail closed), bounded retry, and NONE/COMPLETE/PARTIAL manifest logic
-      # without publishing anything.
+      # Classifier + admission self-tests: the classifier library against a
+      # local mock HTTP server, and the Raft-only lane's fail-closed env/mode
+      # contract + dry-run task mapping (no Gradle, no network, no publishing).
       - name: Run publish-lib classifier self-tests
         shell: bash
         working-directory: DatetimeKMM
@@ -52,7 +51,7 @@ jobs:
       - name: Run publish admission self-tests
         shell: bash
         working-directory: DatetimeKMM
-        run: bash scripts/test-publish-admission.sh
+        run: bash scripts/test-raft-publish-admission.sh
 
       # Prove the per-platform Gradle publish tasks really exist (normal
       # Android + metadata on this tree).
@@ -134,13 +133,12 @@ jobs:
         working-directory: DatetimeKMM
         run: |
           set -euo pipefail
-          # Bind publish and verifier to one explicit isolated repo: the Gradle
-          # JVM user.home is not necessarily the runner shell HOME in a container
-          # job, so never assume ~/.m2. -Dmaven.repo.local redirects mavenLocal().
+          # Bind publish and verifier to one explicit isolated task-scoped
+          # staging repo: never ~/.m2 / mavenLocal semantics in this lane.
           verify_repo="$RUNNER_TEMP/datetime-m2"
           rm -rf "$verify_repo"
-          ./gradlew :datetime:publishToMavenLocal \
-            -Dmaven.repo.local="$verify_repo" \
+          DATETIME_STAGING_DIR="$verify_repo" DATETIME_SOURCE_SHA="$(git rev-parse HEAD)" \
+            ./gradlew :datetime:publish \
             --no-daemon --console=plain --stacktrace
           bash scripts/verify-publication-legal.sh "$verify_repo" normal
 
@@ -193,8 +191,8 @@ jobs:
           set -euo pipefail
           verify_repo="$RUNNER_TEMP/datetime-m2"
           rm -rf "$verify_repo"
-          ./gradlew :datetime:publishToMavenLocal \
-            -Dmaven.repo.local="$verify_repo" \
+          DATETIME_STAGING_DIR="$verify_repo" DATETIME_SOURCE_SHA="$(git rev-parse HEAD)" \
+            ./gradlew :datetime:publish \
             --no-daemon --console=plain --stacktrace
           bash scripts/verify-publication-legal.sh "$verify_repo" ios
 
@@ -265,7 +263,7 @@ jobs:
           set -euo pipefail
           verify_repo="$RUNNER_TEMP/datetime-m2"
           rm -rf "$verify_repo"
-          ./gradlew -c settings.ohos.gradle.kts :datetime:publishToMavenLocal \
-            -Dmaven.repo.local="$verify_repo" \
+          DATETIME_STAGING_DIR="$verify_repo" DATETIME_SOURCE_SHA="$(git rev-parse HEAD)" \
+            ./gradlew -c settings.ohos.gradle.kts :datetime:publish \
             --no-daemon --console=plain --stacktrace
           bash scripts/verify-publication-legal.sh "$verify_repo" ohos

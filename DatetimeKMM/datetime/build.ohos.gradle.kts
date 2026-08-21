@@ -1,5 +1,4 @@
 import org.gradle.api.publish.maven.MavenPublication
-import java.util.Locale
 
 plugins {
     kotlin("multiplatform")
@@ -60,23 +59,27 @@ afterEvaluate {
     }
 }
 
-val githubRepository = System.getenv("GITHUB_REPOSITORY") ?: "bytemain/KuiklyBase-components"
-val githubOwner = githubRepository.substringBefore('/').lowercase(Locale.US)
-val githubRepositoryName = githubRepository.substringAfter('/', "KuiklyBase-components")
+// Raft-only lane (task #106): no remote repository in the build. The OHOS
+// tree stages into the same task-scoped file Maven repository as the normal
+// tree; the reviewed uploader carries the staged bytes to Raft.
+val stagingDir = System.getenv("DATETIME_STAGING_DIR")
+    ?: rootProject.layout.buildDirectory.dir("publication-staging").get().asFile.absolutePath
+
+// Provider-backed, lazy: POM generation fails closed at publish time when the
+// exact dispatch SHA is not bound; non-publish builds never read it.
+val datetimeSourceSha = providers.environmentVariable("DATETIME_SOURCE_SHA")
+    .map { value ->
+        require(value.matches(Regex("[0-9a-f]{40}"))) {
+            "DATETIME_SOURCE_SHA must be the exact 40-character lowercase commit SHA"
+        }
+        value
+    }
 
 publishing {
     repositories {
         maven {
-            name = "githubPackages"
-            url = uri("https://maven.pkg.github.com/$githubOwner/$githubRepositoryName")
-            credentials {
-                username = System.getenv("GITHUB_PACKAGES_USERNAME")
-                    ?: System.getenv("GITHUB_ACTOR")
-                    ?: ""
-                password = System.getenv("GITHUB_PACKAGES_TOKEN")
-                    ?: System.getenv("GITHUB_TOKEN")
-                    ?: ""
-            }
+            name = "staging"
+            url = uri(stagingDir)
         }
     }
 
@@ -104,7 +107,9 @@ publishing {
                 connection.set("scm:git:https://github.com/bytemain/KuiklyBase-components.git")
                 developerConnection.set("scm:git:ssh://git@github.com/bytemain/KuiklyBase-components.git")
                 url.set("https://github.com/bytemain/KuiklyBase-components")
+                tag.set(datetimeSourceSha)
             }
+            properties.put("dev.raft.sourceSha", datetimeSourceSha)
         }
     }
 }

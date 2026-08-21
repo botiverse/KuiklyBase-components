@@ -1,0 +1,587 @@
+# Publish DatetimeKMM to Raft Artifacts (Raft-only lane, task #106).
+#
+# New versions publish ONLY to our own registry (artin's standing rule); no
+# GitHub Packages write exists anywhere in this lane. The Gradle build has no
+# remote repository: each platform stages its publications into a task-scoped
+# file Maven repository; ONE aggregate plan over the whole version is made
+# before any upload; the single writer then publishes the frozen bundle
+# through the server-side atomic release ledger — one claim bound to the
+# dispatch-provided release task id, invisible staging, one commit as the
+# only visibility linearization point, abort on any mid-release failure;
+# every run ends in a byte-exact readback and an aggregate receipt.
+#
+# Aggregate state machine (frozen by review):
+#   globally ALL_ABSENT            -> atomic claim/stage/commit of every shard
+#   globally ALL_PRESENT_IDENTICAL -> zero staged objects, full byte
+#                                     readback: a verified no-op SUCCESS
+#                                     (never a stale rerun failure)
+#   anything else (cross-shard partial, extra owned key, digest mismatch)
+#                                  -> zero staged objects, fail closed, human
+#                                     decision
+#
+# Credential lifecycle (platform rule): a task-minted short-lived scoped token
+# is injected into the raft-artifacts-production environment before dispatch
+# and revoked right after the verified readback. Stage jobs never see it.
+name: Publish DatetimeKMM to Raft Artifacts
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional; must be empty or byte-equal to committed DatetimeKMM/gradle.properties mavenVersion"
+        required: false
+        type: string
+      source_sha:
+        description: "Required exact 40-character source SHA; must equal current landed master"
+        required: true
+        type: string
+      release_task_id:
+        description: "Required release task id bound into the server-side release claim ledger"
+        required: true
+        type: string
+
+# Serialize publish runs so two dispatches can never double-publish the same
+# immutable coordinate (non-canceling: a running publish is not interrupted).
+concurrency:
+  group: datetime-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_SDK_ZIP: https://dl.google.com/android/repository/commandlinetools-mac-11076708_latest.zip
+  DATETIME_SOURCE_SHA: ${{ github.sha }}
+
+jobs:
+  admission:
+    name: Admission guard (master ref + committed version + exact source binding)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate ref, version and source exact
+        id: resolve
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+          REQUESTED_SOURCE_SHA: ${{ github.event.inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" != "refs/heads/master" ]]; then
+            echo "::error::publish is only allowed from refs/heads/master (got ${GITHUB_REF})"; exit 1
+          fi
+          committed="$(grep '^mavenVersion=' DatetimeKMM/gradle.properties | cut -d= -f2)"
+          if [[ -n "${REQUESTED_VERSION:-}" && "$REQUESTED_VERSION" != "$committed" ]]; then
+            echo "::error::requested version '${REQUESTED_VERSION}' != committed mavenVersion '${committed}'; bump via a source PR first"; exit 1
+          fi
+          if ! printf '%s' "$committed" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "::error::unsafe mavenVersion format: ${committed}"; exit 1
+          fi
+          # The dispatcher must name the exact source AND that exact must be
+          # the current landed master, so a release can never silently run
+          # from a stale or foreign tree.
+          [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "::error::source_sha is not a 40-hex SHA"; exit 1; }
+          [ "$REQUESTED_SOURCE_SHA" = "$GITHUB_SHA" ] \
+            || { echo "::error::source_sha does not equal the dispatch SHA $GITHUB_SHA"; exit 1; }
+          git fetch --quiet origin master
+          [ "$(git rev-parse origin/master)" = "$REQUESTED_SOURCE_SHA" ] \
+            || { echo "::error::source_sha is not current landed master"; exit 1; }
+          echo "Publishing version: $committed from exact $REQUESTED_SOURCE_SHA"
+          echo "version=$committed" >> "$GITHUB_OUTPUT"
+
+  # --- Global pre-publish legal preflight barrier ---------------------------
+  # Each platform produces an isolated staging publication of the exact
+  # committed source and runs the legal byte-equality gate BEFORE any remote
+  # mutation. Every stage job depends on the full barrier.
+  preflight-android:
+    name: Preflight isolated publication + legal (Android/normal)
+    needs: admission
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    env:
+      MAVEN_VERSION: ${{ needs.admission.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        shell: bash
+      - name: Isolated publication + legal gate (normal)
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/preflight-staging"; rm -rf "$staging"
+          DATETIME_STAGING_DIR="$staging" ./gradlew -PmavenVersion="$MAVEN_VERSION" :datetime:publish \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$staging" normal
+          python3 scripts/raft-publish.py audit-staging --staging "$staging"
+
+  preflight-ohos:
+    name: Preflight isolated publication + legal (OHOS)
+    needs: admission
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    env:
+      MAVEN_VERSION: ${{ needs.admission.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        shell: bash
+      - name: Resolve HarmonyOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found"; exit 1; }
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home/native" >> "$GITHUB_ENV"
+          echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
+          echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)" >> "$GITHUB_ENV"
+          echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../.." && pwd)" >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+      - name: Isolated publication + legal gate (OHOS)
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/preflight-staging"; rm -rf "$staging"
+          DATETIME_STAGING_DIR="$staging" ./gradlew -c settings.ohos.gradle.kts -PmavenVersion="$MAVEN_VERSION" :datetime:publish \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$staging" ohos
+          python3 scripts/raft-publish.py audit-staging --staging "$staging"
+
+  preflight-ios:
+    name: Preflight isolated publication + legal (iOS)
+    needs: admission
+    runs-on: macos-latest
+    env:
+      ANDROID_HOME: /tmp/android-sdk
+      ANDROID_SDK_ROOT: /tmp/android-sdk
+      MAVEN_VERSION: ${{ needs.admission.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL "$ANDROID_SDK_ZIP" -o /tmp/act.zip
+          unzip -q /tmp/act.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"; echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+      - name: Isolated publication + legal gate (iOS)
+        shell: bash
+        working-directory: DatetimeKMM
+        run: |
+          set -euo pipefail
+          staging="$RUNNER_TEMP/preflight-staging"; rm -rf "$staging"
+          DATETIME_STAGING_DIR="$staging" ./gradlew -PmavenVersion="$MAVEN_VERSION" :datetime:publish \
+            --no-daemon --console=plain --stacktrace
+          bash scripts/verify-publication-legal.sh "$staging" ios
+          python3 scripts/raft-publish.py audit-staging --staging "$staging"
+
+  # --- Stage shards (no credentials, no Raft traffic) ------------------------
+  stage-ohos:
+    name: "Stage OHOS shard (ohosArm64 + root, -ohos)"
+    needs: [admission, preflight-android, preflight-ohos, preflight-ios]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    permissions:
+      contents: read
+    env:
+      DATETIME_PUBLISH_MODE: ohos-tree
+      DATETIME_SETTINGS_FILE: settings.ohos.gradle.kts
+      MAVEN_VERSION: ${{ needs.admission.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        shell: bash
+      - name: Resolve HarmonyOS SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ohos_sdk_home="${OHOS_SDK_HOME:-${OHOS_BASE_SDK_HOME:-/opt/harmonyos-tools/command-line-tools/sdk/default/openharmony}}"
+          test -d "$ohos_sdk_home/native/sysroot" || { echo "HarmonyOS SDK sysroot not found"; exit 1; }
+          ohos_sdk_home="$(cd "$ohos_sdk_home" && pwd)"
+          echo "OHOS_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"; echo "OHOS_BASE_SDK_HOME=$ohos_sdk_home" >> "$GITHUB_ENV"
+          echo "OHOS_NDK_HOME=$ohos_sdk_home/native" >> "$GITHUB_ENV"; echo "OHOS_LLVM_HOME=$ohos_sdk_home/native/llvm" >> "$GITHUB_ENV"
+          echo "DEVECO_SDK_HOME=$(cd "$ohos_sdk_home/../.." && pwd)" >> "$GITHUB_ENV"
+          echo "DEVECO_STUDIO_HOME=$(cd "$ohos_sdk_home/../../.." && pwd)" >> "$GITHUB_ENV"
+          echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
+      - name: Stage shard + manifest
+        shell: bash
+        env:
+          DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/publish-raft-artifacts.sh
+      - name: Upload shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-shard-ohos
+          path: |
+            ${{ runner.temp }}/datetime-staging/
+            ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 5
+
+  stage-android:
+    name: Stage Android shard (normal tree)
+    needs: [admission, preflight-android, preflight-ohos, preflight-ios]
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    permissions:
+      contents: read
+    env:
+      DATETIME_PUBLISH_MODE: android
+      MAVEN_VERSION: ${{ needs.admission.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+        shell: bash
+      - name: Stage shard + manifest
+        shell: bash
+        env:
+          DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/publish-raft-artifacts.sh
+      - name: Upload shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-shard-android
+          path: |
+            ${{ runner.temp }}/datetime-staging/
+            ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 5
+
+  stage-ios:
+    name: Stage iOS shard (normal tree, 3 targets)
+    needs: [admission, preflight-android, preflight-ohos, preflight-ios]
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      ANDROID_HOME: /tmp/android-sdk
+      ANDROID_SDK_ROOT: /tmp/android-sdk
+      DATETIME_PUBLISH_MODE: ios
+      MAVEN_VERSION: ${{ needs.admission.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL "$ANDROID_SDK_ZIP" -o /tmp/act.zip
+          unzip -q /tmp/act.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"; echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+      - name: Stage shard + manifest
+        shell: bash
+        env:
+          DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/publish-raft-artifacts.sh
+      - name: Upload shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-shard-ios
+          path: |
+            ${{ runner.temp }}/datetime-staging/
+            ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 5
+
+  stage-metadata:
+    name: Stage KMP metadata shard (normal tree root)
+    needs: [admission, preflight-android, preflight-ohos, preflight-ios]
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    env:
+      ANDROID_HOME: /tmp/android-sdk
+      ANDROID_SDK_ROOT: /tmp/android-sdk
+      DATETIME_PUBLISH_MODE: metadata
+      MAVEN_VERSION: ${{ needs.admission.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: "17" }
+      - name: Install Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$ANDROID_SDK_ROOT/cmdline-tools"
+          curl -fsSL "$ANDROID_SDK_ZIP" -o /tmp/act.zip
+          unzip -q /tmp/act.zip -d "$ANDROID_SDK_ROOT/cmdline-tools"
+          mv "$ANDROID_SDK_ROOT/cmdline-tools/cmdline-tools" "$ANDROID_SDK_ROOT/cmdline-tools/latest"
+          yes | "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-36" "build-tools;36.0.0"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"; echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+      - name: Stage shard + manifest
+        shell: bash
+        env:
+          DATETIME_STAGING_DIR: ${{ runner.temp }}/datetime-staging
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          bash scripts/publish-raft-artifacts.sh
+      - name: Upload shard
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-shard-metadata
+          path: |
+            ${{ runner.temp }}/datetime-staging/
+            ${{ runner.temp }}/datetime-staging.work/
+          if-no-files-found: error
+          retention-days: 5
+
+  # --- THE aggregate plan: exactly one classification over the whole version,
+  # before any remote mutation anywhere --------------------------------------
+  plan:
+    name: Aggregate plan (one decision for the whole version)
+    needs: [stage-ohos, stage-android, stage-ios, stage-metadata]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    permissions:
+      contents: read
+    env:
+      # Protected sidecar written by the platform mint alongside the token.
+      RAFT_ARTIFACTS_EXPECT_PRINCIPAL: ${{ secrets.RAFT_ARTIFACTS_EXPECT_PRINCIPAL }}
+    outputs:
+      decision: ${{ steps.plan.outputs.decision }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download shards
+        uses: actions/download-artifact@v4
+        with:
+          pattern: datetime-raft-shard-*
+          path: shards
+      - name: Merge shard manifests + release-wide revalidation + aggregate classification
+        id: plan
+        shell: bash
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          maps=()
+          roots=()
+          for shard in ../shards/*/; do
+            maps+=("${shard}datetime-staging.work/manifest.json")
+            roots+=("${shard}datetime-staging")
+          done
+          [ "${#maps[@]}" -eq 4 ] || { echo "expected 4 shard manifests, got ${#maps[@]}"; exit 1; }
+          python3 scripts/raft-publish.py merge --manifests "${maps[@]}" --output merged-manifest.json
+          # Release-wide zero-mutation barrier: every staged byte of the
+          # whole version is re-hashed and every shard staging re-enumerated
+          # BEFORE classification, so no writer job can ever start from
+          # drifted bytes.
+          python3 scripts/raft-publish.py revalidate \
+            --manifest merged-manifest.json \
+            --staging-roots "${roots[@]}"
+          # The token self-receipt is minted at the first credentialed contact
+          # and its hash prefix rides the plan, so the terminal receipt can
+          # prove one token served the whole run.
+          python3 scripts/raft-publish.py token-receipt --output token-receipt.json
+          python3 scripts/raft-publish.py classify --manifest merged-manifest.json --output global-plan.json
+          # Freeze THE bundle: one content-addressed tar of exactly the
+          # revalidated primaries. The single writer later consumes only this.
+          python3 scripts/raft-publish.py freeze \
+            --manifest merged-manifest.json \
+            --staging-roots "${roots[@]}" \
+            --output frozen-bundle.tar \
+            --digest-out bundle.sha256
+          python3 - <<'PY'
+          import json
+          plan = json.load(open("global-plan.json"))
+          token = json.load(open("token-receipt.json"))
+          plan["tokenHashPrefix"] = token["hashPrefix"]
+          plan["bundleSha256"] = open("bundle.sha256").read().strip()
+          json.dump(plan, open("global-plan.json", "w"), indent=2, sort_keys=True)
+          open("global-plan.json", "a").write("\n")
+          PY
+          decision="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["decision"])' global-plan.json)"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+      - name: Upload aggregate plan + frozen bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-global-plan
+          path: |
+            DatetimeKMM/merged-manifest.json
+            DatetimeKMM/global-plan.json
+            DatetimeKMM/token-receipt.json
+            DatetimeKMM/frozen-bundle.tar
+            DatetimeKMM/bundle.sha256
+          if-no-files-found: error
+          retention-days: 90
+
+  # --- THE single writer: consumes only the plan-frozen bundle --------------
+  publish:
+    name: "Publish whole release (single writer, atomic claim/stage/commit)"
+    needs: [plan]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    permissions:
+      contents: read
+    env:
+      RAFT_ARTIFACTS_EXPECT_PRINCIPAL: ${{ secrets.RAFT_ARTIFACTS_EXPECT_PRINCIPAL }}
+      RAFT_RELEASE_TASK_ID: ${{ github.event.inputs.release_task_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download global plan + frozen bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: datetime-raft-global-plan
+          path: artifacts-in
+      - name: Publish + verify per global decision
+        shell: bash
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          GLOBAL_DECISION: ${{ needs.plan.outputs.decision }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          # Common first-PUT barrier piece: the landed master must still equal
+          # the admitted dispatch source right here, before any mutation.
+          git fetch --quiet origin master
+          [ "$(git rev-parse origin/master)" = "${GITHUB_SHA}" ]             || { echo "landed master drifted before publish — stop" >&2; exit 1; }
+          case "$GLOBAL_DECISION" in
+            publish)
+              # Atomic release writes the terminal publish receipt (status=committed
+              # + claimId/taskId/manifestDigest/commitReceipt). Verify must NOT
+              # overwrite it — readback goes to a separate artifact.
+              python3 scripts/raft-publish.py release \
+                --manifest ../artifacts-in/merged-manifest.json \
+                --plan ../artifacts-in/global-plan.json \
+                --bundle ../artifacts-in/frozen-bundle.tar \
+                --token-receipt-out publish-token-receipt.json \
+                --output publish-receipt.json
+              python3 scripts/raft-publish.py verify \
+                --manifest ../artifacts-in/merged-manifest.json \
+                --output verify-receipt.json
+              ;;
+            noop-verified)
+              # All-present: first attempt exact-claim recovery so a prior
+              # exhausted-unknown commit still yields the original atomic
+              # receipt (claimId/commitReceipt). Only when recover exits 2
+              # (no committed claim for this identity) fall through to a
+              # generic complete verify receipt.
+              python3 scripts/raft-publish.py token-receipt --output publish-token-receipt.json
+              set +e
+              python3 scripts/raft-publish.py recover-claim \
+                --manifest ../artifacts-in/merged-manifest.json \
+                --output publish-receipt.json
+              recover_rc=$?
+              set -e
+              if [ "$recover_rc" -eq 0 ]; then
+                echo "noop-verified recovered committed atomic receipt for exact claim"
+                python3 scripts/raft-publish.py verify \
+                  --manifest ../artifacts-in/merged-manifest.json \
+                  --output verify-receipt.json
+              elif [ "$recover_rc" -eq 2 ]; then
+                python3 scripts/raft-publish.py verify \
+                  --manifest ../artifacts-in/merged-manifest.json \
+                  --output publish-receipt.json
+                echo "global decision is noop-verified: zero staged objects (no recoverable claim)"
+              else
+                echo "recover-claim failed hard (rc=$recover_rc)" >&2
+                exit "$recover_rc"
+              fi
+              ;;
+            *)
+              echo "unknown global decision: $GLOBAL_DECISION" >&2; exit 1 ;;
+          esac
+      - name: Upload publish receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-receipt-publish
+          path: |
+            DatetimeKMM/publish-receipt.json
+            DatetimeKMM/publish-token-receipt.json
+            DatetimeKMM/verify-receipt.json
+          if-no-files-found: error
+          retention-days: 90
+
+  # --- Terminal aggregate receipt: cross-checks the publish receipt, the
+  # merged manifest, and the (non-secret) token identities of every
+  # credentialed job ---------------------------------------------------------------
+  receipt:
+    name: Aggregate publication receipt
+    needs: [plan, publish]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    permissions:
+      contents: read
+    env:
+      RAFT_ARTIFACTS_EXPECT_PRINCIPAL: ${{ secrets.RAFT_ARTIFACTS_EXPECT_PRINCIPAL }}
+      RAFT_RELEASE_TASK_ID: ${{ github.event.inputs.release_task_id }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Download plan and receipts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: datetime-raft-*
+          path: artifacts-in
+      - name: Token self-receipt (server-side introspection, non-secret output)
+        shell: bash
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          python3 scripts/raft-publish.py token-receipt --output token-receipt.json
+      - name: Aggregate receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd DatetimeKMM
+          python3 scripts/aggregate-release-receipt.py \
+            --artifacts ../artifacts-in \
+            --terminal-token-receipt token-receipt.json \
+            --output aggregate-receipt.json
+      - name: Upload aggregate receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: datetime-raft-aggregate-receipt
+          path: |
+            DatetimeKMM/aggregate-receipt.json
+            DatetimeKMM/token-receipt.json
+          if-no-files-found: error
+          retention-days: 90

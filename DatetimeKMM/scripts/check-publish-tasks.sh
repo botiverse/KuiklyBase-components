@@ -27,22 +27,22 @@ tasks_output="$(./gradlew "${discover_args[@]}" :datetime:tasks --all)"
 expected=()
 case "$MODE" in
   android)
-    expected=("publishAndroidReleasePublicationToGithubPackagesRepository")
+    expected=("publishAndroidReleasePublicationToStagingRepository")
     ;;
   ios)
     expected=(
-      "publishIosX64PublicationToGithubPackagesRepository"
-      "publishIosArm64PublicationToGithubPackagesRepository"
-      "publishIosSimulatorArm64PublicationToGithubPackagesRepository"
+      "publishIosX64PublicationToStagingRepository"
+      "publishIosArm64PublicationToStagingRepository"
+      "publishIosSimulatorArm64PublicationToStagingRepository"
     )
     ;;
   metadata)
-    expected=("publishKotlinMultiplatformPublicationToGithubPackagesRepository")
+    expected=("publishKotlinMultiplatformPublicationToStagingRepository")
     ;;
   ohos-tree)
     expected=(
-      "publishOhosArm64PublicationToGithubPackagesRepository"
-      "publishKotlinMultiplatformPublicationToGithubPackagesRepository"
+      "publishOhosArm64PublicationToStagingRepository"
+      "publishKotlinMultiplatformPublicationToStagingRepository"
     )
     ;;
   *)
@@ -60,6 +60,17 @@ for t in "${expected[@]}"; do
     fail=1
   fi
 done
+
+# Negative evidence (Raft-only lane): the build must expose NO remote publish
+# repository tasks at all -- uploads ride the reviewed staging uploader only.
+# (publish*ToMavenLocal tasks always exist in maven-publish and never touch a
+# network; they are not repositories and are not matched here.)
+if printf '%s\n' "$tasks_output" | grep -qE "To(GithubPackages|RaftArtifacts)Repository"; then
+  echo "  FAIL remote/local-repo publish task present (Raft-only lane stages to a file repo only)" >&2
+  fail=1
+else
+  echo "  OK   no remote-repository publish tasks (staging file repo only)"
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "PUBLISH_TASKS_FAIL ($MODE)" >&2

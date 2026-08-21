@@ -8,3 +8,4 @@
 local.properties
 github-packages.properties
 *.hprof
+__pycache__/

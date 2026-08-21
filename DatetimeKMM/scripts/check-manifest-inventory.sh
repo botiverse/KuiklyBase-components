@@ -26,32 +26,35 @@ VERSION="${MAVEN_VERSION:-$(grep '^mavenVersion=' gradle.properties | cut -d= -f
 m2="$(mktemp -d)"
 trap 'rm -rf "$m2"' EXIT
 
+# Isolated task-scoped staging repo (never mavenLocal). POM provenance reads
+# DATETIME_SOURCE_SHA lazily at publication time; bind the local checkout HEAD.
+export DATETIME_STAGING_DIR="$m2"
+export DATETIME_SOURCE_SHA="${DATETIME_SOURCE_SHA:-$(git rev-parse HEAD)}"
+
 publish_args=(--no-daemon --console=plain -PmavenVersion="$VERSION")
 if [[ -n "$SETTINGS" ]]; then publish_args+=("-c" "$SETTINGS"); fi
 
 echo "== publishing isolated local publication (mode=$MODE version=$VERSION) =="
 case "$MODE" in
   android)
-    ./gradlew "${publish_args[@]}" :datetime:publishAndroidReleasePublicationToMavenLocal \
-      :datetime:publishKotlinMultiplatformPublicationToMavenLocal -Dmaven.repo.local="$m2" >/dev/null
+    ./gradlew "${publish_args[@]}" :datetime:publishAndroidReleasePublicationToStagingRepository \
+      :datetime:publishKotlinMultiplatformPublicationToStagingRepository >/dev/null
     specs="datetime-android/$VERSION/android datetime/$VERSION/root-metadata"
     ;;
   metadata)
-    ./gradlew "${publish_args[@]}" :datetime:publishKotlinMultiplatformPublicationToMavenLocal \
-      -Dmaven.repo.local="$m2" >/dev/null
+    ./gradlew "${publish_args[@]}" :datetime:publishKotlinMultiplatformPublicationToStagingRepository >/dev/null
     specs="datetime/$VERSION/root-metadata"
     ;;
   ios)
     ./gradlew "${publish_args[@]}" \
-      :datetime:publishIosX64PublicationToMavenLocal \
-      :datetime:publishIosArm64PublicationToMavenLocal \
-      :datetime:publishIosSimulatorArm64PublicationToMavenLocal \
-      -Dmaven.repo.local="$m2" >/dev/null
+      :datetime:publishIosX64PublicationToStagingRepository \
+      :datetime:publishIosArm64PublicationToStagingRepository \
+      :datetime:publishIosSimulatorArm64PublicationToStagingRepository >/dev/null
     specs="datetime-iosx64/$VERSION/native datetime-iosarm64/$VERSION/native datetime-iossimulatorarm64/$VERSION/native"
     ;;
   ohos-tree)
-    ./gradlew "${publish_args[@]}" :datetime:publishOhosArm64PublicationToMavenLocal \
-      :datetime:publishKotlinMultiplatformPublicationToMavenLocal -Dmaven.repo.local="$m2" >/dev/null
+    ./gradlew "${publish_args[@]}" :datetime:publishOhosArm64PublicationToStagingRepository \
+      :datetime:publishKotlinMultiplatformPublicationToStagingRepository >/dev/null
     specs="datetime-ohosarm64/$VERSION-ohos/native-ohos datetime/$VERSION-ohos/root-metadata"
     ;;
   *)
