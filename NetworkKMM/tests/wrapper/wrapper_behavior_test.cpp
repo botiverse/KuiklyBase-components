@@ -596,6 +596,142 @@ int main(int argc, char **argv) {
         DeleteCurlClient(otherHandle);
     }
 
+    // task #52 phase 2 — connection-generation rotation.
+    //
+    // The engine's CURLM handle owns the reusable connection cache, so retiring
+    // the engine is what actually drops a connection that outlived a network
+    // change; rotating the default/H3 CURLSH pair cannot, because that pair
+    // shares DNS and TLS-session data only. Retire must also differ from delete
+    // in exactly one way: already-accepted requests still finish.
+    {
+        CurlMultiEngineHandle retired = CreateCurlMultiEngine("wrapper-rotation-retired");
+        CHECK(retired != nullptr, "rotation source engine starts");
+        const std::string rotationUrl = base + "/ok";
+
+        auto performOn = [&](CurlMultiEngineHandle engine,
+                             int64_t requestId,
+                             const std::string &url,
+                             CurClientHandle *outHandle) {
+            StringDic headers{};
+            CurlRequest request{};
+            request.url = url.c_str();
+            request.method = "GET";
+            request.headers = &headers;
+            request.timeout = 5000;
+            MultiCaptured captured;
+            captured.expected = 1;
+            captured.callbackCounts.assign(1, 0);
+            captured.codes.assign(1, -1);
+            captured.httpCodes.assign(1, -1);
+            MultiCallbackRef ref{&captured, 0};
+            CurlCallback callback{&ref, OnMultiResponse};
+            CurClientHandle handle = CreateCurlClient("wrapper-rotation");
+            SetCurlProxy(handle, "");
+            CHECK(SubmitBufferedRequestV27(
+                      engine, requestId, handle, &request, sizeof(request),
+                      CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+                  "rotation request is accepted");
+            CHECK(AwaitMulti(captured, 5000), "rotation request reaches terminal");
+            CHECK(captured.codes[0] == 0 && captured.httpCodes[0] == 200,
+                  "rotation request succeeds");
+            CurlCompletionInfoV1 info{};
+            CHECK(GetCurlCompletionInfoV1(
+                      handle, &info, sizeof(info), CURL_COMPLETION_INFO_ABI_VERSION) == 1,
+                  "rotation completion snapshot succeeds");
+            *outHandle = handle;
+            return info;
+        };
+
+        CurClientHandle firstHandle = nullptr;
+        CurClientHandle reusedHandle = nullptr;
+        const CurlCompletionInfoV1 first =
+            performOn(retired, 31'000, rotationUrl, &firstHandle);
+        const CurlCompletionInfoV1 reused =
+            performOn(retired, 31'001, rotationUrl, &reusedHandle);
+        // Positive control, and the reason the rotation assertion below means
+        // anything: prove this engine really was reusing one connection. Without
+        // it, "the post-rotation request used a different connection" is equally
+        // satisfied by an engine that never reused connections at all.
+        CHECK(first.connectionCacheId == reused.connectionCacheId &&
+                  first.connectionId == reused.connectionId,
+              "pre-rotation requests really do reuse one physical connection");
+
+        // A request already accepted when the rotation starts must still finish.
+        // This is the difference between retiring and deleting: a network change
+        // must not fail transfers that happen to be in flight.
+        StringDic inFlightHeaders{};
+        const std::string delayedUrl = base + "/multi-delay";
+        CurlRequest inFlightRequest{};
+        inFlightRequest.url = delayedUrl.c_str();
+        inFlightRequest.method = "GET";
+        inFlightRequest.headers = &inFlightHeaders;
+        inFlightRequest.timeout = 5000;
+        MultiCaptured inFlight;
+        inFlight.expected = 1;
+        inFlight.callbackCounts.assign(1, 0);
+        inFlight.codes.assign(1, -1);
+        inFlight.httpCodes.assign(1, -1);
+        MultiCallbackRef inFlightRef{&inFlight, 0};
+        CurlCallback inFlightCallback{&inFlightRef, OnMultiResponse};
+        CurClientHandle inFlightHandle = CreateCurlClient("wrapper-rotation-inflight");
+        SetCurlProxy(inFlightHandle, "");
+        CHECK(SubmitBufferedRequestV27(
+                  retired, 31'002, inFlightHandle, &inFlightRequest,
+                  sizeof(inFlightRequest), CURL_WRAPPER_ABI_VERSION,
+                  &inFlightCallback) == 1,
+              "in-flight request is accepted before rotation");
+
+        RetireCurlMultiEngine(retired);
+        CHECK(CurlMultiEngineIsDrained(retired) == 0,
+              "engine with an accepted request is not drained yet");
+
+        // New work must not reach the retired cache even via a stale handle.
+        StringDic refusedHeaders{};
+        CurlRequest refusedRequest{};
+        refusedRequest.url = rotationUrl.c_str();
+        refusedRequest.method = "GET";
+        refusedRequest.headers = &refusedHeaders;
+        refusedRequest.timeout = 5000;
+        MultiCaptured refused;
+        refused.expected = 1;
+        refused.callbackCounts.assign(1, 0);
+        refused.codes.assign(1, -1);
+        refused.httpCodes.assign(1, -1);
+        MultiCallbackRef refusedRef{&refused, 0};
+        CurlCallback refusedCallback{&refusedRef, OnMultiResponse};
+        CurClientHandle refusedHandle = CreateCurlClient("wrapper-rotation-refused");
+        SetCurlProxy(refusedHandle, "");
+        CHECK(SubmitBufferedRequestV27(
+                  retired, 31'003, refusedHandle, &refusedRequest,
+                  sizeof(refusedRequest), CURL_WRAPPER_ABI_VERSION,
+                  &refusedCallback) == 0,
+              "retired engine refuses new submissions");
+
+        CHECK(AwaitMulti(inFlight, 5000),
+              "request accepted before rotation still reaches terminal");
+        CHECK(inFlight.codes[0] == 0 && inFlight.httpCodes[0] == 200,
+              "rotation does not fail a transfer that was already in flight");
+
+        CHECK(CurlMultiEngineIsDrained(retired) == 1,
+              "retired engine reports drained once its last request completes");
+
+        CurlMultiEngineHandle fresh = CreateCurlMultiEngine("wrapper-rotation-fresh");
+        CHECK(fresh != nullptr, "rotation replacement engine starts");
+        CurClientHandle freshHandle = nullptr;
+        const CurlCompletionInfoV1 afterRotation =
+            performOn(fresh, 31'004, rotationUrl, &freshHandle);
+        CHECK(afterRotation.connectionCacheId != first.connectionCacheId,
+              "post-rotation request cannot land on the retired connection cache");
+
+        DeleteCurlMultiEngine(retired);
+        DeleteCurlMultiEngine(fresh);
+        DeleteCurlClient(firstHandle);
+        DeleteCurlClient(reusedHandle);
+        DeleteCurlClient(inFlightHandle);
+        DeleteCurlClient(refusedHandle);
+        DeleteCurlClient(freshHandle);
+    }
+
     // A real non-TLS completion is a known 0us TLS phase, while an HTTPS
     // transfer that never reaches TLS carries the explicit not-reached state.
     {

@@ -2104,7 +2104,11 @@ class CurlMultiEngine {
         }
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (stopping_ || jobs_by_id_.count(job->request_id) != 0) {
+            // A retired engine keeps driving what it already accepted but takes
+            // nothing new: rotation publishes a fresh engine first, and this
+            // closes the window where a caller that already read the old handle
+            // submits onto the connection cache we are retiring.
+            if (stopping_ || retiring_ || jobs_by_id_.count(job->request_id) != 0) {
                 return false;
             }
             if (!cohort_initialized_) {
@@ -2119,6 +2123,19 @@ class CurlMultiEngine {
         }
         curl_multi_wakeup(multi_);
         return true;
+    }
+
+    // Rotation, not shutdown: accept nothing further, finish what is already in.
+    void Retire() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        retiring_ = true;
+    }
+
+    // True once no accepted or pending request can still be using a connection
+    // from this engine's cache, so deleting it now cancels nothing.
+    bool IsDrained() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return pending_.empty() && jobs_by_id_.empty();
     }
 
     void Cancel(int64_t requestId) {
@@ -2313,6 +2330,7 @@ class CurlMultiEngine {
     std::thread owner_;
     mutable std::mutex mutex_;
     bool stopping_ = false;
+    bool retiring_ = false;
     bool cohort_initialized_ = false;
     bool http3_cohort_ = false;
     int64_t connection_cache_id_ = 0;
@@ -2387,6 +2405,19 @@ int SubmitBufferedRequestV27(CurlMultiEngineHandle engine, int64_t requestId,
         *request,
         *callback);
     return reinterpret_cast<CurlMultiEngine *>(engine)->Submit(std::move(job)) ? 1 : 0;
+}
+
+void RetireCurlMultiEngine(CurlMultiEngineHandle engine) {
+    if (engine != nullptr) {
+        reinterpret_cast<CurlMultiEngine *>(engine)->Retire();
+    }
+}
+
+int CurlMultiEngineIsDrained(CurlMultiEngineHandle engine) {
+    if (engine == nullptr) {
+        return 1;
+    }
+    return reinterpret_cast<CurlMultiEngine *>(engine)->IsDrained() ? 1 : 0;
 }
 
 void CancelCurlMultiRequest(CurlMultiEngineHandle engine, int64_t requestId) {
