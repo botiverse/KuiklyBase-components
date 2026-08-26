@@ -732,6 +732,68 @@ int main(int argc, char **argv) {
         DeleteCurlClient(freshHandle);
     }
 
+    // Deleting a retired engine has to happen off the caller's thread. A
+    // completion erases its job before invoking that job's callback, so an
+    // engine already reports drained while its own callback is still running on
+    // its owner thread — deleting it there would join the owner thread from the
+    // owner thread. This hands the engine to the shared reaper from inside a
+    // completion callback, which is the exact shape that would deadlock.
+    {
+        struct RetireFromCallback {
+            MultiCaptured batch;
+            CurlMultiEngineHandle engine = nullptr;
+        };
+        RetireFromCallback state;
+        state.batch.expected = 1;
+        state.batch.callbackCounts.assign(1, 0);
+        state.batch.codes.assign(1, -1);
+        state.batch.httpCodes.assign(1, -1);
+
+        state.engine = CreateCurlMultiEngine("wrapper-rotation-reaper");
+        CHECK(state.engine != nullptr, "reaper test engine starts");
+
+        StringDic headers{};
+        const std::string url = base + "/multi-delay";
+        CurlRequest request{};
+        request.url = url.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+
+        MultiCallbackRef ref{&state.batch, 0};
+        CurlCallback callback{&ref, OnMultiResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-rotation-reaper-request");
+        SetCurlProxy(handle, "");
+        CHECK(SubmitBufferedRequestV27(
+                  state.engine, 31'100, handle, &request, sizeof(request),
+                  CURL_WRAPPER_ABI_VERSION, &callback) == 1,
+              "reaper test request is accepted");
+
+        // Hand the engine over while its request is still running. This orders
+        // the two observations so neither can be faked by the other: the engine
+        // cannot be deleted yet, so a non-zero count proves the handover
+        // registered it, and the later zero proves the reaper actually ran.
+        RetireCurlMultiEngine(state.engine);
+        ScheduleRetiredEngineDeletion(state.engine);
+        CHECK(CurlRetiredEngineCountForTesting() >= 1,
+              "handing over an undrained engine registers it rather than deleting it");
+
+        CHECK(AwaitMulti(state.batch, 5000), "reaper test request reaches terminal");
+        CHECK(state.batch.codes[0] == 0 && state.batch.httpCodes[0] == 200,
+              "handing an engine over does not disturb its running request");
+
+        bool reaped = false;
+        for (int attempt = 0; attempt < 100 && !reaped; ++attempt) {
+            reaped = CurlRetiredEngineCountForTesting() == 0;
+            if (!reaped) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            }
+        }
+        CHECK(reaped, "retired engine is deleted by the reaper without blocking the caller");
+
+        DeleteCurlClient(handle);
+    }
+
     // A real non-TLS completion is a known 0us TLS phase, while an HTTPS
     // transfer that never reaches TLS carries the explicit not-reached state.
     {

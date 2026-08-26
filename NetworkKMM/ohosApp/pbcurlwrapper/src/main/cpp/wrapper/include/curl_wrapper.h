@@ -370,10 +370,25 @@ void RetireCurlMultiEngine(CurlMultiEngineHandle engine);
 // cache no longer backs a live transfer. Returns 1 for a null handle so a
 // caller draining a set is not blocked by an engine that failed to create.
 int CurlMultiEngineIsDrained(CurlMultiEngineHandle engine);
+
+// Hand a retired engine over to be deleted once it drains, and return
+// immediately. Safe to call from anywhere, including an engine callback --
+// which is the reason this exists rather than each platform polling
+// CurlMultiEngineIsDrained and calling delete itself.
+//
+// A completion erases its job before invoking that job's callback, so while an
+// engine's callback runs on its owner thread the engine already reports
+// drained. Deleting it there would join the owner thread from the owner
+// thread. Deletion therefore happens on a reaper thread that is never an
+// engine owner. Ownership of `engine` transfers to the reaper: the caller must
+// not use, delete or re-retire it afterwards.
+void ScheduleRetiredEngineDeletion(CurlMultiEngineHandle engine);
 int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
                        size_t infoSize, int abiVersion);
 
 #if defined(NETWORKKMM_WRAPPER_TESTING)
+// Host-test-only seam: how many retired engines have not been deleted yet.
+int CurlRetiredEngineCountForTesting(void);
 // Host-test-only seam: 1 fails the next multi perform, 2 the next multi poll.
 void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode);
 void SetCurlClientTestConfigureFailure(CurClientHandle handle);
