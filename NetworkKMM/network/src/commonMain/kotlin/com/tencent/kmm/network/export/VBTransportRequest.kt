@@ -145,7 +145,7 @@ open class VBTransportBaseRequest {
     internal var streamIdleTimeoutMillis: Long = 60_000L
     internal var streamWholeTimeoutMillis: Long = 0L
     internal var curlBufferedBodyIdleTimeoutMillis: Long = 7_000L
-    internal var curlMaxBufferedResponseBytes: Long = 16L * 1024L * 1024L
+    internal var curlMaxBufferedResponseBytes: Long = 64L * 1024L * 1024L
 
     internal open fun bodyData(): Any? = null
 }

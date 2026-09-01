@@ -146,7 +146,7 @@ class AndroidCurlNetworkEngineTest {
         assertEquals(trustStoreFile.absolutePath, nativeRequest.caInfoPath)
         assertEquals("", nativeRequest.proxyUrl)
         assertEquals(7_000L, nativeRequest.bufferedBodyIdleTimeoutMillis)
-        assertEquals(16L * 1024L * 1024L, nativeRequest.maxBufferedResponseBytes)
+        assertEquals(64L * 1024L * 1024L, nativeRequest.maxBufferedResponseBytes)
     }
 
     @Test

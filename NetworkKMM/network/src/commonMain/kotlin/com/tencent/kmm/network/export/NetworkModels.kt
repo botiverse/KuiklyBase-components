@@ -447,7 +447,7 @@ data class NetworkCurlBufferedResponsePolicy(
     /** Final headers -> first byte and inter-body-progress idle deadline. */
     val bodyIdleTimeoutMillis: Long = 7_000,
     /** Decoded bytes retained in memory. Zero disables the cap. */
-    val maxDecodedBytes: Long = 16L * 1024L * 1024L,
+    val maxDecodedBytes: Long = 64L * 1024L * 1024L,
     /** One fresh physical attempt for replay-safe GET/HEAD body stalls. */
     val freshRetryEnabled: Boolean = true,
 )
