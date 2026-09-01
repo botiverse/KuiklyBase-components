@@ -165,7 +165,7 @@ class IosCurlNetworkEngineTest {
         assertEquals(trustStorePath, nativeRequest.caInfoPath)
         assertEquals("", nativeRequest.proxyUrl)
         assertEquals(7_000L, nativeRequest.bufferedBodyIdleTimeoutMillis)
-        assertEquals(64L * 1024L * 1024L, nativeRequest.maxBufferedResponseBytes)
+        assertEquals(com.tencent.kmm.network.export.DEFAULT_CURL_MAX_BUFFERED_RESPONSE_BYTES, nativeRequest.maxBufferedResponseBytes)
     }
 
     @Test

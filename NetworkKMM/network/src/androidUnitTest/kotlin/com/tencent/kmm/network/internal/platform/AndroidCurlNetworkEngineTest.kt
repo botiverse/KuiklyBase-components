@@ -18,6 +18,7 @@ package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.export.NetworkBody
+import com.tencent.kmm.network.export.DEFAULT_CURL_MAX_BUFFERED_RESPONSE_BYTES
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkEngineCapabilities
 import com.tencent.kmm.network.export.NetworkErrorKind
@@ -146,7 +147,7 @@ class AndroidCurlNetworkEngineTest {
         assertEquals(trustStoreFile.absolutePath, nativeRequest.caInfoPath)
         assertEquals("", nativeRequest.proxyUrl)
         assertEquals(7_000L, nativeRequest.bufferedBodyIdleTimeoutMillis)
-        assertEquals(64L * 1024L * 1024L, nativeRequest.maxBufferedResponseBytes)
+        assertEquals(DEFAULT_CURL_MAX_BUFFERED_RESPONSE_BYTES, nativeRequest.maxBufferedResponseBytes)
     }
 
     @Test
