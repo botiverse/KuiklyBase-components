@@ -18,11 +18,11 @@ package com.tencent.kmm.network.export
 
 import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.locks.SynchronizedObject
-
-internal const val DEFAULT_CURL_MAX_BUFFERED_RESPONSE_BYTES: Long = 64L * 1024L * 1024L
 import kotlinx.atomicfu.locks.synchronized
 import kotlin.math.min
 import kotlin.random.Random
+
+internal const val DEFAULT_CURL_MAX_BUFFERED_RESPONSE_BYTES: Long = 64L * 1024L * 1024L
 
 data class NetworkQueryParameter(
     val name: String,
