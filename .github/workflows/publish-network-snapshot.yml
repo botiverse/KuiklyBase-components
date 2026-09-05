@@ -53,33 +53,16 @@ jobs:
         working-directory: NetworkKMM
         env:
           RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          NETWORK_SOURCE_SHA: ${{ env.SOURCE_SHA }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "$RAFT_ARTIFACTS_PUBLISH_TOKEN"
-          cat > /tmp/raft-maven.init.gradle.kts <<'EOF'
-          import org.gradle.api.publish.PublishingExtension
-          allprojects {
-              pluginManager.withPlugin("maven-publish") {
-                  extensions.configure<PublishingExtension> {
-                      repositories.maven {
-                          name = "raftMaven"
-                          url = uri(System.getenv("RAFT_MAVEN_BASE_URL"))
-                          credentials {
-                              username = "token"
-                              password = System.getenv("RAFT_ARTIFACTS_PUBLISH_TOKEN")
-                          }
-                      }
-                  }
-              }
-          }
-          EOF
           ./gradlew --no-daemon --stacktrace \
-            -I /tmp/raft-maven.init.gradle.kts \
             -PmavenVersion="$MAVEN_VERSION" \
-            :network:publishAndroidPublicationToRaftMavenRepository \
-            :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToRaftMavenRepository \
-            :network:publishKotlinMultiplatformPublicationToRaftMavenRepository
+            :network:publishAndroidPublicationToRaftArtifactsRepository \
+            :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToRaftArtifactsRepository \
+            :network:publishKotlinMultiplatformPublicationToRaftArtifactsRepository
 
       - name: Anonymous readback and SHA-256 receipt
         shell: bash
@@ -105,6 +88,9 @@ jobs:
           for extension in pom module; do
             file="$RAFT_ARTIFACT-$snapshot_value.$extension"
             curl --fail --silent --show-error --max-time 30 --output "/tmp/network.$extension" "$base/$file"
+            if [[ "$extension" == pom ]]; then
+              grep -Fq "$SOURCE_SHA" "/tmp/network.$extension"
+            fi
             sha256sum "/tmp/network.$extension"
             echo "readback $base/$file"
           done
