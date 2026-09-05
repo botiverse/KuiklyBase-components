@@ -77,8 +77,9 @@ jobs:
           ./gradlew --no-daemon --stacktrace \
             -I /tmp/raft-maven.init.gradle.kts \
             -PmavenVersion="$MAVEN_VERSION" \
-            :network:publishAllPublicationsToRaftMavenRepository \
-            :network-android-curl-runtime:publishAllPublicationsToRaftMavenRepository
+            :network:publishAndroidPublicationToRaftMavenRepository \
+            :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToRaftMavenRepository \
+            :network:publishKotlinMultiplatformPublicationToRaftMavenRepository
 
       - name: Anonymous readback and SHA-256 receipt
         shell: bash
