@@ -1232,6 +1232,10 @@ class CurlClient {
             logE(log_tag_, "CURLOPT_HTTP_VERSION failed: " + std::to_string(httpVersionResult));
             return false;
         }
+        const CURLcode pipeWaitResult = curl_easy_setopt(curl_, CURLOPT_PIPEWAIT, 1L);
+        if (pipeWaitResult != CURLE_OK) {
+            logE(log_tag_, "CURLOPT_PIPEWAIT failed: " + std::to_string(pipeWaitResult));
+        }
 
         // SSL: verify the server certificate chain and hostname (raft.2). The
         // trust anchors are the OHOS system CA store — libcurl/OpenSSL are built
@@ -2070,6 +2074,11 @@ class CurlMultiEngine {
         }
         multi_ = curl_multi_init();
         if (multi_ != nullptr) {
+            const CURLMcode multiplexResult = curl_multi_setopt(
+                multi_, CURLMOPT_PIPELINING, CURLPIPE_MULTIPLEX);
+            if (multiplexResult != CURLM_OK) {
+                logE(log_tag_, "CURLMOPT_PIPELINING failed: " + std::to_string(multiplexResult));
+            }
             owner_ = std::thread(&CurlMultiEngine::Run, this);
         }
     }
