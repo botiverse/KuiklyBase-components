@@ -348,10 +348,47 @@ int SubmitBufferedRequestV27(CurlMultiEngineHandle engine, int64_t requestId,
                              size_t requestSize, int abiVersion,
                              const CurlCallback *callback);
 void CancelCurlMultiRequest(CurlMultiEngineHandle engine, int64_t requestId);
+
+// Connection-generation rotation (task #52 phase 2).
+//
+// An engine's CURLM handle owns the reusable connection cache, so retiring an
+// engine is what actually drops a connection that survived a network change.
+// The default/H3 CURLSH pair does not: it shares DNS and TLS-session data only
+// (CURL_LOCK_DATA_CONNECT is deliberately not shared), so rotating it leaves a
+// half-dead connection in place.
+//
+// Retire makes the engine refuse new submissions while every already-accepted
+// request runs to its normal terminal. That is the whole difference from
+// DeleteCurlMultiEngine, which cancels them: rotation must not fail requests
+// that happen to be in flight when the network changes. The caller publishes a
+// fresh engine for new work, then deletes the retired one once
+// CurlMultiEngineIsDrained reports 1 — at which point delete cancels nothing.
+// Retiring is idempotent and safe to call from any thread.
+void RetireCurlMultiEngine(CurlMultiEngineHandle engine);
+
+// 1 when the engine holds no pending or accepted request, so its connection
+// cache no longer backs a live transfer. Returns 1 for a null handle so a
+// caller draining a set is not blocked by an engine that failed to create.
+int CurlMultiEngineIsDrained(CurlMultiEngineHandle engine);
+
+// Hand a retired engine over to be deleted once it drains, and return
+// immediately. Safe to call from anywhere, including an engine callback --
+// which is the reason this exists rather than each platform polling
+// CurlMultiEngineIsDrained and calling delete itself.
+//
+// A completion erases its job before invoking that job's callback, so while an
+// engine's callback runs on its owner thread the engine already reports
+// drained. Deleting it there would join the owner thread from the owner
+// thread. Deletion therefore happens on a reaper thread that is never an
+// engine owner. Ownership of `engine` transfers to the reaper: the caller must
+// not use, delete or re-retire it afterwards.
+void ScheduleRetiredEngineDeletion(CurlMultiEngineHandle engine);
 int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
                        size_t infoSize, int abiVersion);
 
 #if defined(NETWORKKMM_WRAPPER_TESTING)
+// Host-test-only seam: how many retired engines have not been deleted yet.
+int CurlRetiredEngineCountForTesting(void);
 // Host-test-only seam: 1 fails the next multi perform, 2 the next multi poll.
 void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode);
 void SetCurlClientTestConfigureFailure(CurClientHandle handle);
