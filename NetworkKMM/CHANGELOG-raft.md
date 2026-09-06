@@ -1,5 +1,11 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.37 (curl multiplex wait)
+
+- Enable curl to wait for an existing multiplexable connection before opening
+  another connection, with committed Android native binaries rebuilt from the
+  exact wrapper source.
+
 ## 0.1.0-raft.35 / 0.1.0-raft.35-ohos (default User-Agent)
 
 - Send a default `User-Agent` when the caller sets none. The library
