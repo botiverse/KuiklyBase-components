@@ -58,11 +58,29 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$RAFT_ARTIFACTS_PUBLISH_TOKEN"
+          cat > /tmp/raft-maven.init.gradle.kts <<'EOF'
+          import org.gradle.api.publish.PublishingExtension
+          allprojects {
+              pluginManager.withPlugin("maven-publish") {
+                  extensions.configure<PublishingExtension> {
+                      repositories.maven {
+                          name = "raftMaven"
+                          url = uri("https://maven.artifacts.botiverse.dev")
+                          credentials {
+                              username = "token"
+                              password = System.getenv("RAFT_ARTIFACTS_PUBLISH_TOKEN")
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
           ./gradlew --no-daemon --stacktrace \
+            -I /tmp/raft-maven.init.gradle.kts \
             -PmavenVersion="$MAVEN_VERSION" \
-            :network:publishAndroidPublicationToRaftArtifactsRepository \
-            :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToRaftArtifactsRepository \
-            :network:publishKotlinMultiplatformPublicationToRaftArtifactsRepository
+            :network:publishAndroidPublicationToRaftMavenRepository \
+            :network-android-curl-runtime:publishAndroidCurlRuntimePublicationToRaftMavenRepository \
+            :network:publishKotlinMultiplatformPublicationToRaftMavenRepository
 
       - name: Anonymous readback and SHA-256 receipt
         shell: bash
