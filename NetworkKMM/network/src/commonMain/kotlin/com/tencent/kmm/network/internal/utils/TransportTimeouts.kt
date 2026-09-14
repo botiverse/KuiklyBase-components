@@ -38,7 +38,11 @@ package com.tencent.kmm.network.internal.utils
  */
 internal const val TRANSPORT_CONNECT_TIMEOUT_MILLIS: Long = 10_000L
 
-/** Explicit connection budgets are independent of the whole-request deadline. */
+/**
+ * Uses request timeout first, then whole-transfer timeout. With a total,
+ * reserve 5 seconds (or half for short totals); without one, explicit values
+ * pass through and an absent value uses the 10-second default.
+ */
 internal fun transportConnectTimeoutMillis(
     totalTimeout: Long,
     wholeTransferTimeout: Long,
