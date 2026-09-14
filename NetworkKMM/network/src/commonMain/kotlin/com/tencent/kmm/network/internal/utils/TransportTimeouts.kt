@@ -39,11 +39,17 @@ package com.tencent.kmm.network.internal.utils
 internal const val TRANSPORT_CONNECT_TIMEOUT_MILLIS: Long = 10_000L
 
 /** Explicit connection budgets are independent of the whole-request deadline. */
-internal fun transportConnectTimeoutMillis(totalTimeout: Long, requestedConnectTimeout: Long?): Long {
-    if (totalTimeout <= 0L) return requestedConnectTimeout ?: TRANSPORT_CONNECT_TIMEOUT_MILLIS
+internal fun transportConnectTimeoutMillis(
+    totalTimeout: Long,
+    wholeTransferTimeout: Long,
+    requestedConnectTimeout: Long?,
+): Long {
+    val effectiveTotal = totalTimeout.takeIf { it > 0 } ?: wholeTransferTimeout.takeIf { it > 0 } ?: 0L
+    val requested = requestedConnectTimeout?.takeIf { it > 0 } ?: TRANSPORT_CONNECT_TIMEOUT_MILLIS
+    if (effectiveTotal <= 0L) return requested
     val maximum = when {
-        totalTimeout > 10_000L -> totalTimeout - 5_000L
-        else -> totalTimeout / 2
+        effectiveTotal > 10_000L -> effectiveTotal - 5_000L
+        else -> effectiveTotal / 2
     }
-    return minOf(requestedConnectTimeout.takeIf { it > 0 } ?: TRANSPORT_CONNECT_TIMEOUT_MILLIS, maximum)
+    return minOf(requested, maximum)
 }

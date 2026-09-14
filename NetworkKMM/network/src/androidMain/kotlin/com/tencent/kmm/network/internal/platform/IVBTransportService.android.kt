@@ -590,7 +590,7 @@ object AndroidTransportImpl : IVBTransportService {
                         }
                     } else {
                         timeout {
-                            connectTimeoutMillis = transportConnectTimeoutMillis(requestBudget.millis, request.streamConnectTimeoutMillis)
+                            connectTimeoutMillis = transportConnectTimeoutMillis(requestBudget.millis, request.streamWholeTimeoutMillis, request.streamConnectTimeoutMillis)
                             if (requestBudget is AndroidRequestTimeoutBudget.Remaining) {
                                 requestTimeoutMillis = requestBudget.millis
                                 socketTimeoutMillis = requestBudget.millis
