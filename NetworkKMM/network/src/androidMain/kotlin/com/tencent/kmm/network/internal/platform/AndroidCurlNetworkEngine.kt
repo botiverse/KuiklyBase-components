@@ -386,7 +386,10 @@ internal class AndroidCurlNetworkEngine(
             method = method.name,
             headers = nativeHeaders,
             timeoutMillis = timeoutMillis,
-            streamConnectTimeoutMillis = policy.streamTimeouts.connectTimeoutMillis,
+            streamConnectTimeoutMillis = transportConnectTimeoutMillis(
+                policy.timeoutMillis,
+                policy.streamTimeouts.connectTimeoutMillis,
+            ),
             streamResponseHeadersTimeoutMillis = policy.streamTimeouts.responseHeadersTimeoutMillis,
             streamIdleTimeoutMillis = policy.streamTimeouts.interChunkIdleTimeoutMillis,
             streamWholeTimeoutMillis = policy.streamTimeouts.wholeTransferTimeoutMillis,
