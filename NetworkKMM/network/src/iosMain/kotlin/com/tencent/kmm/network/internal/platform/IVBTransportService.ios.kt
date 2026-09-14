@@ -117,7 +117,7 @@ class IOSTransportImpl : IVBTransportService {
                 val response = client.request(request.url) {
                     method = HttpMethod(request.method.name)
                     timeout {
-                        connectTimeoutMillis = transportConnectTimeoutMillis(request.streamConnectTimeoutMillis)
+                        connectTimeoutMillis = transportConnectTimeoutMillis(request.totalTimeout, request.streamConnectTimeoutMillis)
                         if (request.totalTimeout > 0) {
                             requestTimeoutMillis = request.totalTimeout
                             socketTimeoutMillis = request.totalTimeout
