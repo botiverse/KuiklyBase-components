@@ -62,5 +62,6 @@ class TransportTimeoutsTest {
         // budget still applies so a dead address family cannot hang forever.
         kotlin.test.assertEquals(30_000L, transportConnectTimeoutMillis(0L, 0L, 30_000L))
         kotlin.test.assertEquals(10_000L, transportConnectTimeoutMillis(0L, 0L, null))
+        kotlin.test.assertEquals(15_000L, transportConnectTimeoutMillis(0L, 20_000L, 30_000L))
     }
 }
