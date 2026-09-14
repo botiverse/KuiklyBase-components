@@ -32,6 +32,7 @@ import com.tencent.kmm.network.export.NetworkResponse
 import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.VBTransportMethod
+import com.tencent.kmm.network.internal.utils.transportConnectTimeoutMillis
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.internal.VBPBRequestIdGenerator
 import com.tencent.kmm.network.internal.RequestIdOwnerRegistry
