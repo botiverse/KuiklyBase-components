@@ -456,7 +456,7 @@ data class NetworkCurlBufferedResponsePolicy(
 
 data class NetworkStreamTimeoutPolicy(
     /** DNS, socket, proxy tunnel and TLS establishment budget. */
-    val connectTimeoutMillis: Long = 3_000,
+    val connectTimeoutMillis: Long = 10_000,
     /**
      * Final origin response-header budget. Curl starts this phase after each
      * connection/proxy/TLS pre-transfer point. Ktor transports enforce the

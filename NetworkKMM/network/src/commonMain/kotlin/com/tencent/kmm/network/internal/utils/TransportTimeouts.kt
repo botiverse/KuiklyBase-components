@@ -28,17 +28,16 @@ package com.tencent.kmm.network.internal.utils
  * up as 5/15/30s cold-connection ladders while the same request completed
  * in ~300ms once a connection existed.
  *
- * 3s, not sub-second: with serial connection attempts a connect timeout is
+ * 10s, not the previous 3s: with serial connection attempts a connect timeout is
  * a hard verdict to abandon that address family, and a legitimate TCP
  * handshake on high-RTT cellular can take 1-3s — sub-second values would
- * fail slow-but-working paths. 3s caps the dead-family detour at one
- * ladder step (16s → ~3.3s observed shape) without breaking weak networks.
+ * fail slow-but-working paths. 10s allows slower mobile handshakes while keeping
+ * the dead-family detour bounded below the usual 30s request budget.
  * True zero-cost fallback (RFC 8305 parallel racing) is an engine-level
  * capability tracked separately (OkHttp fastFallback / infra RFC).
  */
-internal const val TRANSPORT_CONNECT_TIMEOUT_MILLIS: Long = 30_000L
+internal const val TRANSPORT_CONNECT_TIMEOUT_MILLIS: Long = 10_000L
 
-/** Connect budget for a request: never longer than the request's own total timeout. */
-internal fun transportConnectTimeoutMillis(totalTimeout: Long): Long =
-    if (totalTimeout in 1 until TRANSPORT_CONNECT_TIMEOUT_MILLIS) totalTimeout
-    else TRANSPORT_CONNECT_TIMEOUT_MILLIS
+/** Explicit connection budgets are independent of the whole-request deadline. */
+internal fun transportConnectTimeoutMillis(connectTimeout: Long): Long =
+    if (connectTimeout > 0) connectTimeout else TRANSPORT_CONNECT_TIMEOUT_MILLIS
