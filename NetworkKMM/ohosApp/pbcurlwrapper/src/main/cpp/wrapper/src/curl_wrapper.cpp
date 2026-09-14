@@ -1194,7 +1194,7 @@ class CurlClient {
         // transports' 3s cap) so a black-holed address family fails fast
         // instead of inheriting the whole-request timeout, and Happy Eyeballs
         // racing is pinned explicitly instead of trusting the libcurl default.
-        const long connectTimeout = stream_mode_ && request.streamConnectTimeoutMs > 0
+        const long connectTimeout = request.streamConnectTimeoutMs > 0
             ? static_cast<long>(request.streamConnectTimeoutMs)
             : 3000L;
         curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, connectTimeout);

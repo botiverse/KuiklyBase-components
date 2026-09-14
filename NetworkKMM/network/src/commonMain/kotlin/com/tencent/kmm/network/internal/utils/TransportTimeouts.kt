@@ -36,7 +36,7 @@ package com.tencent.kmm.network.internal.utils
  * True zero-cost fallback (RFC 8305 parallel racing) is an engine-level
  * capability tracked separately (OkHttp fastFallback / infra RFC).
  */
-internal const val TRANSPORT_CONNECT_TIMEOUT_MILLIS: Long = 3_000L
+internal const val TRANSPORT_CONNECT_TIMEOUT_MILLIS: Long = 30_000L
 
 /** Connect budget for a request: never longer than the request's own total timeout. */
 internal fun transportConnectTimeoutMillis(totalTimeout: Long): Long =
