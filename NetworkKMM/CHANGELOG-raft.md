@@ -1,5 +1,27 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.39 / 0.1.0-raft.39-ohos (native carrier refresh)
+
+- Rebuild and commit the Android/iOS/OHOS native binaries from the reviewed
+  wrapper source. The raft.38 native carriers were stale — Android still at
+  raft.37, iOS/OHOS still at raft.31 — because binary refresh is a manual
+  workflow_dispatch and raft.38 shipped without running it. The Kotlin side
+  truthfully reported `effectiveConnectTimeoutMillis=10000`, but buffered
+  native requests still applied the old 3000 ms default connect timeout
+  (proven by on-device acceptance). The iOS/OHOS carriers additionally lack
+  the raft.37 multiplex wait (symbol-level provenance: zero multiplex marker
+  strings).
+- Treat the raft.38 native carriers as audit-only and not consumable; the
+  Kotlin sources shared with raft.38 are unaffected.
+- Add CI freshness gates so this cannot recur: when a committed binary lags
+  the wrapper source, the native build lanes fail red instead of silently
+  shipping a stale binary. Android and iOS assert byte-level equality of the
+  rebuilt artifact against the committed one (both lanes are proven
+  reproducible: two independent CI runs from one source tree produced
+  byte-identical .so / xcframework); OHOS reproducibility is not yet proven,
+  so its gate asserts the multiplex provenance marker count on the freshly
+  built wrapper instead.
+
 ## 0.1.0-raft.38 / 0.1.0-raft.38-ohos (caller connect budgets)
 
 - Honor caller connection budgets for non-streaming curl requests and Ktor.
