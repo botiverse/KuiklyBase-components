@@ -581,6 +581,12 @@ object AndroidTransportImpl : IVBTransportService {
                         if (remainingWholeMillis == 0L) {
                             throw SocketTimeoutException("stream whole-transfer timeout exhausted")
                         }
+                        // Stream route applies no connect clamp: the requested
+                        // value is what the engine gets.
+                        AndroidTransportPhaseTracer.reportEffectiveConnectTimeout(
+                            request.requestId,
+                            request.streamConnectTimeoutMillis,
+                        )
                         timeout {
                             if (remainingWholeMillis != null) {
                                 requestTimeoutMillis = remainingWholeMillis
@@ -589,12 +595,19 @@ object AndroidTransportImpl : IVBTransportService {
                             socketTimeoutMillis = request.streamIdleTimeoutMillis
                         }
                     } else {
+                        val effectiveConnectTimeoutMillis = transportConnectTimeoutMillis(
+                            (requestBudget as? AndroidRequestTimeoutBudget.Remaining)?.millis ?: 0L,
+                            request.streamWholeTimeoutMillis,
+                            request.streamConnectTimeoutMillis,
+                        )
+                        // Per attempt, so a fresh retry overwrites with the
+                        // budget its own remaining total produced.
+                        AndroidTransportPhaseTracer.reportEffectiveConnectTimeout(
+                            request.requestId,
+                            effectiveConnectTimeoutMillis,
+                        )
                         timeout {
-                            connectTimeoutMillis = transportConnectTimeoutMillis(
-                                (requestBudget as? AndroidRequestTimeoutBudget.Remaining)?.millis ?: 0L,
-                                request.streamWholeTimeoutMillis,
-                                request.streamConnectTimeoutMillis,
-                            )
+                            connectTimeoutMillis = effectiveConnectTimeoutMillis
                             if (requestBudget is AndroidRequestTimeoutBudget.Remaining) {
                                 requestTimeoutMillis = requestBudget.millis
                                 socketTimeoutMillis = requestBudget.millis

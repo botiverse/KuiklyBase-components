@@ -143,4 +143,6 @@ data class VBTransportElapseStatistics(
     var curlFirstAttemptFirstBodyElapsedMs: Double = 0.0,
     var curlFirstAttemptLastBodyProgressElapsedMs: Double = 0.0,
     var curlFirstAttemptBodyBytes: Long = 0,
+    /** Connect budget actually handed to the engine after total/whole-transfer clamping; 0 when the engine route does not report it. */
+    var effectiveConnectTimeoutMillis: Long = 0,
 )

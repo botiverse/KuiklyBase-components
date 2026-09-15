@@ -114,10 +114,19 @@ class IOSTransportImpl : IVBTransportService {
             try {
                 val client = getHttpClient(request) as HttpClient
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
+                // Report the clamped connect budget handed to the engine;
+                // buildResponseAndCallback copies transportElapseStatistics
+                // into the response's elapseStatis.
+                val effectiveConnectTimeoutMillis = transportConnectTimeoutMillis(
+                    request.totalTimeout,
+                    request.streamWholeTimeoutMillis,
+                    request.streamConnectTimeoutMillis
+                )
+                request.transportElapseStatistics.effectiveConnectTimeoutMillis = effectiveConnectTimeoutMillis
                 val response = client.request(request.url) {
                     method = HttpMethod(request.method.name)
                     timeout {
-                        connectTimeoutMillis = transportConnectTimeoutMillis(request.totalTimeout, request.streamWholeTimeoutMillis, request.streamConnectTimeoutMillis)
+                        connectTimeoutMillis = effectiveConnectTimeoutMillis
                         if (request.totalTimeout > 0) {
                             requestTimeoutMillis = request.totalTimeout
                             socketTimeoutMillis = request.totalTimeout

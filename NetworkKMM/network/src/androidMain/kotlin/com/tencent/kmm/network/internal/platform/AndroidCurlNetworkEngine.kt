@@ -222,7 +222,7 @@ internal class AndroidCurlNetworkEngine(
             return cancelledResponse(request)
         }
         return try {
-            bridge.downloadStream(
+            val nativeResponse = bridge.downloadStream(
                 request = nativeRequest,
                 onResponseStart = { httpCode, headerText ->
                     val headers = parseCurlHeaders(headerText)
@@ -238,7 +238,9 @@ internal class AndroidCurlNetworkEngine(
                     }
                     onChunk(chunk)
                 }
-            ).toNetworkResponse(request)
+            )
+            nativeResponse.elapse.effectiveConnectTimeoutMillis = nativeRequest.streamConnectTimeoutMillis
+            nativeResponse.toNetworkResponse(request)
         } finally {
             androidCurlRequestOwners.release(requestId, owner)
         }
@@ -316,6 +318,7 @@ internal class AndroidCurlNetworkEngine(
                 }
             }
             val nativeResponse = bridge.uploadStream(nativeRequest, uploadSource)
+            nativeResponse.elapse.effectiveConnectTimeoutMillis = nativeRequest.streamConnectTimeoutMillis
             if (nativeResponse.isBufferedBodyIdleTimeout()) {
                 nativeResponse.elapse.curlBodyStallDetected = true
             }
@@ -362,7 +365,12 @@ internal class AndroidCurlNetworkEngine(
             return CurlNativeResponse(code = 42, errorMsg = "cancelled before Android curl native start")
         }
         return try {
-            if (freshConnection) bridge.executeFresh(nativeRequest) else bridge.execute(nativeRequest)
+            val response =
+                if (freshConnection) bridge.executeFresh(nativeRequest) else bridge.execute(nativeRequest)
+            // toNativeRequest clamps into streamConnectTimeoutMillis; report the
+            // budget this attempt actually handed to the native engine.
+            response.elapse.effectiveConnectTimeoutMillis = nativeRequest.streamConnectTimeoutMillis
+            response
         } finally {
             androidCurlRequestOwners.release(requestId, owner)
         }
