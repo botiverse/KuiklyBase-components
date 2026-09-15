@@ -1,5 +1,11 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.38 / 0.1.0-raft.38-ohos (caller connect budgets)
+
+- Honor caller connection budgets for non-streaming curl requests and Ktor.
+- Use a 10-second default while keeping connection budgets below bounded
+  request totals; preserve explicit budgets when no total is configured.
+
 ## 0.1.0-raft.37 (curl multiplex wait)
 
 - Enable curl to wait for an existing multiplexable connection before opening

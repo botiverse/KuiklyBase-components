@@ -1190,13 +1190,9 @@ class CurlClient {
         } else if (stream_mode_ && request.streamWholeTimeoutMs > 0) {
             curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, request.streamWholeTimeoutMs);
         }
-        // raft.11: connect gets its own short budget (aligned with the ktor
-        // transports' 3s cap) so a black-holed address family fails fast
-        // instead of inheriting the whole-request timeout, and Happy Eyeballs
-        // racing is pinned explicitly instead of trusting the libcurl default.
-        const long connectTimeout = stream_mode_ && request.streamConnectTimeoutMs > 0
+        const long connectTimeout = request.streamConnectTimeoutMs > 0
             ? static_cast<long>(request.streamConnectTimeoutMs)
-            : 3000L;
+            : 10000L;
         curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, connectTimeout);
         curl_easy_setopt(curl_, CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200L);
         // Share DNS/TLS sessions across per-request easy handles. Connection

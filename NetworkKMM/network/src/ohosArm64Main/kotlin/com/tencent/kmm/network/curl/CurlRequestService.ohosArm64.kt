@@ -998,6 +998,11 @@ object CurlRequestServiceHM : ICurlRequestService {
             request.url = nativeResponse.redirectUrl
         }
 
+        // Mirrors curl_wrapper.cpp (`streamConnectTimeoutMs > 0 ? it : 10000`):
+        // the wrapper ABI does not echo the connect budget it applied, so the
+        // Kotlin side recomputes the value the C++ engine will use.
+        nativeResponse.elapse.effectiveConnectTimeoutMillis =
+            if (request.streamConnectTimeoutMillis > 0) request.streamConnectTimeoutMillis else 10_000L
         response.elapseStatis = nativeResponse.elapse
         // raft.11: phase breakdown for failed or slow transfers, so "connect
         // slow vs transfer slow" is one log line instead of a manual ledger of

@@ -91,6 +91,20 @@ class TransportAndroidEngineTest {
     }
 
     @Test
+    fun transportTracerCarriesReportedEffectiveConnectTimeout() {
+        try {
+            AndroidTransportPhaseTracer.scheduled(requestId = 43)
+            AndroidTransportPhaseTracer.reportEffectiveConnectTimeout(requestId = 43, millis = 7_000L)
+
+            val timing = AndroidTransportPhaseTracer.complete(requestId = 43)
+
+            assertEquals(7_000L, timing.effectiveConnectTimeoutMillis)
+        } finally {
+            AndroidTransportPhaseTracer.resetForTests()
+        }
+    }
+
+    @Test
     fun okHttpToggleSelectsOkHttpEngine() {
         buildTransportHttpClient(okHttpEnabled = true).use { client ->
             assertIs<OkHttpEngine>(client.engine)

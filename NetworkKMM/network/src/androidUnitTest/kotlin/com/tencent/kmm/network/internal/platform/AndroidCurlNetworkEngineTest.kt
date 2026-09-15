@@ -148,6 +148,31 @@ class AndroidCurlNetworkEngineTest {
         assertEquals("", nativeRequest.proxyUrl)
         assertEquals(7_000L, nativeRequest.bufferedBodyIdleTimeoutMillis)
         assertEquals(64L * 1024L * 1024L, nativeRequest.maxBufferedResponseBytes)
+        // No total timeout -> the 10s default connect budget passes through.
+        assertEquals(10_000L, nativeRequest.streamConnectTimeoutMillis)
+        assertEquals(10_000L, response.timing.effectiveConnectTimeoutMillis)
+    }
+
+    @Test
+    fun clampedConnectBudgetIsReportedInTimingAndNativeRequest() = runBlocking {
+        val bridge = FakeBridge().apply {
+            executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        }
+        val request = NetworkRequest(
+            method = VBTransportMethod.GET,
+            url = "https://example.test",
+            policy = NetworkRequestPolicy(
+                timeoutMillis = 12_000,
+                streamTimeouts = NetworkStreamTimeoutPolicy(connectTimeoutMillis = 8_000)
+            )
+        )
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        // min(requested 8s, total 12s - 5s reserve) = 7s: the clamped value,
+        // not the requested one, is what the engine gets and timing reports.
+        assertEquals(7_000L, bridge.lastRequest?.streamConnectTimeoutMillis)
+        assertEquals(7_000L, response.timing.effectiveConnectTimeoutMillis)
     }
 
     @Test
@@ -187,6 +212,9 @@ class AndroidCurlNetworkEngineTest {
         assertEquals(true, response.timing.curlFirstAttemptFirstBodyObserved)
         assertEquals(9.0, response.timing.curlFirstAttemptLastBodyProgressElapsedMs)
         assertEquals(3L, response.timing.curlFirstAttemptBodyBytes)
+        // The returned timing is the retried attempt's: total 20s leaves a
+        // 15s clamp ceiling, so the 10s default connect budget stands.
+        assertEquals(10_000L, response.timing.effectiveConnectTimeoutMillis)
     }
 
     @Test
@@ -866,6 +894,9 @@ class AndroidCurlNetworkEngineTest {
         assertEquals(202L, bridge.lastRequest?.streamResponseHeadersTimeoutMillis)
         assertEquals(303L, bridge.lastRequest?.streamIdleTimeoutMillis)
         assertEquals(404L, bridge.lastRequest?.streamWholeTimeoutMillis)
+        // whole-transfer 404ms caps the connect budget at 202ms, so the
+        // requested 101ms passes through and is reported.
+        assertEquals(101L, response.timing.effectiveConnectTimeoutMillis)
     }
 
     @Test
@@ -904,6 +935,7 @@ class AndroidCurlNetworkEngineTest {
             ),
             progress
         )
+        assertEquals(10_000L, response.timing.effectiveConnectTimeoutMillis)
     }
 
     @Test

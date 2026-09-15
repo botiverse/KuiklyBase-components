@@ -450,7 +450,7 @@ class NetworkModelsTest {
     @Test
     fun streamTimeoutPolicyUsesPhaseDeadlinesAndCopyPreservesOverrides() {
         val defaults = NetworkRequestPolicy().streamTimeouts
-        assertEquals(3_000L, defaults.connectTimeoutMillis)
+        assertEquals(10_000L, defaults.connectTimeoutMillis)
         assertEquals(30_000L, defaults.responseHeadersTimeoutMillis)
         assertEquals(60_000L, defaults.interChunkIdleTimeoutMillis)
         assertEquals(0L, defaults.wholeTransferTimeoutMillis)
@@ -591,7 +591,7 @@ class NetworkModelsTest {
     fun legacyDirectTransportStreamUsesSafePhaseDeadlineDefaults() {
         val request = VBTransportRequest()
 
-        assertEquals(3_000L, request.streamConnectTimeoutMillis)
+        assertEquals(10_000L, request.streamConnectTimeoutMillis)
         assertEquals(30_000L, request.streamResponseHeadersTimeoutMillis)
         assertEquals(60_000L, request.streamIdleTimeoutMillis)
         assertEquals(0L, request.streamWholeTimeoutMillis)

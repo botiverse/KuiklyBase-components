@@ -165,6 +165,10 @@ internal object AndroidTransportPhaseTracer {
         }
     }
 
+    fun reportEffectiveConnectTimeout(requestId: Int, millis: Long) {
+        update(requestId) { effectiveConnectTimeoutMillis = millis }
+    }
+
     internal fun callStarted(requestId: Int) {
         update(requestId) { callStartNanos = nanoTime() }
     }
@@ -377,6 +381,7 @@ internal object AndroidTransportPhaseTracer {
         var staleH2ConcurrentRequestCount = 0
         var freshRetry = false
         var freshRetryResult: String? = null
+        var effectiveConnectTimeoutMillis = 0L
         var attemptToken = 0
         var maturedAttemptToken = 0
         var triggeredAttemptToken = 0
@@ -544,6 +549,7 @@ internal object AndroidTransportPhaseTracer {
                 connectionRolloverRateLimited = connectionRolloverRateLimited,
                 freshRetry = freshRetry,
                 freshRetryResult = freshRetryResult,
+                effectiveConnectTimeoutMillis = effectiveConnectTimeoutMillis,
                 noResponseHeadersDurationMs = millis(noResponseHeadersDurationNanos),
                 staleH2ConcurrentRequestCount = staleH2ConcurrentRequestCount,
             )

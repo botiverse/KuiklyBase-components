@@ -47,19 +47,22 @@ class TransportFailureClassifierTest {
 
 class TransportTimeoutsTest {
     @Test
-    fun connectBudgetIsCappedAtThreeSeconds() {
-        kotlin.test.assertEquals(3_000L, transportConnectTimeoutMillis(30_000L))
+    fun connectBudgetDefaultsToTenSeconds() {
+        kotlin.test.assertEquals(10_000L, transportConnectTimeoutMillis(30_000L, 0L, 10_000L))
     }
 
     @Test
     fun connectBudgetNeverExceedsTheRequestTotalTimeout() {
-        kotlin.test.assertEquals(1_500L, transportConnectTimeoutMillis(1_500L))
+        kotlin.test.assertEquals(750L, transportConnectTimeoutMillis(1_500L, 0L, 10_000L))
     }
 
     @Test
     fun nonPositiveTotalTimeoutFallsBackToTheDefaultConnectBudget() {
         // totalTimeout <= 0 means "no explicit timeout" upstream; the connect
         // budget still applies so a dead address family cannot hang forever.
-        kotlin.test.assertEquals(3_000L, transportConnectTimeoutMillis(0L))
+        kotlin.test.assertEquals(30_000L, transportConnectTimeoutMillis(0L, 0L, 30_000L))
+        kotlin.test.assertEquals(10_000L, transportConnectTimeoutMillis(0L, 0L, null))
+        kotlin.test.assertEquals(15_000L, transportConnectTimeoutMillis(0L, 20_000L, 30_000L))
+        kotlin.test.assertEquals(30_000L, transportConnectTimeoutMillis(0L, 60_000L, 30_000L))
     }
 }

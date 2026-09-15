@@ -114,15 +114,21 @@ class IOSTransportImpl : IVBTransportService {
             try {
                 val client = getHttpClient(request) as HttpClient
                 val startMark = kotlin.time.TimeSource.Monotonic.markNow()
+                // Report the clamped connect budget handed to the engine;
+                // buildResponseAndCallback copies transportElapseStatistics
+                // into the response's elapseStatis.
+                val effectiveConnectTimeoutMillis = transportConnectTimeoutMillis(
+                    request.totalTimeout,
+                    request.streamWholeTimeoutMillis,
+                    request.streamConnectTimeoutMillis
+                )
+                request.transportElapseStatistics.effectiveConnectTimeoutMillis = effectiveConnectTimeoutMillis
                 val response = client.request(request.url) {
                     method = HttpMethod(request.method.name)
-                    if (request.totalTimeout > 0) {
-                        timeout {
+                    timeout {
+                        connectTimeoutMillis = effectiveConnectTimeoutMillis
+                        if (request.totalTimeout > 0) {
                             requestTimeoutMillis = request.totalTimeout
-                            // raft.9: connect gets its own short budget so a dead
-                            // address family can't eat the whole request timeout
-                            // (see TransportTimeouts.kt for the 3s rationale).
-                            connectTimeoutMillis = transportConnectTimeoutMillis(request.totalTimeout)
                             socketTimeoutMillis = request.totalTimeout
                         }
                     }
