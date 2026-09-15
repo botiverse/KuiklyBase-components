@@ -161,6 +161,38 @@ jobs:
           grep -q -- "--openssldir=/etc/ssl" "$script"
           echo "TLS verification + system CA path: OK"
 
+      # Multiplex provenance gate: OHOS reproducibility is NOT yet proven, so
+      # unlike the Android/iOS lanes there is deliberately no sha256 freshness
+      # assertion here. Instead count the raft.37 multiplex marker strings
+      # ("CURLOPT_PIPEWAIT failed" / "CURLMOPT_PIPELINING failed" from
+      # curl_wrapper.cpp) in the freshly built wrapper: the build always runs
+      # from source, so exactly 2 markers prove the built carrier carries the
+      # reviewed raft.37+ source regardless of the committed binary's state.
+      # Assert on pull_request; on workflow_dispatch (the refresh mechanism)
+      # print only. If a future source change alters the count, update the
+      # expectation deliberately — that is a human review point, by design.
+      - name: Multiplex provenance markers (built libpbcurlwrapper.so)
+        shell: bash
+        env:
+          GATE_ASSERT: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          so="NetworkKMM/network/libs/libpbcurlwrapper.so"
+          test -f "$so"
+          pattern='CURLOPT_PIPEWAIT failed|CURLMOPT_PIPELINING failed'
+          if command -v strings >/dev/null 2>&1; then
+            # grep -c exits 1 on a zero count, so capture with `|| true`.
+            count="$(strings -a "$so" | grep -cE "$pattern" || true)"
+          else
+            # Fallback for images without binutils: count occurrences directly.
+            count="$(grep -aoE "$pattern" "$so" | wc -l | tr -d ' ')"
+          fi
+          echo "multiplex_markers=$count (expected 2)"
+          if [[ "$GATE_ASSERT" == "true" && "$count" != "2" ]]; then
+            echo "::error::Expected exactly 2 multiplex provenance markers in the built libpbcurlwrapper.so, got $count — the rebuilt wrapper does not match the reviewed raft.37+ source." >&2
+            exit 1
+          fi
+
       - name: Build paired OHOS Kotlin/Native consumer
         shell: bash
         run: |

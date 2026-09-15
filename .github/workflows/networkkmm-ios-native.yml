@@ -43,6 +43,22 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      # Record the committed xcframework's deterministic tree hash before the
+      # build overwrites it in place; the freshness gate below compares
+      # against this. The tree may be absent (first-ever build on a branch) —
+      # the gate then asserts nothing on equality and only the marker counts
+      # apply.
+      - name: Record committed xcframework tree hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="NetworkKMM/network/libs/ios/NetworkKMMCurl.xcframework"
+          if [[ -d "$root" ]]; then
+            echo "COMMITTED_TREE_SHA=$(find "$root" -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)" >> "$GITHUB_ENV"
+          else
+            echo "COMMITTED_TREE_SHA=<absent>" >> "$GITHUB_ENV"
+          fi
+
       - name: Test deterministic xcframework assembler
         shell: bash
         run: bash NetworkKMM/scripts/test-ios-curl-xcframework-assembler.sh
@@ -76,6 +92,59 @@ jobs:
             exit 1
           }
           echo "Layout OK: $(du -sh "$root" | cut -f1)"
+
+      # Freshness gate: iOS native reproducibility is proven (two independent
+      # CI runs — PR build vs dispatch build — from one source tree produced
+      # byte-identical xcframeworks), so the committed tree must hash equal
+      # to what the wrapper source just built. Assert only on pull_request:
+      # workflow_dispatch with commit_binaries=true IS the refresh mechanism
+      # (committed == old, built == new by design), so there only print both
+      # hashes.
+      - name: Freshness gate (committed vs rebuilt tree hash)
+        shell: bash
+        env:
+          GATE_ASSERT: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          root="NetworkKMM/network/libs/ios/NetworkKMMCurl.xcframework"
+          built_tree_sha="$(find "$root" -type f -print0 | sort -z | xargs -0 shasum -a 256 | shasum -a 256 | cut -d' ' -f1)"
+          echo "committed_tree_sha=$COMMITTED_TREE_SHA"
+          echo "built_tree_sha=$built_tree_sha"
+          if [[ "$GATE_ASSERT" == "true" && "$built_tree_sha" != "$COMMITTED_TREE_SHA" ]]; then
+            echo "::error::Committed iOS xcframework is stale relative to the wrapper source." >&2
+            echo "Refresh it by dispatching this workflow with commit_binaries=true on the branch that changes the wrapper source: gh workflow run networkkmm-ios-native.yml --ref <branch> -f commit_binaries=true (source + refreshed binary land in the same reviewed PR)." >&2
+            exit 1
+          fi
+
+      # Multiplex provenance: the raft.37 multiplex wait compiled into the
+      # wrapper leaves exactly two marker strings per architecture slice
+      # ("CURLOPT_PIPEWAIT failed" / "CURLMOPT_PIPELINING failed" from
+      # curl_wrapper.cpp) — 2 in ios-arm64, 4 in the two-slice simulator fat
+      # library. A future source or slice-matrix change that alters a count
+      # must update these expectations deliberately — that is a human review
+      # point, by design. Same PR-only assert / dispatch-print split.
+      # grep -c exits 1 on a zero count, so capture with `|| true`.
+      - name: Multiplex provenance markers
+        shell: bash
+        env:
+          GATE_ASSERT: ${{ github.event_name == 'pull_request' }}
+        run: |
+          set -euo pipefail
+          root="NetworkKMM/network/libs/ios/NetworkKMMCurl.xcframework"
+          arm64_count="$(strings -a "$root/ios-arm64/libNetworkKMMCurl.a" | grep -cE 'CURLOPT_PIPEWAIT failed|CURLMOPT_PIPELINING failed' || true)"
+          sim_count="$(strings -a "$root/ios-arm64_x86_64-simulator/libNetworkKMMCurl.a" | grep -cE 'CURLOPT_PIPEWAIT failed|CURLMOPT_PIPELINING failed' || true)"
+          echo "ios-arm64 markers=$arm64_count (expected 2)"
+          echo "simulator-fat markers=$sim_count (expected 4: two slices x 2)"
+          if [[ "$GATE_ASSERT" == "true" ]]; then
+            if [[ "$arm64_count" != "2" ]]; then
+              echo "::error::Expected exactly 2 multiplex provenance markers in ios-arm64, got $arm64_count — the rebuilt wrapper does not match the reviewed raft.37+ source." >&2
+              exit 1
+            fi
+            if [[ "$sim_count" != "4" ]]; then
+              echo "::error::Expected exactly 4 multiplex provenance markers in the simulator fat library, got $sim_count — the rebuilt wrapper does not match the reviewed raft.37+ source (or the slice matrix changed; update the expectation deliberately)." >&2
+              exit 1
+            fi
+          fi
 
       - name: Set up Java
         uses: actions/setup-java@v4
