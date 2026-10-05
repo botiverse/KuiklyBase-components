@@ -506,6 +506,7 @@ class AndroidCurlRuntimeInstrumentedTest {
                 http3Enabled = true
             )
             val h3 = curlClient().execute(publicRequest(PUBLIC_HTTP3_URL))
+            android.util.Log.i("NetworkKmmH3Diagnostic", "utcMillis=${System.currentTimeMillis()} protocol=${h3.protocol} success=${h3.isSuccess} error=${h3.error?.message}")
             assertTrue("explicit h3 request failed: ${h3.error?.message}", h3.isSuccess)
             assertEquals(NetworkHttpProtocol.HTTP_3, h3.protocol)
 

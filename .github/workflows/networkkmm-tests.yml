@@ -11,12 +11,18 @@ on:
       - ".github/workflows/networkkmm-tests.yml"
       - ".github/workflows/publish-network-github-packages.yml"
   workflow_dispatch:
+    inputs:
+      android_h3_diagnostic:
+        description: "Run only the Android gate with same-emulator H3 diagnostics (not a full validation)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   publication-contract:
+    if: ${{ !inputs.android_h3_diagnostic }}
     name: Immutable GitHub + Raft publication contract
     runs-on: ubuntu-latest
     container:
@@ -82,6 +88,7 @@ jobs:
         run: NetworkKMM/scripts/publish-github-packages.sh
 
   publication-contract-ios:
+    if: ${{ !inputs.android_h3_diagnostic }}
     name: Immutable iOS publication task graph
     runs-on: macos-latest
     steps:
@@ -192,6 +199,7 @@ jobs:
           PY
 
   ca-bundle-contract:
+    if: ${{ !inputs.android_h3_diagnostic }}
     name: App-owned CA bundle pin
     runs-on: ubuntu-latest
     steps:
@@ -210,6 +218,7 @@ jobs:
           test -s /tmp/networkkmm-cacert.pem
 
   android-unit-tests:
+    if: ${{ !inputs.android_h3_diagnostic }}
     name: Android unit tests (:network)
     runs-on: ubuntu-latest
     # The image bakes the Android SDK (platforms;android-36 + build-tools;
@@ -295,7 +304,7 @@ jobs:
   android-curl-runtime-tests:
     name: Android curl runtime tests (emulator x86_64)
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -323,6 +332,16 @@ jobs:
           NetworkKMM/scripts/prepare-app-owned-ca-bundle.sh \
             "$asset_dir/networkkmm-cacert.pem"
 
+      - name: Prepare same-emulator diagnostic and test APK
+        if: inputs.android_h3_diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager "ndk;28.0.13004108"
+          NetworkKMM/scripts/prepare-android-h3-diagnostic.sh "$RUNNER_TEMP/h3-guest-probe"
+          cd NetworkKMM
+          ./gradlew :network:assembleDebugAndroidTest --no-daemon --stacktrace
+
       # Diagnostic only (does not gate): runner-side HTTP/3 probe of the public h3 endpoint,
       # before and after the emulator run. It narrows an `http3` gate result down; on its own
       # it does not establish the Android root cause (different curl and network path).
@@ -340,11 +359,20 @@ jobs:
           target: google_apis
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: >-
-            cd NetworkKMM &&
-            ./gradlew :network:connectedDebugAndroidTest
-            -Pandroid.testInstrumentationRunnerArguments.class=com.tencent.kmm.network.internal.platform.AndroidCurlRuntimeInstrumentedTest
-            --no-daemon --stacktrace
+          script: |
+            if [ "${{ inputs.android_h3_diagnostic }}" = "true" ]; then NetworkKMM/scripts/run-android-h3-diagnostic.sh "$RUNNER_TEMP/h3-guest-probe"; else cd NetworkKMM && ./gradlew :network:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.class=com.tencent.kmm.network.internal.platform.AndroidCurlRuntimeInstrumentedTest --no-daemon --stacktrace; fi
+
+      - name: Upload same-emulator diagnostic evidence
+        if: always() && inputs.android_h3_diagnostic
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-android-h3-guest-probe
+          path: |
+            ${{ runner.temp }}/h3-guest-probe/**
+            !${{ runner.temp }}/h3-guest-probe/reference-root.tar
+            NetworkKMM/network/build/outputs/apk/androidTest/**
+            NetworkKMM/network/build/outputs/androidTest-results/**
+          if-no-files-found: error
 
       - name: Upload Android curl runtime report
         if: failure()
@@ -370,6 +398,7 @@ jobs:
           if-no-files-found: warn
 
   darwin-behavior-tests:
+    if: ${{ !inputs.android_h3_diagnostic }}
     name: Darwin engine behavior tests (macosArm64)
     runs-on: macos-latest
     steps:
@@ -444,6 +473,7 @@ jobs:
         run: kill "$(cat /tmp/test-server.pid)" 2>/dev/null || true
 
   ios-curl-runtime-tests:
+    if: ${{ !inputs.android_h3_diagnostic }}
     name: iOS curl runtime tests (Simulator)
     runs-on: macos-latest
     steps:
@@ -474,6 +504,7 @@ jobs:
             NetworkKMM/network/build/test-results/iosX64Test/
 
   ohos-tree:
+    if: ${{ !inputs.android_h3_diagnostic }}
     name: OHOS tree compile & publication metadata (:network)
     runs-on: ubuntu-latest
     container:
