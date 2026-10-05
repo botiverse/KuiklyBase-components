@@ -13,7 +13,9 @@ set -uo pipefail
 evidence_dir="${1:?evidence dir}"
 label="${2:?label}"
 url="https://cloudflare-quic.com/"
-# debian:trixie-slim; its curl package is built with nghttp3 (HTTP3 feature).
+# Only the base image is pinned (digest). curl itself is installed with apt at run time, so the
+# package version follows the Debian archive and is recorded per run (curl_package) rather than
+# fixed; trixie's curl package is built with nghttp3 (HTTP3 feature).
 image="debian:trixie-slim@sha256:a99cfc517144bc59b1978475ec53b46ecabec7e43635402ee5b77cc54cd1b20a"
 per_request_seconds=20
 
@@ -30,7 +32,9 @@ summary="$out/summary.txt"
 
 # One container run: install curl, record version/features, then three requests.
 # Each request: verbose log to its own file, -w line to the summary, exit code recorded.
-timeout 240 docker run --rm -v "$out:/out" "$image" bash -c '
+# The container id is captured so a run cut off by `timeout` is still force-removed below.
+cidfile="$(mktemp -u "${TMPDIR:-/tmp}/h3-probe-cid.XXXXXX")"
+timeout 240 docker run --rm --cidfile "$cidfile" -v "$out:/out" "$image" bash -c '
   set -u
   url="$1"; t="$2"
   if ! { apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates; } > /out/apt.log 2>&1; then
@@ -56,6 +60,10 @@ timeout 240 docker run --rm -v "$out:/out" "$image" bash -c '
   probe h2_baseline --http2
 ' bash "$url" "$per_request_seconds" >> "$out/docker.log" 2>&1
 echo "docker_exit=$?" >> "$summary"
+if [ -s "$cidfile" ]; then
+  docker rm -f "$(cat "$cidfile")" > /dev/null 2>&1 || true
+fi
+rm -f "$cidfile"
 echo "utc_end=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$summary"
 cat "$summary"
 exit 0
