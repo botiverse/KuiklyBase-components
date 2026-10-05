@@ -323,6 +323,15 @@ jobs:
           NetworkKMM/scripts/prepare-app-owned-ca-bundle.sh \
             "$asset_dir/networkkmm-cacert.pem"
 
+      # Diagnostic only (does not gate): runner-side HTTP/3 probe of the public h3 endpoint,
+      # before and after the emulator run. It narrows an `http3` gate result down; on its own
+      # it does not establish the Android root cause (different curl and network path).
+      - name: Probe HTTP/3 from the hosted runner (before gate, diagnostic)
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: NetworkKMM/scripts/probe-runner-http3.sh "$RUNNER_TEMP/h3-runner-probe" before-gate
+
       - name: Run committed Android curl artifact runtime gate
         uses: reactivecircus/android-emulator-runner@v2
         with:
@@ -343,6 +352,22 @@ jobs:
         with:
           name: network-android-curl-runtime-report
           path: NetworkKMM/network/build/reports/androidTests/connected/
+
+      - name: Probe HTTP/3 from the hosted runner (after gate, diagnostic)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: NetworkKMM/scripts/probe-runner-http3.sh "$RUNNER_TEMP/h3-runner-probe" after-gate
+
+      - name: Upload HTTP/3 runner probe evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-android-h3-runner-probe
+          path: ${{ runner.temp }}/h3-runner-probe/
+          if-no-files-found: warn
 
   darwin-behavior-tests:
     name: Darwin engine behavior tests (macosArm64)
