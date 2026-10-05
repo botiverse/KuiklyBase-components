@@ -332,6 +332,10 @@ jobs:
           NetworkKMM/scripts/prepare-app-owned-ca-bundle.sh \
             "$asset_dir/networkkmm-cacert.pem"
 
+      - name: Set up Android command-line tools for diagnostic build
+        if: inputs.android_h3_diagnostic
+        uses: android-actions/setup-android@v3
+
       - name: Prepare same-emulator diagnostic and test APK
         if: inputs.android_h3_diagnostic
         shell: bash
