@@ -9,7 +9,9 @@ transfer facts and both response-body protection setters were unavailable too.
 Run `NetworkKMM/scripts/test-apple-curl-optional-api.sh` on macOS. It compiles
 both C and C++ callers against the production header, links real static
 archives with dead stripping and only `main` exported, strips local symbols,
-and executes the result. Current wrappers must forward all eight APIs and
+and executes the result through both clang-driver and direct `ld` links (eight
+cases). The direct link checks the argument boundary used by Kotlin/Native;
+only clang calls wrap the native `.def` arguments with `-Xlinker`. Current wrappers must forward all eight APIs and
 arguments; old wrappers must link and return the unavailable defaults. The
 link options are read from the production `ios_curl.def`, rather than inventing
 an independent test-only linkage contract. That definition allows only the

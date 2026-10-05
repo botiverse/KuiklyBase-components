@@ -1,4 +1,4 @@
 headers = networkkmm_curl_facts_compat.h
 package = com.tencent.kmm.network.curl.native
 staticLibraries = libNetworkKMMCurl.a
-linkerOpts = -lc++ -framework Security -framework SystemConfiguration -lz -Wl,-U,_GetCurlTransferInfoV1 -Wl,-U,_GetCurlCompletionInfoV1 -Wl,-U,_SetCurlMaxBufferedResponseBytes -Wl,-U,_SetCurlBufferedBodyIdleTimeoutMs -Wl,-U,_CreateCurlMultiEngine -Wl,-U,_SubmitBufferedRequestV27 -Wl,-U,_CancelCurlMultiRequest -Wl,-U,_GetCurlMultiInfoV1
+linkerOpts = -lc++ -framework Security -framework SystemConfiguration -lz -U _GetCurlTransferInfoV1 -U _GetCurlCompletionInfoV1 -U _SetCurlMaxBufferedResponseBytes -U _SetCurlBufferedBodyIdleTimeoutMs -U _CreateCurlMultiEngine -U _SubmitBufferedRequestV27 -U _CancelCurlMultiRequest -U _GetCurlMultiInfoV1
