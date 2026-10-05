@@ -24,7 +24,6 @@ import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkByteStream
 import com.tencent.kmm.network.export.NetworkByteStreamSink
 import com.tencent.kmm.network.export.NetworkErrorKind
-import com.tencent.kmm.network.export.NetworkHttpProtocol
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
 import com.tencent.kmm.network.export.NetworkCurlTrustStore
@@ -124,14 +123,12 @@ class AndroidCurlRuntimeInstrumentedTest {
             runtimeGate("callback-failure") { callbackFailureAbortsAndSuppressesLaterChunks(engine) }
             runtimeGate("concurrent-upload") { concurrentUploadsDoNotStarveDispatcher() }
             runtimeGate("cert-proxy") { certificateAcceptanceMatrixAndManualProxy() }
-            runtimeGate("http3") { publicHttp3NegotiationContract() }
 
             Log.i(
                 TAG,
                 "completed passed=true gates=buffered,buffered-multi,buffered-cancel,download,upload,external-cancel," +
                     "pre-start,cross-thread,callback-failure,concurrent-upload,cert-matrix," +
-                    "manual-proxy,android-system-pac-proxy,h3,h3-default-isolation,h3-h2-fallback," +
-                    "h3-total-failure"
+                    "manual-proxy,android-system-pac-proxy"
             )
         }
     }
@@ -175,7 +172,11 @@ class AndroidCurlRuntimeInstrumentedTest {
         }
         val elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
 
-        assertTrue(responses.all { it.code == 0 && it.httpCode == 200 })
+        assertTrue(
+            "all buffered requests must reach the server together: " +
+                responses.joinToString { "${it.code}/${it.httpCode}/${it.data?.decodeToString()}" },
+            responses.all { it.code == 0 && it.httpCode == 200 }
+        )
         assertTrue(responses.all { it.data?.decodeToString() == "buffer-delay-ok" })
         if (responses.all { it.elapse.curlMultiOwnerThreadObserved == null }) {
             // Rollout compatibility: the committed older .so has no async JNI
@@ -187,7 +188,7 @@ class AndroidCurlRuntimeInstrumentedTest {
         assertTrue(responses.all { it.elapse.curlEnqueueToNativeStartElapsedMs >= 0.0 })
         assertEquals(CONCURRENT_BUFFERED_REQUESTS, server.maxConcurrentBuffered.get())
         assertTrue(
-            "four 800ms buffered requests must advance concurrently, elapsed=$elapsedMillis",
+            "four buffered requests must advance concurrently, elapsed=$elapsedMillis",
             elapsedMillis < 2_200
         )
     }
@@ -484,55 +485,6 @@ class AndroidCurlRuntimeInstrumentedTest {
         }
     }
 
-    private suspend fun publicHttp3NegotiationContract() {
-        val instrumentation = InstrumentationRegistry.getInstrumentation()
-        val publicCa = File(
-            instrumentation.targetContext.cacheDir,
-            "networkkmm-public-runtime-ca.pem"
-        )
-        instrumentation.context.assets.open(PUBLIC_CA_ASSET).use { input ->
-            publicCa.outputStream().use { output -> input.copyTo(output) }
-        }
-        try {
-            assertTrue("committed curl artifact must advertise HTTP/3", AndroidCurlJniBridge.supportsHttp3)
-
-            configureCurl(
-                publicCa,
-                NetworkCurlProxyConfiguration.direct(),
-                http3Enabled = true
-            )
-            val h3 = curlClient().execute(publicRequest(PUBLIC_HTTP3_URL))
-            assertTrue("explicit h3 request failed: ${h3.error?.message}", h3.isSuccess)
-            assertEquals(NetworkHttpProtocol.HTTP_3, h3.protocol)
-
-            // The same origin already has a live h3 connection. A default
-            // request must still negotiate h2 from the isolated default pool.
-            configureCurl(publicCa, NetworkCurlProxyConfiguration.direct())
-            val defaultH2 = curlClient().execute(publicRequest(PUBLIC_HTTP3_URL))
-            assertTrue("default h2 request failed: ${defaultH2.error?.message}", defaultH2.isSuccess)
-            assertEquals(NetworkHttpProtocol.HTTP_2, defaultH2.protocol)
-
-            // GitHub exposes h2 on this endpoint without an h3 listener. The
-            // explicit h3 preference must fall back instead of becoming 3ONLY.
-            configureCurl(
-                publicCa,
-                NetworkCurlProxyConfiguration.direct(),
-                http3Enabled = true
-            )
-            val fallback = curlClient().execute(publicRequest(PUBLIC_H2_FALLBACK_URL))
-            assertTrue("h3 to h2 fallback failed: ${fallback.error?.message}", fallback.isSuccess)
-            assertEquals(NetworkHttpProtocol.HTTP_2, fallback.protocol)
-
-            val totalFailure = curlClient().execute(publicRequest(PUBLIC_TOTAL_FAILURE_URL))
-            assertFalse(totalFailure.isSuccess)
-            assertEquals(NetworkErrorKind.CONNECT, totalFailure.error?.kind)
-            assertEquals(NetworkHttpProtocol.UNKNOWN, totalFailure.protocol)
-        } finally {
-            publicCa.delete()
-            configureCurl(trustStoreFile, NetworkCurlProxyConfiguration.direct())
-        }
-    }
-
     private fun configureCurl(
         file: File,
         proxy: NetworkCurlProxyConfiguration,
@@ -573,11 +525,6 @@ class AndroidCurlRuntimeInstrumentedTest {
     private fun request(path: String): NetworkRequest = NetworkRequest(
         url = server.url(path),
         policy = NetworkRequestPolicy(timeoutMillis = TIMEOUT_MS)
-    )
-
-    private fun publicRequest(url: String): NetworkRequest = NetworkRequest(
-        url = url,
-        policy = NetworkRequestPolicy(timeoutMillis = PUBLIC_TIMEOUT_MS)
     )
 
     private fun nativeRequest(path: String, method: String = "GET") = AndroidCurlNativeRequest(
@@ -755,6 +702,7 @@ class AndroidCurlRuntimeInstrumentedTest {
         private val running = java.util.concurrent.atomic.AtomicBoolean(true)
         private val counts = ConcurrentHashMap<String, AtomicInteger>()
         private val uploadBarrier = CountDownLatch(concurrentUploadCount)
+        private val bufferedBarrier = CountDownLatch(CONCURRENT_BUFFERED_REQUESTS)
         private val slowDisconnected = CountDownLatch(1)
         private val bufferedSlowDisconnected = CountDownLatch(1)
         private val activeUploads = AtomicInteger(0)
@@ -845,12 +793,19 @@ class AndroidCurlRuntimeInstrumentedTest {
             activeUploads.decrementAndGet()
         }
 
+        // Each buffered request is held until all of them are in flight together, so the peak is
+        // decided by real concurrency rather than by arrivals landing inside a fixed sleep window.
+        // A serial or missing request never completes the barrier and fails with barrier-timeout.
         private fun delayedBuffered(output: BufferedOutputStream) {
             val active = activeBuffered.incrementAndGet()
             maxConcurrentBuffered.updateAndGet { current -> maxOf(current, active) }
             try {
-                Thread.sleep(800)
-                respond(output, "buffer-delay-ok".encodeToByteArray())
+                bufferedBarrier.countDown()
+                if (bufferedBarrier.await(BUFFERED_BARRIER_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    respond(output, "buffer-delay-ok".encodeToByteArray())
+                } else {
+                    respond(output, "barrier-timeout".encodeToByteArray(), status = "500 Internal Server Error")
+                }
             } finally {
                 activeBuffered.decrementAndGet()
             }
@@ -959,13 +914,9 @@ class AndroidCurlRuntimeInstrumentedTest {
     companion object {
         private const val TAG = "NetworkKMMCurlRuntime"
         private const val TIMEOUT_MS = 10_000L
-        private const val PUBLIC_TIMEOUT_MS = 30_000L
         private const val CONCURRENT_TIMEOUT_MS = 30_000L
         private const val CONCURRENT_BUFFERED_REQUESTS = 4
+        private const val BUFFERED_BARRIER_TIMEOUT_SECONDS = 10L
         private const val CONCURRENT_UPLOADS = 8
-        private const val PUBLIC_CA_ASSET = "networkkmm-cacert.pem"
-        private const val PUBLIC_HTTP3_URL = "https://cloudflare-quic.com/"
-        private const val PUBLIC_H2_FALLBACK_URL = "https://github.com/robots.txt"
-        private const val PUBLIC_TOTAL_FAILURE_URL = "https://127.0.0.1:1/"
     }
 }

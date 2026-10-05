@@ -3,24 +3,25 @@
 
 #include "curl_wrapper.h"
 
+// New cinterop clients must still link against older wrapper archives. On
+// Apple, bind optional functions weakly at link time: dlsym(RTLD_DEFAULT)
+// cannot find static wrapper functions hidden by a Release app's export table.
+// The required wrapper calls pull in the same archive object; optional symbols
+// resolve when present and remain null when linking an older wrapper.
+// ios_curl.def permits only these eight weak imports to remain unresolved.
 #if defined(__APPLE__)
-#include <dlfcn.h>
-#include <pthread.h>
-#endif
-
-// Native apps can be rebuilt before their packaged wrapper artifact is. Keep
-// the additive facts symbol weak so an older artifact remains request-capable:
-// callers receive unavailable facts instead of a load/link failure.
-#if !defined(__APPLE__) && defined(__GNUC__)
+extern __typeof__(GetCurlTransferInfoV1) GetCurlTransferInfoV1 __attribute__((weak_import));
+extern __typeof__(GetCurlCompletionInfoV1) GetCurlCompletionInfoV1 __attribute__((weak_import));
+extern __typeof__(SetCurlMaxBufferedResponseBytes) SetCurlMaxBufferedResponseBytes __attribute__((weak_import));
+extern __typeof__(SetCurlBufferedBodyIdleTimeoutMs) SetCurlBufferedBodyIdleTimeoutMs __attribute__((weak_import));
+extern __typeof__(CreateCurlMultiEngine) CreateCurlMultiEngine __attribute__((weak_import));
+extern __typeof__(SubmitBufferedRequestV27) SubmitBufferedRequestV27 __attribute__((weak_import));
+extern __typeof__(CancelCurlMultiRequest) CancelCurlMultiRequest __attribute__((weak_import));
+extern __typeof__(GetCurlMultiInfoV1) GetCurlMultiInfoV1 __attribute__((weak_import));
+#elif defined(__GNUC__)
 #pragma weak GetCurlTransferInfoV1
 #pragma weak GetCurlCompletionInfoV1
-#endif
-
-#if !defined(__APPLE__) && defined(__GNUC__)
 #pragma weak SetCurlMaxBufferedResponseBytes
-#endif
-
-#if !defined(__APPLE__) && defined(__GNUC__)
 #pragma weak SetCurlBufferedBodyIdleTimeoutMs
 #pragma weak CreateCurlMultiEngine
 #pragma weak SubmitBufferedRequestV27
@@ -28,66 +29,18 @@
 #pragma weak GetCurlMultiInfoV1
 #endif
 
-#if defined(__APPLE__)
-typedef CurlMultiEngineHandle (*NetworkKmmCreateMultiFn)(const char *);
-typedef int (*NetworkKmmSubmitMultiFn)(CurlMultiEngineHandle, int64_t,
-    CurClientHandle, const CurlRequest *, size_t, int, const CurlCallback *);
-typedef void (*NetworkKmmCancelMultiFn)(CurlMultiEngineHandle, int64_t);
-typedef int (*NetworkKmmGetMultiInfoFn)(CurClientHandle, CurlMultiInfoV1 *, size_t, int);
-
-typedef struct NetworkKmmMultiApiState {
-    NetworkKmmCreateMultiFn create;
-    NetworkKmmSubmitMultiFn submit;
-    NetworkKmmCancelMultiFn cancel;
-    NetworkKmmGetMultiInfoFn getInfo;
-    int available;
-} NetworkKmmMultiApiState;
-
-static NetworkKmmMultiApiState gNetworkKmmMultiApiState;
-static pthread_once_t gNetworkKmmMultiApiOnce = PTHREAD_ONCE_INIT;
-
-static void NetworkKmmInitMultiApiState(void) {
-    gNetworkKmmMultiApiState.create = (NetworkKmmCreateMultiFn)dlsym(
-        RTLD_DEFAULT, "CreateCurlMultiEngine");
-    gNetworkKmmMultiApiState.submit = (NetworkKmmSubmitMultiFn)dlsym(
-        RTLD_DEFAULT, "SubmitBufferedRequestV27");
-    gNetworkKmmMultiApiState.cancel = (NetworkKmmCancelMultiFn)dlsym(
-        RTLD_DEFAULT, "CancelCurlMultiRequest");
-    gNetworkKmmMultiApiState.getInfo = (NetworkKmmGetMultiInfoFn)dlsym(
-        RTLD_DEFAULT, "GetCurlMultiInfoV1");
-    gNetworkKmmMultiApiState.available =
-        gNetworkKmmMultiApiState.create != 0 &&
-        gNetworkKmmMultiApiState.submit != 0 &&
-        gNetworkKmmMultiApiState.cancel != 0 &&
-        gNetworkKmmMultiApiState.getInfo != 0;
-}
-
-static inline NetworkKmmMultiApiState *NetworkKmmGetMultiApiState(void) {
-    pthread_once(&gNetworkKmmMultiApiOnce, NetworkKmmInitMultiApiState);
-    return &gNetworkKmmMultiApiState;
-}
-#endif
-
 static inline int NetworkKmmCurlMultiApiAvailable(void) {
-#if defined(__APPLE__)
-    return NetworkKmmGetMultiApiState()->available;
-#else
     return CreateCurlMultiEngine != 0 &&
         SubmitBufferedRequestV27 != 0 &&
         CancelCurlMultiRequest != 0 &&
         GetCurlMultiInfoV1 != 0;
-#endif
 }
 
 static inline CurlMultiEngineHandle NetworkKmmCreateCurlMultiEngineIfAvailable(
     const char *logTag
 ) {
     if (!NetworkKmmCurlMultiApiAvailable()) return 0;
-#if defined(__APPLE__)
-    return NetworkKmmGetMultiApiState()->create(logTag);
-#else
     return CreateCurlMultiEngine(logTag);
-#endif
 }
 
 static inline int NetworkKmmSubmitBufferedRequestV27IfAvailable(
@@ -100,13 +53,8 @@ static inline int NetworkKmmSubmitBufferedRequestV27IfAvailable(
     const CurlCallback *callback
 ) {
     if (!NetworkKmmCurlMultiApiAvailable()) return 0;
-#if defined(__APPLE__)
-    return NetworkKmmGetMultiApiState()->submit(
-        engine, requestId, handle, request, requestSize, abiVersion, callback);
-#else
     return SubmitBufferedRequestV27(
         engine, requestId, handle, request, requestSize, abiVersion, callback);
-#endif
 }
 
 static inline void NetworkKmmCancelCurlMultiRequestIfAvailable(
@@ -114,11 +62,7 @@ static inline void NetworkKmmCancelCurlMultiRequestIfAvailable(
     int64_t requestId
 ) {
     if (!NetworkKmmCurlMultiApiAvailable()) return;
-#if defined(__APPLE__)
-    NetworkKmmGetMultiApiState()->cancel(engine, requestId);
-#else
     CancelCurlMultiRequest(engine, requestId);
-#endif
 }
 
 static inline int NetworkKmmGetCurlMultiInfoV1IfAvailable(
@@ -128,11 +72,7 @@ static inline int NetworkKmmGetCurlMultiInfoV1IfAvailable(
     int abiVersion
 ) {
     if (!NetworkKmmCurlMultiApiAvailable()) return 0;
-#if defined(__APPLE__)
-    return NetworkKmmGetMultiApiState()->getInfo(handle, info, infoSize, abiVersion);
-#else
     return GetCurlMultiInfoV1(handle, info, infoSize, abiVersion);
-#endif
 }
 
 static inline int NetworkKmmGetCurlTransferInfoV1IfAvailable(
@@ -141,25 +81,10 @@ static inline int NetworkKmmGetCurlTransferInfoV1IfAvailable(
     size_t infoSize,
     int abiVersion
 ) {
-#if defined(__APPLE__)
-    typedef int (*GetTransferInfoFn)(
-        CurClientHandle,
-        CurlTransferInfoV1 *,
-        size_t,
-        int);
-    GetTransferInfoFn function = (GetTransferInfoFn)dlsym(
-        RTLD_DEFAULT,
-        "GetCurlTransferInfoV1");
-    if (function == 0) {
-        return 0;
-    }
-    return function(handle, info, infoSize, abiVersion);
-#else
     if (GetCurlTransferInfoV1 == 0) {
         return 0;
     }
     return GetCurlTransferInfoV1(handle, info, infoSize, abiVersion);
-#endif
 }
 
 static inline int NetworkKmmGetCurlCompletionInfoV1IfAvailable(
@@ -168,71 +93,32 @@ static inline int NetworkKmmGetCurlCompletionInfoV1IfAvailable(
     size_t infoSize,
     int abiVersion
 ) {
-#if defined(__APPLE__)
-    typedef int (*GetCompletionInfoFn)(
-        CurClientHandle,
-        CurlCompletionInfoV1 *,
-        size_t,
-        int);
-    GetCompletionInfoFn function = (GetCompletionInfoFn)dlsym(
-        RTLD_DEFAULT,
-        "GetCurlCompletionInfoV1");
-    if (function == 0) {
-        return 0;
-    }
-    return function(handle, info, infoSize, abiVersion);
-#else
     if (GetCurlCompletionInfoV1 == 0) {
         return 0;
     }
     return GetCurlCompletionInfoV1(handle, info, infoSize, abiVersion);
-#endif
 }
 
 static inline int NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable(
     CurClientHandle handle,
     int64_t maxBytes
 ) {
-#if defined(__APPLE__)
-    typedef void (*SetMaxBufferedResponseBytesFn)(CurClientHandle, int64_t);
-    SetMaxBufferedResponseBytesFn function = (SetMaxBufferedResponseBytesFn)dlsym(
-        RTLD_DEFAULT,
-        "SetCurlMaxBufferedResponseBytes");
-    if (function == 0) {
-        return 0;
-    }
-    function(handle, maxBytes);
-    return 1;
-#else
     if (SetCurlMaxBufferedResponseBytes == 0) {
         return 0;
     }
     SetCurlMaxBufferedResponseBytes(handle, maxBytes);
     return 1;
-#endif
 }
 
 static inline int NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable(
     CurClientHandle handle,
     int64_t timeoutMs
 ) {
-#if defined(__APPLE__)
-    typedef void (*SetBufferedBodyIdleTimeoutMsFn)(CurClientHandle, int64_t);
-    SetBufferedBodyIdleTimeoutMsFn function = (SetBufferedBodyIdleTimeoutMsFn)dlsym(
-        RTLD_DEFAULT,
-        "SetCurlBufferedBodyIdleTimeoutMs");
-    if (function == 0) {
-        return 0;
-    }
-    function(handle, timeoutMs);
-    return 1;
-#else
     if (SetCurlBufferedBodyIdleTimeoutMs == 0) {
         return 0;
     }
     SetCurlBufferedBodyIdleTimeoutMs(handle, timeoutMs);
     return 1;
-#endif
 }
 
 #endif  // NETWORKKMM_CURL_FACTS_COMPAT_H
