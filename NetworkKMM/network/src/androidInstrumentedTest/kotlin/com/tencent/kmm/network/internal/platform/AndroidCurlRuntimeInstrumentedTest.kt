@@ -175,7 +175,11 @@ class AndroidCurlRuntimeInstrumentedTest {
         }
         val elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAt)
 
-        assertTrue(responses.all { it.code == 0 && it.httpCode == 200 })
+        assertTrue(
+            "all buffered requests must reach the server together: " +
+                responses.joinToString { "${it.code}/${it.httpCode}/${it.data?.decodeToString()}" },
+            responses.all { it.code == 0 && it.httpCode == 200 }
+        )
         assertTrue(responses.all { it.data?.decodeToString() == "buffer-delay-ok" })
         if (responses.all { it.elapse.curlMultiOwnerThreadObserved == null }) {
             // Rollout compatibility: the committed older .so has no async JNI
@@ -187,7 +191,7 @@ class AndroidCurlRuntimeInstrumentedTest {
         assertTrue(responses.all { it.elapse.curlEnqueueToNativeStartElapsedMs >= 0.0 })
         assertEquals(CONCURRENT_BUFFERED_REQUESTS, server.maxConcurrentBuffered.get())
         assertTrue(
-            "four 800ms buffered requests must advance concurrently, elapsed=$elapsedMillis",
+            "four buffered requests must advance concurrently, elapsed=$elapsedMillis",
             elapsedMillis < 2_200
         )
     }
@@ -755,6 +759,7 @@ class AndroidCurlRuntimeInstrumentedTest {
         private val running = java.util.concurrent.atomic.AtomicBoolean(true)
         private val counts = ConcurrentHashMap<String, AtomicInteger>()
         private val uploadBarrier = CountDownLatch(concurrentUploadCount)
+        private val bufferedBarrier = CountDownLatch(CONCURRENT_BUFFERED_REQUESTS)
         private val slowDisconnected = CountDownLatch(1)
         private val bufferedSlowDisconnected = CountDownLatch(1)
         private val activeUploads = AtomicInteger(0)
@@ -845,12 +850,19 @@ class AndroidCurlRuntimeInstrumentedTest {
             activeUploads.decrementAndGet()
         }
 
+        // Each buffered request is held until all of them are in flight together, so the peak is
+        // decided by real concurrency rather than by arrivals landing inside a fixed sleep window.
+        // A serial or missing request never completes the barrier and fails with barrier-timeout.
         private fun delayedBuffered(output: BufferedOutputStream) {
             val active = activeBuffered.incrementAndGet()
             maxConcurrentBuffered.updateAndGet { current -> maxOf(current, active) }
             try {
-                Thread.sleep(800)
-                respond(output, "buffer-delay-ok".encodeToByteArray())
+                bufferedBarrier.countDown()
+                if (bufferedBarrier.await(BUFFERED_BARRIER_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                    respond(output, "buffer-delay-ok".encodeToByteArray())
+                } else {
+                    respond(output, "barrier-timeout".encodeToByteArray(), status = "500 Internal Server Error")
+                }
             } finally {
                 activeBuffered.decrementAndGet()
             }
@@ -962,6 +974,7 @@ class AndroidCurlRuntimeInstrumentedTest {
         private const val PUBLIC_TIMEOUT_MS = 30_000L
         private const val CONCURRENT_TIMEOUT_MS = 30_000L
         private const val CONCURRENT_BUFFERED_REQUESTS = 4
+        private const val BUFFERED_BARRIER_TIMEOUT_SECONDS = 10L
         private const val CONCURRENT_UPLOADS = 8
         private const val PUBLIC_CA_ASSET = "networkkmm-cacert.pem"
         private const val PUBLIC_HTTP3_URL = "https://cloudflare-quic.com/"
