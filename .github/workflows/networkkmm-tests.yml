@@ -335,13 +335,15 @@ jobs:
       - name: Set up Android command-line tools for diagnostic build
         if: inputs.android_h3_diagnostic
         uses: android-actions/setup-android@v3
+        with:
+          packages: "platform-tools ndk;28.0.13004108"
+          log-accepted-android-sdk-licenses: false
 
       - name: Prepare same-emulator diagnostic and test APK
         if: inputs.android_h3_diagnostic
         shell: bash
         run: |
           set -euo pipefail
-          sdkmanager "ndk;28.0.13004108"
           NetworkKMM/scripts/prepare-android-h3-diagnostic.sh "$RUNNER_TEMP/h3-guest-probe"
           cd NetworkKMM
           ./gradlew :network:assembleDebugAndroidTest --no-daemon --stacktrace
