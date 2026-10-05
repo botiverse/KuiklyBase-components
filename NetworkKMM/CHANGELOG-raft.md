@@ -1,5 +1,15 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased
+
+- Bind optional iOS curl APIs through narrowly allowed weak imports instead of
+  `dlsym`. Static wrapper functions can exist in a Release app without being
+  dynamically exported; treating them as missing disabled the multi request
+  engine, detailed completion/transfer facts, body-size cap and body-idle
+  timeout. Preserve the unavailable fallback when linking older wrappers.
+- Exercise the actual compat header in C and C++ against current and older
+  static wrapper fixtures, with dead stripping and only `main` exported.
+
 ## 0.1.0-raft.39 / 0.1.0-raft.39-ohos (native carrier refresh)
 
 - Rebuild and commit the Android/iOS/OHOS native binaries from the reviewed

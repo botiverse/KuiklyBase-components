@@ -425,6 +425,9 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Verify optional curl APIs with Release-style hidden symbols
+        run: NetworkKMM/scripts/test-apple-curl-optional-api.sh
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
