@@ -11,12 +11,18 @@ on:
       - ".github/workflows/networkkmm-tests.yml"
       - ".github/workflows/publish-network-github-packages.yml"
   workflow_dispatch:
+    inputs:
+      android_h3_contract_only:
+        description: "Only execute Android H3 contract tests; not full SDK acceptance"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   publication-contract:
+    if: ${{ !inputs.android_h3_contract_only }}
     name: Immutable GitHub + Raft publication contract
     runs-on: ubuntu-latest
     container:
@@ -82,6 +88,7 @@ jobs:
         run: NetworkKMM/scripts/publish-github-packages.sh
 
   publication-contract-ios:
+    if: ${{ !inputs.android_h3_contract_only }}
     name: Immutable iOS publication task graph
     runs-on: macos-latest
     steps:
@@ -192,6 +199,7 @@ jobs:
           PY
 
   ca-bundle-contract:
+    if: ${{ !inputs.android_h3_contract_only }}
     name: App-owned CA bundle pin
     runs-on: ubuntu-latest
     steps:
@@ -210,6 +218,7 @@ jobs:
           test -s /tmp/networkkmm-cacert.pem
 
   android-unit-tests:
+    if: ${{ !inputs.android_h3_contract_only }}
     name: Android unit tests (:network)
     runs-on: ubuntu-latest
     # The image bakes the Android SDK (platforms;android-36 + build-tools;
@@ -295,7 +304,7 @@ jobs:
   android-curl-runtime-tests:
     name: Android curl runtime tests (emulator x86_64)
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -331,20 +340,88 @@ jobs:
           target: google_apis
           disable-animations: true
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: >-
-            cd NetworkKMM &&
-            ./gradlew :network:connectedDebugAndroidTest
-            -Pandroid.testInstrumentationRunnerArguments.class=com.tencent.kmm.network.internal.platform.AndroidCurlRuntimeInstrumentedTest
-            --no-daemon --stacktrace
+          script: NetworkKMM/scripts/run-android-curl-contract.sh ordinary "$RUNNER_TEMP/android-curl-contract" "${{ inputs.android_h3_contract_only && 'targeted' || 'full' }}"
 
       - name: Upload Android curl runtime report
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: network-android-curl-runtime-report
-          path: NetworkKMM/network/build/reports/androidTests/connected/
+          path: |
+            NetworkKMM/network/build/reports/androidTests/connected/
+            NetworkKMM/network/build/outputs/androidTest-results/
+            NetworkKMM/network/build/outputs/apk/androidTest/
+            ${{ runner.temp }}/android-curl-contract/
+          if-no-files-found: error
+
+  android-curl-h3-positive:
+    name: Android committed curl H3 positive and default isolation
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Stage pinned public CA for HTTP/3 runtime gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_dir="NetworkKMM/network/src/androidTest/assets"
+          mkdir -p "$asset_dir"
+          NetworkKMM/scripts/prepare-app-owned-ca-bundle.sh \
+            "$asset_dir/networkkmm-cacert.pem"
+
+      - name: Prepare controlled IPv4 DNS for positive test only
+        shell: bash
+        run: NetworkKMM/scripts/prepare-android-h3-dns.sh "$RUNNER_TEMP/h3-dns"
+
+      - name: Run mandatory App H3 positive and default isolation
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -dns-server 127.0.0.1
+          script: NetworkKMM/scripts/run-android-curl-contract.sh positive "$RUNNER_TEMP/android-curl-contract"
+
+      - name: Upload Android curl runtime report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-android-curl-h3-positive-report
+          path: |
+            NetworkKMM/network/build/reports/androidTests/connected/
+            NetworkKMM/network/build/outputs/androidTest-results/
+            NetworkKMM/network/build/outputs/apk/androidTest/
+            ${{ runner.temp }}/android-curl-contract/
+            ${{ runner.temp }}/h3-dns/
+          if-no-files-found: error
+
+      - name: Stop test DNS
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$RUNNER_TEMP/h3-dns/dnsmasq.pid" ]; then
+            sudo kill "$(cat "$RUNNER_TEMP/h3-dns/dnsmasq.pid")"
+          fi
 
   darwin-behavior-tests:
+    if: ${{ !inputs.android_h3_contract_only }}
     name: Darwin engine behavior tests (macosArm64)
     runs-on: macos-latest
     steps:
@@ -419,6 +496,7 @@ jobs:
         run: kill "$(cat /tmp/test-server.pid)" 2>/dev/null || true
 
   ios-curl-runtime-tests:
+    if: ${{ !inputs.android_h3_contract_only }}
     name: iOS curl runtime tests (Simulator)
     runs-on: macos-latest
     steps:
@@ -449,6 +527,7 @@ jobs:
             NetworkKMM/network/build/test-results/iosX64Test/
 
   ohos-tree:
+    if: ${{ !inputs.android_h3_contract_only }}
     name: OHOS tree compile & publication metadata (:network)
     runs-on: ubuntu-latest
     container:
