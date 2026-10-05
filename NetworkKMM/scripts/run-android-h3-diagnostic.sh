@@ -42,11 +42,26 @@ probe() {
   done
   set -e
 }
+# sys.boot_completed is not a network-ready signal. Wait for a real route,
+# without configuring/changing the emulator's network or treating H3 as readiness.
+route_ready=false
+for attempt in $(seq 1 60); do
+  if adb shell "ip route get $ip" > "$out/route-ready.txt" 2>&1; then
+    route_ready=true
+    break
+  fi
+  sleep 2
+done
+adb shell 'ip addr; ip rule; ip route show table all; dumpsys connectivity' > "$out/guest-network-ready.txt"
+if [ "$route_ready" != true ]; then
+  echo 'No route after 120 seconds; probes are setup failure, not H3 evidence.' >&2
+  exit 2
+fi
 probe before
 # Install and hash the same prebuilt instrumentation APK before Gradle executes it.
 mapfile -t apks < <(find "$root/network/build/outputs/apk/androidTest" -name '*.apk')
 test "${#apks[@]}" = 1
-adb install -r "${apks[0]}" > "$out/explicit-install.txt"
+adb install -t -r --bypass-low-target-sdk-block "${apks[0]}" > "$out/explicit-install.txt"
 adb shell 'pm path com.tencent.tmm.networkkmm.test' > "$out/installed-apk-path.txt"
 installed_apk="$(tr -d '\r' < "$out/installed-apk-path.txt" | sed -n 's/^package://p' | head -n 1)"
 test -n "$installed_apk"
