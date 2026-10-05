@@ -505,8 +505,29 @@ class AndroidCurlRuntimeInstrumentedTest {
                 NetworkCurlProxyConfiguration.direct(),
                 http3Enabled = true
             )
-            val h3 = curlClient().execute(publicRequest(PUBLIC_HTTP3_URL))
-            android.util.Log.i("NetworkKmmH3Diagnostic", "utcMillis=${System.currentTimeMillis()} protocol=${h3.protocol} success=${h3.isSuccess} error=${h3.error?.message}")
+            // Diagnostic delegation preserves the original request and JNI call.
+            // Fresh control runs only after that call; it cannot make its assertion pass.
+            var observedRequest: AndroidCurlNativeRequest? = null
+            AndroidCurlEngineProvider.testBridge = object : AndroidCurlNativeBridge by AndroidCurlJniBridge {
+                override suspend fun execute(request: AndroidCurlNativeRequest): com.tencent.kmm.network.curl.CurlNativeResponse {
+                    observedRequest = request
+                    android.util.Log.i("NetworkKmmH3Diagnostic", "native uid=${android.os.Process.myUid()} h3=${request.http3Enabled} proxy=${request.proxyUrl} url=${request.url} timeout=${request.timeoutMillis}")
+                    return AndroidCurlJniBridge.execute(request)
+                }
+            }
+            val h3 = try {
+                curlClient().execute(publicRequest(PUBLIC_HTTP3_URL))
+            } finally {
+                AndroidCurlEngineProvider.testBridge = null
+            }
+            android.util.Log.i("NetworkKmmH3Diagnostic", "utcMillis=${System.currentTimeMillis()} protocol=${h3.protocol} success=${h3.isSuccess} error=${h3.error?.message} metadata=${h3.request.metadata} timing=${h3.timing}")
+            observedRequest?.let { observed ->
+                val fresh = AndroidCurlJniBridge.executeFresh(observed.copy(
+                    requestId = 1900000001,
+                    cancellationSignal = AndroidCurlCancellationSignal()
+                ))
+                android.util.Log.i("NetworkKmmH3Diagnostic", "fresh same uid/DNS/policy code=${fresh.code} http=${fresh.httpCode} error=${fresh.errorMsg} timing=${fresh.elapse}")
+            }
             assertTrue("explicit h3 request failed: ${h3.error?.message}", h3.isSuccess)
             assertEquals(NetworkHttpProtocol.HTTP_3, h3.protocol)
 

@@ -40,12 +40,20 @@ probe() {
     echo "adb_exit=$?" >> "$out/$label/reference-$mode.txt"
     date -u +%FT%TZ > "$out/$label/$mode-end.txt"
   done
+  for mode in h3-only-multi h3-fallback-multi; do
+    adb shell "$guest/probe $guest/libnetworkkmmcurl.so $guest/ca.pem $mode $ip" > "$out/$label/committed-$mode.txt" 2>&1
+    echo "adb_exit=$?" >> "$out/$label/committed-$mode.txt"
+  done
+  for mode in h3-only h3-fallback h3-fallback-multi; do
+    adb shell "$guest/probe $guest/libnetworkkmmcurl.so $guest/ca.pem $mode dns" > "$out/$label/committed-$mode-dns.txt" 2>&1
+    echo "adb_exit=$?" >> "$out/$label/committed-$mode-dns.txt"
+  done
   set -e
 }
 # sys.boot_completed is not a network-ready signal. Wait for a real route,
 # without configuring/changing the emulator's network or treating H3 as readiness.
 route_ready=false
-for attempt in $(seq 1 60); do
+for _attempt in $(seq 1 60); do
   if adb shell "ip route get $ip" > "$out/route-ready.txt" 2>&1; then
     route_ready=true
     break

@@ -40,3 +40,11 @@ Local checks: Android NDK28 cross-compilation with warnings-as-errors, Bash synt
 shellcheck, actionlint (workflow-only validation; pre-existing SC2129 warnings in
 unrelated jobs), and git diff whitespace checks. Runtime results come from the
 bound hosted run, not these checks.
+
+The follow-up adds direct curl multi controls and normal DNS/address selection
+controls with the original library. It also observes the unchanged effective
+native request at the test bridge, then invokes the existing fresh/blocking JNI
+path with the same request policy in the **same app UID** after the original
+multi call completes. Its result cannot replace the original assertion. This
+separates configuration propagation, address selection and easy/multi behavior;
+no product native binary is rebuilt.
