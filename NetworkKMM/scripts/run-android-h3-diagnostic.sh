@@ -83,11 +83,27 @@ log_pid=$!
 trap 'kill "$log_pid" 2>/dev/null || true' EXIT
 set +e
 (cd "$root" && ./gradlew :network:connectedDebugAndroidTest \
-  -Pandroid.testInstrumentationRunnerArguments.class=com.tencent.kmm.network.internal.platform.AndroidCurlRuntimeInstrumentedTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=com.tencent.kmm.network.internal.platform.AndroidCurlRuntimeInstrumentedTest#committedAndroidCurlArtifactPassesRuntimeGate \
   --no-daemon --stacktrace) 2>&1 | tee "$out/original-gate.txt"
 gate_rc=${PIPESTATUS[0]}
 set -e
 printf '%s\n' "$gate_rc" > "$out/original-gate-exit.txt"
+# Preserve original reports before Gradle overwrites them for the isolated call.
+if [ -d "$root/network/build/outputs/androidTest-results" ]; then
+  cp -R "$root/network/build/outputs/androidTest-results" "$out/original-androidTest-results"
+fi
+# Separate instrumentation process, unchanged H3 assertion and normal app UID.
+# This diagnostic must run even if the original process crashed before H3.
+set +e
+(cd "$root" && ./gradlew :network:connectedDebugAndroidTest \
+  -Pandroid.testInstrumentationRunnerArguments.class=com.tencent.kmm.network.internal.platform.AndroidCurlRuntimeInstrumentedTest#diagnosticPublicHttp3Path \
+  --no-daemon --stacktrace) 2>&1 | tee "$out/isolated-h3-gate.txt"
+h3_rc=${PIPESTATUS[0]}
+set -e
+printf '%s\n' "$h3_rc" > "$out/isolated-h3-gate-exit.txt"
+if [ -d "$root/network/build/outputs/androidTest-results" ]; then
+  cp -R "$root/network/build/outputs/androidTest-results" "$out/isolated-h3-androidTest-results"
+fi
 kill "$log_pid" 2>/dev/null || true
 wait "$log_pid" 2>/dev/null || true
 trap - EXIT
@@ -114,4 +130,6 @@ adb shell dumpsys package com.tencent.tmm.networkkmm.test > "$out/installed-test
 # connectedDebugAndroidTest may uninstall on completion; logs/APK pin that fact.
 probe after
 date -u +%FT%TZ > "$out/guest-end.txt"
-exit "$gate_rc"
+# Never conceal either failure; original and isolated outcomes stay separate.
+if [ "$gate_rc" -ne 0 ]; then exit "$gate_rc"; fi
+exit "$h3_rc"

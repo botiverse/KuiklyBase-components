@@ -136,6 +136,16 @@ class AndroidCurlRuntimeInstrumentedTest {
         }
     }
 
+    // Diagnostic branch only. Run separately so an earlier gate failure cannot
+    // suppress H3 evidence; this does not replace the full runtime gate.
+    @Test
+    fun diagnosticPublicHttp3Path() {
+        runBlocking {
+            assertTrue("instrumentation APK must load the committed curl artifact", VBTransportAndroidCurl.nativeAvailable)
+            runtimeGate("http3-isolated-diagnostic") { publicHttp3NegotiationContract() }
+        }
+    }
+
     private suspend fun runtimeGate(name: String, block: suspend () -> Unit) {
         try {
             block()

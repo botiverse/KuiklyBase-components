@@ -48,3 +48,9 @@ path with the same request policy in the **same app UID** after the original
 multi call completes. Its result cannot replace the original assertion. This
 separates configuration propagation, address selection and easy/multi behavior;
 no product native binary is rebuilt.
+
+The diagnostic additionally invokes `diagnosticPublicHttp3Path` in a separate
+instrumentation process after the original full gate. This preserves H3 evidence
+when an earlier gate aborts. Both exit codes and original XML reports are saved;
+either failure leaves the workflow failed. This isolated call is not full-gate
+acceptance, and no original assertion or product library is changed.
