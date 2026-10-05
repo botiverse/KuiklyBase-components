@@ -23,6 +23,9 @@ sudo /usr/sbin/dnsmasq --conf-file=/dev/null --no-hosts --bind-interfaces \
   --listen-address=127.0.0.1 --port=53 --cache-size=0 \
   --host-record="cloudflare-quic.com,$ipv4" --local=/cloudflare-quic.com/ \
   --log-queries --log-facility="$out/dnsmasq.log" --pid-file="$out/dnsmasq.pid"
+# dnsmasq creates a restricted log owned by its service UID. This disposable
+# fixture contains public DNS queries only; the runner must retain it as evidence.
+sudo chmod a+r "$out/dnsmasq.log"
 dig @127.0.0.1 cloudflare-quic.com A > "$out/dns-a.txt"
 dig @127.0.0.1 cloudflare-quic.com AAAA > "$out/dns-aaaa.txt"
 test "$(dig @127.0.0.1 +short cloudflare-quic.com A)" = "$ipv4"
