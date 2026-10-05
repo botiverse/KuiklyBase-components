@@ -54,3 +54,10 @@ instrumentation process after the original full gate. This preserves H3 evidence
 when an earlier gate aborts. Both exit codes and original XML reports are saved;
 either failure leaves the workflow failed. This isolated call is not full-gate
 acceptance, and no original assertion or product library is changed.
+
+Buffered-multi logs availableProcessors, launch/completion counts and threads,
+server arrival/barrier/error timestamps, plus a read-only reflection observation
+of the bridge's existing asyncSubmitAvailable flag. A false flag before execute
+selects the existing blocking compatibility path. Reflection failure is reported
+as unobserved. No dispatcher, timeout, barrier, exception, or assertion behavior
+is changed by this observation.

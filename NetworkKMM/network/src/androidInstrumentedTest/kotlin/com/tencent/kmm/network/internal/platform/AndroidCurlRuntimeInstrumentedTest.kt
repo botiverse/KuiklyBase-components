@@ -176,10 +176,26 @@ class AndroidCurlRuntimeInstrumentedTest {
 
     private suspend fun concurrentBufferedRequestsShareOneNativeOwner() = coroutineScope {
         val startedAt = System.nanoTime()
+        val launched = AtomicInteger(0)
+        fun asyncSubmitState(): String = runCatching {
+            val field = AndroidCurlJniBridge.javaClass.getDeclaredField("asyncSubmitAvailable")
+            field.isAccessible = true
+            (field.get(AndroidCurlJniBridge) as java.util.concurrent.atomic.AtomicBoolean).get().toString()
+        }.getOrElse { "unobserved:${it.javaClass.simpleName}" }
+        Log.i(TAG, "bufferdiag begin processors=${Runtime.getRuntime().availableProcessors()} " +
+            "thread=${Thread.currentThread().name} asyncSubmitAvailable=${asyncSubmitState()} ns=$startedAt")
         val responses = withTimeout(CONCURRENT_TIMEOUT_MS) {
             (0 until CONCURRENT_BUFFERED_REQUESTS).map { index ->
                 async(Dispatchers.Default) {
-                    AndroidCurlJniBridge.execute(nativeRequest("/buffer-delay/$index"))
+                    Log.i(TAG, "bufferdiag launch index=$index count=${launched.incrementAndGet()} " +
+                        "thread=${Thread.currentThread().name} ns=${System.nanoTime()} " +
+                        "asyncSubmitAvailable=${asyncSubmitState()}")
+                    AndroidCurlJniBridge.execute(nativeRequest("/buffer-delay/$index")).also { response ->
+                        Log.i(TAG, "bufferdiag complete index=$index thread=${Thread.currentThread().name} " +
+                            "ns=${System.nanoTime()} code=${response.code} http=${response.httpCode} " +
+                            "multiOwner=${response.elapse.curlMultiOwnerThreadObserved} " +
+                            "asyncSubmitAvailable=${asyncSubmitState()}")
+                    }
                 }
             }.awaitAll()
         }
@@ -850,7 +866,7 @@ class AndroidCurlRuntimeInstrumentedTest {
                 val body = readBody(input, headers)
                 when {
                     path == "/buffer" -> respond(output, "buffer-ok".encodeToByteArray())
-                    path.startsWith("/buffer-delay/") -> delayedBuffered(output)
+                    path.startsWith("/buffer-delay/") -> delayedBuffered(output, path)
                     path == "/stream" -> stream(output, listOf("stream-one", "stream-two"))
                     path == "/upload" -> respond(output, "upload:${body.decodeToString()}".encodeToByteArray())
                     path == "/slow" -> slow(output)
@@ -885,16 +901,24 @@ class AndroidCurlRuntimeInstrumentedTest {
         // Each buffered request is held until all of them are in flight together, so the peak is
         // decided by real concurrency rather than by arrivals landing inside a fixed sleep window.
         // A serial or missing request never completes the barrier and fails with barrier-timeout.
-        private fun delayedBuffered(output: BufferedOutputStream) {
+        private fun delayedBuffered(output: BufferedOutputStream, path: String) {
             val active = activeBuffered.incrementAndGet()
             maxConcurrentBuffered.updateAndGet { current -> maxOf(current, active) }
             try {
                 bufferedBarrier.countDown()
-                if (bufferedBarrier.await(BUFFERED_BARRIER_TIMEOUT_SECONDS, TimeUnit.SECONDS)) {
+                Log.i(TAG, "bufferdiag arrived path=$path active=$active remaining=${bufferedBarrier.count} " +
+                    "thread=${Thread.currentThread().name} ns=${System.nanoTime()}")
+                val allArrived = bufferedBarrier.await(BUFFERED_BARRIER_TIMEOUT_SECONDS, TimeUnit.SECONDS)
+                Log.i(TAG, "bufferdiag barrier path=$path allArrived=$allArrived remaining=${bufferedBarrier.count} " +
+                    "thread=${Thread.currentThread().name} ns=${System.nanoTime()}")
+                if (allArrived) {
                     respond(output, "buffer-delay-ok".encodeToByteArray())
                 } else {
                     respond(output, "barrier-timeout".encodeToByteArray(), status = "500 Internal Server Error")
                 }
+            } catch (failure: Throwable) {
+                Log.e(TAG, "bufferdiag server-error path=$path ns=${System.nanoTime()}", failure)
+                throw failure
             } finally {
                 activeBuffered.decrementAndGet()
             }
