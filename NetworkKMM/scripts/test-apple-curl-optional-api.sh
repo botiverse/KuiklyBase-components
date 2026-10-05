@@ -9,7 +9,9 @@ read -r -a linker_flags <<< "$(sed -n 's/^linkerOpts = //p' "$root/network/src/i
 work="$(mktemp -d "${TMPDIR:-/tmp}/networkkmm-apple-optional.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 for mode in current old; do
-  flags=()
+  # Bash 3.2 treats an empty array as unset under `set -u`. An explicit
+  # undefine also makes the old-wrapper fixture independent of macro defaults.
+  flags=(-UOPTIONAL_API)
   expected=0
   if [[ "$mode" == current ]]; then flags=(-DOPTIONAL_API); expected=1; fi
   for language in c c++; do
