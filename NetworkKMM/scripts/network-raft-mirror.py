@@ -417,18 +417,50 @@ def validate_staged(receipt: dict[str, Any], bytes_dir: Path) -> None:
         require(len(body) == entry["size"] and sha256_bytes(body) == entry["sha256"], f"authority byte changed: {relative}")
 
 
-def list_scope() -> list[str]:
+# The scope listing is a single unpaginated GET whose latency grows with the
+# scope (515 artifacts measured 30-42 s on 2026-10-06 and exceeded the former
+# 60 s limit from GitHub runners, failing every raft.40 lane at the same step).
+# A listing is read-only, so a transport fault or 5xx is retried a bounded
+# number of times before the lane fails closed.
+SCOPE_LIST_TIMEOUT_SECONDS = 300
+SCOPE_LIST_ATTEMPTS = 4
+
+
+def fetch_scope_listing(
+    opener: Optional[urllib.request.OpenerDirector] = None,
+    attempts: int = SCOPE_LIST_ATTEMPTS,
+    timeout: float = SCOPE_LIST_TIMEOUT_SECONDS,
+    sleep=time.sleep,
+) -> bytes:
     url = f"{CONTROL_BASE_URL}/api/scopes/{SCOPE}/artifacts"
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    opener = urllib.request.build_opener(RejectRedirectHandler())
-    try:
-        with opener.open(request, timeout=60) as response:
-            body = response.read()
-            require(response.status == 200, f"Raft control-plane HTTP {response.status}")
-    except urllib.error.HTTPError as error:
-        raise MirrorError(f"Raft control-plane HTTP {error.code}") from error
-    except urllib.error.URLError as error:
-        raise MirrorError(f"Raft control-plane transport failure: {error.reason}") from error
+    opener = opener or urllib.request.build_opener(RejectRedirectHandler())
+    last_error = ""
+    for attempt in range(attempts):
+        try:
+            with opener.open(request, timeout=timeout) as response:
+                body = response.read()
+                require(response.status == 200, f"Raft control-plane HTTP {response.status}")
+                return body
+        except MirrorError:
+            raise
+        except urllib.error.HTTPError as error:
+            if 500 <= error.code <= 599 and attempt + 1 < attempts:
+                last_error = f"HTTP {error.code}"
+                sleep(attempt + 1)
+                continue
+            raise MirrorError(f"Raft control-plane HTTP {error.code}") from error
+        except (urllib.error.URLError, TimeoutError, OSError) as error:
+            last_error = str(getattr(error, "reason", error))
+            if attempt + 1 < attempts:
+                sleep(attempt + 1)
+                continue
+            raise MirrorError(f"Raft control-plane transport failure: {last_error}") from error
+    raise MirrorError(f"Raft control-plane transport failure: {last_error}")
+
+
+def list_scope() -> list[str]:
+    body = fetch_scope_listing()
     try:
         payload = json.loads(body.decode())
     except (UnicodeDecodeError, json.JSONDecodeError) as error:

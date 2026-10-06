@@ -6,8 +6,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import socket
 import sys
 import tempfile
+import urllib.error
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -160,7 +162,62 @@ def main() -> None:
     assert race_writer.put(victim, files[victim]) == 409
     status, body = FakeReader(race_store).get(victim)
     assert status == 200 and digest(body) == digest(files[victim])
-    print("network Raft mirror teeth: 8/8 PASS")
+    # Scope listing: a read timeout on the first attempts is retried with a
+    # bounded backoff; exhaustion fails closed as a transport failure; a 4xx is
+    # never retried.
+    class FlakyOpener:
+        def __init__(self, failures: list[BaseException], body: bytes) -> None:
+            self.failures = list(failures)
+            self.body = body
+            self.calls = 0
+            self.timeouts: list[float] = []
+
+        def open(self, request, timeout):
+            self.calls += 1
+            self.timeouts.append(timeout)
+            if self.failures:
+                raise self.failures.pop(0)
+            opener = self
+
+            class Response:
+                status = 200
+
+                def __enter__(self_inner):
+                    return self_inner
+
+                def __exit__(self_inner, *exc):
+                    return False
+
+                def read(self_inner):
+                    return opener.body
+
+            return Response()
+
+    sleeps: list[float] = []
+    listing = json.dumps({"scope": mirror.SCOPE, "artifacts": [{"key": "a/b"}]}).encode()
+    flaky = FlakyOpener([socket.timeout("The read operation timed out"), urllib.error.URLError("reset")], listing)
+    body = mirror.fetch_scope_listing(opener=flaky, attempts=4, timeout=123, sleep=sleeps.append)
+    assert body == listing and flaky.calls == 3 and sleeps == [1, 2], (flaky.calls, sleeps)
+    assert flaky.timeouts == [123, 123, 123]
+    assert mirror.SCOPE_LIST_TIMEOUT_SECONDS >= 300 and mirror.SCOPE_LIST_ATTEMPTS >= 3
+
+    exhausted = FlakyOpener([socket.timeout("timed out")] * 4, listing)
+    expect_error(
+        "scope listing exhaustion",
+        lambda: mirror.fetch_scope_listing(opener=exhausted, attempts=4, sleep=lambda _: None),
+        "Raft control-plane transport failure",
+    )
+    assert exhausted.calls == 4
+
+    forbidden = FlakyOpener([urllib.error.HTTPError("u", 403, "forbidden", {}, None)], listing)
+    expect_error(
+        "scope listing 4xx",
+        lambda: mirror.fetch_scope_listing(opener=forbidden, attempts=4, sleep=lambda _: None),
+        "Raft control-plane HTTP 403",
+    )
+    assert forbidden.calls == 1
+
+    print("network Raft mirror teeth: 11/11 PASS")
 
 
 if __name__ == "__main__":
