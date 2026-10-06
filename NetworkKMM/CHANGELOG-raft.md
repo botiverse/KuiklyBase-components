@@ -1,6 +1,6 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased
+## 0.1.0-raft.40 / 0.1.0-raft.40-ohos (iOS optional curl API linking)
 
 - Bind optional iOS curl APIs through narrowly allowed weak imports instead of
   `dlsym`. Static wrapper functions can exist in a Release app without being
@@ -9,6 +9,12 @@
   timeout. Preserve the unavailable fallback when linking older wrappers.
 - Exercise the actual compat header in C and C++ against current and older
   static wrapper fixtures, with dead stripping and only `main` exported.
+- Android: validate the committed curl runtime against an HTTP/3-positive
+  contract and the HTTP/2 fallback separately (instrumented tests + scripts
+  under `NetworkKMM/scripts/`). No native binary changed in this release:
+  Android/iOS/OHOS carriers are byte-identical to raft.39; the fix lives in
+  the iOS cinterop (`ios_curl.def` + `networkkmm_curl_facts_compat.h`) and
+  ships inside the `network` iosArm64 klib.
 
 ## 0.1.0-raft.39 / 0.1.0-raft.39-ohos (native carrier refresh)
 
