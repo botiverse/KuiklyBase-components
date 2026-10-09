@@ -101,6 +101,7 @@ class AndroidCurlNetworkEngineTest {
 
     @AfterTest
     fun resetBridge() {
+        androidCurlDohPreference.clear()
         AndroidCurlEngineProvider.testBridge = null
         AndroidCurlSystemProxyResolver.testResolver = null
         VBTransportCurl.clear()
@@ -229,7 +230,45 @@ class AndroidCurlNetworkEngineTest {
         assertEquals("doh_fallback_failure", response.timing.freshRetryResult)
     }
 
-    private fun configureDohFallback(provider: NetworkCurlDohFallbackProvider) {
+    @Test
+    fun dohProvidersAreTriedInOrderAndAFixedFailurePrefersThatProviderForAWhile() = runBlocking {
+        configureDohFallback(NetworkCurlDohFallbackProvider.ALIDNS, NetworkCurlDohFallbackProvider.CLOUDFLARE)
+        val unresolved = CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
+        val bridge = FakeBridge().apply {
+            executeResponses += unresolved // system
+            executeResponses += unresolved.copy() // alidns
+            executeResponses += CurlNativeResponse(code = 0, httpCode = 200) // cloudflare
+        }
+        val first = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+        val firstResponse = AndroidCurlNetworkEngine(bridge).execute(first, NetworkCall(first))
+        assertEquals(listOf(0, 1, 2), bridge.executeRequests.map { it.dohFallbackProvider })
+        assertEquals("doh_fallback_success", firstResponse.timing.freshRetryResult)
+
+        // The next request goes straight to the provider that worked: no system failure first.
+        bridge.executeRequests.clear()
+        bridge.executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
+        val second = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+        val secondResponse = AndroidCurlNetworkEngine(bridge).execute(second, NetworkCall(second))
+        assertEquals(listOf(2), bridge.executeRequests.map { it.dohFallbackProvider })
+        assertEquals("doh_preferred", secondResponse.timing.freshRetryResult)
+
+        // The preferred provider fails: the system resolver is tried again (and works).
+        bridge.executeRequests.clear()
+        bridge.executeResponses += unresolved.copy()
+        bridge.executeResponses += CurlNativeResponse(code = 0, httpCode = 200)
+        val third = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+        val thirdResponse = AndroidCurlNetworkEngine(bridge).execute(third, NetworkCall(third))
+        assertEquals(listOf(2, 0), bridge.executeRequests.map { it.dohFallbackProvider })
+        assertEquals("system_after_doh_failure", thirdResponse.timing.freshRetryResult)
+
+        // ...and the preference is gone: system first again.
+        bridge.executeRequests.clear()
+        val fourth = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+        AndroidCurlNetworkEngine(bridge).execute(fourth, NetworkCall(fourth))
+        assertEquals(listOf(0), bridge.executeRequests.map { it.dohFallbackProvider })
+    }
+
+    private fun configureDohFallback(vararg providers: NetworkCurlDohFallbackProvider) {
         VBTransportCurl.configure(
             NetworkCurlRuntimeConfiguration(
                 trustStore = NetworkCurlTrustStore(
@@ -237,7 +276,7 @@ class AndroidCurlNetworkEngineTest {
                     sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
                 ),
                 proxy = NetworkCurlProxyConfiguration.direct(),
-                dohFallback = provider
+                dohFallbackProviders = providers.toList()
             )
         )
     }
