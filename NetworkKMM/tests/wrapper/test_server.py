@@ -9,10 +9,15 @@ import gzip
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 AUTH_BODY = b'{"error":"Invalid or expired token","code":"auth_required"}'
+# Releases /multi-barrier requests only once MULTI_BARRIER_PARTIES are in flight
+# together, so a client that serializes them behind the first response fails.
+MULTI_BARRIER_PARTIES = 4
+MULTI_BARRIER = threading.Barrier(MULTI_BARRIER_PARTIES)
 ENCODED_BODY = b'{"encoded":true,"padding":"' + b"x" * 256 + b'"}'
 
 
@@ -53,6 +58,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/multi-delay":
             time.sleep(0.8)
             self._send(200, b'{"multi":true}')
+        elif self.path == "/multi-barrier":
+            try:
+                MULTI_BARRIER.wait(timeout=3)
+            except threading.BrokenBarrierError:
+                MULTI_BARRIER.reset()
+                self._send(504, b'{"barrier":"timeout"}')
+                return
+            self._send(200, b'{"barrier":true}')
         elif self.path == "/redirect":
             self.send_response(302)
             self.send_header("Location", "/ok")
