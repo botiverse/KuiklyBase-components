@@ -1,5 +1,14 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased
+
+- Native wrapper: set `CURLOPT_PIPEWAIT` only for https (h2 via ALPN) or
+  HTTP/3. On plain http (always HTTP/1.1) it parked every later request to the
+  host until the first response headers arrived, serializing concurrent
+  requests and deadlocking ones the server answers together (the Android
+  `buffered-multi` runtime gate's recurring 4x curl 28). Android/iOS/OHOS
+  carriers refreshed.
+
 ## 0.1.0-raft.40 / 0.1.0-raft.40-ohos (iOS optional curl API linking)
 
 - Bind optional iOS curl APIs through narrowly allowed weak imports instead of
