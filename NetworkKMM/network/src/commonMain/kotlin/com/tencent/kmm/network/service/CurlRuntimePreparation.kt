@@ -197,9 +197,12 @@ internal fun prepareCurlRuntime(
         expectedGeneration = runtimeSnapshot.proxyHttp3Generation
     )
     request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_APP_OWNED
-    configuration.dohFallback?.let { provider ->
-        request.metadata[CURL_RUNTIME_DOH_FALLBACK] = provider.nativeId.toString()
-    } ?: request.metadata.remove(CURL_RUNTIME_DOH_FALLBACK)
+    if (configuration.dohFallbackProviders.isEmpty()) {
+        request.metadata.remove(CURL_RUNTIME_DOH_FALLBACK)
+    } else {
+        request.metadata[CURL_RUNTIME_DOH_FALLBACK] =
+            configuration.dohFallbackProviders.distinct().joinToString(",") { it.nativeId.toString() }
+    }
     request.metadata[CURL_RUNTIME_READY] = "true"
     return NetworkEngineAvailability.Available
 }
@@ -214,9 +217,12 @@ internal fun preparedCurlCaInfoPath(request: NetworkRequest): String? =
 internal fun preparedCurlProxyUrl(request: NetworkRequest): String? =
     request.metadata[CURL_RUNTIME_PROXY_URL]
 
-/** Native DoH provider id for a fallback retry, or 0 when DoH fallback is off. */
-internal fun preparedCurlDohFallbackProvider(request: NetworkRequest): Int =
-    request.metadata[CURL_RUNTIME_DOH_FALLBACK]?.toIntOrNull() ?: 0
+/** Native DoH provider ids for a fallback retry, in order; empty when DoH fallback is off. */
+internal fun preparedCurlDohFallbackProviders(request: NetworkRequest): List<Int> =
+    request.metadata[CURL_RUNTIME_DOH_FALLBACK]
+        ?.split(',')
+        ?.mapNotNull { it.trim().toIntOrNull()?.takeIf { id -> id > 0 } }
+        .orEmpty()
 
 internal fun preparedCurlHttp3Enabled(request: NetworkRequest): Boolean =
     request.metadata[CURL_RUNTIME_HTTP3] == "true"

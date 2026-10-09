@@ -256,11 +256,15 @@ is no SNI-safe custom resolver contract; setting `httpDnsEnabled` makes curl ine
 
 ### DNS-over-HTTPS fallback (curl, Android)
 
-`NetworkCurlRuntimeConfiguration(dohFallback = NetworkCurlDohFallbackProvider.ALIDNS)` (off by
-default) retries a buffered request **once** through DNS-over-HTTPS, and only when the system
-resolver failed (`CURLE_COULDNT_RESOLVE_HOST`). A successful system resolution is never replaced,
-and connect/TLS/timeout failures are not retried. Because no connection was made, any method may be
-retried. The retry is reported as `freshRetryResult = doh_fallback_success | doh_fallback_failure`.
+`NetworkCurlRuntimeConfiguration(dohFallbackProviders = listOf(ALIDNS, CLOUDFLARE))` (empty = off,
+the default) retries a buffered request through DNS-over-HTTPS, provider by provider, only when the
+system resolver failed (`CURLE_COULDNT_RESOLVE_HOST`). A successful system resolution is never
+replaced, and connect/TLS/timeout failures are not retried. Because no connection was made, any
+method may be retried. After a system failure that a provider fixed, requests resolve through that
+provider first for 60 s (instead of failing on the system resolver each time); if it fails, the
+system resolver is tried again and the preference is dropped. Diagnostics: `freshRetryResult =
+doh_fallback_success | doh_fallback_failure | system_after_doh_failure`, and `doh_preferred` for a
+request that went to the preferred provider first.
 
 Unlike `httpDnsEnabled`, this is SNI-safe: libcurl resolves internally and the business request
 keeps its own hostname for SNI and certificate verification. Providers are a closed built-in table

@@ -27,14 +27,60 @@ internal fun shouldFreshRetryCurlBufferedStall(
 internal const val CURL_CODE_COULDNT_RESOLVE_HOST: Int = 6
 
 /**
- * Raft task #153: retry once through the configured DoH provider only when the system resolver
- * failed to resolve the host. Nothing was sent to the server (no connection was made), so any
- * method may be retried. [provider] is the native provider id; 0 means DoH fallback is off.
+ * Raft task #153: move on to the next resolution attempt (DoH provider, or the system resolver
+ * again after a preferred DoH provider failed) only when the host could not be resolved. Nothing
+ * was sent to the server (no connection was made), so any method may be retried.
  */
 internal fun shouldRetryCurlWithDohFallback(
     curlCode: Int,
-    provider: Int,
+    hasNextAttempt: Boolean,
     cancelled: Boolean,
     remainingTimeoutMillis: Long?,
-): Boolean = curlCode == CURL_CODE_COULDNT_RESOLVE_HOST && provider != 0 && !cancelled &&
+): Boolean = curlCode == CURL_CODE_COULDNT_RESOLVE_HOST && hasNextAttempt && !cancelled &&
     remainingTimeoutMillis != 0L
+
+/**
+ * The resolution attempts after a first attempt that used [firstProvider] (0 = system resolver):
+ * after the system, the configured DoH providers in order; after a preferred DoH provider, the
+ * system resolver and then the other providers.
+ */
+internal fun curlDohFallbackAttempts(firstProvider: Int, configured: List<Int>): List<Int> =
+    if (firstProvider == 0) configured.distinct() else listOf(0) + configured.distinct().filter { it != firstProvider }
+
+/** How long requests go to DoH first after a system resolve failure that DoH fixed. */
+internal const val CURL_DOH_PREFERRED_WINDOW_MILLIS: Long = 60_000L
+
+/**
+ * Process-wide memory of a recent system resolve failure that a DoH provider fixed (raft task
+ * #153). Within [CURL_DOH_PREFERRED_WINDOW_MILLIS] requests resolve through that provider first
+ * instead of failing on the system resolver again; any DoH failure clears it, and the window
+ * ending (or a provider no longer configured) returns to system-first.
+ */
+internal class CurlDohPreference(
+    private val nowMillis: () -> Long,
+    private val windowMillis: Long = CURL_DOH_PREFERRED_WINDOW_MILLIS,
+) {
+    private val lock = kotlinx.atomicfu.locks.SynchronizedObject()
+    private var provider = 0
+    private var until = 0L
+
+    /** The provider to try first, or 0 to use the system resolver first. */
+    fun preferredProvider(configured: List<Int>): Int =
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            if (provider != 0 && nowMillis() < until && provider in configured) provider else 0
+        }
+
+    fun onDohResolved(providerId: Int) {
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            provider = providerId
+            until = nowMillis() + windowMillis
+        }
+    }
+
+    fun clear() {
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            provider = 0
+            until = 0L
+        }
+    }
+}

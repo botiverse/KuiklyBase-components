@@ -91,11 +91,13 @@ data class NetworkCurlRuntimeConfiguration(
     /** Explicit gray gate. Native capability is probed before a request can use HTTP/3. */
     val http3Enabled: Boolean = false,
     /**
-     * DNS-over-HTTPS fallback (off by default). When set, a buffered request whose system name
-     * resolution failed (CURLE_COULDNT_RESOLVE_HOST) is retried once, resolving through this
-     * built-in provider. A successful system resolution is never replaced. Android only for now.
+     * DNS-over-HTTPS fallback, tried in order (empty = off, the default). When the system resolver
+     * fails to resolve a host (CURLE_COULDNT_RESOLVE_HOST), a buffered request is retried through
+     * each provider until one resolves it. A successful system resolution is never replaced. After
+     * a system failure that DoH fixed, requests go to that provider first for a short window
+     * instead of failing on the system resolver each time. Android only for now.
      */
-    val dohFallback: NetworkCurlDohFallbackProvider? = null
+    val dohFallbackProviders: List<NetworkCurlDohFallbackProvider> = emptyList()
 )
 
 /**
