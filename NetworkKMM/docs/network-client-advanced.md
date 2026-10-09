@@ -277,6 +277,12 @@ verifies its hostname; `CURLOPT_DOH_SSL_VERIFYPEER/HOST` are never relaxed. Priv
 sees the hostname being resolved. The addresses change only with a release. iOS and OHOS ignore the
 setting for now.
 
+libcurl caches a failed resolve as a negative entry. DoH-fallback clients therefore use their own
+shared DNS cache, separate from system-resolver clients: a cached system failure for the API host
+can never short-circuit the DoH attempt, and DoH answers never leak into system-resolver clients.
+All clients use a 20 s DNS cache timeout (libcurl default 60 s), so a negative entry lasts ~10 s
+after a DNS outage ends instead of ~30 s.
+
 HTTP/3 is an explicit native curl gray gate. The current Android, iOS, and OHOS curl artifacts build
 curl 8.16.0 with OpenSSL 3.5.4 QUIC and nghttp3 1.17.0. Existing consumers can keep the process-wide
 default in the verified curl runtime configuration:

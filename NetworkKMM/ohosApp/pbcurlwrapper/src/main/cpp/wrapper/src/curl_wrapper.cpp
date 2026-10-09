@@ -628,6 +628,12 @@ static std::string CurlUrlScheme(const char *url) {
 // loop must own connection reuse and H2/H3 multiplexing.
 static CURLSH *gCurlDefaultShare = nullptr;
 static CURLSH *gCurlHttp3Share = nullptr;
+// DoH fallback clients (raft task #153) get their own DNS cache: libcurl caches a failed system
+// resolve as a negative entry, and a shared negative entry for the API host would make the DoH
+// retry fail from cache without ever asking the DoH provider. The provider's pinned address and
+// the DoH answers live here, so they also never leak into system-resolver clients.
+static CURLSH *gCurlDohShare = nullptr;
+static CURLSH *gCurlDohHttp3Share = nullptr;
 static std::mutex gShareInitMutex;
 static std::mutex gShareDataMutexes[CURL_LOCK_DATA_LAST];
 
@@ -642,6 +648,8 @@ static void ShareUnlockCallback(CURL *handle, curl_lock_data data, void *userptr
         gShareDataMutexes[data].unlock();
     }
 }
+
+static constexpr long kDnsCacheTimeoutSeconds = 20L;
 
 // Built-in DoH providers (raft task #153). Addresses are public anycast
 // resolvers; refreshing them is a code change that ships with a release.
@@ -668,9 +676,11 @@ static const DohProvider *FindDohProvider(int id) {
     return nullptr;
 }
 
-static CURLSH *GetCurlShare(bool http3Enabled) {
+static CURLSH *GetCurlShare(bool http3Enabled, bool dohFallback) {
     std::lock_guard<std::mutex> guard(gShareInitMutex);
-    CURLSH **slot = http3Enabled ? &gCurlHttp3Share : &gCurlDefaultShare;
+    CURLSH **slot = dohFallback
+        ? (http3Enabled ? &gCurlDohHttp3Share : &gCurlDohShare)
+        : (http3Enabled ? &gCurlHttp3Share : &gCurlDefaultShare);
     if (*slot == nullptr) {
         *slot = curl_share_init();
         if (*slot != nullptr) {
@@ -1223,11 +1233,16 @@ class CurlClient {
         // Share DNS/TLS sessions across per-request easy handles. Connection
         // caches deliberately remain easy-owned; cross-thread sharing is not
         // supported by libcurl and does not provide multiplexing.
-        CURLSH *share = GetCurlShare(http3_enabled_);
+        const DohProvider *doh = FindDohProvider(doh_provider_);
+        CURLSH *share = GetCurlShare(http3_enabled_, doh != nullptr);
         if (share != nullptr) {
             curl_easy_setopt(curl_, CURLOPT_SHARE, share);
         }
-        const DohProvider *doh = FindDohProvider(doh_provider_);
+        // libcurl caches a failed resolve as a negative entry that lives half the cache timeout.
+        // With the 60 s default one DNS outage kept every request failing from cache for ~30 s
+        // after the network recovered (raft task #150). 20 s keeps positive reuse and cuts the
+        // negative window to ~10 s.
+        curl_easy_setopt(curl_, CURLOPT_DNS_CACHE_TIMEOUT, kDnsCacheTimeoutSeconds);
         if (doh != nullptr && share == nullptr) {
             // The DoH probe reads the pinned provider address from the shared DNS cache; without
             // a share it would fall back to the system resolver that just failed. It still fails
