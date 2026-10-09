@@ -1228,6 +1228,12 @@ class CurlClient {
             curl_easy_setopt(curl_, CURLOPT_SHARE, share);
         }
         const DohProvider *doh = FindDohProvider(doh_provider_);
+        if (doh != nullptr && share == nullptr) {
+            // The DoH probe reads the pinned provider address from the shared DNS cache; without
+            // a share it would fall back to the system resolver that just failed. It still fails
+            // closed (doh_fallback_failure), but say why.
+            logE(log_tag_, std::string("doh_fallback_without_share provider=") + doh->name);
+        }
         if (!resolve_entry_.empty() || doh != nullptr) {
             if (!resolve_entry_.empty() && !AppendResolveEntry(resolve_entry_.c_str())) {
                 return false;
