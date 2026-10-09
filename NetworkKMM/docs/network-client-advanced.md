@@ -256,8 +256,8 @@ is no SNI-safe custom resolver contract; setting `httpDnsEnabled` makes curl ine
 
 ### DNS-over-HTTPS fallback (curl: Android, iOS, OHOS)
 
-`NetworkCurlRuntimeConfiguration(dohFallbackProviders = listOf(ALIDNS, CLOUDFLARE))` (empty = off,
-the default) retries a buffered request through DNS-over-HTTPS, provider by provider, only when the
+`VBTransportCurl.setDohFallbackProviders(listOf(ALIDNS, CLOUDFLARE))` (empty = off, the default)
+retries a buffered request through DNS-over-HTTPS, provider by provider, only when the
 system resolver failed (`CURLE_COULDNT_RESOLVE_HOST`). A successful system resolution is never
 replaced, and connect/TLS/timeout failures are not retried. Because no connection was made, any
 method may be retried. After a system failure that a provider fixed, requests resolve through that
@@ -267,6 +267,11 @@ when the device switches networks or its DNS configuration changes to drop the w
 Privacy: during the window the provider sees every hostname resolved (up to 60 s). Diagnostics: `freshRetryResult =
 doh_fallback_success | doh_fallback_failure | system_after_doh_failure`, and `doh_preferred` for a
 request that went to the preferred provider first.
+
+The setting is independent of `VBTransportCurl.configure(...)`: it applies with an app-owned trust
+store and on the platform-default trust path alike (OHOS hosts that never call `configure`), and can
+be changed at runtime, e.g. from a feature flag. New requests use the current list; turning it off
+or changing it also drops the DoH-first window.
 
 Unlike `httpDnsEnabled`, this is SNI-safe: libcurl resolves internally and the business request
 keeps its own hostname for SNI and certificate verification. Providers are a closed built-in table

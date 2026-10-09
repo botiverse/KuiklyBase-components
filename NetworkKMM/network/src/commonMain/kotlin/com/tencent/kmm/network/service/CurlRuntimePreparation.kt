@@ -17,6 +17,7 @@
 package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.export.NetworkCurlConfigurationFailureReason
+import com.tencent.kmm.network.export.NetworkCurlDohFallbackProvider
 import com.tencent.kmm.network.export.NetworkCurlProxyMode
 import com.tencent.kmm.network.export.NetworkCurlProxyHttp3Environment
 import com.tencent.kmm.network.export.NetworkCurlTrustMode
@@ -132,6 +133,7 @@ internal fun prepareCurlRuntime(
                 expectedGeneration = runtimeSnapshot.proxyHttp3Generation
             )
             request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_PLATFORM_DEFAULT
+            prepareCurlDohFallback(request, runtimeSnapshot.dohFallbackProviders)
             request.metadata[CURL_RUNTIME_READY] = "true"
             return NetworkEngineAvailability.Available
         }
@@ -197,14 +199,19 @@ internal fun prepareCurlRuntime(
         expectedGeneration = runtimeSnapshot.proxyHttp3Generation
     )
     request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_APP_OWNED
-    if (configuration.dohFallbackProviders.isEmpty()) {
+    prepareCurlDohFallback(request, runtimeSnapshot.dohFallbackProviders)
+    request.metadata[CURL_RUNTIME_READY] = "true"
+    return NetworkEngineAvailability.Available
+}
+
+/** Raft task #153: both trust paths carry the DoH providers set on [VBTransportCurl]. */
+private fun prepareCurlDohFallback(request: NetworkRequest, providers: List<NetworkCurlDohFallbackProvider>) {
+    if (providers.isEmpty()) {
         request.metadata.remove(CURL_RUNTIME_DOH_FALLBACK)
     } else {
         request.metadata[CURL_RUNTIME_DOH_FALLBACK] =
-            configuration.dohFallbackProviders.distinct().joinToString(",") { it.nativeId.toString() }
+            providers.distinct().joinToString(",") { it.nativeId.toString() }
     }
-    request.metadata[CURL_RUNTIME_READY] = "true"
-    return NetworkEngineAvailability.Available
 }
 
 internal fun preparedCurlTrustSource(request: NetworkRequest): String? =

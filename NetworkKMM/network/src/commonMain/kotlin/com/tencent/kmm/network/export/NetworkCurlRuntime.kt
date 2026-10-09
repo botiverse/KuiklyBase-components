@@ -89,16 +89,7 @@ data class NetworkCurlRuntimeConfiguration(
     /** Reserved gate. Custom DNS is rejected until a SNI-safe resolver contract lands. */
     val httpDnsEnabled: Boolean = false,
     /** Explicit gray gate. Native capability is probed before a request can use HTTP/3. */
-    val http3Enabled: Boolean = false,
-    /**
-     * DNS-over-HTTPS fallback, tried in order (empty = off, the default). When the system resolver
-     * fails to resolve a host (CURLE_COULDNT_RESOLVE_HOST), a buffered request is retried through
-     * each provider until one resolves it. A successful system resolution is never replaced. After
-     * a system failure that DoH fixed, requests go to that provider first for a short window
-     * instead of failing on the system resolver each time. Applies to buffered requests on
-     * Android, iOS and OHOS; [VBTransportCurl.onNetworkChanged] drops the window.
-     */
-    val dohFallbackProviders: List<NetworkCurlDohFallbackProvider> = emptyList()
+    val http3Enabled: Boolean = false
 )
 
 /**
@@ -168,6 +159,7 @@ object VBTransportCurl {
     private val statusState = atomic(missingConfigurationStatus())
     private val trustModeState = atomic(NetworkCurlTrustMode.PLATFORM_DEFAULT)
     private val proxyHttp3Recovery = NetworkCurlProxyHttp3RecoveryState()
+    private val dohFallbackProvidersState = atomic<List<NetworkCurlDohFallbackProvider>>(emptyList())
 
     val configurationStatus: NetworkCurlConfigurationStatus
         get() = statusState.value
@@ -220,6 +212,30 @@ object VBTransportCurl {
         }
     }
 
+    /** DoH fallback providers in effect, in order; empty = off. See [setDohFallbackProviders]. */
+    val dohFallbackProviders: List<NetworkCurlDohFallbackProvider>
+        get() = dohFallbackProvidersState.value
+
+    /**
+     * DNS-over-HTTPS fallback, tried in order (empty = off, the default; raft task #153). When the
+     * system resolver fails to resolve a host (CURLE_COULDNT_RESOLVE_HOST), a buffered request is
+     * retried through each provider until one resolves it. A successful system resolution is never
+     * replaced. After a system failure that DoH fixed, requests go to that provider first for a
+     * short window instead of failing on the system resolver each time; [onNetworkChanged] drops
+     * the window.
+     *
+     * Independent of [configure]: it applies to the app-owned trust configuration and to the
+     * platform-default trust path alike (OHOS hosts that never call [configure]), on Android, iOS
+     * and OHOS, and may be changed at runtime (e.g. by a feature flag). Requests already prepared
+     * keep the providers they started with. Turning it off or changing the list drops the window.
+     */
+    fun setDohFallbackProviders(providers: List<NetworkCurlDohFallbackProvider>) {
+        val next = providers.distinct()
+        if (dohFallbackProvidersState.getAndSet(next) != next) {
+            com.tencent.kmm.network.curl.curlDohPreference.clear()
+        }
+    }
+
     /**
      * The device moved to another network, or its DNS configuration changed (raft task #153).
      * Drops the short DoH-first window so the system resolver is tried first again on the new
@@ -248,7 +264,8 @@ object VBTransportCurl {
             configuration = configurationState.value,
             status = statusState.value,
             trustMode = trustModeState.value,
-            proxyHttp3Generation = proxyHttp3Recovery.currentGeneration()
+            proxyHttp3Generation = proxyHttp3Recovery.currentGeneration(),
+            dohFallbackProviders = dohFallbackProvidersState.value
         )
     }
 
@@ -367,7 +384,8 @@ internal data class NetworkCurlRuntimeSnapshot(
     val configuration: NetworkCurlRuntimeConfiguration?,
     val status: NetworkCurlConfigurationStatus,
     val trustMode: NetworkCurlTrustMode,
-    val proxyHttp3Generation: Long
+    val proxyHttp3Generation: Long,
+    val dohFallbackProviders: List<NetworkCurlDohFallbackProvider> = emptyList()
 )
 
 internal data class NetworkCurlProxyHttp3Environment(

@@ -16,6 +16,8 @@
  */
 package com.tencent.kmm.network.service
 
+import com.tencent.kmm.network.curl.curlDohPreference
+import com.tencent.kmm.network.export.NetworkCurlDohFallbackProvider
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
 import com.tencent.kmm.network.export.NetworkCurlTrustMode
@@ -53,11 +55,65 @@ class CurlRuntimePreparationTest {
     @BeforeTest
     fun resetRuntime() {
         VBTransportCurl.clear()
+        VBTransportCurl.setDohFallbackProviders(emptyList())
+        curlDohPreference.clear()
     }
 
     @AfterTest
     fun restoreRuntime() {
         VBTransportCurl.clear()
+        VBTransportCurl.setDohFallbackProviders(emptyList())
+        curlDohPreference.clear()
+    }
+
+    @Test
+    fun dohFallbackIsOffUnlessSet() {
+        val request = NetworkRequest(url = "https://example.com/api")
+        assertTrue(prepareCurlRuntime(request, verifiedDefault).available)
+        assertEquals(emptyList<Int>(), preparedCurlDohFallbackProviders(request))
+    }
+
+    @Test
+    fun platformDefaultTrustCarriesTheDohFallbackProviders() {
+        // Raft task #153: OHOS hosts never call configure(); DoH must still reach the request.
+        VBTransportCurl.setDohFallbackProviders(
+            listOf(NetworkCurlDohFallbackProvider.ALIDNS, NetworkCurlDohFallbackProvider.CLOUDFLARE)
+        )
+        val request = NetworkRequest(url = "https://example.com/api")
+
+        assertTrue(prepareCurlRuntime(request, verifiedDefault).available)
+        assertEquals(CURL_RUNTIME_TRUST_PLATFORM_DEFAULT, preparedCurlTrustSource(request))
+        assertEquals(listOf(1, 2), preparedCurlDohFallbackProviders(request))
+    }
+
+    @Test
+    fun dohFallbackChangesApplyToNewRequestsAndSurviveTrustClear() {
+        VBTransportCurl.setDohFallbackProviders(listOf(NetworkCurlDohFallbackProvider.CLOUDFLARE))
+        VBTransportCurl.clear()
+        val first = NetworkRequest(url = "https://example.com/api")
+        assertTrue(prepareCurlRuntime(first, verifiedDefault).available)
+        assertEquals(listOf(2), preparedCurlDohFallbackProviders(first))
+
+        VBTransportCurl.setDohFallbackProviders(emptyList())
+        val second = NetworkRequest(url = "https://example.com/api")
+        assertTrue(prepareCurlRuntime(second, verifiedDefault).available)
+        assertEquals(emptyList<Int>(), preparedCurlDohFallbackProviders(second))
+        // The already-prepared request keeps what it started with.
+        assertEquals(listOf(2), preparedCurlDohFallbackProviders(first))
+    }
+
+    @Test
+    fun changingTheDohProvidersDropsTheDohFirstWindow() {
+        VBTransportCurl.setDohFallbackProviders(listOf(NetworkCurlDohFallbackProvider.ALIDNS))
+        curlDohPreference.onDohResolved(1)
+        assertEquals(1, curlDohPreference.preferredProvider(listOf(1)))
+
+        // Same list again: no change, the window stays.
+        VBTransportCurl.setDohFallbackProviders(listOf(NetworkCurlDohFallbackProvider.ALIDNS))
+        assertEquals(1, curlDohPreference.preferredProvider(listOf(1)))
+
+        VBTransportCurl.setDohFallbackProviders(emptyList())
+        assertEquals(0, curlDohPreference.preferredProvider(listOf(1)))
     }
 
     @Test
