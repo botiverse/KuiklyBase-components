@@ -52,6 +52,7 @@ import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlMultiInfoV1IfAvailab
 import com.tencent.kmm.network.curl.native.NetworkKmmSetCurlBufferedBodyIdleTimeoutMsIfAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmSetCurlMaxBufferedResponseBytesIfAvailable
 import com.tencent.kmm.network.curl.native.SetCurlCaInfo
+import com.tencent.kmm.network.curl.native.SetCurlDohFallbackProvider
 import com.tencent.kmm.network.curl.native.SetCurlHttp3Enabled
 import com.tencent.kmm.network.curl.native.SetCurlProxy
 import com.tencent.kmm.network.curl.native.SetCurlResolve
@@ -134,6 +135,8 @@ internal data class IosCurlNativeRequest(
     /** Empty string means explicit direct mode. */
     val proxyUrl: String,
     val http3Enabled: Boolean = false,
+    /** Native DoH provider id for a fallback attempt (raft task #153); 0 = system resolver only. */
+    val dohFallbackProvider: Int = 0,
     val resolveEntry: String? = null,
     val cancellationSignal: IosCurlCancellationSignal = IosCurlCancellationSignal()
 ) {
@@ -256,6 +259,10 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
         try {
             if (SetCurlHttp3Enabled(handle, if (request.http3Enabled) 1 else 0) == 0) {
                 cleanupAndResume(unavailable("HTTP/3 requested but iOS curl backend is unavailable"))
+                return@suspendCancellableCoroutine
+            }
+            if (SetCurlDohFallbackProvider(handle, request.dohFallbackProvider) == 0) {
+                cleanupAndResume(unavailable("unknown DoH fallback provider"))
                 return@suspendCancellableCoroutine
             }
             SetCurlCaInfo(handle, request.caInfoPath)
@@ -432,6 +439,9 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
                 return@withContext unavailableWithDiagnostics(
                     "HTTP/3 requested but iOS curl backend is unavailable"
                 )
+            }
+            if (SetCurlDohFallbackProvider(handle, request.dohFallbackProvider) == 0) {
+                return@withContext unavailableWithDiagnostics("unknown DoH fallback provider")
             }
             SetCurlCaInfo(handle, request.caInfoPath)
             SetCurlProxy(handle, request.proxyUrl)

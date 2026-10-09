@@ -21,11 +21,9 @@ import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
 import com.tencent.kmm.network.curl.isCurlProxyHttp3Incompatibility
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
+import com.tencent.kmm.network.curl.curlDohPreference
+import com.tencent.kmm.network.curl.runCurlDohFallback
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
-import com.tencent.kmm.network.curl.CURL_CODE_COULDNT_RESOLVE_HOST
-import com.tencent.kmm.network.curl.CurlDohPreference
-import com.tencent.kmm.network.curl.curlDohFallbackAttempts
-import com.tencent.kmm.network.curl.shouldRetryCurlWithDohFallback
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlProxyHttp3Failure
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
@@ -130,7 +128,7 @@ internal class AndroidCurlNetworkEngine(
         }
         val startedAt = TimeSource.Monotonic.markNow()
         val dohProviders = preparedCurlDohFallbackProviders(request)
-        val preferredDohProvider = androidCurlDohPreference.preferredProvider(dohProviders)
+        val preferredDohProvider = curlDohPreference.preferredProvider(dohProviders)
         val first = executeBufferedAttempt(
             request = request,
             call = call,
@@ -139,12 +137,22 @@ internal class AndroidCurlNetworkEngine(
             timeoutMillis = request.policy.timeoutMillis,
             dohFallbackProvider = preferredDohProvider,
         )
-        if (preferredDohProvider != 0 && first.code != CURL_CODE_COULDNT_RESOLVE_HOST) {
-            first.elapse.freshRetryResult = "doh_preferred"
-        }
-        dohFallbackRetryOrNull(
-            request, call, body.bytes, body.contentType, first, preferredDohProvider, dohProviders, startedAt
-        )?.let { return it }
+        runCurlDohFallback(
+            first = first,
+            firstProvider = preferredDohProvider,
+            configuredProviders = dohProviders,
+            isCancelled = { call.isCancelled },
+            remainingTimeoutMillis = { remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt) },
+        ) { provider, timeoutMillis ->
+            executeBufferedAttempt(
+                request = request,
+                call = call,
+                body = body.bytes,
+                contentType = body.contentType,
+                timeoutMillis = timeoutMillis,
+                dohFallbackProvider = provider,
+            )
+        }?.let { return it.toNetworkResponse(request) }
         if (preparedCurlHttp3Enabled(request) &&
             !preparedCurlProxyUrl(request).isNullOrBlank() &&
             isCurlProxyHttp3Incompatibility(first.code, first.errorMsg)
@@ -435,67 +443,6 @@ internal class AndroidCurlNetworkEngine(
         )
     }
 
-    /**
-     * Raft task #153: when the host could not be resolved, walk the remaining resolution attempts
-     * (DoH providers in order; after a failed preferred DoH provider, the system resolver first)
-     * until one resolves it. Returns null when no retry applies (the first response stands).
-     * Diagnostics: freshRetryResult = doh_fallback_success | system_after_doh_failure |
-     * doh_fallback_failure; a first attempt that used the preferred provider is doh_preferred.
-     */
-    private suspend fun dohFallbackRetryOrNull(
-        request: NetworkRequest,
-        call: NetworkCall,
-        body: ByteArray?,
-        contentType: String?,
-        first: CurlNativeResponse,
-        firstProvider: Int,
-        configuredProviders: List<Int>,
-        startedAt: TimeMark,
-    ): NetworkResponse? {
-        val attempts = curlDohFallbackAttempts(firstProvider, configuredProviders)
-        if (firstProvider != 0 && first.code == CURL_CODE_COULDNT_RESOLVE_HOST) androidCurlDohPreference.clear()
-        var last = first
-        var lastProvider = firstProvider
-        var retried = false
-        for ((index, provider) in attempts.withIndex()) {
-            val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
-            if (!shouldRetryCurlWithDohFallback(
-                    curlCode = last.code,
-                    hasNextAttempt = index < attempts.size,
-                    cancelled = call.isCancelled,
-                    remainingTimeoutMillis = remainingTimeout,
-                )) {
-                break
-            }
-            val attempt = executeBufferedAttempt(
-                request = request,
-                call = call,
-                body = body,
-                contentType = contentType,
-                timeoutMillis = remainingTimeout ?: 0L,
-                dohFallbackProvider = provider,
-            )
-            attempt.elapse.retainFirstAttemptCurlFacts(first.elapse)
-            last = attempt
-            lastProvider = provider
-            retried = true
-        }
-        if (!retried) return null
-        if (last.code != CURL_CODE_COULDNT_RESOLVE_HOST && lastProvider != 0) {
-            androidCurlDohPreference.onDohResolved(lastProvider)
-        } else if (lastProvider != 0) {
-            androidCurlDohPreference.clear()
-        }
-        last.elapse.freshRetry = true
-        last.elapse.freshRetryResult =
-            when {
-                last.code == CURL_CODE_COULDNT_RESOLVE_HOST -> "doh_fallback_failure"
-                lastProvider == 0 -> "system_after_doh_failure"
-                else -> "doh_fallback_success"
-            }
-        return last.toNetworkResponse(request)
-    }
-
     private fun cancelledResponse(request: NetworkRequest): NetworkResponse =
         com.tencent.kmm.network.curl.CurlNativeResponse(
             code = 42,
@@ -511,11 +458,6 @@ private fun remainingCurlTimeoutMillis(totalTimeoutMillis: Long, startedAt: Time
 
 private val androidCurlRequestOwners = RequestIdOwnerRegistry()
 
-private val androidCurlDohPreferenceClock = kotlin.time.TimeSource.Monotonic.markNow()
-
-/** Process-wide: a system resolve failure fixed by DoH makes the next minute DoH-first. */
-internal val androidCurlDohPreference =
-    CurlDohPreference(nowMillis = { androidCurlDohPreferenceClock.elapsedNow().inWholeMilliseconds })
 
 internal class AndroidCurlUploadPullBridge {
     private val channel = Channel<ByteArray>(capacity = 4)

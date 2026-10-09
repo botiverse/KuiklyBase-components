@@ -18,6 +18,8 @@ package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.contentLength
+import com.tencent.kmm.network.curl.curlDohPreference
+import com.tencent.kmm.network.curl.runCurlDohFallback
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
@@ -44,6 +46,7 @@ import com.tencent.kmm.network.service.hasPotentialStreamingSource
 import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
 import com.tencent.kmm.network.service.prepareCurlRuntime
 import com.tencent.kmm.network.service.preparedCurlCaInfoPath
+import com.tencent.kmm.network.service.preparedCurlDohFallbackProviders
 import com.tencent.kmm.network.service.preparedCurlHttp3Enabled
 import com.tencent.kmm.network.service.preparedCurlProxyUrl
 import kotlinx.coroutines.channels.Channel
@@ -108,13 +111,32 @@ internal class IosCurlNetworkEngine(
             )
         }
         val startedAt = TimeSource.Monotonic.markNow()
+        val dohProviders = preparedCurlDohFallbackProviders(request)
+        val preferredDohProvider = curlDohPreference.preferredProvider(dohProviders)
         val first = executeBufferedAttempt(
             request = request,
             call = call,
             body = body.bytes,
             contentType = body.contentType,
             timeoutMillis = request.policy.timeoutMillis,
+            dohFallbackProvider = preferredDohProvider,
         )
+        runCurlDohFallback(
+            first = first,
+            firstProvider = preferredDohProvider,
+            configuredProviders = dohProviders,
+            isCancelled = { call.isCancelled },
+            remainingTimeoutMillis = { remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt) },
+        ) { provider, timeoutMillis ->
+            executeBufferedAttempt(
+                request = request,
+                call = call,
+                body = body.bytes,
+                contentType = body.contentType,
+                timeoutMillis = timeoutMillis,
+                dohFallbackProvider = provider,
+            )
+        }?.let { return it.toNetworkResponse(request) }
         if (!first.isBufferedBodyIdleTimeout()) {
             return first.toNetworkResponse(request)
         }
@@ -286,6 +308,7 @@ internal class IosCurlNetworkEngine(
         body: ByteArray?,
         contentType: String?,
         timeoutMillis: Long,
+        dohFallbackProvider: Int = 0,
     ): CurlNativeResponse {
         val owner = Any()
         val requestId = iosCurlRequestOwners.reserve(owner)
@@ -295,6 +318,7 @@ internal class IosCurlNetworkEngine(
                 body = body,
                 contentType = contentType,
                 timeoutMillis = timeoutMillis,
+                dohFallbackProvider = dohFallbackProvider,
             )
         } catch (throwable: Throwable) {
             iosCurlRequestOwners.release(requestId, owner)
@@ -321,6 +345,7 @@ internal class IosCurlNetworkEngine(
         contentType: String? = null,
         uploadContentLength: Long? = null,
         timeoutMillis: Long = policy.timeoutMillis,
+        dohFallbackProvider: Int = 0,
     ): IosCurlNativeRequest {
         val nativeHeaders = headers.toMutableMap()
         contentType?.let { type ->
@@ -348,7 +373,8 @@ internal class IosCurlNetworkEngine(
             proxyUrl = checkNotNull(preparedCurlProxyUrl(this)) {
                 "Curl proxy decision missing after runtime preparation"
             },
-            http3Enabled = preparedCurlHttp3Enabled(this)
+            http3Enabled = preparedCurlHttp3Enabled(this),
+            dohFallbackProvider = dohFallbackProvider
         )
     }
 
