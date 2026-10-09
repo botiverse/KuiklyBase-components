@@ -639,7 +639,15 @@ class AndroidCurlRuntimeInstrumentedTest {
                 while (running.get()) {
                     try {
                         val socket = server.accept()
-                        executor.execute { handle(socket) }
+                        executor.execute {
+                            // A client that gave up (timeout, cancellation) closes its end and the
+                            // late write throws. That outcome belongs to the client-side assertion;
+                            // it must not crash the whole instrumentation process.
+                            try {
+                                handle(socket)
+                            } catch (_: java.io.IOException) {
+                            }
+                        }
                     } catch (_: Throwable) {
                         if (running.get()) throw AssertionError("proxy accept loop failed")
                     }
@@ -716,7 +724,15 @@ class AndroidCurlRuntimeInstrumentedTest {
                 while (running.get()) {
                     try {
                         val socket = server.accept()
-                        executor.execute { handle(socket) }
+                        executor.execute {
+                            // A client that gave up (timeout, cancellation) closes its end and the
+                            // late write throws. That outcome belongs to the client-side assertion;
+                            // it must not crash the whole instrumentation process.
+                            try {
+                                handle(socket)
+                            } catch (_: java.io.IOException) {
+                            }
+                        }
                     } catch (_: Throwable) {
                         if (running.get()) throw AssertionError("HTTP accept loop failed")
                     }
