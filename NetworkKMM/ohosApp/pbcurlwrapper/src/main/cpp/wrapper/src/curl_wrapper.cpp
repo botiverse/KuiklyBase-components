@@ -1288,7 +1288,13 @@ class CurlClient {
             logE(log_tag_, "CURLOPT_HTTP_VERSION failed: " + std::to_string(httpVersionResult));
             return false;
         }
-        const CURLcode pipeWaitResult = curl_easy_setopt(curl_, CURLOPT_PIPEWAIT, 1L);
+        // PIPEWAIT only where the connection can multiplex (TLS: h2 via ALPN, or
+        // HTTP/3). On plain http (always HTTP/1.1) libcurl parks every later
+        // request to the host until the first response headers arrive, which
+        // serializes concurrent requests and deadlocks any that the server only
+        // answers together.
+        const long pipeWait = (http3_enabled_ || request_scheme_ == "https") ? 1L : 0L;
+        const CURLcode pipeWaitResult = curl_easy_setopt(curl_, CURLOPT_PIPEWAIT, pipeWait);
         if (pipeWaitResult != CURLE_OK) {
             logE(log_tag_, "CURLOPT_PIPEWAIT failed: " + std::to_string(pipeWaitResult));
         }

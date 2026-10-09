@@ -349,6 +349,54 @@ int main(int argc, char **argv) {
     }
 
     {
+        // Plain-http HTTP/1.1 requests on one multi engine must not wait for one
+        // another: with CURLOPT_PIPEWAIT, libcurl parks later requests until the
+        // first response headers arrive, so a server that answers only once all
+        // four are in flight (the Android buffered-multi gate) times them all out.
+        constexpr int requestCount = 4;
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-h1-no-pipewait");
+        CHECK(engine != nullptr, "h1 barrier multi engine starts");
+        MultiCaptured batch;
+        batch.expected = requestCount;
+        batch.callbackCounts.assign(requestCount, 0);
+        batch.codes.assign(requestCount, -1);
+        batch.httpCodes.assign(requestCount, -1);
+        std::vector<MultiCallbackRef> refs(requestCount);
+        std::vector<CurClientHandle> handles(requestCount, nullptr);
+        const std::string barrierUrl = base + "/multi-barrier";
+        StringDic headers{};
+        for (int index = 0; index < requestCount; ++index) {
+            refs[index] = MultiCallbackRef{&batch, index};
+            handles[index] = CreateCurlClient("wrapper-multi-h1-barrier");
+            CurlRequest request{};
+            request.url = barrierUrl.c_str();
+            request.method = "GET";
+            request.headers = &headers;
+            request.timeout = 6000;
+            CurlCallback callback{&refs[index], OnMultiResponse};
+            CHECK(
+                SubmitBufferedRequestV27(
+                    engine,
+                    15'000 + index,
+                    handles[index],
+                    &request,
+                    sizeof(request),
+                    CURL_WRAPPER_ABI_VERSION,
+                    &callback) == 1,
+                "multi engine accepts h1 barrier request");
+        }
+        CHECK(AwaitMulti(batch, 8000), "h1 barrier requests all complete");
+        for (int index = 0; index < requestCount; ++index) {
+            CHECK(batch.codes[index] == 0 && batch.httpCodes[index] == 200,
+                  "plain-http h1 requests reach the server together (no PIPEWAIT serialization)");
+        }
+        DeleteCurlMultiEngine(engine);
+        for (CurClientHandle handle : handles) {
+            DeleteCurlClient(handle);
+        }
+    }
+
+    {
         constexpr int requestCount = 4;
         CurlMultiEngineHandle engine = CreateCurlMultiEngine("wrapper-multi-owner");
         CHECK(engine != nullptr, "single-owner multi engine starts");
