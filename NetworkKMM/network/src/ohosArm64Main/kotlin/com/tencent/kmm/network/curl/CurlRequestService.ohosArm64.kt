@@ -39,6 +39,7 @@ import com.tencent.qqlive.kmm.native.libcurl.CurlRequest
 import com.tencent.qqlive.kmm.native.libcurl.CurlResponse
 import com.tencent.qqlive.kmm.native.libcurl.DeleteCurlClient
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlCaInfo
+import com.tencent.qqlive.kmm.native.libcurl.SetCurlDohFallbackProvider
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlHttp3Enabled
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlProxy
 import com.tencent.qqlive.kmm.native.libcurl.CurlStreamCallback
@@ -216,6 +217,9 @@ object CurlRequestServiceHM : ICurlRequestService {
         )
         check(SetCurlHttp3Enabled(handle, if (request.curlHttp3Enabled) 1 else 0) != 0) {
             "HTTP/3 requested but OHOS curl backend is unavailable"
+        }
+        check(SetCurlDohFallbackProvider(handle, request.curlDohFallbackProvider) != 0) {
+            "unknown DoH fallback provider"
         }
     }
 

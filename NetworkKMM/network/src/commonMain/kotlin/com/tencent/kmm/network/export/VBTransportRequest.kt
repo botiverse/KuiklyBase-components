@@ -140,6 +140,8 @@ open class VBTransportBaseRequest {
     internal var curlCaInfoPath: String? = null
     internal var curlProxyUrl: String? = null
     internal var curlHttp3Enabled: Boolean = false
+    /** Native DoH provider id for a fallback attempt (raft task #153); 0 = system resolver only. */
+    internal var curlDohFallbackProvider: Int = 0
     internal var streamConnectTimeoutMillis: Long = 10_000L
     internal var streamResponseHeadersTimeoutMillis: Long = 30_000L
     internal var streamIdleTimeoutMillis: Long = 60_000L

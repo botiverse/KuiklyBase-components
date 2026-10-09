@@ -11,6 +11,7 @@
 package com.tencent.kmm.network.curl
 
 import com.tencent.kmm.network.export.NetworkCurlBufferedResponsePolicy
+import com.tencent.kmm.network.export.VBTransportElapseStatistics
 import com.tencent.kmm.network.export.VBTransportMethod
 
 internal fun shouldFreshRetryCurlBufferedStall(
@@ -84,3 +85,86 @@ internal class CurlDohPreference(
         }
     }
 }
+
+private val curlDohPreferenceClock = kotlin.time.TimeSource.Monotonic.markNow()
+
+/** Process-wide DoH preference shared by every curl engine (Android, iOS, OHOS). */
+internal val curlDohPreference: CurlDohPreference =
+    CurlDohPreference(nowMillis = { curlDohPreferenceClock.elapsedNow().inWholeMilliseconds })
+
+/**
+ * Raft task #153, shared by the curl engines: after a first attempt that used [firstProvider]
+ * (0 = system resolver) could not resolve the host, walk the remaining resolution attempts until
+ * one resolves it, updating [preference]. Returns null when no retry applies (the first response
+ * stands). The returned response carries freshRetryResult = doh_fallback_success |
+ * system_after_doh_failure | doh_fallback_failure; a first attempt that used the preferred
+ * provider and resolved is marked doh_preferred.
+ */
+internal suspend fun <R> runDohFallback(
+    first: R,
+    firstProvider: Int,
+    configuredProviders: List<Int>,
+    isUnresolved: (R) -> Boolean,
+    timing: (R) -> VBTransportElapseStatistics,
+    isCancelled: () -> Boolean,
+    remainingTimeoutMillis: () -> Long?,
+    preference: CurlDohPreference = curlDohPreference,
+    attempt: suspend (provider: Int, timeoutMillis: Long) -> R,
+): R? {
+    if (firstProvider != 0 && !isUnresolved(first)) {
+        timing(first).freshRetryResult = "doh_preferred"
+        return null
+    }
+    val attempts = curlDohFallbackAttempts(firstProvider, configuredProviders)
+    if (firstProvider != 0) preference.clear()
+    var last = first
+    var lastProvider = firstProvider
+    var retried = false
+    for (provider in attempts) {
+        val remainingTimeout = remainingTimeoutMillis()
+        val canRetry = isUnresolved(last) && !isCancelled() && remainingTimeout != 0L
+        if (!canRetry) break
+        val next = attempt(provider, remainingTimeout ?: 0L)
+        timing(next).retainFirstAttemptCurlFacts(timing(first))
+        last = next
+        lastProvider = provider
+        retried = true
+    }
+    if (!retried) return null
+    val unresolved = isUnresolved(last)
+    if (!unresolved && lastProvider != 0) {
+        preference.onDohResolved(lastProvider)
+    } else if (lastProvider != 0) {
+        preference.clear()
+    }
+    timing(last).freshRetry = true
+    timing(last).freshRetryResult =
+        when {
+            unresolved -> "doh_fallback_failure"
+            lastProvider == 0 -> "system_after_doh_failure"
+            else -> "doh_fallback_success"
+        }
+    return last
+}
+
+/** [runDohFallback] for engines that see the raw curl result (Android, iOS). */
+internal suspend fun runCurlDohFallback(
+    first: CurlNativeResponse,
+    firstProvider: Int,
+    configuredProviders: List<Int>,
+    isCancelled: () -> Boolean,
+    remainingTimeoutMillis: () -> Long?,
+    preference: CurlDohPreference = curlDohPreference,
+    attempt: suspend (provider: Int, timeoutMillis: Long) -> CurlNativeResponse,
+): CurlNativeResponse? =
+    runDohFallback(
+        first = first,
+        firstProvider = firstProvider,
+        configuredProviders = configuredProviders,
+        isUnresolved = { it.code == CURL_CODE_COULDNT_RESOLVE_HOST },
+        timing = { it.elapse },
+        isCancelled = isCancelled,
+        remainingTimeoutMillis = remainingTimeoutMillis,
+        preference = preference,
+        attempt = attempt,
+    )

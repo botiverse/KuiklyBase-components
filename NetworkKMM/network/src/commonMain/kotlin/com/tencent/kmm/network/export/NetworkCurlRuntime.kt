@@ -95,7 +95,8 @@ data class NetworkCurlRuntimeConfiguration(
      * fails to resolve a host (CURLE_COULDNT_RESOLVE_HOST), a buffered request is retried through
      * each provider until one resolves it. A successful system resolution is never replaced. After
      * a system failure that DoH fixed, requests go to that provider first for a short window
-     * instead of failing on the system resolver each time. Android only for now.
+     * instead of failing on the system resolver each time. Applies to buffered requests on
+     * Android, iOS and OHOS; [VBTransportCurl.onNetworkChanged] drops the window.
      */
     val dohFallbackProviders: List<NetworkCurlDohFallbackProvider> = emptyList()
 )
@@ -217,6 +218,15 @@ object VBTransportCurl {
             trustModeState.value = NetworkCurlTrustMode.PLATFORM_DEFAULT
             proxyHttp3Recovery.configurationChanged()
         }
+    }
+
+    /**
+     * The device moved to another network, or its DNS configuration changed (raft task #153).
+     * Drops the short DoH-first window so the system resolver is tried first again on the new
+     * network, instead of sending names to the DoH provider for up to a minute.
+     */
+    fun onNetworkChanged() {
+        com.tencent.kmm.network.curl.curlDohPreference.clear()
     }
 
     /**

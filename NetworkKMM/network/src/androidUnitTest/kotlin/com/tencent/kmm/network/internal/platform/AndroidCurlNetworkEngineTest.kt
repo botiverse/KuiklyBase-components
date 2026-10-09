@@ -30,6 +30,7 @@ import com.tencent.kmm.network.export.NetworkRetryPolicy
 import com.tencent.kmm.network.export.NetworkStreamTimeoutPolicy
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
+import com.tencent.kmm.network.curl.curlDohPreference
 import com.tencent.kmm.network.export.NetworkCurlDohFallbackProvider
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
 import com.tencent.kmm.network.export.NetworkCurlTrustStore
@@ -101,7 +102,7 @@ class AndroidCurlNetworkEngineTest {
 
     @AfterTest
     fun resetBridge() {
-        androidCurlDohPreference.clear()
+        curlDohPreference.clear()
         AndroidCurlEngineProvider.testBridge = null
         AndroidCurlSystemProxyResolver.testResolver = null
         VBTransportCurl.clear()
