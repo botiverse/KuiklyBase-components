@@ -16,7 +16,10 @@
  */
 package com.tencent.kmm.network.service
 
+import com.tencent.kmm.network.curl.CURL_CODE_COULDNT_RESOLVE_HOST
+import com.tencent.kmm.network.curl.curlDohPreference
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
+import com.tencent.kmm.network.curl.runDohFallback
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.export.NetworkBody
 import com.tencent.kmm.network.export.NetworkBodyBytes
@@ -769,12 +772,37 @@ object VBTransportNetworkEngine : NetworkEngine {
         }
 
         val startedAt = TimeSource.Monotonic.markNow()
+        val dohProviders = if (usesCurlPlatformDefault) preparedCurlDohFallbackProviders(request) else emptyList()
+        val preferredDohProvider = curlDohPreference.preferredProvider(dohProviders)
         val first = executeBufferedPlatformAttempt(
             request = request,
             call = call,
             bodyBytes = bodyBytes,
             timeoutMillis = request.policy.timeoutMillis,
+            dohFallbackProvider = preferredDohProvider,
         )
+        if (dohProviders.isNotEmpty()) {
+            // Raft task #153 (OHOS curl through VBTransport): same DoH fallback as Android/iOS.
+            runDohFallback(
+                first = first,
+                firstProvider = preferredDohProvider,
+                configuredProviders = dohProviders,
+                isUnresolved = { it.isCurlUnresolvedHost() },
+                timing = { it.timing },
+                isCancelled = { call.isCancelled },
+                remainingTimeoutMillis = {
+                    remainingPlatformCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
+                },
+            ) { provider, timeoutMillis ->
+                executeBufferedPlatformAttempt(
+                    request = request,
+                    call = call,
+                    bodyBytes = bodyBytes,
+                    timeoutMillis = timeoutMillis,
+                    dohFallbackProvider = provider,
+                )
+            }?.let { return it }
+        }
         if (!usesCurlPlatformDefault || !first.isCurlBufferedBodyIdleTimeout()) {
             return first
         }
@@ -810,6 +838,7 @@ object VBTransportNetworkEngine : NetworkEngine {
         call: NetworkCall,
         bodyBytes: NetworkBodyBytes,
         timeoutMillis: Long,
+        dohFallbackProvider: Int = 0,
     ): NetworkResponse = suspendCancellableCoroutine { continuation ->
             val vbRequest = VBTransportRequest().apply {
                 method = request.method
@@ -827,6 +856,7 @@ object VBTransportNetworkEngine : NetworkEngine {
                 curlCaInfoPath = preparedCurlCaInfoPath(request)
                 curlProxyUrl = preparedCurlProxyUrl(request)
                 curlHttp3Enabled = preparedCurlHttp3Enabled(request)
+                curlDohFallbackProvider = dohFallbackProvider
                 bodyBytes.bytes?.let { data = it }
             }
 
@@ -969,6 +999,13 @@ object VBTransportNetworkEngine : NetworkEngine {
         get() = com.tencent.kmm.network.internal.platform.platformDefaultNetworkTransportEngine ==
             NetworkTransportEngine.CURL
 }
+
+/**
+ * The curl transfer failed with CURLE_COULDNT_RESOLVE_HOST. Matches the CURLcode, not the
+ * classified error kind, whose text match also catches e.g. CURLE_COULDNT_RESOLVE_PROXY (5).
+ */
+internal fun NetworkResponse.isCurlUnresolvedHost(): Boolean =
+    statusCode == null && error?.rawCode == CURL_CODE_COULDNT_RESOLVE_HOST
 
 private fun NetworkResponse.isCurlBufferedBodyIdleTimeout(): Boolean =
     error?.rawCode == 28 && error.message.contains("buffered body idle timeout")
