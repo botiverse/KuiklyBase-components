@@ -61,6 +61,8 @@ internal data class AndroidCurlNativeRequest(
     /** Empty string means explicit direct mode. */
     val proxyUrl: String,
     val http3Enabled: Boolean = false,
+    /** Native DoH provider id for a fallback retry; 0 = system resolver only. */
+    val dohFallbackProvider: Int = 0,
     val cancellationSignal: AndroidCurlCancellationSignal = AndroidCurlCancellationSignal()
 ) {
     fun cancel() {
@@ -192,6 +194,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
                 caInfoPath = request.caInfoPath,
                 proxyUrl = request.proxyUrl,
                 http3Enabled = request.http3Enabled,
+                dohFallbackProvider = request.dohFallbackProvider,
                 callback = callback
             )
             if (!accepted) {
@@ -243,6 +246,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
                 caInfoPath = request.caInfoPath,
                 proxyUrl = request.proxyUrl,
                 http3Enabled = request.http3Enabled,
+                dohFallbackProvider = request.dohFallbackProvider,
                 mode = mode,
                 callback = callback
             )
@@ -275,6 +279,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
         caInfoPath: String,
         proxyUrl: String,
         http3Enabled: Boolean,
+        dohFallbackProvider: Int,
         mode: Int,
         callback: AndroidCurlJniCallback
     )
@@ -291,6 +296,7 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
         caInfoPath: String,
         proxyUrl: String,
         http3Enabled: Boolean,
+        dohFallbackProvider: Int,
         callback: AndroidCurlJniCallback
     ): Boolean
 

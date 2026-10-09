@@ -643,6 +643,31 @@ static void ShareUnlockCallback(CURL *handle, curl_lock_data data, void *userptr
     }
 }
 
+// Built-in DoH providers (raft task #153). Addresses are public anycast
+// resolvers; refreshing them is a code change that ships with a release.
+struct DohProvider {
+    int id;
+    const char *name;
+    const char *url;
+    const char *resolveEntry;  // CURLOPT_RESOLVE "host:port:addr[,addr]"
+};
+
+static const DohProvider kDohProviders[] = {
+    {CURL_DOH_PROVIDER_ALIDNS, "alidns", "https://dns.alidns.com/dns-query",
+     "dns.alidns.com:443:223.5.5.5,223.6.6.6"},
+    {CURL_DOH_PROVIDER_CLOUDFLARE, "cloudflare", "https://cloudflare-dns.com/dns-query",
+     "cloudflare-dns.com:443:1.1.1.1,1.0.0.1"},
+};
+
+static const DohProvider *FindDohProvider(int id) {
+    for (const DohProvider &provider : kDohProviders) {
+        if (provider.id == id) {
+            return &provider;
+        }
+    }
+    return nullptr;
+}
+
 static CURLSH *GetCurlShare(bool http3Enabled) {
     std::lock_guard<std::mutex> guard(gShareInitMutex);
     CURLSH **slot = http3Enabled ? &gCurlHttp3Share : &gCurlDefaultShare;
@@ -1202,18 +1227,32 @@ class CurlClient {
         if (share != nullptr) {
             curl_easy_setopt(curl_, CURLOPT_SHARE, share);
         }
-        if (!resolve_entry_.empty()) {
-            struct curl_slist *updated_resolve_list = curl_slist_append(resolve_list_, resolve_entry_.c_str());
-            if (updated_resolve_list == nullptr) {
-                logE(log_tag_, "failed to allocate CURLOPT_RESOLVE entry");
+        const DohProvider *doh = FindDohProvider(doh_provider_);
+        if (!resolve_entry_.empty() || doh != nullptr) {
+            if (!resolve_entry_.empty() && !AppendResolveEntry(resolve_entry_.c_str())) {
                 return false;
             }
-            resolve_list_ = updated_resolve_list;
+            // Pin the DoH provider's hostname so the DoH lookup itself never needs the
+            // system resolver that just failed. The DoH probe shares this client's
+            // CURLOPT_SHARE (DNS cache), where libcurl loads these entries.
+            if (doh != nullptr && !AppendResolveEntry(doh->resolveEntry)) {
+                return false;
+            }
             CURLcode resolveResult = curl_easy_setopt(curl_, CURLOPT_RESOLVE, resolve_list_);
             if (resolveResult != CURLE_OK) {
                 logE(log_tag_, "CURLOPT_RESOLVE failed: " + std::to_string(resolveResult));
                 return false;
             }
+        }
+        if (doh != nullptr) {
+            // Hostname URL; CURLOPT_DOH_SSL_VERIFYPEER/VERIFYHOST stay at libcurl's
+            // default (enabled) and are deliberately never set here.
+            CURLcode dohResult = curl_easy_setopt(curl_, CURLOPT_DOH_URL, doh->url);
+            if (dohResult != CURLE_OK) {
+                logE(log_tag_, "CURLOPT_DOH_URL failed: " + std::to_string(dohResult));
+                return false;
+            }
+            logI(log_tag_, std::string("doh_fallback provider=") + doh->name);
         }
         // Default requests are explicitly capped at h2/h1.1. Gray HTTP/3
         // requests use CURL_HTTP_VERSION_3, whose documented semantics race
@@ -1880,6 +1919,24 @@ class CurlClient {
         return true;
     }
 
+    bool SetDohFallbackProvider(int providerId) {
+        if (providerId != CURL_DOH_PROVIDER_NONE && FindDohProvider(providerId) == nullptr) {
+            return false;
+        }
+        doh_provider_ = providerId;
+        return true;
+    }
+
+    bool AppendResolveEntry(const char *entry) {
+        struct curl_slist *updated_resolve_list = curl_slist_append(resolve_list_, entry);
+        if (updated_resolve_list == nullptr) {
+            logE(log_tag_, "failed to allocate CURLOPT_RESOLVE entry");
+            return false;
+        }
+        resolve_list_ = updated_resolve_list;
+        return true;
+    }
+
     bool SetHttp3Enabled(bool enabled) {
         if (enabled && !CurlSupportsHttp3()) {
             return false;
@@ -1948,6 +2005,7 @@ class CurlClient {
     CURL *curl_ = nullptr;
     struct curl_slist *header_list_ = nullptr;
     struct curl_slist *resolve_list_ = nullptr;
+    int doh_provider_ = CURL_DOH_PROVIDER_NONE;
     char curl_error_msg_[CURL_ERROR_SIZE];
     std::string headers_;
     std::string current_headers_;
@@ -2592,6 +2650,13 @@ void SetCurlBufferedBodyIdleTimeoutMs(CurClientHandle handle, int64_t timeoutMs)
         return;
     }
     reinterpret_cast<CurlClient *>(handle)->SetBufferedBodyIdleTimeoutMs(timeoutMs);
+}
+
+int SetCurlDohFallbackProvider(CurClientHandle handle, int providerId) {
+    if (handle == nullptr) {
+        return 0;
+    }
+    return reinterpret_cast<CurlClient *>(handle)->SetDohFallbackProvider(providerId) ? 1 : 0;
 }
 
 int SetCurlResolve(CurClientHandle handle, const char *resolveEntry) {
