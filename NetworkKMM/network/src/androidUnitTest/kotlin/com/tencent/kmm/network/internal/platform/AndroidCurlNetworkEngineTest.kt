@@ -102,6 +102,7 @@ class AndroidCurlNetworkEngineTest {
 
     @AfterTest
     fun resetBridge() {
+        VBTransportCurl.setDohFallbackProviders(emptyList())
         curlDohPreference.clear()
         AndroidCurlEngineProvider.testBridge = null
         AndroidCurlSystemProxyResolver.testResolver = null
@@ -276,10 +277,10 @@ class AndroidCurlNetworkEngineTest {
                     path = trustStoreFile.absolutePath,
                     sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
                 ),
-                proxy = NetworkCurlProxyConfiguration.direct(),
-                dohFallbackProviders = providers.toList()
+                proxy = NetworkCurlProxyConfiguration.direct()
             )
         )
+        VBTransportCurl.setDohFallbackProviders(providers.toList())
     }
 
     @Test
