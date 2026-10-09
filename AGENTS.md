@@ -40,6 +40,15 @@ Key points:
   itself (pbcurlwrapper) is still rebuilt + committed via the
   `networkkmm-ohos-native.yml` workflow (`commit_binaries`), same as raft.3/4.
 
+## Refreshing committed native binaries in a PR
+
+A wrapper `.cpp`/header change makes the committed Android `.so`, iOS xcframework and OHOS `.so`
+stale; the PR's freshness gates fail until they are rebuilt. Dispatch, one at a time on the PR
+branch (each commits to it): `networkkmm-android-native.yml`, `networkkmm-ios-native.yml`,
+`networkkmm-ohos-native.yml`, each with `commit_binaries=true`. Those commits carry `[skip ci]`,
+so afterwards push one more ordinary commit (not empty, not `[skip ci]`) so the `pull_request`
+checks — including the freshness gates — run on the final head before review/merge.
+
 ## Publishing a new raft.N
 
 1. Merge the change to `master`; bump `NetworkKMM/gradle.properties`
