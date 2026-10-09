@@ -16,6 +16,7 @@
  */
 package com.tencent.kmm.network.service
 
+import com.tencent.kmm.network.curl.CURL_CODE_COULDNT_RESOLVE_HOST
 import com.tencent.kmm.network.curl.curlDohPreference
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.runDohFallback
@@ -786,7 +787,7 @@ object VBTransportNetworkEngine : NetworkEngine {
                 first = first,
                 firstProvider = preferredDohProvider,
                 configuredProviders = dohProviders,
-                isUnresolved = { it.statusCode == null && it.error?.kind == NetworkErrorKind.DNS },
+                isUnresolved = { it.isCurlUnresolvedHost() },
                 timing = { it.timing },
                 isCancelled = { call.isCancelled },
                 remainingTimeoutMillis = {
@@ -998,6 +999,13 @@ object VBTransportNetworkEngine : NetworkEngine {
         get() = com.tencent.kmm.network.internal.platform.platformDefaultNetworkTransportEngine ==
             NetworkTransportEngine.CURL
 }
+
+/**
+ * The curl transfer failed with CURLE_COULDNT_RESOLVE_HOST. Matches the CURLcode, not the
+ * classified error kind, whose text match also catches e.g. CURLE_COULDNT_RESOLVE_PROXY (5).
+ */
+internal fun NetworkResponse.isCurlUnresolvedHost(): Boolean =
+    statusCode == null && error?.rawCode == CURL_CODE_COULDNT_RESOLVE_HOST
 
 private fun NetworkResponse.isCurlBufferedBodyIdleTimeout(): Boolean =
     error?.rawCode == 28 && error.message.contains("buffered body idle timeout")

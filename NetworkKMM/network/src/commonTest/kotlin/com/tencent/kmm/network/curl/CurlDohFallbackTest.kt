@@ -1,10 +1,17 @@
 package com.tencent.kmm.network.curl
 
+import com.tencent.kmm.network.export.NetworkError
+import com.tencent.kmm.network.export.NetworkErrorKind
+import com.tencent.kmm.network.export.NetworkRequest
+import com.tencent.kmm.network.export.NetworkResponse
+import com.tencent.kmm.network.export.NetworkResponseBody
 import com.tencent.kmm.network.export.VBTransportCurl
+import com.tencent.kmm.network.service.isCurlUnresolvedHost
 import kotlinx.coroutines.runBlocking
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -97,5 +104,20 @@ class CurlDohFallbackTest {
         assertEquals(1, curlDohPreference.preferredProvider(listOf(1)))
         VBTransportCurl.onNetworkChanged()
         assertEquals(0, curlDohPreference.preferredProvider(listOf(1)))
+    }
+
+    @Test
+    fun ohosTriggerIsTheCurlCodeNotTheDnsTextMatch() {
+        fun failed(rawCode: Int, statusCode: Int? = null) = NetworkResponse(
+            request = NetworkRequest(),
+            statusCode = statusCode,
+            headers = emptyMap(),
+            body = NetworkResponseBody(),
+            error = NetworkError(NetworkErrorKind.DNS, "[dns] could not resolve", statusCode, rawCode = rawCode),
+        )
+        assertTrue(failed(CURL_CODE_COULDNT_RESOLVE_HOST).isCurlUnresolvedHost())
+        // CURLE_COULDNT_RESOLVE_PROXY is classified DNS by text, but DoH cannot fix a proxy name.
+        assertFalse(failed(5).isCurlUnresolvedHost())
+        assertFalse(failed(CURL_CODE_COULDNT_RESOLVE_HOST, statusCode = 502).isCurlUnresolvedHost())
     }
 }
