@@ -1,13 +1,32 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased
+## 0.1.0-raft.41 / 0.1.0-raft.41-ohos (DoH fallback, PIPEWAIT scope)
 
+- DNS-over-HTTPS fallback (raft task #153; #158, #159, #161, #164). Off unless
+  the app calls `VBTransportCurl.setDohFallbackProviders(...)`, a standalone
+  setting that applies with an app-owned trust store and on the
+  platform-default trust path alike and can be toggled at runtime. Only after
+  the system resolver fails a request (CURLcode 6) is it retried through the
+  configured providers in order (built-in only: `ALIDNS` dns.alidns.com,
+  `CLOUDFLARE` cloudflare-dns.com; hostnames pinned to their published IPs via
+  `CURLOPT_RESOLVE`, TLS verification unchanged). A DoH success makes DoH the
+  first attempt for 60 s; `VBTransportCurl.onNetworkChanged()` ends that window
+  so a new network resolves through the system first. Android, iOS and OHOS
+  share one retry loop; diagnostics report `freshRetryResult` =
+  `doh_fallback_success` | `doh_fallback_failure` | `system_after_doh_failure`
+  | `doh_preferred`. A failed system lookup is no longer negative-cached in the
+  shared DNS cache that DoH requests use (separate DoH shares, 20 s cache).
 - Native wrapper: set `CURLOPT_PIPEWAIT` only for https (h2 via ALPN) or
   HTTP/3. On plain http (always HTTP/1.1) it parked every later request to the
   host until the first response headers arrived, serializing concurrent
   requests and deadlocking ones the server answers together (the Android
-  `buffered-multi` runtime gate's recurring 4x curl 28). Android/iOS/OHOS
-  carriers refreshed.
+  `buffered-multi` runtime gate's recurring 4x curl 28; #162).
+- Tests and tooling: the Android runtime test server survives a client
+  disconnect (#160); the Raft artifact mirror retries the scope listing with a
+  300 s timeout (#157).
+- Native carriers: Android/iOS/OHOS rebuilt from the reviewed wrapper source
+  (DoH provider API + PIPEWAIT scope); freshness gates assert committed ==
+  rebuilt.
 
 ## 0.1.0-raft.40 / 0.1.0-raft.40-ohos (iOS optional curl API linking)
 
