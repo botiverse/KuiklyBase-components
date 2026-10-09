@@ -36,6 +36,7 @@ private const val CURL_RUNTIME_CA_PATH = "com.tencent.kmm.network.curl.runtime.c
 private const val CURL_RUNTIME_PROXY_URL = "com.tencent.kmm.network.curl.runtime.proxy_url"
 private const val CURL_RUNTIME_TRUST = "com.tencent.kmm.network.curl.runtime.trust"
 private const val CURL_RUNTIME_HTTP3 = "com.tencent.kmm.network.curl.runtime.http3"
+private const val CURL_RUNTIME_DOH_FALLBACK = "com.tencent.kmm.network.curl.runtime.doh_fallback"
 private const val CURL_RUNTIME_HTTP3_REQUESTED =
     "com.tencent.kmm.network.curl.runtime.http3_requested"
 private const val CURL_RUNTIME_PROXY_HTTP3_GENERATION =
@@ -196,6 +197,9 @@ internal fun prepareCurlRuntime(
         expectedGeneration = runtimeSnapshot.proxyHttp3Generation
     )
     request.metadata[CURL_RUNTIME_TRUST] = CURL_RUNTIME_TRUST_APP_OWNED
+    configuration.dohFallback?.let { provider ->
+        request.metadata[CURL_RUNTIME_DOH_FALLBACK] = provider.nativeId.toString()
+    } ?: request.metadata.remove(CURL_RUNTIME_DOH_FALLBACK)
     request.metadata[CURL_RUNTIME_READY] = "true"
     return NetworkEngineAvailability.Available
 }
@@ -209,6 +213,10 @@ internal fun preparedCurlCaInfoPath(request: NetworkRequest): String? =
 /** Empty means explicit direct mode and is still passed to CURLOPT_PROXY. */
 internal fun preparedCurlProxyUrl(request: NetworkRequest): String? =
     request.metadata[CURL_RUNTIME_PROXY_URL]
+
+/** Native DoH provider id for a fallback retry, or 0 when DoH fallback is off. */
+internal fun preparedCurlDohFallbackProvider(request: NetworkRequest): Int =
+    request.metadata[CURL_RUNTIME_DOH_FALLBACK]?.toIntOrNull() ?: 0
 
 internal fun preparedCurlHttp3Enabled(request: NetworkRequest): Boolean =
     request.metadata[CURL_RUNTIME_HTTP3] == "true"

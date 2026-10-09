@@ -301,6 +301,20 @@ void SetCurlBufferedBodyIdleTimeoutMs(CurClientHandle handle, int64_t timeoutMs)
 // an already-resolved address. Empty clears the override.
 int SetCurlResolve(CurClientHandle handle, const char *resolveEntry);
 
+// DNS-over-HTTPS fallback (raft task #153). Callers set a provider only for a
+// retry after the system resolver failed (CURLE_COULDNT_RESOLVE_HOST); this
+// client then resolves through that provider instead of the system resolver.
+// Providers are a closed built-in table: the DoH URL always names the
+// provider's hostname, which is pinned to built-in addresses via
+// CURLOPT_RESOLVE so the DoH lookup does not depend on system DNS, while TLS
+// still verifies the provider's hostname. DoH TLS verification is never
+// relaxed, and the business request still verifies its own hostname. 0
+// disables DoH; an unknown id is rejected (returns 0).
+#define CURL_DOH_PROVIDER_NONE 0
+#define CURL_DOH_PROVIDER_ALIDNS 1
+#define CURL_DOH_PROVIDER_CLOUDFLARE 2
+int SetCurlDohFallbackProvider(CurClientHandle handle, int providerId);
+
 // Runtime artifact capability probe. Version numbers alone are insufficient:
 // this checks libcurl's compiled feature bits for an actual HTTP/3 backend.
 int CurlSupportsHttp3(void);

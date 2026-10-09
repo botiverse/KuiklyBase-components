@@ -89,8 +89,27 @@ data class NetworkCurlRuntimeConfiguration(
     /** Reserved gate. Custom DNS is rejected until a SNI-safe resolver contract lands. */
     val httpDnsEnabled: Boolean = false,
     /** Explicit gray gate. Native capability is probed before a request can use HTTP/3. */
-    val http3Enabled: Boolean = false
+    val http3Enabled: Boolean = false,
+    /**
+     * DNS-over-HTTPS fallback (off by default). When set, a buffered request whose system name
+     * resolution failed (CURLE_COULDNT_RESOLVE_HOST) is retried once, resolving through this
+     * built-in provider. A successful system resolution is never replaced. Android only for now.
+     */
+    val dohFallback: NetworkCurlDohFallbackProvider? = null
 )
+
+/**
+ * Closed set of DoH providers built into the native wrapper (raft task #153). Each names its
+ * DoH hostname, pinned natively to built-in addresses; there is no way to supply a URL or IP.
+ * The provider sees the hostname being resolved.
+ */
+enum class NetworkCurlDohFallbackProvider(internal val nativeId: Int) {
+    /** dns.alidns.com (223.5.5.5, 223.6.6.6). */
+    ALIDNS(1),
+
+    /** cloudflare-dns.com (1.1.1.1, 1.0.0.1). */
+    CLOUDFLARE(2)
+}
 
 enum class NetworkCurlConfigurationFailureReason {
     NONE,

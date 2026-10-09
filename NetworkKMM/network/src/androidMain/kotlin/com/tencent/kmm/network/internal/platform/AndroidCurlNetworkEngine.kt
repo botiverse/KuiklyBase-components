@@ -22,6 +22,7 @@ import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
 import com.tencent.kmm.network.curl.isCurlProxyHttp3Incompatibility
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
+import com.tencent.kmm.network.curl.shouldRetryCurlWithDohFallback
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlProxyHttp3Failure
 import com.tencent.kmm.network.curl.parseCurlHeaders
 import com.tencent.kmm.network.curl.toNetworkResponse
@@ -49,6 +50,7 @@ import com.tencent.kmm.network.service.networkUploadStreamSourceOrNull
 import com.tencent.kmm.network.service.latchPreparedCurlProxyHttp3Fallback
 import com.tencent.kmm.network.service.prepareCurlRuntime
 import com.tencent.kmm.network.service.preparedCurlCaInfoPath
+import com.tencent.kmm.network.service.preparedCurlDohFallbackProvider
 import com.tencent.kmm.network.service.preparedCurlHttp3Enabled
 import com.tencent.kmm.network.service.preparedCurlProxyUrl
 import kotlinx.coroutines.Dispatchers
@@ -131,6 +133,7 @@ internal class AndroidCurlNetworkEngine(
             contentType = body.contentType,
             timeoutMillis = request.policy.timeoutMillis,
         )
+        dohFallbackRetryOrNull(request, call, body.bytes, body.contentType, first, startedAt)?.let { return it }
         if (preparedCurlHttp3Enabled(request) &&
             !preparedCurlProxyUrl(request).isNullOrBlank() &&
             isCurlProxyHttp3Incompatibility(first.code, first.errorMsg)
@@ -342,6 +345,7 @@ internal class AndroidCurlNetworkEngine(
         contentType: String?,
         timeoutMillis: Long,
         freshConnection: Boolean = false,
+        dohFallbackProvider: Int = 0,
     ): CurlNativeResponse {
         val owner = Any()
         val requestId = androidCurlRequestOwners.reserve(owner)
@@ -351,6 +355,7 @@ internal class AndroidCurlNetworkEngine(
                 body = body,
                 contentType = contentType,
                 timeoutMillis = timeoutMillis,
+                dohFallbackProvider = dohFallbackProvider,
             )
         } catch (throwable: Throwable) {
             androidCurlRequestOwners.release(requestId, owner)
@@ -382,6 +387,7 @@ internal class AndroidCurlNetworkEngine(
         contentType: String? = null,
         uploadContentLength: Long? = null,
         timeoutMillis: Long = policy.timeoutMillis,
+        dohFallbackProvider: Int = 0,
     ): AndroidCurlNativeRequest {
         val nativeHeaders = headers.toMutableMap()
         contentType?.let { type ->
@@ -413,8 +419,46 @@ internal class AndroidCurlNetworkEngine(
             proxyUrl = checkNotNull(preparedCurlProxyUrl(this)) {
                 "Curl proxy decision missing after runtime preparation"
             },
-            http3Enabled = preparedCurlHttp3Enabled(this)
+            http3Enabled = preparedCurlHttp3Enabled(this),
+            dohFallbackProvider = dohFallbackProvider
         )
+    }
+
+    /**
+     * Raft task #153: when the system resolver could not resolve the host and a DoH fallback
+     * provider is configured, retry the buffered request once resolving through DoH. Returns null
+     * when no retry applies (the first response stands).
+     */
+    private suspend fun dohFallbackRetryOrNull(
+        request: NetworkRequest,
+        call: NetworkCall,
+        body: ByteArray?,
+        contentType: String?,
+        first: CurlNativeResponse,
+        startedAt: TimeMark,
+    ): NetworkResponse? {
+        val provider = preparedCurlDohFallbackProvider(request)
+        val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
+        if (!shouldRetryCurlWithDohFallback(
+                curlCode = first.code,
+                provider = provider,
+                cancelled = call.isCancelled,
+                remainingTimeoutMillis = remainingTimeout,
+            )) {
+            return null
+        }
+        val retried = executeBufferedAttempt(
+            request = request,
+            call = call,
+            body = body,
+            contentType = contentType,
+            timeoutMillis = remainingTimeout ?: 0L,
+            dohFallbackProvider = provider,
+        )
+        retried.elapse.retainFirstAttemptCurlFacts(first.elapse)
+        retried.elapse.freshRetry = true
+        retried.elapse.freshRetryResult = if (retried.code == 0) "doh_fallback_success" else "doh_fallback_failure"
+        return retried.toNetworkResponse(request)
     }
 
     private fun cancelledResponse(request: NetworkRequest): NetworkResponse =

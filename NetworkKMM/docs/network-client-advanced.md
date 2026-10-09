@@ -254,6 +254,35 @@ key. `forcePlatformDefault` is the immediate rollback switch. HTTPDNS remains un
 is no SNI-safe custom resolver contract; setting `httpDnsEnabled` makes curl ineligible with
 `HTTPDNS_UNSUPPORTED`.
 
+### DNS-over-HTTPS fallback (curl, Android)
+
+`NetworkCurlRuntimeConfiguration(dohFallback = NetworkCurlDohFallbackProvider.ALIDNS)` (off by
+default) retries a buffered request **once** through DNS-over-HTTPS, and only when the system
+resolver failed (`CURLE_COULDNT_RESOLVE_HOST`). A successful system resolution is never replaced,
+and connect/TLS/timeout failures are not retried. Because no connection was made, any method may be
+retried. The retry is reported as `freshRetryResult = doh_fallback_success | doh_fallback_failure`.
+
+Unlike `httpDnsEnabled`, this is SNI-safe: libcurl resolves internally and the business request
+keeps its own hostname for SNI and certificate verification. Providers are a closed built-in table
+(there is no way to pass a URL or IP):
+
+| Provider | DoH URL | Pinned addresses |
+|---|---|---|
+| `ALIDNS` | `https://dns.alidns.com/dns-query` | 223.5.5.5, 223.6.6.6 |
+| `CLOUDFLARE` | `https://cloudflare-dns.com/dns-query` | 1.1.1.1, 1.0.0.1 |
+
+The DoH hostname is pinned with `CURLOPT_RESOLVE` (the DoH probe shares the client's DNS cache), so
+the lookup does not depend on the failing system resolver, while TLS to the DoH server still
+verifies its hostname; `CURLOPT_DOH_SSL_VERIFYPEER/HOST` are never relaxed. Privacy: the provider
+sees the hostname being resolved. The addresses change only with a release. iOS and OHOS ignore the
+setting for now.
+
+libcurl caches a failed resolve as a negative entry. DoH-fallback clients therefore use their own
+shared DNS cache, separate from system-resolver clients: a cached system failure for the API host
+can never short-circuit the DoH attempt, and DoH answers never leak into system-resolver clients.
+All clients use a 20 s DNS cache timeout (libcurl default 60 s), so a negative entry lasts ~10 s
+after a DNS outage ends instead of ~30 s.
+
 HTTP/3 is an explicit native curl gray gate. The current Android, iOS, and OHOS curl artifacts build
 curl 8.16.0 with OpenSSL 3.5.4 QUIC and nghttp3 1.17.0. Existing consumers can keep the process-wide
 default in the verified curl runtime configuration:

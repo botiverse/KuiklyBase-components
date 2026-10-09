@@ -476,6 +476,7 @@ jboolean NativeSubmitBuffered(
     jstring ca_info_path,
     jstring proxy_url,
     jboolean http3_enabled,
+    jint doh_fallback_provider,
     jobject callback
 ) {
     if (CurlWrapperAbiVersion() != CURL_WRAPPER_ABI_VERSION || callback == nullptr) {
@@ -554,7 +555,8 @@ jboolean NativeSubmitBuffered(
     ConfigureBufferedPolicy(context.get());
     SetCurlCaInfo(client, ca_chars.get());
     SetCurlProxy(client, proxy_chars.get());
-    if (SetCurlHttp3Enabled(client, http3_enabled == JNI_TRUE ? 1 : 0) == 0) {
+    if (SetCurlHttp3Enabled(client, http3_enabled == JNI_TRUE ? 1 : 0) == 0 ||
+        SetCurlDohFallbackProvider(client, static_cast<int>(doh_fallback_provider)) == 0) {
         env->DeleteGlobalRef(context->callback);
         DeleteCurlClient(client);
         return JNI_FALSE;
@@ -612,6 +614,7 @@ void NativePerform(
     jstring ca_info_path,
     jstring proxy_url,
     jboolean http3_enabled,
+    jint doh_fallback_provider,
     jint mode,
     jobject callback
 ) {
@@ -695,6 +698,12 @@ void NativePerform(
     SetCurlProxy(client, proxy_chars.get());
     if (SetCurlHttp3Enabled(client, http3_enabled == JNI_TRUE ? 1 : 0) == 0) {
         InvokeEngineFailure(&context, "HTTP/3 requested but native curl backend is unavailable");
+        context.client = nullptr;
+        DeleteCurlClient(client);
+        return;
+    }
+    if (SetCurlDohFallbackProvider(client, static_cast<int>(doh_fallback_provider)) == 0) {
+        InvokeEngineFailure(&context, "unknown DoH fallback provider");
         context.client = nullptr;
         DeleteCurlClient(client);
         return;
@@ -795,7 +804,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
             const_cast<char *>("nativeSubmitBuffered"),
             const_cast<char *>(
                 "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;J[BLjava/lang/String;"
-                "Ljava/lang/String;ZLcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)Z"
+                "Ljava/lang/String;ZILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)Z"
             ),
             reinterpret_cast<void *>(NativeSubmitBuffered)
         },
@@ -803,7 +812,7 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
             const_cast<char *>("nativePerform"),
             const_cast<char *>(
                 "(ILjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;JJJJJ[BJLjava/lang/String;"
-                "Ljava/lang/String;ZILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)V"
+                "Ljava/lang/String;ZIILcom/tencent/kmm/network/internal/platform/AndroidCurlJniCallback;)V"
             ),
             reinterpret_cast<void *>(NativePerform)
         },

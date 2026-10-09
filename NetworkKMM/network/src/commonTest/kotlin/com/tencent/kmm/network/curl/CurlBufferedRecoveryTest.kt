@@ -31,4 +31,18 @@ class CurlBufferedRecoveryTest {
             )
         )
     }
+
+    @Test
+    fun dohFallbackRetriesOnlyAnUnresolvedHostWithAProviderInBudget() {
+        assertTrue(shouldRetryCurlWithDohFallback(CURL_CODE_COULDNT_RESOLVE_HOST, 1, false, null))
+        assertTrue(shouldRetryCurlWithDohFallback(CURL_CODE_COULDNT_RESOLVE_HOST, 2, false, 5))
+        // Off, cancelled, out of time, or any other failure: the first response stands.
+        assertFalse(shouldRetryCurlWithDohFallback(CURL_CODE_COULDNT_RESOLVE_HOST, 0, false, null))
+        assertFalse(shouldRetryCurlWithDohFallback(CURL_CODE_COULDNT_RESOLVE_HOST, 1, true, null))
+        assertFalse(shouldRetryCurlWithDohFallback(CURL_CODE_COULDNT_RESOLVE_HOST, 1, false, 0))
+        assertFalse(shouldRetryCurlWithDohFallback(0, 1, false, null))
+        assertFalse(shouldRetryCurlWithDohFallback(7, 1, false, null)) // couldn't connect
+        assertFalse(shouldRetryCurlWithDohFallback(28, 1, false, null)) // timeout
+        assertFalse(shouldRetryCurlWithDohFallback(35, 1, false, null)) // TLS
+    }
 }

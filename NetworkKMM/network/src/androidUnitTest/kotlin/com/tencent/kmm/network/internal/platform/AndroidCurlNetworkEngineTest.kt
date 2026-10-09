@@ -30,6 +30,7 @@ import com.tencent.kmm.network.export.NetworkRetryPolicy
 import com.tencent.kmm.network.export.NetworkStreamTimeoutPolicy
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
+import com.tencent.kmm.network.export.NetworkCurlDohFallbackProvider
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
 import com.tencent.kmm.network.export.NetworkCurlTrustStore
 import com.tencent.kmm.network.export.NetworkCurlConfigurationFailureReason
@@ -173,6 +174,72 @@ class AndroidCurlNetworkEngineTest {
         // not the requested one, is what the engine gets and timing reports.
         assertEquals(7_000L, bridge.lastRequest?.streamConnectTimeoutMillis)
         assertEquals(7_000L, response.timing.effectiveConnectTimeoutMillis)
+    }
+
+    @Test
+    fun unresolvedHostRetriesOnceThroughTheConfiguredDohProvider() = runBlocking {
+        configureDohFallback(NetworkCurlDohFallbackProvider.ALIDNS)
+        val bridge = FakeBridge().apply {
+            executeResponses += CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
+            executeResponses += CurlNativeResponse(code = 0, httpCode = 200, data = "ok".encodeToByteArray())
+        }
+        // POST too: an unresolved host means nothing was sent.
+        val request = NetworkRequest(
+            method = VBTransportMethod.POST,
+            url = "https://example.test",
+            body = NetworkBody.Json("{}"),
+            policy = NetworkRequestPolicy(timeoutMillis = 20_000)
+        )
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals("ok", response.body.text())
+        assertEquals(listOf(0, 1), bridge.executeRequests.map { it.dohFallbackProvider })
+        assertContentEquals("{}".encodeToByteArray(), bridge.executeRequests[1].body)
+        assertTrue(response.timing.freshRetry)
+        assertEquals("doh_fallback_success", response.timing.freshRetryResult)
+    }
+
+    @Test
+    fun dohFallbackNeverReplacesASystemResolutionAndIsOffByDefault() = runBlocking {
+        // Off by default: an unresolved host is returned as-is, no second attempt.
+        val off = FakeBridge().apply {
+            executeResponse = CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
+        }
+        val offRequest = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+        AndroidCurlNetworkEngine(off).execute(offRequest, NetworkCall(offRequest))
+        assertEquals(listOf(0), off.executeRequests.map { it.dohFallbackProvider })
+
+        configureDohFallback(NetworkCurlDohFallbackProvider.CLOUDFLARE)
+        // Resolved by the system (success or a later failure such as connect/TLS): no DoH.
+        for (code in listOf(0, 7, 35)) {
+            val bridge = FakeBridge().apply { executeResponse = CurlNativeResponse(code = code, httpCode = 200) }
+            val request = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+            AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+            assertEquals(listOf(0), bridge.executeRequests.map { it.dohFallbackProvider }, "curl code $code")
+        }
+
+        // A failed DoH retry is reported, not retried again.
+        val bothFail = FakeBridge().apply {
+            executeResponse = CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
+        }
+        val request = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+        val response = AndroidCurlNetworkEngine(bothFail).execute(request, NetworkCall(request))
+        assertEquals(listOf(0, 2), bothFail.executeRequests.map { it.dohFallbackProvider })
+        assertEquals("doh_fallback_failure", response.timing.freshRetryResult)
+    }
+
+    private fun configureDohFallback(provider: NetworkCurlDohFallbackProvider) {
+        VBTransportCurl.configure(
+            NetworkCurlRuntimeConfiguration(
+                trustStore = NetworkCurlTrustStore(
+                    path = trustStoreFile.absolutePath,
+                    sha256 = networkCurlSha256Hex(trustStoreFile.readBytes())
+                ),
+                proxy = NetworkCurlProxyConfiguration.direct(),
+                dohFallback = provider
+            )
+        )
     }
 
     @Test

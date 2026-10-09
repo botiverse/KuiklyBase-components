@@ -22,3 +22,19 @@ internal fun shouldFreshRetryCurlBufferedStall(
 ): Boolean = policy.freshRetryEnabled && bodyRepeatable && !cancelled &&
     remainingTimeoutMillis != 0L &&
     (method == VBTransportMethod.GET || method == VBTransportMethod.HEAD)
+
+/** libcurl CURLE_COULDNT_RESOLVE_HOST. */
+internal const val CURL_CODE_COULDNT_RESOLVE_HOST: Int = 6
+
+/**
+ * Raft task #153: retry once through the configured DoH provider only when the system resolver
+ * failed to resolve the host. Nothing was sent to the server (no connection was made), so any
+ * method may be retried. [provider] is the native provider id; 0 means DoH fallback is off.
+ */
+internal fun shouldRetryCurlWithDohFallback(
+    curlCode: Int,
+    provider: Int,
+    cancelled: Boolean,
+    remainingTimeoutMillis: Long?,
+): Boolean = curlCode == CURL_CODE_COULDNT_RESOLVE_HOST && provider != 0 && !cancelled &&
+    remainingTimeoutMillis != 0L
