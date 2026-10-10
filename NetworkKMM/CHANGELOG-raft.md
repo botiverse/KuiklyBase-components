@@ -14,8 +14,9 @@
   stale_address_success`; attempt order `0 → 3 → providers`. Hostname and TLS
   verification unchanged.
 - Native wrapper: TCP keepalive (45 s idle / interval) and
-  `CURLOPT_MAXAGE_CONN` 90 s on every connection. Native carriers must be
-  refreshed on all three platforms.
+  `CURLOPT_MAXAGE_CONN` 90 s on every connection. Native carriers refreshed
+  on all three platforms from this source (Android run 38023035063, OHOS run
+  38024086813, iOS run 38023036735).
 
 ## 0.1.0-raft.42 / 0.1.0-raft.42-ohos (DoH for downloads and uploads)
 
