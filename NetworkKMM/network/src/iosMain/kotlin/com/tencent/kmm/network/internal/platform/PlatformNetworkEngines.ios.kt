@@ -38,3 +38,9 @@ internal actual fun platformCurlSupportsHttp3(): Boolean =
 internal actual fun platformFlushCurlStaleAddresses() {
     FlushCurlStaleAddressCache()
 }
+
+internal actual fun platformRetireCurlPooledEngines() {
+    val bridge = IosCurlEngineProvider.testBridge ?: IosCurlCInteropBridge
+    bridge.retirePooledEngine(http3Enabled = false)
+    bridge.retirePooledEngine(http3Enabled = true)
+}

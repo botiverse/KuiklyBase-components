@@ -38,6 +38,7 @@ import com.tencent.qqlive.kmm.native.libcurl.CurlCallback
 import com.tencent.qqlive.kmm.native.libcurl.CurlRequest
 import com.tencent.qqlive.kmm.native.libcurl.CurlResponse
 import com.tencent.qqlive.kmm.native.libcurl.DeleteCurlClient
+import com.tencent.qqlive.kmm.native.libcurl.DeleteCurlMultiEngine
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlCaInfo
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlDohFallbackProvider
 import com.tencent.qqlive.kmm.native.libcurl.SetCurlHttp3Enabled
@@ -102,6 +103,11 @@ import kotlinx.cinterop.usePinned
 import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.locks.SynchronizedObject
 import kotlinx.atomicfu.locks.synchronized
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import platform.posix.int8_tVar
 import platform.posix.memcpy
 import kotlin.reflect.KFunction1
@@ -117,6 +123,12 @@ private const val CURL_LOG_LEVEL_INFO = 1
 private const val CURL_LOG_LEVEL_WARN = 2
 private const val CURL_LOG_LEVEL_ERROR = 3
 
+/** raft.46: swaps out both pooled engines (network change, dead HTTP/2 connection); see [OhosCurlMultiEngines.retire]. */
+internal fun retireOhosCurlPooledEngines() {
+    OhosCurlMultiEngines.retire(http3 = false)
+    OhosCurlMultiEngines.retire(http3 = true)
+}
+
 private object OhosCurlMultiEngines : SynchronizedObject() {
     private var capability: Boolean? = null
     private var defaultEngine: COpaquePointer? = null
@@ -125,6 +137,28 @@ private object OhosCurlMultiEngines : SynchronizedObject() {
     fun isApiAvailable(): Boolean = synchronized(this) {
         capability ?: (NetworkKmmCurlMultiApiAvailable() != 0).also { capability = it }
     }
+
+    /**
+     * raft.46: the next request gets a new engine (new connections). The retired one keeps serving
+     * what it already accepted and is deleted after [RETIRED_ENGINE_GRACE_MILLIS], past every
+     * request timeout.
+     */
+    fun retire(http3: Boolean) {
+        val retired = synchronized(this) {
+            if (http3) {
+                http3Engine.also { http3Engine = null }
+            } else {
+                defaultEngine.also { defaultEngine = null }
+            }
+        } ?: return
+        retiredEngineScope.launch {
+            delay(RETIRED_ENGINE_GRACE_MILLIS)
+            DeleteCurlMultiEngine(retired)
+        }
+    }
+
+    private const val RETIRED_ENGINE_GRACE_MILLIS = 60_000L
+    private val retiredEngineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     fun engine(http3: Boolean): COpaquePointer? = synchronized(this) {
         val available = capability ?: (NetworkKmmCurlMultiApiAvailable() != 0)

@@ -1,5 +1,75 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.46 / 0.1.0-raft.46-ohos (dead reused connections: Cronet-style liveness and recovery)
+
+Hands 79db9fe6 / f717ac6f (artin, Android 1.13.1): the server and ALB answered in milliseconds, but
+on the phone requests on a reused curl HTTP/2 connection got no response headers for 6-30 s. The
+reused-H2 watchdog only existed on the OkHttp lane. libcurl 8.16.0 checks a pooled connection
+passively before reuse (a zero-timeout poll for a closed/errored socket, `cf_socket_conn_is_alive` /
+`http2_connisalive`), and its upkeep PING (`curl_easy_upkeep`) is sent without tracking the ACK, so a
+connection whose peer silently vanished (NAT mapping dropped, network switched) stayed in the pool
+and took new requests until the 30 s request timeout. Cronet keeps reusing connections but pings one
+idle for 10 s and drops it when no ACK arrives within 10 s; this release gets the same detection from
+the kernel and keeps normal reuse.
+
+- Every connection socket gets a 10 s deadline for unacknowledged data (`CURLOPT_SOCKOPTFUNCTION`:
+  `TCP_USER_TIMEOUT` = 10000 ms on Android/OHOS, `TCP_RXT_CONNDROPTIME` = 10 s on iOS; the build
+  fails if the platform lacks the option). TCP keepalive probes start after 10 s idle, every 5 s
+  (was 45/45; `CURLOPT_TCP_KEEPCNT` 2 where libcurl >= 8.9). A dead idle connection is failed by
+  the kernel and dropped by libcurl's reuse check before a request is put on it; a request already
+  on a dead connection fails with `CURLE_RECV_ERROR` and libcurl replays it once on a new connection
+  (`Curl_retry_request`: reused connection, no response byte received). One `socket liveness ...
+  applied|failed errno=N` log line per process (every failure) records the option on the device.
+- Only GET/HEAD may be replayed. libcurl's replay (`Curl_retry_request`) ignores the method, so a
+  POST whose connection died after the server took it but before any response byte would go out
+  twice. `CURLOPT_PREREQFUNCTION` runs before every request libcurl sends; a second call that is not
+  a redirect is a replay, and for any method other than GET/HEAD it is refused: the request fails
+  with `CURLE_RECV_ERROR` "connection died before any response byte; request not replayed (not
+  GET/HEAD)". The replayed request's own method decides (`CURLINFO_EFFECTIVE_METHOD`): a POST
+  redirected by 303 is replayed as the GET it became; a POST kept by 307 is not. This also stops
+  the replay of POST/PUT/DELETE after a dropped or reset keep-alive connection, which raft.45 did
+  (the server saw them twice).
+- A buffered GET/HEAD that fails on the connection before any response status (CURLE_SEND_ERROR
+  55, RECV_ERROR 56, HTTP2 16, HTTP2_STREAM 92) gets one fresh-connection retry on all three
+  platforms (OkHttp retryOnConnectionFailure / recoverFromOneHttp2ErrorRequiresNewConnection).
+  libcurl replays only RECV_ERROR itself; when an HTTP/2 connection dies with several streams in
+  flight, the others fail with SEND_ERROR and were not recovered. Other methods are never retried.
+- One retry per request end to end (at most 2 sends): when libcurl already replayed a GET/HEAD on a
+  new connection and it still failed, the wrapper prefixes the error with `after transport replay: `
+  and neither the connection-failure retry nor the stall retry runs again.
+- Idle reuse limit back to 90 s (`CURLOPT_MAXAGE_CONN`); dead connections are detected, not avoided.
+- Buffered GET/HEAD: once the request went out (PRETRANSFER) and no response headers arrived within
+  the body-idle budget (7 s by default), the request aborts with `buffered response headers timeout`
+  and is replayed once on a fresh connection (the existing replay-safe GET/HEAD body-stall path).
+  Other methods keep waiting.
+- The replay of any buffered stall runs on a new connection: Android `executeFresh` and the iOS
+  non-multi path bypass the pooled CURLM engines; before, the replay re-entered the pool and could
+  land on the same dead connection. A response-headers stall also retires the pooled engines (at most
+  once per 10 s) so the requests that follow open a new connection; a retired engine finishes what it
+  accepted and is deleted after 60 s (Android JNI `nativeRetireMultiEngine`, iOS
+  `IosCurlMultiEngines.retire`, OHOS `OhosCurlMultiEngines.retire`, new).
+- `VBTransportCurl.onNetworkChanged()` retires the pooled engines on all three platforms, so no new
+  request goes out on a connection opened on the previous network (Cronet stops new streams on
+  existing sessions on a mobile IP change).
+- Tests: `tests/wrapper/dead_connection_probe.sh` blackholes a pooled loopback connection with
+  iptables (run by `run_tests.sh` where passwordless sudo exists) and counts POSTs on the server:
+  after 25 s idle the next GET succeeds at once on a new connection (raft.45: 30 s timeout); a POST
+  on a just-died connection fails in ~10 s and reaches the server 0 times (raft.45: 30 s timeout); a
+  POST the server took before the path died fails in ~15 s and reaches it exactly once. The behavior
+  test reads `TCP_USER_TIMEOUT` back from the kernel. `tests/wrapper/connection_reuse_test.cpp`
+  (OkHttp ConnectionReuseTest/CallTest analogues, no root needed) covers dropped/reset reused
+  connections for GET/HEAD (replayed, server sees 2) and POST/PUT/DELETE (refused, server sees 1;
+  raft.45 failed 6 of these checks), a body cut mid-way (error, no replay), 303/307 redirect hops
+  that drop, close-delimited bodies, 408 passthrough, and 1 KB/64 KB POSTs after a server-closed
+  idle connection (sent once). `tests/wrapper/h2_reuse_test.cpp` + `h2_test_server.py` (TLS + ALPN
+  h2, Python `h2`) cover HTTP/2: multiplexed reuse, GOAWAY (next request on a new connection, sent
+  once), REFUSED_STREAM (GET retried, POST refused, sent once), RST_STREAM INTERNAL_ERROR (fails,
+  sent once; GET then retried by the routing layer), and a connection dying with 2 GET + 1 POST in
+  flight (GETs succeed or fail with a retryable connection code; the POST is never sent again),
+  and four streams with per-request counters (first/middle GET, a GET whose status arrived, POST
+  last): each GET reaches the server at most twice at this layer, the GET with a status is not
+  replayed and keeps its status (so the routing layer does not retry it), the POST exactly once.
+
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 
 Raft task #153 follow-up (artin 2026-10-10: optimise the fallback; Sentinel's survey of

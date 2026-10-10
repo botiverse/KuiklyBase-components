@@ -35,3 +35,9 @@ internal actual fun platformCurlSupportsHttp3(): Boolean =
 internal actual fun platformFlushCurlStaleAddresses() {
     (AndroidCurlEngineProvider.testBridge ?: AndroidCurlJniBridge).flushStaleAddresses()
 }
+
+internal actual fun platformRetireCurlPooledEngines() {
+    val bridge = AndroidCurlEngineProvider.testBridge ?: AndroidCurlJniBridge
+    bridge.retirePooledEngine(http3Enabled = false)
+    bridge.retirePooledEngine(http3Enabled = true)
+}

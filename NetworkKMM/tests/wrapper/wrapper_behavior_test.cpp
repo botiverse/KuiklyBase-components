@@ -1112,6 +1112,21 @@ int main(int argc, char **argv) {
     CHECK(bufferedIdle.data.empty(),
           "buffered idle timeout fences native partial body from the caller");
 
+    // raft.46 (Hands 79db9fe6): a buffered GET whose request went out but whose response headers
+    // never come within the body-idle budget is stuck on a dead reused HTTP/2 connection; it aborts
+    // with a stable reason so Kotlin replays it on a fresh connection. A POST keeps waiting: it is
+    // not replay-safe and a slow write must not be cut short.
+    Captured headersStall = Fetch(base + "/delayed-headers", 5000, "GET", nullptr, 500);
+    CHECK(headersStall.code == 28, "buffered GET response-headers stall completes as CURLE_OPERATION_TIMEDOUT");
+    CHECK(headersStall.errorMsg.find("buffered response headers timeout") != std::string::npos,
+          "buffered response-headers stall reason crosses the wrapper response ABI");
+    Captured postWaits = Fetch(base + "/post-delayed-headers", 5000, "POST", "x", 500);
+    CHECK(postWaits.code == 0 && postWaits.httpCode == 200,
+          "a buffered POST is not cut short while its response headers are slow");
+    Captured noBudget = Fetch(base + "/delayed-headers", 5000, "GET", nullptr, 0);
+    CHECK(noBudget.code == 0 && noBudget.httpCode == 200,
+          "without a body-idle budget a slow GET still completes");
+
     {
         Captured factsResponse;
         StringDic headers{};
@@ -1298,6 +1313,17 @@ int main(int argc, char **argv) {
     Captured redir = Fetch(base + "/redirect");
     CHECK(redir.httpCode == 200, "/redirect followed to 200");
     CHECK(redir.data == "{\"ok\":true}", "/redirect final body is /ok");
+
+    // raft.46: the replay guard (CURLOPT_PREREQFUNCTION refuses a second send that is not a
+    // redirect for non-GET/HEAD) must not mistake a followed redirect for a replay. 307 keeps the
+    // POST and its body; 302 turns it into GET /ok. Both reuse the same keep-alive connection.
+    Captured post307 = Fetch(base + "/post-redirect-307", 5000, "POST", "hello-307");
+    CHECK(post307.code == 0 && post307.httpCode == 200 &&
+              post307.data.find("\"redirectedEchoLen\":9") != std::string::npos,
+          "POST 307 redirect is followed with its body (not refused as a replay)");
+    Captured post302 = Fetch(base + "/post-redirect-302", 5000, "POST", "hello-302");
+    CHECK(post302.code == 0 && post302.httpCode == 200 && post302.data == "{\"ok\":true}",
+          "POST 302 redirect is followed (not refused as a replay)");
 
     // 6. POST body echo (custom-method plumbing).
     Captured post = Fetch(base + "/ok", 5000, "POST", "hello-wrapper");
@@ -1691,6 +1717,9 @@ int main(int argc, char **argv) {
     CheckDecodedContentEncoding(base, "/zstd", "zstd", supportsZstd);
     CheckStaleAddressCache(base, base);
     CheckFallbackAttemptUnreachableMovesOn();
+    // raft.46: every connection socket carries the 10 s unacked-data deadline (kernel read-back).
+    CHECK(CurlLivenessOptionTestReadBack() == 10000,
+          "connection sockets carry TCP_USER_TIMEOUT=10000ms (dead peers fail instead of hanging)");
 
     if (gFailures > 0) {
         std::fprintf(stderr, "\n%d failure(s)\n", gFailures);

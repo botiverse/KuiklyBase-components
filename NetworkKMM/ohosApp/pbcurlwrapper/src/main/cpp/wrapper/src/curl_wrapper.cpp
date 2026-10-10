@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
@@ -29,7 +30,10 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -137,6 +141,77 @@ static const char *CurlProtocolName(long httpVersion) {
 // provider or the stale address). A provider that hangs instead of refusing would otherwise eat the
 // whole request timeout before the next one is tried. Data transfer keeps the request's timeouts.
 static constexpr long kFallbackAttemptConnectTimeoutMs = 4000L;
+
+// raft.46 (Hands 79db9fe6): Cronet sends a PING on an HTTP/2 session idle for 10 s and closes it when
+// no ACK arrives within 10 s. libcurl's reuse check is passive (a zero-timeout poll for a closed or
+// errored socket; cf_socket_conn_is_alive / http2_connisalive in 8.16.0) and its upkeep PING is
+// fire-and-forget, so a connection whose peer silently vanished (NAT mapping dropped, network
+// switched) looks healthy and keeps being reused. The kernel gives the same ACK deadline: any byte
+// we sent (a request, a keepalive probe) that is not acknowledged within this time fails the socket,
+// libcurl's next liveness check sees the error, and the connection leaves the pool. A request already
+// on it fails with CURLE_RECV_ERROR before any byte arrived, which libcurl itself replays once on a
+// new connection (Curl_retry_request: reused connection, nothing received), the same rule Chromium
+// applies to a reused socket. Keepalive probes on idle connections make the kernel find a dead
+// connection before a request is put on it.
+static constexpr int kUnackedDataTimeoutMs = 10000;
+static constexpr long kKeepAliveIdleSeconds = 10L;
+static constexpr long kKeepAliveIntervalSeconds = 5L;
+
+// Android, OHOS and Linux hosts: TCP_USER_TIMEOUT (ms). Apple: TCP_RXT_CONNDROPTIME (s), public in
+// XNU netinet/tcp.h. A build without the option must fail rather than silently lose the deadline.
+#if defined(__APPLE__)
+#if !defined(TCP_RXT_CONNDROPTIME)
+#error "TCP_RXT_CONNDROPTIME is required for the dead-connection deadline"
+#endif
+#elif !defined(TCP_USER_TIMEOUT)
+#error "TCP_USER_TIMEOUT is required for the dead-connection deadline"
+#endif
+
+static std::atomic<int> g_liveness_option_result{1};  // 1: not applied yet, 0: ok, <0: -errno
+static std::atomic<bool> g_liveness_option_logged{false};
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+static std::atomic<int> g_liveness_option_read_back{-1};
+#endif
+
+static constexpr const char *kAfterTransportReplayPrefix = "after transport replay: ";
+
+static int ApplyLivenessSocketOptions(void *, curl_socket_t fd, curlsocktype purpose) {
+    if (purpose != CURLSOCKTYPE_IPCXN) {
+        return CURL_SOCKOPT_OK;
+    }
+#if defined(__APPLE__)
+    const int value = kUnackedDataTimeoutMs / 1000;
+    const int rc = setsockopt(fd, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, &value, sizeof(value));
+    const char *option = "TCP_RXT_CONNDROPTIME";
+#else
+    const unsigned int value = kUnackedDataTimeoutMs;
+    const int rc = setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, sizeof(value));
+    const char *option = "TCP_USER_TIMEOUT";
+#endif
+    const int result = rc == 0 ? 0 : -errno;
+    g_liveness_option_result.store(result, std::memory_order_relaxed);
+#if defined(NETWORKKMM_WRAPPER_TESTING) && !defined(__APPLE__)
+    unsigned int readBack = 0;
+    socklen_t readBackLen = sizeof(readBack);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &readBack, &readBackLen) == 0) {
+        g_liveness_option_read_back.store(static_cast<int>(readBack), std::memory_order_relaxed);
+    }
+#endif
+    // One line per process (and every failure): which option the connection got.
+    if (result != 0 || !g_liveness_option_logged.exchange(true)) {
+        const std::string line = std::string("socket liveness ") + option + "=" +
+            std::to_string(value) + " keepidle=" + std::to_string(kKeepAliveIdleSeconds) +
+            " keepintvl=" + std::to_string(kKeepAliveIntervalSeconds) +
+            (result == 0 ? " applied" : " failed errno=" + std::to_string(-result));
+        if (result == 0) {
+            logI("NetworkKMM-socket", line);
+        } else {
+            logE("NetworkKMM-socket", line);
+        }
+    }
+    // A failed option leaves the connection usable; it only loses the early dead-peer detection.
+    return CURL_SOCKOPT_OK;
+}
 
 struct DohProvider {
     int id;
@@ -1248,7 +1323,10 @@ class CurlClient {
     }
 
     bool BufferedBodyTimedOut() {
-        if (!final_headers_ready_ || buffered_body_idle_timeout_ms_ <= 0) {
+        if (!final_headers_ready_) {
+            return BufferedResponseHeadersTimedOut();
+        }
+        if (buffered_body_idle_timeout_ms_ <= 0) {
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -1261,6 +1339,68 @@ class CurlClient {
         std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
         logE(log_tag_, buffered_timeout_reason_);
         return true;
+    }
+
+    // Raft task #150 follow-up (raft.46, Hands 79db9fe6): a buffered GET/HEAD whose request went out
+    // (PRETRANSFER reached) but got no response headers within the body-idle budget is stuck on a
+    // dead reused HTTP/2 connection; servers and the ALB answered in milliseconds while the phone
+    // waited 6-30 s. Abort so the routing layer replays it on a fresh connection. Other methods
+    // keep waiting: they are not replay-safe and a slow POST must not be cut short.
+    bool BufferedResponseHeadersTimedOut() {
+        if (!buffered_headers_deadline_eligible_ || buffered_body_idle_timeout_ms_ <= 0) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!buffered_headers_phase_started_) {
+            double pretransferSeconds = 0.0;
+            if (curl_easy_getinfo(curl_, CURLINFO_PRETRANSFER_TIME, &pretransferSeconds) != CURLE_OK ||
+                pretransferSeconds <= 0.0) {
+                return false;
+            }
+            buffered_headers_phase_started_ = true;
+            buffered_headers_phase_started_at_ = now;
+            return false;
+        }
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - buffered_headers_phase_started_at_).count();
+        if (waited < buffered_body_idle_timeout_ms_) {
+            return false;
+        }
+        buffered_timeout_reason_ = "buffered response headers timeout after " + std::to_string(waited) + "ms";
+        std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
+        logE(log_tag_, buffered_timeout_reason_);
+        return true;
+    }
+
+    // Runs before every request libcurl sends on this handle: the first one, each redirect, and each
+    // transport-level replay. A second call without a new redirect is a replay.
+    static int PrereqCallback(void *clientp, char *, char *, int, int) {
+        auto *client = static_cast<CurlClient *>(clientp);
+        if (client == nullptr) {
+            return CURL_PREREQFUNC_OK;
+        }
+        long redirects = 0;
+        curl_easy_getinfo(client->curl_, CURLINFO_REDIRECT_COUNT, &redirects);
+        const bool replay = client->prereq_calls_ > 0 && redirects == client->prereq_redirect_count_;
+        client->prereq_calls_++;
+        client->prereq_redirect_count_ = redirects;
+        // The replayed request's own method decides: a POST answered with 303 is replayed as the
+        // GET it became, a POST kept by 307 stays a POST.
+        bool replayAllowed = client->transport_replay_allowed_;
+        char *effectiveMethod = nullptr;
+        if (replay && curl_easy_getinfo(client->curl_, CURLINFO_EFFECTIVE_METHOD, &effectiveMethod) == CURLE_OK &&
+            effectiveMethod != nullptr) {
+            replayAllowed = std::strcmp(effectiveMethod, "GET") == 0 || std::strcmp(effectiveMethod, "HEAD") == 0;
+        }
+        if (replay && replayAllowed) {
+            client->transport_replayed_ = true;
+        }
+        if (replay && !replayAllowed) {
+            client->transport_replay_blocked_ = true;
+            logE(client->log_tag_, "connection died before any response byte; request not replayed (not GET/HEAD)");
+            return CURL_PREREQFUNC_ABORT;
+        }
+        return CURL_PREREQFUNC_OK;
     }
 
     bool StreamPhaseTimedOut() {
@@ -1426,9 +1566,16 @@ class CurlClient {
         // Chrome uses keep the mapping alive and surface dead connections before a
         // request is sent on them; MAXAGE retires idle connections before typical
         // carrier NAT timeouts instead of libcurl's 118 s default.
+        // raft.46: probe after 10 s idle (was 45 s) and bound unacknowledged data to 10 s, see
+        // ApplyLivenessSocketOptions. A dead idle connection is failed by the kernel within about
+        // 20 s of silence and dropped by libcurl's reuse check instead of taking the next request.
         curl_easy_setopt(curl_, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPIDLE, 45L);
-        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPINTVL, 45L);
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPIDLE, kKeepAliveIdleSeconds);
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
+#if LIBCURL_VERSION_NUM >= 0x080900
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPCNT, 2L);
+#endif
+        curl_easy_setopt(curl_, CURLOPT_SOCKOPTFUNCTION, ApplyLivenessSocketOptions);
         curl_easy_setopt(curl_, CURLOPT_MAXAGE_CONN, 90L);
         // Share DNS/TLS sessions across per-request easy handles. Connection
         // caches deliberately remain easy-owned; cross-thread sharing is not
@@ -1615,6 +1762,19 @@ class CurlClient {
         first_body_seen_ = false;
         buffered_timeout_reason_.clear();
         buffered_response_limit_reason_.clear();
+        buffered_headers_deadline_eligible_ = method == "GET" || method == "HEAD";
+        buffered_headers_phase_started_ = false;
+        // raft.46: libcurl replays a request whose reused connection died before any response byte
+        // (Curl_retry_request) whatever the method, also when the server already had it. Only
+        // GET/HEAD may go out twice; any other method fails instead (OkHttp's rule: no replay once
+        // the request may have been sent).
+        transport_replay_allowed_ = method == "GET" || method == "HEAD";
+        transport_replay_blocked_ = false;
+        transport_replayed_ = false;
+        prereq_calls_ = 0;
+        prereq_redirect_count_ = 0;
+        curl_easy_setopt(curl_, CURLOPT_PREREQFUNCTION, PrereqCallback);
+        curl_easy_setopt(curl_, CURLOPT_PREREQDATA, this);
         // Detection and replay eligibility are deliberately separate:
         // every buffered response (including POST/upload responses) must stop
         // on body-idle, while the routing layer may later replay only explicit
@@ -1669,7 +1829,21 @@ class CurlClient {
         // libcurl transparently decodes the body per the negotiated
         // Content-Encoding (zlib/brotli/zstd), so content_data_ is already the
         // decompressed payload — no manual gzip pass.
-        FinishBufferedRequest(NormalizeBufferedTerminal(result), callback);
+        const CURLcode terminal = NormalizeBufferedTerminal(result);
+        MarkFailureAfterTransportReplay(terminal);
+        FinishBufferedRequest(terminal, callback);
+    }
+
+    // raft.46: one retry budget per request across native and routing layers. When libcurl already
+    // replayed this GET/HEAD on a new connection and it still failed, the error says so, and the
+    // routing layer's connection-failure retry (isConnectionFailureBeforeResponse) stands down.
+    void MarkFailureAfterTransportReplay(CURLcode terminal) {
+        if (!transport_replayed_ || terminal == CURLE_OK) {
+            return;
+        }
+        const std::string original = curl_error_msg_;
+        std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s%s", kAfterTransportReplayPrefix,
+            original.c_str());
     }
 
     CURL *EasyHandle() const {
@@ -1793,6 +1967,11 @@ class CurlClient {
             // rewrite an already-completed success into a false cancellation.
             std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", "cancelled by caller");
             return CURLE_ABORTED_BY_CALLBACK;
+        }
+        if (transport_replay_blocked_ && callbackAbort) {
+            std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s",
+                "connection died before any response byte; request not replayed (not GET/HEAD)");
+            return CURLE_RECV_ERROR;
         }
         if (!buffered_timeout_reason_.empty()) {
             // libcurl owns CURLOPT_ERRORBUFFER while perform is running and
@@ -2323,6 +2502,14 @@ class CurlClient {
     int64_t buffered_body_bytes_ = 0;
     bool first_body_seen_ = false;
     std::string buffered_timeout_reason_;
+    bool buffered_headers_deadline_eligible_ = false;
+    bool buffered_headers_phase_started_ = false;
+    bool transport_replay_allowed_ = true;
+    bool transport_replay_blocked_ = false;
+    bool transport_replayed_ = false;
+    int prereq_calls_ = 0;
+    long prereq_redirect_count_ = 0;
+    std::chrono::steady_clock::time_point buffered_headers_phase_started_at_{};
     int64_t max_buffered_response_bytes_ = 0;
     int64_t connection_cache_id_ = 0;
     CurlCompletionInfoV1 completion_info_{};
@@ -2861,6 +3048,10 @@ void DeleteCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion) {
 }
 
 #if defined(NETWORKKMM_WRAPPER_TESTING)
+int CurlLivenessOptionTestReadBack(void) {
+    return g_liveness_option_read_back.load(std::memory_order_relaxed);
+}
+
 void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode) {
     if (engine != nullptr) {
         reinterpret_cast<CurlMultiEngine *>(engine)->SetTestFailureMode(mode);

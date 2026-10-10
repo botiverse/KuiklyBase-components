@@ -29,7 +29,32 @@ data class CurlNativeResponse(
 )
 
 internal fun CurlNativeResponse.isBufferedBodyIdleTimeout(): Boolean =
-    code == 28 && errorMsg.contains("buffered body idle timeout")
+    code == 28 && (errorMsg.contains("buffered body idle timeout") || isBufferedResponseHeadersTimeout())
+
+/**
+ * raft.46: a buffered GET/HEAD got no response headers within the body-idle budget after its request
+ * went out: the reused HTTP/2 connection is dead. Replayed on a fresh connection like a body stall.
+ */
+internal fun CurlNativeResponse.isBufferedResponseHeadersTimeout(): Boolean =
+    code == 28 && errorMsg.contains("buffered response headers timeout")
+
+/**
+ * raft.46: the connection failed before any response status arrived: CURLE_SEND_ERROR (55),
+ * CURLE_RECV_ERROR (56), CURLE_HTTP2 (16), CURLE_HTTP2_STREAM (92). libcurl replays such a request
+ * itself only for RECV_ERROR on a reused connection; when an HTTP/2 connection dies with several
+ * streams in flight, the others fail with SEND_ERROR and are not replayed. A replay-safe GET/HEAD
+ * then gets one fresh-connection retry, like OkHttp's retryOnConnectionFailure.
+ */
+internal fun CurlNativeResponse.isConnectionFailureBeforeResponse(): Boolean =
+    httpCode == 0 && code in CURL_CONNECTION_FAILURE_CODES && !errorMsg.startsWith(CURL_AFTER_TRANSPORT_REPLAY_PREFIX)
+
+/**
+ * The wrapper prefixes the error of a GET/HEAD that libcurl already replayed on a new connection:
+ * one retry per request across native and routing layers, so that request is not retried again.
+ */
+internal const val CURL_AFTER_TRANSPORT_REPLAY_PREFIX: String = "after transport replay: "
+
+internal val CURL_CONNECTION_FAILURE_CODES: Set<Int> = setOf(16, 55, 56, 92)
 
 internal data class CurlResponseFields(
     val code: Int = 0,

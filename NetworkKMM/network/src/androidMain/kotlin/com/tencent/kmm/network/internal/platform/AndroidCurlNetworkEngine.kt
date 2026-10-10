@@ -18,7 +18,11 @@ package com.tencent.kmm.network.internal.platform
 
 import com.tencent.kmm.network.curl.contentLength
 import com.tencent.kmm.network.curl.CurlNativeResponse
+import com.tencent.kmm.network.curl.curlPooledEngineRetirement
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
+import com.tencent.kmm.network.curl.isBufferedResponseHeadersTimeout
+import com.tencent.kmm.network.curl.isConnectionFailureBeforeResponse
+import com.tencent.kmm.network.curl.CURL_AFTER_TRANSPORT_REPLAY_PREFIX
 import com.tencent.kmm.network.curl.isCurlProxyHttp3Incompatibility
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.CURL_CODE_COULDNT_RESOLVE_HOST
@@ -183,10 +187,14 @@ internal class AndroidCurlNetworkEngine(
                 if (retried.code == 0) "proxy_h3_to_h2_success" else "proxy_h3_to_h2_failure"
             return retried.toNetworkResponse(request)
         }
-        if (!first.isBufferedBodyIdleTimeout()) {
+        val stalled = first.isBufferedBodyIdleTimeout()
+        // One retry per request end to end: none here once libcurl already replayed it.
+        if (first.errorMsg.startsWith(CURL_AFTER_TRANSPORT_REPLAY_PREFIX) ||
+            (!stalled && !first.isConnectionFailureBeforeResponse())
+        ) {
             return first.toNetworkResponse(request)
         }
-        first.elapse.curlBodyStallDetected = true
+        if (stalled) first.elapse.curlBodyStallDetected = true
         val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
         if (!shouldFreshRetryCurlBufferedStall(
                 method = request.method,
@@ -198,17 +206,25 @@ internal class AndroidCurlNetworkEngine(
             return first.toNetworkResponse(request)
         }
 
-        // Each attempt reserves a new request id; the JNI bridge creates a new
-        // easy/client handle. CONNECT sharing is disabled, so the retry cannot
-        // re-enter the failed attempt's connection cache.
+        // raft.46 (Hands 79db9fe6): a stall means the pooled engine's multiplexed HTTP/2 connection
+        // is dead. The replay runs outside the pooled engines on a new easy handle (its own new
+        // connection), and a response-headers stall also retires the pooled engine so the requests
+        // that follow stop queueing on the dead connection. Before raft.46 the replay re-entered the
+        // pool and could land on the very connection that had stalled.
+        if (first.isBufferedResponseHeadersTimeout()) {
+            curlPooledEngineRetirement.retireIfDue(preparedCurlHttp3Enabled(request)) {
+                bridge.retirePooledEngine(it)
+            }
+        }
         val retried = executeBufferedAttempt(
             request = request,
             call = call,
             body = body.bytes,
             contentType = body.contentType,
             timeoutMillis = remainingTimeout ?: 0L,
+            freshConnection = true,
         )
-        retried.elapse.curlBodyStallDetected = true
+        if (stalled) retried.elapse.curlBodyStallDetected = true
         retried.elapse.retainFirstAttemptCurlFacts(first.elapse)
         retried.elapse.freshRetry = true
         retried.elapse.freshRetryResult = if (retried.code == 0) "success" else "failure"

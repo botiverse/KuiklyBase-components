@@ -82,6 +82,12 @@ internal interface AndroidCurlNativeBridge {
     /** Forget the wrapper's remembered stale addresses (network changed). No-op when not linked. */
     fun flushStaleAddresses() {}
 
+    /**
+     * raft.46: stop handing new requests to the pooled CURLM engine whose HTTP/2 connection stalled;
+     * the next request creates a new engine (and connection). No-op when not linked.
+     */
+    fun retirePooledEngine(http3Enabled: Boolean) {}
+
     suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse
 
     /** Executes outside the process pooled CURLM engines on a new easy handle. */
@@ -120,6 +126,12 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
     override fun flushStaleAddresses() {
         if (loaded) {
             runCatching { nativeFlushStaleAddresses() }
+        }
+    }
+
+    override fun retirePooledEngine(http3Enabled: Boolean) {
+        if (loaded) {
+            runCatching { nativeRetireMultiEngine(http3Enabled) }
         }
     }
 
@@ -317,6 +329,9 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
 
     @JvmStatic
     private external fun nativeFlushStaleAddresses()
+
+    @JvmStatic
+    private external fun nativeRetireMultiEngine(http3Enabled: Boolean)
 
     // ---- Socket.IO (raft task #154): the wrapper's curl Engine.IO v4 / Socket.IO v4 client. ----
 

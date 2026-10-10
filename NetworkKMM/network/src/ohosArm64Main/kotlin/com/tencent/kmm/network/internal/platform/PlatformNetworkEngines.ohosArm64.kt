@@ -39,3 +39,7 @@ internal actual fun platformCurlSupportsHttp3(): Boolean = CurlSupportsHttp3() !
 internal actual fun platformFlushCurlStaleAddresses() {
     FlushCurlStaleAddressCache()
 }
+
+internal actual fun platformRetireCurlPooledEngines() {
+    com.tencent.kmm.network.curl.retireOhosCurlPooledEngines()
+}

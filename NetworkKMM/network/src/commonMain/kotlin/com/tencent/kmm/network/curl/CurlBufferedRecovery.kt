@@ -230,3 +230,41 @@ internal suspend fun runCurlDohFallback(
         preference = preference,
         attempt = attempt,
     )
+
+/** How often a response-headers stall may retire the pooled curl engine (raft.46). */
+internal const val CURL_POOLED_ENGINE_RETIRE_INTERVAL_MILLIS: Long = 10_000L
+
+/**
+ * raft.46: rate limit for retiring the pooled curl engine after a response-headers stall. Several
+ * requests on the same dead connection stall together; the first one retires the engine and the
+ * others (already on the retired engine) must not retire the fresh one that replaced it.
+ */
+internal class CurlPooledEngineRetirement(
+    private val nowMillis: () -> Long,
+    private val intervalMillis: Long = CURL_POOLED_ENGINE_RETIRE_INTERVAL_MILLIS,
+) {
+    private val lock = kotlinx.atomicfu.locks.SynchronizedObject()
+    private val lastRetiredAt = mutableMapOf<Boolean, Long>()
+
+    /** Runs [retire] for the http3/default engine unless one was retired within the interval. */
+    fun retireIfDue(http3Enabled: Boolean, retire: (Boolean) -> Unit): Boolean {
+        val due = kotlinx.atomicfu.locks.synchronized(lock) {
+            val now = nowMillis()
+            val last = lastRetiredAt[http3Enabled]
+            if (last != null && now - last < intervalMillis) {
+                false
+            } else {
+                lastRetiredAt[http3Enabled] = now
+                true
+            }
+        }
+        if (due) retire(http3Enabled)
+        return due
+    }
+}
+
+private val curlPooledEngineRetirementClock = kotlin.time.TimeSource.Monotonic.markNow()
+
+/** Process-wide; shared by the Android and iOS curl engines. */
+internal val curlPooledEngineRetirement: CurlPooledEngineRetirement =
+    CurlPooledEngineRetirement(nowMillis = { curlPooledEngineRetirementClock.elapsedNow().inWholeMilliseconds })

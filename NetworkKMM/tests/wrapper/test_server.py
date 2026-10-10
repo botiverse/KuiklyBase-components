@@ -6,6 +6,8 @@ status passthrough (the raft.3 bug), error bodies, timeouts, redirects, and
 content-encoding decode.
 """
 import gzip
+import socket
+import struct
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,13 @@ def compress_with(command, data):
     return subprocess.check_output([command, "-c"], input=data)
 
 
+COUNTED_POSTS = 0
+# raft.46 connection-reuse cases (OkHttp ConnectionReuseTest/CallTest analogues): requests that
+# reached the server, per /reuse/<key>/... key, and the lock guarding the counters.
+REUSE_HITS = {}
+REUSE_LOCK = threading.Lock()
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -44,9 +53,80 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
 
+    def _reuse(self, body=b""):
+        """/reuse/<key>/<behaviour>: misbehaves on the first hit of <key>, answers afterwards.
+
+        drop-once     close the connection (FIN) without any response
+        rst-once      abort the connection without any response (SO_LINGER 0: the close
+                      after socketserver's SHUT_WR turns into an RST)
+        partial-once  send headers and half the body, then close
+        close-after   answer, then close the connection (Connection: close not announced)
+        ok            always answer
+        """
+        parts = self.path.split("/")
+        if len(parts) != 4 or parts[1] != "reuse":
+            return False
+        key, behaviour = parts[2], parts[3]
+        with REUSE_LOCK:
+            REUSE_HITS[key] = REUSE_HITS.get(key, 0) + 1
+            first = REUSE_HITS[key] == 1
+        payload = b'{"reuse":"%s","echoLen":%d}' % (key.encode(), len(body))
+        if behaviour in ("see-other-drop", "temporary-drop"):
+            # Redirect hop whose target then drops the (reused) connection once.
+            self.send_response(303 if behaviour == "see-other-drop" else 307)
+            self.send_header("Location", "/reuse/%s-target/drop-once" % key)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
+        if behaviour == "close-delimited":
+            # No Content-Length: the body ends with the connection.
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(payload)
+            self.wfile.flush()
+            self.close_connection = True
+            return True
+        if behaviour == "timeout-408":
+            self.send_response(408)
+            self.send_header("Connection", "close")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            self.close_connection = True
+            return True
+        if behaviour == "drop-twice" and REUSE_HITS[key] <= 2:
+            self.close_connection = True
+            return True
+        if first and behaviour == "drop-once":
+            self.close_connection = True
+            return True
+        if first and behaviour == "rst-once":
+            self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            self.close_connection = True
+            return True
+        if first and behaviour == "partial-once":
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload[: len(payload) // 2])
+            self.wfile.flush()
+            self.close_connection = True
+            return True
+        self._send(200, payload)
+        if behaviour == "close-after":
+            self.close_connection = True
+        return True
+
     def do_GET(self):
+        if self._reuse():
+            return
+        if self.path.startswith("/reuse-count/"):
+            with REUSE_LOCK:
+                self._send(200, str(REUSE_HITS.get(self.path.split("/")[2], 0)).encode())
+            return
         if self.path == "/ok":
             self._send(200, b'{"ok":true}')
+        elif self.path == "/post-count":
+            self._send(200, str(COUNTED_POSTS).encode())
         elif self.path == "/auth401":
             # The exact 59-byte body from the production incident.
             self._send(401, AUTH_BODY)
@@ -192,6 +272,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        if self._reuse(body):
+            return
+        if self.path in ("/post-redirect-307", "/post-redirect-302"):
+            # raft.46: a redirected POST is a new request libcurl sends on purpose, not a replay.
+            self.send_response(307 if self.path.endswith("307") else 302)
+            self.send_header("Location", "/post-redirected" if self.path.endswith("307") else "/ok")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/post-redirected":
+            self._send(200, b'{"redirectedEchoLen":%d}' % len(body))
+            return
+        if self.path in ("/counted", "/counted-slow"):
+            # raft.46 dead-connection probe: how many times a POST reached the server.
+            global COUNTED_POSTS
+            COUNTED_POSTS += 1
+            if self.path == "/counted-slow":
+                time.sleep(4)
+            self._send(200, b"counted")
+            return
+        if self.path == "/post-delayed-headers":
+            time.sleep(1.5)
+            self._send(200, b"posted")
+            return
         if self.path == "/post-idle-response":
             self.send_response(200)
             self.send_header("Content-Length", "6")
@@ -210,7 +314,29 @@ class Handler(BaseHTTPRequestHandler):
             return
         self._send(200, b'{"echoLen":%d}' % len(body))
 
+    def do_PUT(self):
+        body = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        if not self._reuse(body):
+            self._send(405, b"")
+
+    def do_DELETE(self):
+        if not self._reuse():
+            self._send(405, b"")
+
     def do_HEAD(self):
+        if self.path.startswith("/reuse/"):
+            # Count and misbehave like GET, but a HEAD answer carries no body.
+            parts = self.path.split("/")
+            with REUSE_LOCK:
+                REUSE_HITS[parts[2]] = REUSE_HITS.get(parts[2], 0) + 1
+                first = REUSE_HITS[parts[2]] == 1
+            if first and parts[3] == "drop-once":
+                self.close_connection = True
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", "12")
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Length", "12")
         self.end_headers()

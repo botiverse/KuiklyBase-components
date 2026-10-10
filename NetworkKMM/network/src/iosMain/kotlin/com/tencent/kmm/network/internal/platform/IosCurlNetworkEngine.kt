@@ -22,7 +22,11 @@ import com.tencent.kmm.network.curl.contentLength
 import com.tencent.kmm.network.curl.curlDohPreference
 import com.tencent.kmm.network.curl.runCurlDohFallback
 import com.tencent.kmm.network.curl.runDohFallback
+import com.tencent.kmm.network.curl.curlPooledEngineRetirement
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
+import com.tencent.kmm.network.curl.isBufferedResponseHeadersTimeout
+import com.tencent.kmm.network.curl.isConnectionFailureBeforeResponse
+import com.tencent.kmm.network.curl.CURL_AFTER_TRANSPORT_REPLAY_PREFIX
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.curl.parseCurlHeaders
@@ -139,10 +143,14 @@ internal class IosCurlNetworkEngine(
                 dohFallbackProvider = provider,
             )
         }?.let { return it.toNetworkResponse(request) }
-        if (!first.isBufferedBodyIdleTimeout()) {
+        val stalled = first.isBufferedBodyIdleTimeout()
+        // One retry per request end to end: none here once libcurl already replayed it.
+        if (first.errorMsg.startsWith(CURL_AFTER_TRANSPORT_REPLAY_PREFIX) ||
+            (!stalled && !first.isConnectionFailureBeforeResponse())
+        ) {
             return first.toNetworkResponse(request)
         }
-        first.elapse.curlBodyStallDetected = true
+        if (stalled) first.elapse.curlBodyStallDetected = true
         val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
         if (!shouldFreshRetryCurlBufferedStall(
                 method = request.method,
@@ -154,14 +162,22 @@ internal class IosCurlNetworkEngine(
             return first.toNetworkResponse(request)
         }
 
+        // raft.46 (Hands 79db9fe6): see AndroidCurlNetworkEngine: replay on a new connection and, for
+        // a response-headers stall, retire the pooled engine whose HTTP/2 connection died.
+        if (first.isBufferedResponseHeadersTimeout()) {
+            curlPooledEngineRetirement.retireIfDue(preparedCurlHttp3Enabled(request)) {
+                bridge.retirePooledEngine(it)
+            }
+        }
         val retried = executeBufferedAttempt(
             request = request,
             call = call,
             body = body.bytes,
             contentType = body.contentType,
             timeoutMillis = remainingTimeout ?: 0L,
+            freshConnection = true,
         )
-        retried.elapse.curlBodyStallDetected = true
+        if (stalled) retried.elapse.curlBodyStallDetected = true
         retried.elapse.retainFirstAttemptCurlFacts(first.elapse)
         retried.elapse.freshRetry = true
         retried.elapse.freshRetryResult = if (retried.code == 0) "success" else "failure"
@@ -347,6 +363,7 @@ internal class IosCurlNetworkEngine(
         contentType: String?,
         timeoutMillis: Long,
         dohFallbackProvider: Int = 0,
+        freshConnection: Boolean = false,
     ): CurlNativeResponse {
         val owner = Any()
         val requestId = iosCurlRequestOwners.reserve(owner)
@@ -371,7 +388,7 @@ internal class IosCurlNetworkEngine(
             return CurlNativeResponse(code = 42, errorMsg = "cancelled before iOS curl native start")
         }
         return try {
-            bridge.execute(nativeRequest)
+            if (freshConnection) bridge.executeFresh(nativeRequest) else bridge.execute(nativeRequest)
         } finally {
             iosCurlRequestOwners.release(requestId, owner)
         }

@@ -248,6 +248,7 @@ object VBTransportCurl {
     fun onNetworkChanged() {
         com.tencent.kmm.network.curl.curlDohPreference.reset()
         runCatching { com.tencent.kmm.network.internal.platform.platformFlushCurlStaleAddresses() }
+        runCatching { com.tencent.kmm.network.internal.platform.platformRetireCurlPooledEngines() }
     }
 
     /**

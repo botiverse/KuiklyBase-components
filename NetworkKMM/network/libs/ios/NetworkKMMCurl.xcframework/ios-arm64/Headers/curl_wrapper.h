@@ -383,6 +383,8 @@ int GetCurlMultiInfoV1(CurClientHandle handle, CurlMultiInfoV1 *info,
                        size_t infoSize, int abiVersion);
 
 #if defined(NETWORKKMM_WRAPPER_TESTING)
+// Host-test-only: TCP_USER_TIMEOUT read back from the last connection socket (-1: none yet).
+int CurlLivenessOptionTestReadBack(void);
 // Host-test-only seam: 1 fails the next multi perform, 2 the next multi poll.
 void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode);
 void SetCurlClientTestConfigureFailure(CurClientHandle handle);
