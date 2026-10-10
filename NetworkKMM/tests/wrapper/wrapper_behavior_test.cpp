@@ -1706,6 +1706,9 @@ int main(int argc, char **argv) {
     CheckDecodedContentEncoding(base, "/zstd", "zstd", supportsZstd);
     CheckStaleAddressCache(base, base);
     CheckFallbackAttemptUnreachableMovesOn();
+    // raft.46: every connection socket carries the 10 s unacked-data deadline (kernel read-back).
+    CHECK(CurlLivenessOptionTestReadBack() == 10000,
+          "connection sockets carry TCP_USER_TIMEOUT=10000ms (dead peers fail instead of hanging)");
 
     if (gFailures > 0) {
         std::fprintf(stderr, "\n%d failure(s)\n", gFailures);

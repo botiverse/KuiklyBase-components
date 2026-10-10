@@ -27,6 +27,9 @@ def compress_with(command, data):
     return subprocess.check_output([command, "-c"], input=data)
 
 
+COUNTED_POSTS = 0
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -47,6 +50,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/ok":
             self._send(200, b'{"ok":true}')
+        elif self.path == "/post-count":
+            self._send(200, str(COUNTED_POSTS).encode())
         elif self.path == "/auth401":
             # The exact 59-byte body from the production incident.
             self._send(401, AUTH_BODY)
@@ -192,6 +197,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        if self.path in ("/counted", "/counted-slow"):
+            # raft.46 dead-connection probe: how many times a POST reached the server.
+            global COUNTED_POSTS
+            COUNTED_POSTS += 1
+            if self.path == "/counted-slow":
+                time.sleep(4)
+            self._send(200, b"counted")
+            return
         if self.path == "/post-delayed-headers":
             time.sleep(1.5)
             self._send(200, b"posted")

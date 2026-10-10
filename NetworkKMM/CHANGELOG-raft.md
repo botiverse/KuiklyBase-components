@@ -1,25 +1,48 @@
 # NetworkKMM Raft fork changelog
 
-## 0.1.0-raft.46 / 0.1.0-raft.46-ohos (dead reused HTTP/2 connections: Cronet-style recovery)
+## 0.1.0-raft.46 / 0.1.0-raft.46-ohos (dead reused connections: Cronet-style liveness and recovery)
 
 Hands 79db9fe6 / f717ac6f (artin, Android 1.13.1): the server and ALB answered in milliseconds, but
 on the phone requests on a reused curl HTTP/2 connection got no response headers for 6-30 s. The
-reused-H2 watchdog only existed on the OkHttp lane; the curl lane had nothing between the request
-going out and the 30 s request timeout, and new requests kept multiplexing onto the dead connection.
+reused-H2 watchdog only existed on the OkHttp lane. libcurl 8.16.0 checks a pooled connection
+passively before reuse (a zero-timeout poll for a closed/errored socket, `cf_socket_conn_is_alive` /
+`http2_connisalive`), and its upkeep PING (`curl_easy_upkeep`) is sent without tracking the ACK, so a
+connection whose peer silently vanished (NAT mapping dropped, network switched) stayed in the pool
+and took new requests until the 30 s request timeout. Cronet keeps reusing connections but pings one
+idle for 10 s and drops it when no ACK arrives within 10 s; this release gets the same detection from
+the kernel and keeps normal reuse.
 
+- Every connection socket gets a 10 s deadline for unacknowledged data (`CURLOPT_SOCKOPTFUNCTION`:
+  `TCP_USER_TIMEOUT` = 10000 ms on Android/OHOS, `TCP_RXT_CONNDROPTIME` = 10 s on iOS; the build
+  fails if the platform lacks the option). TCP keepalive probes start after 10 s idle, every 5 s
+  (was 45/45; `CURLOPT_TCP_KEEPCNT` 2 where libcurl >= 8.9). A dead idle connection is failed by
+  the kernel and dropped by libcurl's reuse check before a request is put on it; a request already
+  on a dead connection fails with `CURLE_RECV_ERROR` and libcurl replays it once on a new connection
+  (`Curl_retry_request`: reused connection, no response byte received). One `socket liveness ...
+  applied|failed errno=N` log line per process (every failure) records the option on the device.
+- Note: libcurl's replay does not look at the method. A POST whose connection dies after the server
+  took it but before any response byte is sent again (Chromium resends in the same case; before this
+  release the request hung for the full timeout, and a reset connection was already replayed).
+- Idle reuse limit back to 90 s (`CURLOPT_MAXAGE_CONN`); dead connections are detected, not avoided.
 - Buffered GET/HEAD: once the request went out (PRETRANSFER) and no response headers arrived within
   the body-idle budget (7 s by default), the request aborts with `buffered response headers timeout`
   and is replayed once on a fresh connection (the existing replay-safe GET/HEAD body-stall path).
-  Other methods keep waiting: not replay-safe, and a slow write must not be cut short.
-- The replay of any buffered stall now runs outside the pooled CURLM engines on a new easy handle
-  (Android `executeFresh`, iOS non-multi path); before, it re-entered the pool and could land on the
-  same dead connection.
-- A response-headers stall retires the pooled engine (at most once per 10 s per pool) so the
-  requests that follow open a new connection; the retired engine finishes what it accepted and is
-  deleted after 60 s. Android: JNI `nativeRetireMultiEngine`; iOS: `IosCurlMultiEngines.retire`.
-- Idle connections are no longer reused after 20 s (`CURLOPT_MAXAGE_CONN` 90 → 20): libcurl cannot
-  ping-and-wait before reuse like Cronet, so idle connections that a NAT may have dropped are retired.
-- OHOS: the platform-default curl path replays the new headers timeout like a body stall.
+  Other methods keep waiting.
+- The replay of any buffered stall runs on a new connection: Android `executeFresh` and the iOS
+  non-multi path bypass the pooled CURLM engines; before, the replay re-entered the pool and could
+  land on the same dead connection. A response-headers stall also retires the pooled engines (at most
+  once per 10 s) so the requests that follow open a new connection; a retired engine finishes what it
+  accepted and is deleted after 60 s (Android JNI `nativeRetireMultiEngine`, iOS
+  `IosCurlMultiEngines.retire`, OHOS `OhosCurlMultiEngines.retire`, new).
+- `VBTransportCurl.onNetworkChanged()` retires the pooled engines on all three platforms, so no new
+  request goes out on a connection opened on the previous network (Cronet stops new streams on
+  existing sessions on a mobile IP change).
+- Tests: `tests/wrapper/dead_connection_probe.sh` blackholes a pooled loopback connection with
+  iptables (run by `run_tests.sh` where passwordless sudo exists): after 25 s idle the next GET
+  succeeds at once on a new connection (raft.45: 30 s timeout); a POST on a just-died connection
+  succeeds in ~10 s and reaches the server once (raft.45: 30 s timeout); a POST held by the server
+  when the path dies reaches it twice (documented above). The behavior test reads
+  `TCP_USER_TIMEOUT` back from the kernel.
 
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 

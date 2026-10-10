@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <climits>
 #include <condition_variable>
@@ -29,7 +30,10 @@
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -137,6 +141,75 @@ static const char *CurlProtocolName(long httpVersion) {
 // provider or the stale address). A provider that hangs instead of refusing would otherwise eat the
 // whole request timeout before the next one is tried. Data transfer keeps the request's timeouts.
 static constexpr long kFallbackAttemptConnectTimeoutMs = 4000L;
+
+// raft.46 (Hands 79db9fe6): Cronet sends a PING on an HTTP/2 session idle for 10 s and closes it when
+// no ACK arrives within 10 s. libcurl's reuse check is passive (a zero-timeout poll for a closed or
+// errored socket; cf_socket_conn_is_alive / http2_connisalive in 8.16.0) and its upkeep PING is
+// fire-and-forget, so a connection whose peer silently vanished (NAT mapping dropped, network
+// switched) looks healthy and keeps being reused. The kernel gives the same ACK deadline: any byte
+// we sent (a request, a keepalive probe) that is not acknowledged within this time fails the socket,
+// libcurl's next liveness check sees the error, and the connection leaves the pool. A request already
+// on it fails with CURLE_RECV_ERROR before any byte arrived, which libcurl itself replays once on a
+// new connection (Curl_retry_request: reused connection, nothing received), the same rule Chromium
+// applies to a reused socket. Keepalive probes on idle connections make the kernel find a dead
+// connection before a request is put on it.
+static constexpr int kUnackedDataTimeoutMs = 10000;
+static constexpr long kKeepAliveIdleSeconds = 10L;
+static constexpr long kKeepAliveIntervalSeconds = 5L;
+
+// Android, OHOS and Linux hosts: TCP_USER_TIMEOUT (ms). Apple: TCP_RXT_CONNDROPTIME (s), public in
+// XNU netinet/tcp.h. A build without the option must fail rather than silently lose the deadline.
+#if defined(__APPLE__)
+#if !defined(TCP_RXT_CONNDROPTIME)
+#error "TCP_RXT_CONNDROPTIME is required for the dead-connection deadline"
+#endif
+#elif !defined(TCP_USER_TIMEOUT)
+#error "TCP_USER_TIMEOUT is required for the dead-connection deadline"
+#endif
+
+static std::atomic<int> g_liveness_option_result{1};  // 1: not applied yet, 0: ok, <0: -errno
+static std::atomic<bool> g_liveness_option_logged{false};
+#if defined(NETWORKKMM_WRAPPER_TESTING)
+static std::atomic<int> g_liveness_option_read_back{-1};
+#endif
+
+static int ApplyLivenessSocketOptions(void *, curl_socket_t fd, curlsocktype purpose) {
+    if (purpose != CURLSOCKTYPE_IPCXN) {
+        return CURL_SOCKOPT_OK;
+    }
+#if defined(__APPLE__)
+    const int value = kUnackedDataTimeoutMs / 1000;
+    const int rc = setsockopt(fd, IPPROTO_TCP, TCP_RXT_CONNDROPTIME, &value, sizeof(value));
+    const char *option = "TCP_RXT_CONNDROPTIME";
+#else
+    const unsigned int value = kUnackedDataTimeoutMs;
+    const int rc = setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, sizeof(value));
+    const char *option = "TCP_USER_TIMEOUT";
+#endif
+    const int result = rc == 0 ? 0 : -errno;
+    g_liveness_option_result.store(result, std::memory_order_relaxed);
+#if defined(NETWORKKMM_WRAPPER_TESTING) && !defined(__APPLE__)
+    unsigned int readBack = 0;
+    socklen_t readBackLen = sizeof(readBack);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &readBack, &readBackLen) == 0) {
+        g_liveness_option_read_back.store(static_cast<int>(readBack), std::memory_order_relaxed);
+    }
+#endif
+    // One line per process (and every failure): which option the connection got.
+    if (result != 0 || !g_liveness_option_logged.exchange(true)) {
+        const std::string line = std::string("socket liveness ") + option + "=" +
+            std::to_string(value) + " keepidle=" + std::to_string(kKeepAliveIdleSeconds) +
+            " keepintvl=" + std::to_string(kKeepAliveIntervalSeconds) +
+            (result == 0 ? " applied" : " failed errno=" + std::to_string(-result));
+        if (result == 0) {
+            logI("NetworkKMM-socket", line);
+        } else {
+            logE("NetworkKMM-socket", line);
+        }
+    }
+    // A failed option leaves the connection usable; it only loses the early dead-peer detection.
+    return CURL_SOCKOPT_OK;
+}
 
 struct DohProvider {
     int id;
@@ -1460,15 +1533,17 @@ class CurlClient {
         // Chrome uses keep the mapping alive and surface dead connections before a
         // request is sent on them; MAXAGE retires idle connections before typical
         // carrier NAT timeouts instead of libcurl's 118 s default.
+        // raft.46: probe after 10 s idle (was 45 s) and bound unacknowledged data to 10 s, see
+        // ApplyLivenessSocketOptions. A dead idle connection is failed by the kernel within about
+        // 20 s of silence and dropped by libcurl's reuse check instead of taking the next request.
         curl_easy_setopt(curl_, CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPIDLE, 45L);
-        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPINTVL, 45L);
-        // raft.46: a connection idle for 20 s is not reused (was 90 s). Mobile NATs and carrier
-        // middleboxes drop idle flows silently, and a dead reused HTTP/2 connection is exactly what
-        // left requests waiting 6-30 s (Hands 79db9fe6). Cronet pings a connection idle for ~10 s
-        // before reusing it; libcurl has no ping-and-wait, so idle connections are retired instead
-        // (one extra handshake after 20 s of silence).
-        curl_easy_setopt(curl_, CURLOPT_MAXAGE_CONN, 20L);
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPIDLE, kKeepAliveIdleSeconds);
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
+#if LIBCURL_VERSION_NUM >= 0x080900
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPCNT, 2L);
+#endif
+        curl_easy_setopt(curl_, CURLOPT_SOCKOPTFUNCTION, ApplyLivenessSocketOptions);
+        curl_easy_setopt(curl_, CURLOPT_MAXAGE_CONN, 90L);
         // Share DNS/TLS sessions across per-request easy handles. Connection
         // caches deliberately remain easy-owned; cross-thread sharing is not
         // supported by libcurl and does not provide multiplexing.
@@ -2905,6 +2980,10 @@ void DeleteCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion) {
 }
 
 #if defined(NETWORKKMM_WRAPPER_TESTING)
+int CurlLivenessOptionTestReadBack(void) {
+    return g_liveness_option_read_back.load(std::memory_order_relaxed);
+}
+
 void SetCurlMultiTestFailureMode(CurlMultiEngineHandle engine, int mode) {
     if (engine != nullptr) {
         reinterpret_cast<CurlMultiEngine *>(engine)->SetTestFailureMode(mode);

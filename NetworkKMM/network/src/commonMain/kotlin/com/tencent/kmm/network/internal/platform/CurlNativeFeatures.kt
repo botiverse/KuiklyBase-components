@@ -25,3 +25,10 @@ internal expect fun platformCurlSupportsHttp3(): Boolean
  * one. Must never throw; a missing native library is a no-op.
  */
 internal expect fun platformFlushCurlStaleAddresses()
+
+/**
+ * raft.46: swaps out the pooled curl engines on network change, so no request is put on a connection
+ * opened on the previous network (Cronet closes its sessions on an IP address change). Connections
+ * already serving requests finish on the retired engine. Must never throw.
+ */
+internal expect fun platformRetireCurlPooledEngines()

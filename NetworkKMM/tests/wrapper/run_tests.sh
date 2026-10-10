@@ -175,3 +175,11 @@ echo "==> Running behavior tests"
   "http://127.0.0.1:$DELAYED_PROXY_PORT" \
   "https://127.0.0.1:$HTTPS_PORT" \
   "$TLS_CERT"
+
+# raft.46: silently dead reused connections (iptables blackhole on loopback; needs root).
+if sudo -n iptables -L OUTPUT >/dev/null 2>&1; then
+  echo "==> Dead reused connection probe"
+  PROBE_PORT="$((PORT + 6))" bash "$SCRIPT_DIR/dead_connection_probe.sh"
+else
+  echo "==> Dead reused connection probe skipped (no passwordless sudo iptables)"
+fi

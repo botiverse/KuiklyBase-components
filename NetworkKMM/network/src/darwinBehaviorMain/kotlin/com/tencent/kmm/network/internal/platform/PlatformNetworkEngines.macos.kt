@@ -34,3 +34,5 @@ internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine)
 internal actual fun platformCurlSupportsHttp3(): Boolean = false
 
 internal actual fun platformFlushCurlStaleAddresses() = Unit
+
+internal actual fun platformRetireCurlPooledEngines() = Unit

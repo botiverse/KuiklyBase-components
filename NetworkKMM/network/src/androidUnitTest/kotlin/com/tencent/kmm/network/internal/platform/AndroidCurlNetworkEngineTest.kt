@@ -159,6 +159,18 @@ class AndroidCurlNetworkEngineTest {
     }
 
     @Test
+    fun networkChangeRetiresBothPooledEngines() {
+        // raft.46: like Cronet on a mobile IP change, no new request goes out on a connection that
+        // was opened on the previous network.
+        val bridge = FakeBridge()
+        AndroidCurlEngineProvider.testBridge = bridge
+
+        VBTransportCurl.onNetworkChanged()
+
+        assertEquals(listOf(false, true), bridge.retiredEngines)
+    }
+
+    @Test
     fun clampedConnectBudgetIsReportedInTimingAndNativeRequest() = runBlocking {
         val bridge = FakeBridge().apply {
             executeResponse = CurlNativeResponse(code = 0, httpCode = 200)
@@ -1483,6 +1495,11 @@ class AndroidCurlNetworkEngineTest {
         var unresolvedUploadAttempts = 0
         val cancelledIds = mutableListOf<Int>()
         var executeDelayMillis: Long = 0
+        val retiredEngines = mutableListOf<Boolean>()
+
+        override fun retirePooledEngine(http3Enabled: Boolean) {
+            retiredEngines += http3Enabled
+        }
         var onExecute: ((AndroidCurlNativeRequest, Int) -> Unit)? = null
 
         override suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse {

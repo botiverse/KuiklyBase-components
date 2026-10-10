@@ -18,6 +18,7 @@ package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.curl.CURL_CODE_COULDNT_RESOLVE_HOST
 import com.tencent.kmm.network.curl.curlDohPreference
+import com.tencent.kmm.network.curl.curlPooledEngineRetirement
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.runDohFallback
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
@@ -45,6 +46,7 @@ import com.tencent.kmm.network.export.cancel
 import com.tencent.kmm.network.export.toBytes
 import com.tencent.kmm.network.export.toNetworkHttpProtocol
 import com.tencent.kmm.network.internal.InflightCallbackGate
+import com.tencent.kmm.network.internal.platform.platformRetireCurlPooledEngines
 import com.tencent.kmm.network.internal.platform.unsupportedStreamingRequestBodyResponse
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CancellationException
@@ -820,6 +822,14 @@ object VBTransportNetworkEngine : NetworkEngine {
             )) {
             return first
         }
+        // raft.46: the replay must not land on the stalled connection again. A response-headers
+        // stall means the pooled engine's HTTP/2 connection is dead, so swap the pooled engines
+        // (at most once per interval) before replaying; the replay then opens a new connection.
+        if (first.isCurlBufferedResponseHeadersTimeout()) {
+            curlPooledEngineRetirement.retireIfDue(http3Enabled = false) {
+                runCatching { platformRetireCurlPooledEngines() }
+            }
+        }
         val retried = executeBufferedPlatformAttempt(
             request = request,
             call = call,
@@ -1074,6 +1084,9 @@ private fun NetworkResponse.isCurlBufferedBodyIdleTimeout(): Boolean =
         (error.message.contains("buffered body idle timeout") ||
             // raft.46: a GET/HEAD whose response headers never came on a reused connection.
             error.message.contains("buffered response headers timeout"))
+
+private fun NetworkResponse.isCurlBufferedResponseHeadersTimeout(): Boolean =
+    error?.rawCode == 28 && error.message.contains("buffered response headers timeout")
 
 private fun remainingPlatformCurlTimeoutMillis(totalTimeoutMillis: Long, startedAt: TimeMark): Long? {
     if (totalTimeoutMillis <= 0) return null
