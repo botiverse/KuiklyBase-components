@@ -57,6 +57,17 @@ int main() {
 
     assert(SocketIoTestDecodeEvent("42not-json", eventName, sizeof(eventName),
                                    payload, sizeof(payload)) == 0);
+    // No-argument event (server `socket.emit("rooms:joined")`) decodes with a JSON null payload.
+    assert(SocketIoTestDecodeEvent("42[\"rooms:joined\"]", eventName, sizeof(eventName),
+                                   payload, sizeof(payload)) == 1);
+    assert(std::strcmp(eventName, "rooms:joined") == 0);
+    assert(std::strcmp(payload, "null") == 0);
+    assert(SocketIoTestDecodeEvent("42[\"rooms:joined\"", eventName, sizeof(eventName),
+                                   payload, sizeof(payload)) == 0);
+    assert(SocketIoTestDecodeEvent("42[\"\"]", eventName, sizeof(eventName),
+                                   payload, sizeof(payload)) == 0);
+    assert(SocketIoTestDecodeEvent("42[\"a\"x]", eventName, sizeof(eventName),
+                                   payload, sizeof(payload)) == 0);
     assert(SocketIoTestEventFrame("bad\nname", "{}", output, sizeof(output)) == 1);
 
     ReentrantCloseCapture capture;

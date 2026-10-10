@@ -1,5 +1,15 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.44 / 0.1.0-raft.44-ohos (Socket.IO events without arguments)
+
+- curl Socket.IO client: an event emitted without arguments (`42["name"]`,
+  e.g. the Raft server's `socket.emit("rooms:joined")`) now reaches
+  `NetworkSocketIoListener.onEvent` with payload `null` instead of being
+  dropped. raft.43 dropped it, so a client never saw `rooms:joined` and never
+  sent `sync:resume` (raft task #154). Same fix on Android, iOS and OHOS.
+- Native carriers rebuilt for the decoder change: Android run 38032528522,
+  iOS run 38032669653, OHOS run 38033151530.
+
 ## 0.1.0-raft.43 / 0.1.0-raft.43-ohos (curl Socket.IO on all platforms, stale-address retry)
 
 - curl Socket.IO client on Android, iOS and OHOS (raft task #154; #167,

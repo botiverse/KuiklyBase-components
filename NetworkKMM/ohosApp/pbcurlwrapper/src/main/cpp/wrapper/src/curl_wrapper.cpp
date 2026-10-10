@@ -509,9 +509,16 @@ class CurlSocketIoClient {
                 name.push_back(character);
             }
         }
-        if (name.empty() || index + 2 >= frame.size() || frame[index + 1] != ',') return false;
+        if (name.empty() || index + 1 >= frame.size() || frame.back() != ']') return false;
+        // An event emitted without arguments (`socket.emit("rooms:joined")` on the Raft server) is
+        // `42["name"]`; it reaches the listener with a JSON null payload instead of being dropped.
+        if (index + 2 == frame.size()) {
+            *eventName = std::move(name);
+            *payloadJson = "null";
+            return true;
+        }
+        if (index + 2 >= frame.size() || frame[index + 1] != ',') return false;
         const size_t payloadStart = index + 2;
-        if (frame.back() != ']') return false;
         *eventName = std::move(name);
         *payloadJson = frame.substr(payloadStart, frame.size() - payloadStart - 1);
         return !payloadJson->empty();
