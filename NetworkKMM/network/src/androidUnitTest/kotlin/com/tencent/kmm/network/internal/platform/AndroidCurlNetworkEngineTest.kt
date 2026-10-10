@@ -394,7 +394,8 @@ class AndroidCurlNetworkEngineTest {
                     curlBodyBytes = 3,
                 )
             )
-            executeResponses += CurlNativeResponse(code = 0, httpCode = 200, data = "ok".encodeToByteArray())
+            // raft.46: the replay goes out on a fresh connection (executeFresh), not the pooled engine.
+            freshExecuteResponse = CurlNativeResponse(code = 0, httpCode = 200, data = "ok".encodeToByteArray())
         }
         val request = NetworkRequest(
             method = VBTransportMethod.GET,
@@ -405,9 +406,10 @@ class AndroidCurlNetworkEngineTest {
         val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
 
         assertEquals("ok", response.body.text())
-        assertEquals(2, bridge.executeRequests.size)
-        assertTrue(bridge.executeRequests[0].requestId != bridge.executeRequests[1].requestId)
-        assertTrue(bridge.executeRequests[1].timeoutMillis in 1..20_000)
+        assertEquals(1, bridge.executeRequests.size)
+        assertEquals(1, bridge.freshExecuteRequests.size)
+        assertTrue(bridge.executeRequests[0].requestId != bridge.freshExecuteRequests[0].requestId)
+        assertTrue(bridge.freshExecuteRequests[0].timeoutMillis in 1..20_000)
         assertTrue(response.timing.curlBodyStallDetected)
         assertTrue(response.timing.freshRetry)
         assertEquals("success", response.timing.freshRetryResult)
@@ -473,7 +475,7 @@ class AndroidCurlNetworkEngineTest {
         )
         val twiceStalled = FakeBridge().apply {
             executeResponses += stall()
-            executeResponses += stall()
+            freshExecuteResponse = stall()
             executeResponses += CurlNativeResponse(code = 0, httpCode = 200)
         }
         val retryingGet = NetworkRequest(
@@ -488,7 +490,9 @@ class AndroidCurlNetworkEngineTest {
 
         val failed = client.execute(retryingGet)
 
-        assertEquals(2, twiceStalled.executeRequests.size)
+        // One pooled attempt + one fresh replay; the stalled replay is not retried again.
+        assertEquals(1, twiceStalled.executeRequests.size)
+        assertEquals(1, twiceStalled.freshExecuteRequests.size)
         assertTrue(failed.timing.freshRetry)
         assertEquals("failure", failed.timing.freshRetryResult)
 
@@ -500,6 +504,7 @@ class AndroidCurlNetworkEngineTest {
         cancelledCall = NetworkCall(retryingGet)
         AndroidCurlNetworkEngine(cancelledBridge).execute(retryingGet, cancelledCall)
         assertEquals(1, cancelledBridge.executeRequests.size)
+        assertEquals(0, cancelledBridge.freshExecuteRequests.size)
 
         val exhaustedBridge = FakeBridge().apply {
             executeResponses += stall()
@@ -510,6 +515,7 @@ class AndroidCurlNetworkEngineTest {
         }
         AndroidCurlNetworkEngine(exhaustedBridge).execute(exhausted, NetworkCall(exhausted))
         assertEquals(1, exhaustedBridge.executeRequests.size)
+        assertEquals(0, exhaustedBridge.freshExecuteRequests.size)
     }
 
     @Test
@@ -519,7 +525,7 @@ class AndroidCurlNetworkEngineTest {
                 code = 28,
                 errorMsg = "buffered body idle timeout after 7000ms"
             )
-            executeResponses += CurlNativeResponse(code = 0, httpCode = 503)
+            freshExecuteResponse = CurlNativeResponse(code = 0, httpCode = 503)
         }
         val request = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
 
