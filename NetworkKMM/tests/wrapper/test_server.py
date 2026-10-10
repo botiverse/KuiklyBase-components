@@ -93,6 +93,9 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.close_connection = True
             return True
+        if behaviour == "drop-twice" and REUSE_HITS[key] <= 2:
+            self.close_connection = True
+            return True
         if first and behaviour == "drop-once":
             self.close_connection = True
             return True

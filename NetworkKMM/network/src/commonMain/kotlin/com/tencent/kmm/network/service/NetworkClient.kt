@@ -17,6 +17,7 @@
 package com.tencent.kmm.network.service
 
 import com.tencent.kmm.network.curl.CURL_CODE_COULDNT_RESOLVE_HOST
+import com.tencent.kmm.network.curl.CURL_AFTER_TRANSPORT_REPLAY_PREFIX
 import com.tencent.kmm.network.curl.CURL_CONNECTION_FAILURE_CODES
 import com.tencent.kmm.network.curl.curlDohPreference
 import com.tencent.kmm.network.curl.curlPooledEngineRetirement
@@ -807,7 +808,11 @@ object VBTransportNetworkEngine : NetworkEngine {
             }?.let { return it }
         }
         val stalled = first.isCurlBufferedBodyIdleTimeout()
-        if (!usesCurlPlatformDefault || (!stalled && !first.isCurlConnectionFailureBeforeResponse())) {
+        // One retry per request end to end: none here once libcurl already replayed it.
+        if (!usesCurlPlatformDefault ||
+            first.error?.message?.startsWith(CURL_AFTER_TRANSPORT_REPLAY_PREFIX) == true ||
+            (!stalled && !first.isCurlConnectionFailureBeforeResponse())
+        ) {
             return first
         }
         if (stalled) first.timing.curlBodyStallDetected = true
@@ -1089,7 +1094,8 @@ private fun NetworkResponse.isCurlBufferedBodyIdleTimeout(): Boolean =
 
 /** raft.46: see CurlNativeResponse.isConnectionFailureBeforeResponse. */
 private fun NetworkResponse.isCurlConnectionFailureBeforeResponse(): Boolean =
-    statusCode == null && error?.rawCode?.let { it in CURL_CONNECTION_FAILURE_CODES } == true
+    statusCode == null && error?.rawCode?.let { it in CURL_CONNECTION_FAILURE_CODES } == true &&
+        !error.message.startsWith(CURL_AFTER_TRANSPORT_REPLAY_PREFIX)
 
 private fun NetworkResponse.isCurlBufferedResponseHeadersTimeout(): Boolean =
     error?.rawCode == 28 && error.message.contains("buffered response headers timeout")

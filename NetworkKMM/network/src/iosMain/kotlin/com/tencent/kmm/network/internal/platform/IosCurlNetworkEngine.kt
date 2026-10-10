@@ -26,6 +26,7 @@ import com.tencent.kmm.network.curl.curlPooledEngineRetirement
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
 import com.tencent.kmm.network.curl.isBufferedResponseHeadersTimeout
 import com.tencent.kmm.network.curl.isConnectionFailureBeforeResponse
+import com.tencent.kmm.network.curl.CURL_AFTER_TRANSPORT_REPLAY_PREFIX
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.curl.parseCurlHeaders
@@ -143,7 +144,10 @@ internal class IosCurlNetworkEngine(
             )
         }?.let { return it.toNetworkResponse(request) }
         val stalled = first.isBufferedBodyIdleTimeout()
-        if (!stalled && !first.isConnectionFailureBeforeResponse()) {
+        // One retry per request end to end: none here once libcurl already replayed it.
+        if (first.errorMsg.startsWith(CURL_AFTER_TRANSPORT_REPLAY_PREFIX) ||
+            (!stalled && !first.isConnectionFailureBeforeResponse())
+        ) {
             return first.toNetworkResponse(request)
         }
         if (stalled) first.elapse.curlBodyStallDetected = true

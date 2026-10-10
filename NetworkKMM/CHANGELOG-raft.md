@@ -34,6 +34,9 @@ the kernel and keeps normal reuse.
   platforms (OkHttp retryOnConnectionFailure / recoverFromOneHttp2ErrorRequiresNewConnection).
   libcurl replays only RECV_ERROR itself; when an HTTP/2 connection dies with several streams in
   flight, the others fail with SEND_ERROR and were not recovered. Other methods are never retried.
+- One retry per request end to end (at most 2 sends): when libcurl already replayed a GET/HEAD on a
+  new connection and it still failed, the wrapper prefixes the error with `after transport replay: `
+  and neither the connection-failure retry nor the stall retry runs again.
 - Idle reuse limit back to 90 s (`CURLOPT_MAXAGE_CONN`); dead connections are detected, not avoided.
 - Buffered GET/HEAD: once the request went out (PRETRANSFER) and no response headers arrived within
   the body-idle budget (7 s by default), the request aborts with `buffered response headers timeout`

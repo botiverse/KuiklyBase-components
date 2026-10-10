@@ -198,6 +198,20 @@ class AndroidCurlNetworkEngineTest {
         assertNull(failed.statusCode)
         assertEquals(0, postBridge.freshExecuteRequests.size)
 
+        // libcurl already replayed it (one retry budget per request): no second retry.
+        val replayedBridge = FakeBridge().apply {
+            executeResponse = CurlNativeResponse(code = 56, errorMsg = "after transport replay: Recv failure")
+        }
+        val replayed = NetworkRequest(url = "https://example.test/replayed")
+        AndroidCurlNetworkEngine(replayedBridge).execute(replayed, NetworkCall(replayed))
+        assertEquals(0, replayedBridge.freshExecuteRequests.size)
+        replayedBridge.executeResponse = CurlNativeResponse(
+            code = 28,
+            errorMsg = "after transport replay: buffered response headers timeout after 7001ms",
+        )
+        AndroidCurlNetworkEngine(replayedBridge).execute(replayed, NetworkCall(replayed))
+        assertEquals(0, replayedBridge.freshExecuteRequests.size)
+
         // A status already arrived (body cut off): not a connection failure before the response.
         val partialBridge = FakeBridge().apply {
             executeResponse = CurlNativeResponse(code = 56, httpCode = 200, errorMsg = "Recv failure")

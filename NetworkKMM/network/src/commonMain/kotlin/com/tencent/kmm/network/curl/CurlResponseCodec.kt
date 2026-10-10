@@ -46,7 +46,13 @@ internal fun CurlNativeResponse.isBufferedResponseHeadersTimeout(): Boolean =
  * then gets one fresh-connection retry, like OkHttp's retryOnConnectionFailure.
  */
 internal fun CurlNativeResponse.isConnectionFailureBeforeResponse(): Boolean =
-    httpCode == 0 && code in CURL_CONNECTION_FAILURE_CODES
+    httpCode == 0 && code in CURL_CONNECTION_FAILURE_CODES && !errorMsg.startsWith(CURL_AFTER_TRANSPORT_REPLAY_PREFIX)
+
+/**
+ * The wrapper prefixes the error of a GET/HEAD that libcurl already replayed on a new connection:
+ * one retry per request across native and routing layers, so that request is not retried again.
+ */
+internal const val CURL_AFTER_TRANSPORT_REPLAY_PREFIX: String = "after transport replay: "
 
 internal val CURL_CONNECTION_FAILURE_CODES: Set<Int> = setOf(16, 55, 56, 92)
 

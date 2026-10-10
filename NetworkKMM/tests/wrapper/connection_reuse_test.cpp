@@ -121,6 +121,17 @@ int main(int argc, char **argv) {
     CHECK(getRst.code == 0 && getRst.httpCode == 200, "GET whose reused connection is reset is replayed and succeeds");
     CHECK(hits == 2, "reset GET reached the server twice");
 
+    // 2b. The replay fails too: the error carries the after-replay prefix so the routing layer does
+    //     not retry again (one retry per request across native and Kotlin), and the server saw the
+    //     GET exactly twice.
+    Outcome getTwice = OnReusedConnection(base, "get-twice", "drop-twice", "GET", &hits);
+    CHECK(getTwice.code != 0 && getTwice.error.rfind("after transport replay: ", 0) == 0,
+          "GET whose replay also fails reports it was already replayed");
+    CHECK(hits == 2, "GET whose replay also fails reached the server exactly twice");
+    Outcome getOnce = OnReusedConnection(base, "get-once-plain", "drop-once", "GET", &hits);
+    CHECK(getOnce.error.find("after transport replay") == std::string::npos,
+          "a successful replay leaves no after-replay marker");
+
     // 3. HEAD follows the GET rule.
     Outcome headDrop = OnReusedConnection(base, "head-drop", "drop-once", "HEAD", &hits);
     CHECK(headDrop.code == 0 && headDrop.httpCode == 200, "HEAD whose reused connection is dropped is replayed and succeeds");

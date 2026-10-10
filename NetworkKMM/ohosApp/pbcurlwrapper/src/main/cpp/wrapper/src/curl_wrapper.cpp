@@ -173,6 +173,8 @@ static std::atomic<bool> g_liveness_option_logged{false};
 static std::atomic<int> g_liveness_option_read_back{-1};
 #endif
 
+static constexpr const char *kAfterTransportReplayPrefix = "after transport replay: ";
+
 static int ApplyLivenessSocketOptions(void *, curl_socket_t fd, curlsocktype purpose) {
     if (purpose != CURLSOCKTYPE_IPCXN) {
         return CURL_SOCKOPT_OK;
@@ -1390,6 +1392,9 @@ class CurlClient {
             effectiveMethod != nullptr) {
             replayAllowed = std::strcmp(effectiveMethod, "GET") == 0 || std::strcmp(effectiveMethod, "HEAD") == 0;
         }
+        if (replay && replayAllowed) {
+            client->transport_replayed_ = true;
+        }
         if (replay && !replayAllowed) {
             client->transport_replay_blocked_ = true;
             logE(client->log_tag_, "connection died before any response byte; request not replayed (not GET/HEAD)");
@@ -1765,6 +1770,7 @@ class CurlClient {
         // the request may have been sent).
         transport_replay_allowed_ = method == "GET" || method == "HEAD";
         transport_replay_blocked_ = false;
+        transport_replayed_ = false;
         prereq_calls_ = 0;
         prereq_redirect_count_ = 0;
         curl_easy_setopt(curl_, CURLOPT_PREREQFUNCTION, PrereqCallback);
@@ -1823,7 +1829,21 @@ class CurlClient {
         // libcurl transparently decodes the body per the negotiated
         // Content-Encoding (zlib/brotli/zstd), so content_data_ is already the
         // decompressed payload — no manual gzip pass.
-        FinishBufferedRequest(NormalizeBufferedTerminal(result), callback);
+        const CURLcode terminal = NormalizeBufferedTerminal(result);
+        MarkFailureAfterTransportReplay(terminal);
+        FinishBufferedRequest(terminal, callback);
+    }
+
+    // raft.46: one retry budget per request across native and routing layers. When libcurl already
+    // replayed this GET/HEAD on a new connection and it still failed, the error says so, and the
+    // routing layer's connection-failure retry (isConnectionFailureBeforeResponse) stands down.
+    void MarkFailureAfterTransportReplay(CURLcode terminal) {
+        if (!transport_replayed_ || terminal == CURLE_OK) {
+            return;
+        }
+        const std::string original = curl_error_msg_;
+        std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s%s", kAfterTransportReplayPrefix,
+            original.c_str());
     }
 
     CURL *EasyHandle() const {
@@ -2486,6 +2506,7 @@ class CurlClient {
     bool buffered_headers_phase_started_ = false;
     bool transport_replay_allowed_ = true;
     bool transport_replay_blocked_ = false;
+    bool transport_replayed_ = false;
     int prereq_calls_ = 0;
     long prereq_redirect_count_ = 0;
     std::chrono::steady_clock::time_point buffered_headers_phase_started_at_{};
