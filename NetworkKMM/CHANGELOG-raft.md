@@ -25,7 +25,10 @@ the kernel and keeps normal reuse.
   twice. `CURLOPT_PREREQFUNCTION` runs before every request libcurl sends; a second call that is not
   a redirect is a replay, and for any method other than GET/HEAD it is refused: the request fails
   with `CURLE_RECV_ERROR` "connection died before any response byte; request not replayed (not
-  GET/HEAD)". This also stops the replay of a POST after a connection reset, which raft.45 did.
+  GET/HEAD)". The replayed request's own method decides (`CURLINFO_EFFECTIVE_METHOD`): a POST
+  redirected by 303 is replayed as the GET it became; a POST kept by 307 is not. This also stops
+  the replay of POST/PUT/DELETE after a dropped or reset keep-alive connection, which raft.45 did
+  (the server saw them twice).
 - Idle reuse limit back to 90 s (`CURLOPT_MAXAGE_CONN`); dead connections are detected, not avoided.
 - Buffered GET/HEAD: once the request went out (PRETRANSFER) and no response headers arrived within
   the body-idle budget (7 s by default), the request aborts with `buffered response headers timeout`
@@ -45,7 +48,12 @@ the kernel and keeps normal reuse.
   after 25 s idle the next GET succeeds at once on a new connection (raft.45: 30 s timeout); a POST
   on a just-died connection fails in ~10 s and reaches the server 0 times (raft.45: 30 s timeout); a
   POST the server took before the path died fails in ~15 s and reaches it exactly once. The behavior
-  test reads `TCP_USER_TIMEOUT` back from the kernel.
+  test reads `TCP_USER_TIMEOUT` back from the kernel. `tests/wrapper/connection_reuse_test.cpp`
+  (OkHttp ConnectionReuseTest/CallTest analogues, no root needed) covers dropped/reset reused
+  connections for GET/HEAD (replayed, server sees 2) and POST/PUT/DELETE (refused, server sees 1;
+  raft.45 failed 6 of these checks), a body cut mid-way (error, no replay), 303/307 redirect hops
+  that drop, close-delimited bodies, 408 passthrough, and 1 KB/64 KB POSTs after a server-closed
+  idle connection (sent once).
 
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 

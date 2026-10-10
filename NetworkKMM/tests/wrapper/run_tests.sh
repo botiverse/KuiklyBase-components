@@ -176,6 +176,18 @@ echo "==> Running behavior tests"
   "https://127.0.0.1:$HTTPS_PORT" \
   "$TLS_CERT"
 
+echo "==> Connection reuse contract (dropped/reset/stale keep-alive connections)"
+g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
+  -I "$CPP_ROOT" \
+  -I "$CPP_ROOT/wrapper/include" \
+  "$CPP_ROOT/wrapper/src/curl_wrapper.cpp" \
+  "$CPP_ROOT/wrapper/src/log/curl_log.cpp" \
+  "$CPP_ROOT/wrapper/src/utils/curl_utils.cpp" \
+  "$SCRIPT_DIR/connection_reuse_test.cpp" \
+  -lcurl -lz -pthread \
+  -o "$BUILD_DIR/connection_reuse_test"
+"$BUILD_DIR/connection_reuse_test" "http://127.0.0.1:$PORT"
+
 # raft.46: silently dead reused connections (iptables blackhole on loopback; needs root).
 if sudo -n iptables -L OUTPUT >/dev/null 2>&1; then
   echo "==> Dead reused connection probe"

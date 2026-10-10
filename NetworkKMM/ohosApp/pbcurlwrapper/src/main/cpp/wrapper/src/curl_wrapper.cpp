@@ -1382,7 +1382,15 @@ class CurlClient {
         const bool replay = client->prereq_calls_ > 0 && redirects == client->prereq_redirect_count_;
         client->prereq_calls_++;
         client->prereq_redirect_count_ = redirects;
-        if (replay && !client->transport_replay_allowed_) {
+        // The replayed request's own method decides: a POST answered with 303 is replayed as the
+        // GET it became, a POST kept by 307 stays a POST.
+        bool replayAllowed = client->transport_replay_allowed_;
+        char *effectiveMethod = nullptr;
+        if (replay && curl_easy_getinfo(client->curl_, CURLINFO_EFFECTIVE_METHOD, &effectiveMethod) == CURLE_OK &&
+            effectiveMethod != nullptr) {
+            replayAllowed = std::strcmp(effectiveMethod, "GET") == 0 || std::strcmp(effectiveMethod, "HEAD") == 0;
+        }
+        if (replay && !replayAllowed) {
             client->transport_replay_blocked_ = true;
             logE(client->log_tag_, "connection died before any response byte; request not replayed (not GET/HEAD)");
             return CURL_PREREQFUNC_ABORT;
