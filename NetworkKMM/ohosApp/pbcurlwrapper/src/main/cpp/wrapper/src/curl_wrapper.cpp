@@ -1248,7 +1248,10 @@ class CurlClient {
     }
 
     bool BufferedBodyTimedOut() {
-        if (!final_headers_ready_ || buffered_body_idle_timeout_ms_ <= 0) {
+        if (!final_headers_ready_) {
+            return BufferedResponseHeadersTimedOut();
+        }
+        if (buffered_body_idle_timeout_ms_ <= 0) {
             return false;
         }
         const auto now = std::chrono::steady_clock::now();
@@ -1258,6 +1261,37 @@ class CurlClient {
             return false;
         }
         buffered_timeout_reason_ = "buffered body idle timeout after " + std::to_string(idle) + "ms";
+        std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
+        logE(log_tag_, buffered_timeout_reason_);
+        return true;
+    }
+
+    // Raft task #150 follow-up (raft.46, Hands 79db9fe6): a buffered GET/HEAD whose request went out
+    // (PRETRANSFER reached) but got no response headers within the body-idle budget is stuck on a
+    // dead reused HTTP/2 connection; servers and the ALB answered in milliseconds while the phone
+    // waited 6-30 s. Abort so the routing layer replays it on a fresh connection. Other methods
+    // keep waiting: they are not replay-safe and a slow POST must not be cut short.
+    bool BufferedResponseHeadersTimedOut() {
+        if (!buffered_headers_deadline_eligible_ || buffered_body_idle_timeout_ms_ <= 0) {
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (!buffered_headers_phase_started_) {
+            double pretransferSeconds = 0.0;
+            if (curl_easy_getinfo(curl_, CURLINFO_PRETRANSFER_TIME, &pretransferSeconds) != CURLE_OK ||
+                pretransferSeconds <= 0.0) {
+                return false;
+            }
+            buffered_headers_phase_started_ = true;
+            buffered_headers_phase_started_at_ = now;
+            return false;
+        }
+        const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - buffered_headers_phase_started_at_).count();
+        if (waited < buffered_body_idle_timeout_ms_) {
+            return false;
+        }
+        buffered_timeout_reason_ = "buffered response headers timeout after " + std::to_string(waited) + "ms";
         std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", buffered_timeout_reason_.c_str());
         logE(log_tag_, buffered_timeout_reason_);
         return true;
@@ -1429,7 +1463,12 @@ class CurlClient {
         curl_easy_setopt(curl_, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(curl_, CURLOPT_TCP_KEEPIDLE, 45L);
         curl_easy_setopt(curl_, CURLOPT_TCP_KEEPINTVL, 45L);
-        curl_easy_setopt(curl_, CURLOPT_MAXAGE_CONN, 90L);
+        // raft.46: a connection idle for 20 s is not reused (was 90 s). Mobile NATs and carrier
+        // middleboxes drop idle flows silently, and a dead reused HTTP/2 connection is exactly what
+        // left requests waiting 6-30 s (Hands 79db9fe6). Cronet pings a connection idle for ~10 s
+        // before reusing it; libcurl has no ping-and-wait, so idle connections are retired instead
+        // (one extra handshake after 20 s of silence).
+        curl_easy_setopt(curl_, CURLOPT_MAXAGE_CONN, 20L);
         // Share DNS/TLS sessions across per-request easy handles. Connection
         // caches deliberately remain easy-owned; cross-thread sharing is not
         // supported by libcurl and does not provide multiplexing.
@@ -1615,6 +1654,8 @@ class CurlClient {
         first_body_seen_ = false;
         buffered_timeout_reason_.clear();
         buffered_response_limit_reason_.clear();
+        buffered_headers_deadline_eligible_ = method == "GET" || method == "HEAD";
+        buffered_headers_phase_started_ = false;
         // Detection and replay eligibility are deliberately separate:
         // every buffered response (including POST/upload responses) must stop
         // on body-idle, while the routing layer may later replay only explicit
@@ -2323,6 +2364,9 @@ class CurlClient {
     int64_t buffered_body_bytes_ = 0;
     bool first_body_seen_ = false;
     std::string buffered_timeout_reason_;
+    bool buffered_headers_deadline_eligible_ = false;
+    bool buffered_headers_phase_started_ = false;
+    std::chrono::steady_clock::time_point buffered_headers_phase_started_at_{};
     int64_t max_buffered_response_bytes_ = 0;
     int64_t connection_cache_id_ = 0;
     CurlCompletionInfoV1 completion_info_{};

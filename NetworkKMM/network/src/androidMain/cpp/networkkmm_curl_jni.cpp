@@ -18,11 +18,13 @@
 #include <jni.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -792,6 +794,30 @@ void NativeFlushStaleAddresses(JNIEnv *, jclass) {
     FlushCurlStaleAddressCache();
 }
 
+// raft.46 (Hands 79db9fe6): a response-headers stall means the pooled engine's multiplexed HTTP/2
+// connection is dead, and every new request would keep queueing on it. Swap the pooled engine out
+// so the next request opens a new one. The retired engine keeps serving what it already accepted
+// (those requests stall into the same deadline and are replayed fresh by Kotlin) and is deleted
+// after kRetiredMultiEngineGraceSeconds, past every request timeout.
+constexpr int kRetiredMultiEngineGraceSeconds = 60;
+
+void NativeRetireMultiEngine(JNIEnv *, jclass, jboolean http3_enabled) {
+    CurlMultiEngineHandle retired = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_multi_engines_mutex);
+        CurlMultiEngineHandle *slot = http3_enabled == JNI_TRUE
+            ? &g_http3_multi_engine
+            : &g_default_multi_engine;
+        retired = *slot;
+        *slot = nullptr;
+    }
+    if (retired == nullptr) return;
+    std::thread([retired]() {
+        std::this_thread::sleep_for(std::chrono::seconds(kRetiredMultiEngineGraceSeconds));
+        DeleteCurlMultiEngine(retired);
+    }).detach();
+}
+
 // ---- Socket.IO (raft task #154) -------------------------------------------------------------
 // One context per native Socket.IO client. Callbacks run on the wrapper's owner thread; strings go
 // to Kotlin as UTF-8 byte arrays (NewStringUTF needs modified UTF-8 and rejects 4-byte sequences).
@@ -1032,6 +1058,11 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
             const_cast<char *>("nativeFlushStaleAddresses"),
             const_cast<char *>("()V"),
             reinterpret_cast<void *>(NativeFlushStaleAddresses)
+        },
+        {
+            const_cast<char *>("nativeRetireMultiEngine"),
+            const_cast<char *>("(Z)V"),
+            reinterpret_cast<void *>(NativeRetireMultiEngine)
         },
         {
             const_cast<char *>("nativeSocketIoCreate"),

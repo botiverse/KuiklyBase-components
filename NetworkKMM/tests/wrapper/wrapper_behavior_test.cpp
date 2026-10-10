@@ -1112,6 +1112,21 @@ int main(int argc, char **argv) {
     CHECK(bufferedIdle.data.empty(),
           "buffered idle timeout fences native partial body from the caller");
 
+    // raft.46 (Hands 79db9fe6): a buffered GET whose request went out but whose response headers
+    // never come within the body-idle budget is stuck on a dead reused HTTP/2 connection; it aborts
+    // with a stable reason so Kotlin replays it on a fresh connection. A POST keeps waiting: it is
+    // not replay-safe and a slow write must not be cut short.
+    Captured headersStall = Fetch(base + "/delayed-headers", 5000, "GET", nullptr, 500);
+    CHECK(headersStall.code == 28, "buffered GET response-headers stall completes as CURLE_OPERATION_TIMEDOUT");
+    CHECK(headersStall.errorMsg.find("buffered response headers timeout") != std::string::npos,
+          "buffered response-headers stall reason crosses the wrapper response ABI");
+    Captured postWaits = Fetch(base + "/post-delayed-headers", 5000, "POST", "x", 500);
+    CHECK(postWaits.code == 0 && postWaits.httpCode == 200,
+          "a buffered POST is not cut short while its response headers are slow");
+    Captured noBudget = Fetch(base + "/delayed-headers", 5000, "GET", nullptr, 0);
+    CHECK(noBudget.code == 0 && noBudget.httpCode == 200,
+          "without a body-idle budget a slow GET still completes");
+
     {
         Captured factsResponse;
         StringDic headers{};

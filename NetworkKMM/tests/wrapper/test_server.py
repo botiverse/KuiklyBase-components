@@ -192,6 +192,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        if self.path == "/post-delayed-headers":
+            time.sleep(1.5)
+            self._send(200, b"posted")
+            return
         if self.path == "/post-idle-response":
             self.send_response(200)
             self.send_header("Content-Length", "6")

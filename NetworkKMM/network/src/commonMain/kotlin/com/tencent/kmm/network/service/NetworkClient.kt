@@ -1070,7 +1070,10 @@ internal fun NetworkResponse.isCurlUnresolvedHost(): Boolean =
     statusCode == null && error?.rawCode == CURL_CODE_COULDNT_RESOLVE_HOST
 
 private fun NetworkResponse.isCurlBufferedBodyIdleTimeout(): Boolean =
-    error?.rawCode == 28 && error.message.contains("buffered body idle timeout")
+    error?.rawCode == 28 &&
+        (error.message.contains("buffered body idle timeout") ||
+            // raft.46: a GET/HEAD whose response headers never came on a reused connection.
+            error.message.contains("buffered response headers timeout"))
 
 private fun remainingPlatformCurlTimeoutMillis(totalTimeoutMillis: Long, startedAt: TimeMark): Long? {
     if (totalTimeoutMillis <= 0) return null

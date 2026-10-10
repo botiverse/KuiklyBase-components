@@ -46,6 +46,7 @@ import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlTransferInfoV1IfAvai
 import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlCompletionInfoV1IfAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmCurlMultiApiAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmCreateCurlMultiEngineIfAvailable
+import com.tencent.kmm.network.curl.native.DeleteCurlMultiEngine
 import com.tencent.kmm.network.curl.native.NetworkKmmSubmitBufferedRequestV27IfAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmCancelCurlMultiRequestIfAvailable
 import com.tencent.kmm.network.curl.native.NetworkKmmGetCurlMultiInfoV1IfAvailable
@@ -88,6 +89,11 @@ import kotlinx.cinterop.staticCFunction
 import kotlinx.cinterop.toKString
 import kotlinx.cinterop.usePinned
 import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.ObsoleteCoroutinesApi
 import kotlinx.coroutines.newFixedThreadPoolContext
@@ -156,6 +162,12 @@ internal interface IosCurlNativeBridge {
 
     suspend fun execute(request: IosCurlNativeRequest): CurlNativeResponse
 
+    /** raft.46: runs outside the pooled CURLM engines on a new easy handle (a new connection). */
+    suspend fun executeFresh(request: IosCurlNativeRequest): CurlNativeResponse = execute(request)
+
+    /** raft.46: the pooled engine's HTTP/2 connection stalled; the next request gets a new engine. */
+    fun retirePooledEngine(http3Enabled: Boolean) {}
+
     suspend fun downloadStream(
         request: IosCurlNativeRequest,
         onResponseStart: (Long, String) -> Unit,
@@ -210,6 +222,13 @@ internal object IosCurlCInteropBridge : IosCurlNativeBridge {
         } else {
             executeWithOptionalApiDiagnostics(request).response
         }
+
+    override suspend fun executeFresh(request: IosCurlNativeRequest): CurlNativeResponse =
+        executeWithOptionalApiDiagnostics(request).response
+
+    override fun retirePooledEngine(http3Enabled: Boolean) {
+        IosCurlMultiEngines.retire(http3Enabled)
+    }
 
     private suspend fun executeBufferedMulti(
         request: IosCurlNativeRequest
@@ -593,6 +612,27 @@ private object IosCurlMultiEngines : SynchronizedObject() {
     fun isApiAvailable(): Boolean = synchronized(this) {
         capability ?: (NetworkKmmCurlMultiApiAvailable() != 0).also { capability = it }
     }
+
+    /**
+     * raft.46: swap out the pooled engine whose HTTP/2 connection stalled. It keeps serving what it
+     * already accepted and is deleted after [RETIRED_ENGINE_GRACE_MILLIS], past every request timeout.
+     */
+    fun retire(http3: Boolean) {
+        val retired = synchronized(this) {
+            if (http3) {
+                http3Engine.also { http3Engine = null }
+            } else {
+                defaultEngine.also { defaultEngine = null }
+            }
+        } ?: return
+        retiredEngineScope.launch {
+            delay(RETIRED_ENGINE_GRACE_MILLIS)
+            DeleteCurlMultiEngine(retired)
+        }
+    }
+
+    private const val RETIRED_ENGINE_GRACE_MILLIS = 60_000L
+    private val retiredEngineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     fun engine(http3: Boolean): COpaquePointer? = synchronized(this) {
         val available = capability ?: (NetworkKmmCurlMultiApiAvailable() != 0)

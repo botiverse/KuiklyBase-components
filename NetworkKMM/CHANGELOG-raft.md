@@ -1,5 +1,26 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.46 / 0.1.0-raft.46-ohos (dead reused HTTP/2 connections: Cronet-style recovery)
+
+Hands 79db9fe6 / f717ac6f (artin, Android 1.13.1): the server and ALB answered in milliseconds, but
+on the phone requests on a reused curl HTTP/2 connection got no response headers for 6-30 s. The
+reused-H2 watchdog only existed on the OkHttp lane; the curl lane had nothing between the request
+going out and the 30 s request timeout, and new requests kept multiplexing onto the dead connection.
+
+- Buffered GET/HEAD: once the request went out (PRETRANSFER) and no response headers arrived within
+  the body-idle budget (7 s by default), the request aborts with `buffered response headers timeout`
+  and is replayed once on a fresh connection (the existing replay-safe GET/HEAD body-stall path).
+  Other methods keep waiting: not replay-safe, and a slow write must not be cut short.
+- The replay of any buffered stall now runs outside the pooled CURLM engines on a new easy handle
+  (Android `executeFresh`, iOS non-multi path); before, it re-entered the pool and could land on the
+  same dead connection.
+- A response-headers stall retires the pooled engine (at most once per 10 s per pool) so the
+  requests that follow open a new connection; the retired engine finishes what it accepted and is
+  deleted after 60 s. Android: JNI `nativeRetireMultiEngine`; iOS: `IosCurlMultiEngines.retire`.
+- Idle connections are no longer reused after 20 s (`CURLOPT_MAXAGE_CONN` 90 → 20): libcurl cannot
+  ping-and-wait before reuse like Cronet, so idle connections that a NAT may have dropped are retired.
+- OHOS: the platform-default curl path replays the new headers timeout like a body stall.
+
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 
 Raft task #153 follow-up (artin 2026-10-10: optimise the fallback; Sentinel's survey of

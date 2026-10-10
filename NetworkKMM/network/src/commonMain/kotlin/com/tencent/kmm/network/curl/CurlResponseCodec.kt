@@ -29,7 +29,14 @@ data class CurlNativeResponse(
 )
 
 internal fun CurlNativeResponse.isBufferedBodyIdleTimeout(): Boolean =
-    code == 28 && errorMsg.contains("buffered body idle timeout")
+    code == 28 && (errorMsg.contains("buffered body idle timeout") || isBufferedResponseHeadersTimeout())
+
+/**
+ * raft.46: a buffered GET/HEAD got no response headers within the body-idle budget after its request
+ * went out: the reused HTTP/2 connection is dead. Replayed on a fresh connection like a body stall.
+ */
+internal fun CurlNativeResponse.isBufferedResponseHeadersTimeout(): Boolean =
+    code == 28 && errorMsg.contains("buffered response headers timeout")
 
 internal data class CurlResponseFields(
     val code: Int = 0,
