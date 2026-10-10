@@ -28,6 +28,16 @@ internal fun shouldFreshRetryCurlBufferedStall(
 internal const val CURL_CODE_COULDNT_RESOLVE_HOST: Int = 6
 
 /**
+ * Native pseudo provider CURL_DOH_PROVIDER_STALE_ADDRESS (raft task #150 follow-up): the wrapper
+ * pins the request to the address it last reached for the URL's host:port (remembered from any
+ * transfer that got an HTTP status in the last 10 minutes) instead of resolving at all. With
+ * nothing cached the attempt fails at once as CURLE_COULDNT_RESOLVE_HOST ("stale_address_miss")
+ * and the walk continues with the DoH providers. Not a DoH provider: it never becomes the
+ * preferred first attempt and does not touch [CurlDohPreference].
+ */
+internal const val CURL_DOH_PROVIDER_STALE_ADDRESS: Int = 3
+
+/**
  * Raft task #153: move on to the next resolution attempt (DoH provider, or the system resolver
  * again after a preferred DoH provider failed) only when the host could not be resolved. Nothing
  * was sent to the server (no connection was made), so any method may be retried.
@@ -42,11 +52,18 @@ internal fun shouldRetryCurlWithDohFallback(
 
 /**
  * The resolution attempts after a first attempt that used [firstProvider] (0 = system resolver):
- * after the system, the configured DoH providers in order; after a preferred DoH provider, the
- * system resolver and then the other providers.
+ * after the system, the stale address (no resolver round trip, works where DoH is blocked) and
+ * then the configured DoH providers in order; after a preferred DoH provider, the system
+ * resolver, the stale address and then the other providers.
  */
-internal fun curlDohFallbackAttempts(firstProvider: Int, configured: List<Int>): List<Int> =
-    if (firstProvider == 0) configured.distinct() else listOf(0) + configured.distinct().filter { it != firstProvider }
+internal fun curlDohFallbackAttempts(firstProvider: Int, configured: List<Int>): List<Int> {
+    val providers = configured.distinct().filter { it != CURL_DOH_PROVIDER_STALE_ADDRESS }
+    return if (firstProvider == 0) {
+        listOf(CURL_DOH_PROVIDER_STALE_ADDRESS) + providers
+    } else {
+        listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS) + providers.filter { it != firstProvider }
+    }
+}
 
 /** How long requests go to DoH first after a system resolve failure that DoH fixed. */
 internal const val CURL_DOH_PREFERRED_WINDOW_MILLIS: Long = 60_000L
@@ -132,9 +149,10 @@ internal suspend fun <R> runDohFallback(
     }
     if (!retried) return null
     val unresolved = isUnresolved(last)
-    if (!unresolved && lastProvider != 0) {
+    val lastIsDoh = lastProvider != 0 && lastProvider != CURL_DOH_PROVIDER_STALE_ADDRESS
+    if (!unresolved && lastIsDoh) {
         preference.onDohResolved(lastProvider)
-    } else if (lastProvider != 0) {
+    } else if (lastIsDoh) {
         preference.clear()
     }
     timing(last).freshRetry = true
@@ -142,6 +160,7 @@ internal suspend fun <R> runDohFallback(
         when {
             unresolved -> "doh_fallback_failure"
             lastProvider == 0 -> "system_after_doh_failure"
+            lastProvider == CURL_DOH_PROVIDER_STALE_ADDRESS -> "stale_address_success"
             else -> "doh_fallback_success"
         }
     return last

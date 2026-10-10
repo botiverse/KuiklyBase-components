@@ -31,3 +31,7 @@ internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine)
 
 internal actual fun platformCurlSupportsHttp3(): Boolean =
     AndroidCurlEngineProvider.nativeSupportsHttp3
+
+internal actual fun platformFlushCurlStaleAddresses() {
+    (AndroidCurlEngineProvider.testBridge ?: AndroidCurlJniBridge).flushStaleAddresses()
+}

@@ -240,10 +240,13 @@ object VBTransportCurl {
     /**
      * The device moved to another network, or its DNS configuration changed (raft task #153).
      * Drops the short DoH-first window so the system resolver is tried first again on the new
-     * network, instead of sending names to the DoH provider for up to a minute.
+     * network, instead of sending names to the DoH provider for up to a minute, and forgets
+     * the addresses the wrapper reached on the old network (stale-address retries would
+     * otherwise pin requests to them for up to ten minutes).
      */
     fun onNetworkChanged() {
         com.tencent.kmm.network.curl.curlDohPreference.clear()
+        runCatching { com.tencent.kmm.network.internal.platform.platformFlushCurlStaleAddresses() }
     }
 
     /**
