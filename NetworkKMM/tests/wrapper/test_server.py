@@ -197,6 +197,16 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
+        if self.path in ("/post-redirect-307", "/post-redirect-302"):
+            # raft.46: a redirected POST is a new request libcurl sends on purpose, not a replay.
+            self.send_response(307 if self.path.endswith("307") else 302)
+            self.send_header("Location", "/post-redirected" if self.path.endswith("307") else "/ok")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path == "/post-redirected":
+            self._send(200, b'{"redirectedEchoLen":%d}' % len(body))
+            return
         if self.path in ("/counted", "/counted-slow"):
             # raft.46 dead-connection probe: how many times a POST reached the server.
             global COUNTED_POSTS

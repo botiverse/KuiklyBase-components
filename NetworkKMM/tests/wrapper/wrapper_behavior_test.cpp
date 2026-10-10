@@ -1314,6 +1314,17 @@ int main(int argc, char **argv) {
     CHECK(redir.httpCode == 200, "/redirect followed to 200");
     CHECK(redir.data == "{\"ok\":true}", "/redirect final body is /ok");
 
+    // raft.46: the replay guard (CURLOPT_PREREQFUNCTION refuses a second send that is not a
+    // redirect for non-GET/HEAD) must not mistake a followed redirect for a replay. 307 keeps the
+    // POST and its body; 302 turns it into GET /ok. Both reuse the same keep-alive connection.
+    Captured post307 = Fetch(base + "/post-redirect-307", 5000, "POST", "hello-307");
+    CHECK(post307.code == 0 && post307.httpCode == 200 &&
+              post307.data.find("\"redirectedEchoLen\":9") != std::string::npos,
+          "POST 307 redirect is followed with its body (not refused as a replay)");
+    Captured post302 = Fetch(base + "/post-redirect-302", 5000, "POST", "hello-302");
+    CHECK(post302.code == 0 && post302.httpCode == 200 && post302.data == "{\"ok\":true}",
+          "POST 302 redirect is followed (not refused as a replay)");
+
     // 6. POST body echo (custom-method plumbing).
     Captured post = Fetch(base + "/ok", 5000, "POST", "hello-wrapper");
     CHECK(post.httpCode == 200, "POST succeeds");
