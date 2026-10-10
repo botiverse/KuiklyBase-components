@@ -317,7 +317,20 @@ int SetCurlResolve(CurClientHandle handle, const char *resolveEntry);
 #define CURL_DOH_PROVIDER_NONE 0
 #define CURL_DOH_PROVIDER_ALIDNS 1
 #define CURL_DOH_PROVIDER_CLOUDFLARE 2
+// Not a DoH provider: a stale-address attempt. The request is pinned (via
+// CURLOPT_RESOLVE) to the address the wrapper last reached for the URL's
+// host:port, remembered from any transfer that received an HTTP status within
+// the last 10 minutes and dropped by FlushCurlStaleAddressCache. When nothing
+// is cached the request completes immediately with CURLE_COULDNT_RESOLVE_HOST
+// and errorMsg "stale_address_miss" so the caller moves on to a DoH provider.
+// Hostname and TLS verification are unchanged; only the connect address is.
+#define CURL_DOH_PROVIDER_STALE_ADDRESS 3
 int SetCurlDohFallbackProvider(CurClientHandle handle, int providerId);
+
+// Drop every remembered stale address (see CURL_DOH_PROVIDER_STALE_ADDRESS).
+// Hosts call this when the network changes: addresses reached on the previous
+// network may be unreachable or wrong on the new one. Always returns 1.
+int FlushCurlStaleAddressCache(void);
 
 // Runtime artifact capability probe. Version numbers alone are insufficient:
 // this checks libcurl's compiled feature bits for an actual HTTP/3 backend.
