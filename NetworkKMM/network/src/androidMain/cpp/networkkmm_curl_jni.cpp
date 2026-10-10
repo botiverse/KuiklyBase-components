@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -791,6 +792,203 @@ void NativeFlushStaleAddresses(JNIEnv *, jclass) {
     FlushCurlStaleAddressCache();
 }
 
+// ---- Socket.IO (raft task #154) -------------------------------------------------------------
+// One context per native Socket.IO client. Callbacks run on the wrapper's owner thread; strings go
+// to Kotlin as UTF-8 byte arrays (NewStringUTF needs modified UTF-8 and rejects 4-byte sequences).
+// close() from inside a callback (owner thread) defers freeing the context until the callback
+// returns; otherwise CloseCurlSocketIoClientV1 joins the owner thread, so no callback is in flight.
+struct SocketIoContext {
+    CurlSocketIoHandle handle = nullptr;
+    jobject callback = nullptr;
+    jmethodID on_state = nullptr;
+    jmethodID on_event = nullptr;
+    bool close_requested = false;
+};
+
+thread_local SocketIoContext *t_socket_io_in_callback = nullptr;
+
+jbyteArray Utf8Bytes(JNIEnv *env, const char *value) {
+    const char *text = value == nullptr ? "" : value;
+    const jsize length = static_cast<jsize>(std::strlen(text));
+    jbyteArray bytes = env->NewByteArray(length);
+    if (bytes != nullptr && length > 0) {
+        env->SetByteArrayRegion(bytes, 0, length, reinterpret_cast<const jbyte *>(text));
+    }
+    return bytes;
+}
+
+void FreeSocketIoContext(JNIEnv *env, SocketIoContext *context) {
+    if (context->handle != nullptr) {
+        DeleteCurlSocketIoClientV1(context->handle, CURL_SOCKET_IO_ABI_VERSION);
+        context->handle = nullptr;
+    }
+    if (env != nullptr && context->callback != nullptr) {
+        env->DeleteGlobalRef(context->callback);
+    }
+    delete context;
+}
+
+template <typename Deliver>
+void WithSocketIoCallbackEnv(SocketIoContext *context, Deliver deliver) {
+    if (g_java_vm == nullptr || context == nullptr || context->callback == nullptr) return;
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (g_java_vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+#if defined(__ANDROID__)
+        const jint attach_result = g_java_vm->AttachCurrentThread(&env, nullptr);
+#else
+        const jint attach_result = g_java_vm->AttachCurrentThread(reinterpret_cast<void **>(&env), nullptr);
+#endif
+        if (attach_result != JNI_OK || env == nullptr) return;
+        attached = true;
+    }
+    t_socket_io_in_callback = context;
+    deliver(env);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    t_socket_io_in_callback = nullptr;
+    if (context->close_requested) {
+        // Kotlin closed the client from this callback: the wrapper stopped calling back, so the
+        // context can go now that the callback has returned.
+        FreeSocketIoContext(env, context);
+    }
+    if (attached) g_java_vm->DetachCurrentThread();
+}
+
+void SocketIoOnState(void *ref, int state, int code, const char *detail) {
+    auto *context = static_cast<SocketIoContext *>(ref);
+    WithSocketIoCallbackEnv(context, [&](JNIEnv *env) {
+        jbyteArray detailBytes = Utf8Bytes(env, detail);
+        env->CallVoidMethod(context->callback, context->on_state, state, code, detailBytes);
+        if (detailBytes != nullptr) env->DeleteLocalRef(detailBytes);
+    });
+}
+
+void SocketIoOnEvent(void *ref, const char *eventName, const char *payloadJson) {
+    auto *context = static_cast<SocketIoContext *>(ref);
+    WithSocketIoCallbackEnv(context, [&](JNIEnv *env) {
+        jbyteArray nameBytes = Utf8Bytes(env, eventName);
+        jbyteArray payloadBytes = Utf8Bytes(env, payloadJson);
+        env->CallVoidMethod(context->callback, context->on_event, nameBytes, payloadBytes);
+        if (nameBytes != nullptr) env->DeleteLocalRef(nameBytes);
+        if (payloadBytes != nullptr) env->DeleteLocalRef(payloadBytes);
+    });
+}
+
+std::string JStringOr(JNIEnv *env, jstring value, const char *fallback) {
+    if (value == nullptr) return fallback;
+    const char *chars = env->GetStringUTFChars(value, nullptr);
+    std::string result = chars == nullptr ? fallback : chars;
+    if (chars != nullptr) env->ReleaseStringUTFChars(value, chars);
+    return result;
+}
+
+jlong NativeSocketIoCreate(JNIEnv *env, jclass, jstring server_url, jstring auth_json,
+                           jobjectArray header_names, jobjectArray header_values, jstring ca_info_path,
+                           jstring proxy_url, jlong connect_timeout_ms, jlong receive_poll_ms,
+                           jlong reconnect_initial_delay_ms, jlong reconnect_max_delay_ms,
+                           jintArray doh_provider_ids, jobject callback) {
+    if (server_url == nullptr || callback == nullptr) return 0;
+    jclass callbackClass = env->GetObjectClass(callback);
+    jmethodID onState = env->GetMethodID(callbackClass, "onState", "(II[B)V");
+    jmethodID onEvent = env->GetMethodID(callbackClass, "onEvent", "([B[B)V");
+    env->DeleteLocalRef(callbackClass);
+    if (onState == nullptr || onEvent == nullptr) {
+        env->ExceptionClear();
+        return 0;
+    }
+    const std::string server = JStringOr(env, server_url, "");
+    const std::string auth = JStringOr(env, auth_json, "{}");
+    const std::string caInfo = JStringOr(env, ca_info_path, "");
+    const std::string proxy = JStringOr(env, proxy_url, "");
+    std::vector<std::string> names;
+    std::vector<std::string> values;
+    const jsize headerCount =
+        header_names == nullptr || header_values == nullptr
+            ? 0
+            : std::min(env->GetArrayLength(header_names), env->GetArrayLength(header_values));
+    for (jsize index = 0; index < headerCount; ++index) {
+        auto name = static_cast<jstring>(env->GetObjectArrayElement(header_names, index));
+        auto value = static_cast<jstring>(env->GetObjectArrayElement(header_values, index));
+        names.push_back(JStringOr(env, name, ""));
+        values.push_back(JStringOr(env, value, ""));
+        if (name != nullptr) env->DeleteLocalRef(name);
+        if (value != nullptr) env->DeleteLocalRef(value);
+    }
+    std::vector<StringPair> pairs(names.size());
+    for (size_t index = 0; index < names.size(); ++index) {
+        pairs[index].first = names[index].c_str();
+        pairs[index].second = values[index].c_str();
+    }
+    StringDic dictionary{};
+    dictionary.stringPairs = pairs.empty() ? nullptr : pairs.data();
+    dictionary.size = static_cast<int>(pairs.size());
+
+    auto *context = new SocketIoContext();
+    context->callback = env->NewGlobalRef(callback);
+    context->on_state = onState;
+    context->on_event = onEvent;
+
+    CurlSocketIoConfigV1 config{};
+    config.abiVersion = CURL_SOCKET_IO_ABI_VERSION;
+    config.structSize = sizeof(config);
+    config.serverUrl = server.c_str();
+    config.authJson = auth.c_str();
+    config.headers = &dictionary;
+    config.caInfoPath = caInfo.empty() ? nullptr : caInfo.c_str();
+    config.proxyUrl = proxy.c_str();
+    config.connectTimeoutMs = connect_timeout_ms;
+    config.receivePollMs = receive_poll_ms;
+    config.reconnectInitialDelayMs = reconnect_initial_delay_ms;
+    config.reconnectMaxDelayMs = reconnect_max_delay_ms;
+    CurlSocketIoCallbackV1 nativeCallback{context, SocketIoOnState, SocketIoOnEvent};
+    context->handle = CreateCurlSocketIoClientV1(&config, sizeof(config), CURL_SOCKET_IO_ABI_VERSION,
+                                                 &nativeCallback);
+    if (context->handle == nullptr) {
+        FreeSocketIoContext(env, context);
+        return 0;
+    }
+    if (doh_provider_ids != nullptr) {
+        const jsize count = env->GetArrayLength(doh_provider_ids);
+        if (count > 0) {
+            std::vector<jint> ids(static_cast<size_t>(count));
+            env->GetIntArrayRegion(doh_provider_ids, 0, count, ids.data());
+            std::vector<int> nativeIds(ids.begin(), ids.end());
+            SetCurlSocketIoDohFallbackProviders(context->handle, nativeIds.data(),
+                                                static_cast<int>(nativeIds.size()),
+                                                CURL_SOCKET_IO_ABI_VERSION);
+        }
+    }
+    return reinterpret_cast<jlong>(context);
+}
+
+jboolean NativeSocketIoStart(JNIEnv *, jclass, jlong handle) {
+    auto *context = reinterpret_cast<SocketIoContext *>(handle);
+    if (context == nullptr || context->handle == nullptr) return JNI_FALSE;
+    return StartCurlSocketIoClientV1(context->handle, CURL_SOCKET_IO_ABI_VERSION) != 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+jboolean NativeSocketIoEmit(JNIEnv *env, jclass, jlong handle, jstring event_name, jstring payload_json) {
+    auto *context = reinterpret_cast<SocketIoContext *>(handle);
+    if (context == nullptr || context->handle == nullptr || event_name == nullptr) return JNI_FALSE;
+    const std::string name = JStringOr(env, event_name, "");
+    const std::string payload = JStringOr(env, payload_json, "{}");
+    return EmitCurlSocketIoEventV1(context->handle, name.c_str(), payload.c_str(),
+                                   CURL_SOCKET_IO_ABI_VERSION) != 0 ? JNI_TRUE : JNI_FALSE;
+}
+
+void NativeSocketIoClose(JNIEnv *env, jclass, jlong handle) {
+    auto *context = reinterpret_cast<SocketIoContext *>(handle);
+    if (context == nullptr) return;
+    if (context->handle != nullptr) {
+        CloseCurlSocketIoClientV1(context->handle, CURL_SOCKET_IO_ABI_VERSION);
+    }
+    if (t_socket_io_in_callback == context) {
+        context->close_requested = true;  // freed when the current callback returns
+        return;
+    }
+    FreeSocketIoContext(env, context);
+}
+
 }  // namespace
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
@@ -834,6 +1032,29 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
             const_cast<char *>("nativeFlushStaleAddresses"),
             const_cast<char *>("()V"),
             reinterpret_cast<void *>(NativeFlushStaleAddresses)
+        },
+        {
+            const_cast<char *>("nativeSocketIoCreate"),
+            const_cast<char *>(
+                "(Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;[Ljava/lang/String;Ljava/lang/String;"
+                "Ljava/lang/String;JJJJ[ILcom/tencent/kmm/network/internal/platform/AndroidCurlSocketIoCallback;)J"
+            ),
+            reinterpret_cast<void *>(NativeSocketIoCreate)
+        },
+        {
+            const_cast<char *>("nativeSocketIoStart"),
+            const_cast<char *>("(J)Z"),
+            reinterpret_cast<void *>(NativeSocketIoStart)
+        },
+        {
+            const_cast<char *>("nativeSocketIoEmit"),
+            const_cast<char *>("(JLjava/lang/String;Ljava/lang/String;)Z"),
+            reinterpret_cast<void *>(NativeSocketIoEmit)
+        },
+        {
+            const_cast<char *>("nativeSocketIoClose"),
+            const_cast<char *>("(J)V"),
+            reinterpret_cast<void *>(NativeSocketIoClose)
         }
     };
     const jint result = env->RegisterNatives(bridge_class, methods, sizeof(methods) / sizeof(methods[0]));

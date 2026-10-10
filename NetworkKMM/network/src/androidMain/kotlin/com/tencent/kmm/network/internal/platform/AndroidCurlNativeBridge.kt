@@ -317,6 +317,89 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
 
     @JvmStatic
     private external fun nativeFlushStaleAddresses()
+
+    // ---- Socket.IO (raft task #154): the wrapper's curl Engine.IO v4 / Socket.IO v4 client. ----
+
+    /** Native client handle, or 0. [dohProviderIds] are built-in provider ids, tried in order. */
+    internal fun socketIoCreate(
+        serverUrl: String,
+        authJson: String,
+        headers: Map<String, String>,
+        caInfoPath: String?,
+        proxyUrl: String,
+        connectTimeoutMillis: Long,
+        receivePollMillis: Long,
+        reconnectInitialDelayMillis: Long,
+        reconnectMaxDelayMillis: Long,
+        dohProviderIds: IntArray,
+        callback: AndroidCurlSocketIoCallback,
+    ): Long {
+        if (!loaded) return 0L
+        val entries = headers.entries.toList()
+        return nativeSocketIoCreate(
+            serverUrl,
+            authJson,
+            entries.map { it.key }.toTypedArray(),
+            entries.map { it.value }.toTypedArray(),
+            caInfoPath,
+            proxyUrl,
+            connectTimeoutMillis,
+            receivePollMillis,
+            reconnectInitialDelayMillis,
+            reconnectMaxDelayMillis,
+            dohProviderIds,
+            callback,
+        )
+    }
+
+    internal fun socketIoStart(handle: Long): Boolean = handle != 0L && nativeSocketIoStart(handle)
+
+    internal fun socketIoEmit(handle: Long, eventName: String, payloadJson: String): Boolean =
+        handle != 0L && nativeSocketIoEmit(handle, eventName, payloadJson)
+
+    /** Stops the client and frees it; safe from inside a callback (freed after it returns). */
+    internal fun socketIoClose(handle: Long) {
+        if (handle != 0L) nativeSocketIoClose(handle)
+    }
+
+    @JvmStatic
+    private external fun nativeSocketIoCreate(
+        serverUrl: String,
+        authJson: String,
+        headerNames: Array<String>,
+        headerValues: Array<String>,
+        caInfoPath: String?,
+        proxyUrl: String,
+        connectTimeoutMillis: Long,
+        receivePollMillis: Long,
+        reconnectInitialDelayMillis: Long,
+        reconnectMaxDelayMillis: Long,
+        dohProviderIds: IntArray,
+        callback: AndroidCurlSocketIoCallback,
+    ): Long
+
+    @JvmStatic
+    private external fun nativeSocketIoStart(handle: Long): Boolean
+
+    @JvmStatic
+    private external fun nativeSocketIoEmit(handle: Long, eventName: String, payloadJson: String): Boolean
+
+    @JvmStatic
+    private external fun nativeSocketIoClose(handle: Long)
+}
+
+/** Called from the wrapper's Socket.IO owner thread; strings arrive as UTF-8 bytes. */
+internal class AndroidCurlSocketIoCallback(
+    private val onStateBlock: (state: Int, code: Int, detail: String) -> Unit,
+    private val onEventBlock: (eventName: String, payloadJson: String) -> Unit,
+) {
+    fun onState(state: Int, code: Int, detail: ByteArray?) {
+        onStateBlock(state, code, detail?.decodeToString().orEmpty())
+    }
+
+    fun onEvent(eventName: ByteArray?, payloadJson: ByteArray?) {
+        onEventBlock(eventName?.decodeToString().orEmpty(), payloadJson?.decodeToString().orEmpty())
+    }
 }
 
 internal class AndroidCurlJniCallback(
