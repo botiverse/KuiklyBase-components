@@ -14,15 +14,20 @@
 set -euo pipefail
 
 OPENSSL_VERSION="${OPENSSL_VERSION:-3.5.4}"
-CURL_VERSION="${CURL_VERSION:-8.16.0}"
+CURL_VERSION="${CURL_VERSION:-8.22.0}"
 # SHA-256 pins: same values as build-android-curl.sh — one source set, three
 # platforms. No unchecked build-time downloads in the production line.
 OPENSSL_SHA256="${OPENSSL_SHA256:-967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99}"
-CURL_SHA256="${CURL_SHA256:-a21e20476e39eca5a4fc5cfb00acf84bbc1f5d8443ec3853ad14c26b3c85b970}"
+CURL_SHA256="${CURL_SHA256:-d54dd598bf05927a726deb38df31c6a255ba83ff1de57c5d1464dac3ed8f44a1}"
 NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
 NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
-NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.17.0}"
-NGHTTP3_SHA256="${NGHTTP3_SHA256:-9635173e703174a41f9abd0d790e70562c74ec3805064403477db5a1ef94b8f5}"
+NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.18.0}"
+NGHTTP3_SHA256="${NGHTTP3_SHA256:-2812e9c06583fa24c8dc46bdb5291310a69196352ceaca8fbe98106ff36ae7d8}"
+# ngtcp2 is the QUIC transport (curl's only non-experimental HTTP/3 backend;
+# the OpenSSL-QUIC backend curl 8.16 could use was removed in curl 8.19).
+# Its ossl crypto module needs OpenSSL >= 3.5 and ngtcp2 >= 1.12.
+NGTCP2_VERSION="${NGTCP2_VERSION:-1.25.0}"
+NGTCP2_SHA256="${NGTCP2_SHA256:-1c0843076528a87b65e9a9d455100941f4cb65d44f96c5da6ae56df146043955}"
 IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-12.0}"
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -99,6 +104,8 @@ fetch "https://github.com/nghttp2/nghttp2/releases/download/v${NGHTTP2_VERSION}/
   "${DOWNLOADS_DIR}/nghttp2-${NGHTTP2_VERSION}.tar.gz" "$NGHTTP2_SHA256"
 fetch "https://github.com/ngtcp2/nghttp3/releases/download/v${NGHTTP3_VERSION}/nghttp3-${NGHTTP3_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/nghttp3-${NGHTTP3_VERSION}.tar.gz" "$NGHTTP3_SHA256"
+fetch "https://github.com/ngtcp2/ngtcp2/releases/download/v${NGTCP2_VERSION}/ngtcp2-${NGTCP2_VERSION}.tar.gz" \
+  "${DOWNLOADS_DIR}/ngtcp2-${NGTCP2_VERSION}.tar.gz" "$NGTCP2_SHA256"
 
 # min-version flag differs between device and simulator compilations.
 min_flag() {
@@ -129,9 +136,13 @@ build_slice_arch() {
   local nghttp3_build="${slice_root}/nghttp3-build"
   local nghttp3_prefix="${slice_root}/nghttp3-out"
   local nghttp3_stamp="${nghttp3_prefix}/.build-config"
+  local ngtcp2_source="${slice_root}/ngtcp2-${NGTCP2_VERSION}"
+  local ngtcp2_build="${slice_root}/ngtcp2-build"
+  local ngtcp2_prefix="${slice_root}/ngtcp2-out"
+  local ngtcp2_stamp="${ngtcp2_prefix}/.build-config"
   local wrapper_build="${slice_root}/wrapper-build"
   local merged="${slice_root}/libNetworkKMMCurl.a"
-  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}:source-date=${SOURCE_DATE_EPOCH}:zero-ar-date=${ZERO_AR_DATE}:epoch-file=${SOURCE_DATE_EPOCH_FILE_SHA256}:xcframework-assembler=${XCFRAMEWORK_ASSEMBLER_SHA256}:xcframework-matrix=${XCFRAMEWORK_MATRIX_SHA256}"
+  local build_config="${sdk}:${arch}:${IOS_DEPLOYMENT_TARGET}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}:${NGTCP2_VERSION}:source-date=${SOURCE_DATE_EPOCH}:zero-ar-date=${ZERO_AR_DATE}:epoch-file=${SOURCE_DATE_EPOCH_FILE_SHA256}:xcframework-assembler=${XCFRAMEWORK_ASSEMBLER_SHA256}:xcframework-matrix=${XCFRAMEWORK_MATRIX_SHA256}"
   local sdk_path
   sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
 
@@ -203,6 +214,35 @@ build_slice_arch() {
     printf '%s' "$build_config" > "$nghttp3_stamp"
   fi
 
+  echo "==> [${sdk}/${arch}] ngtcp2 ${NGTCP2_VERSION}"
+  if [[ ! -f "${ngtcp2_prefix}/lib/libngtcp2_crypto_ossl.a" || "$(cat "$ngtcp2_stamp" 2>/dev/null)" != "$build_config" ]]; then
+    rm -rf "$ngtcp2_source" "$ngtcp2_build" "$ngtcp2_prefix"
+    tar -xzf "${DOWNLOADS_DIR}/ngtcp2-${NGTCP2_VERSION}.tar.gz" -C "$slice_root"
+    # ENABLE_OPENSSL against OpenSSL 3.5 builds libngtcp2_crypto_ossl (the QUIC
+    # TLS callback API), which curl's USE_NGTCP2 expects for OpenSSL >= 3.5.
+    cmake -S "$ngtcp2_source" -B "$ngtcp2_build" \
+      -DCMAKE_SYSTEM_NAME=iOS \
+      -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+      -DCMAKE_OSX_SYSROOT="$sdk" \
+      -DCMAKE_OSX_ARCHITECTURES="$arch" \
+      -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_INSTALL_PREFIX="$ngtcp2_prefix" \
+      -DOPENSSL_ROOT_DIR="$openssl_prefix" \
+      -DOPENSSL_USE_STATIC_LIBS=ON \
+      -DOPENSSL_INCLUDE_DIR="${openssl_prefix}/include" \
+      -DOPENSSL_CRYPTO_LIBRARY="${openssl_prefix}/lib/libcrypto.a" \
+      -DOPENSSL_SSL_LIBRARY="${openssl_prefix}/lib/libssl.a" \
+      -DENABLE_OPENSSL=ON \
+      -DENABLE_LIB_ONLY=ON \
+      -DENABLE_SHARED_LIB=OFF \
+      -DENABLE_STATIC_LIB=ON \
+      -DBUILD_TESTING=OFF \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
+    cmake --build "$ngtcp2_build" -j"$JOBS" --target install >/dev/null
+    printf '%s' "$build_config" > "$ngtcp2_stamp"
+  fi
+
   echo "==> [${sdk}/${arch}] curl ${CURL_VERSION}"
   if [[ ! -f "${curl_build}/lib/libcurl.a" || "$(cat "$curl_stamp" 2>/dev/null)" != "$build_config" ]]; then
     rm -rf "$curl_source" "$curl_build"
@@ -237,7 +277,10 @@ build_slice_arch() {
       -DUSE_NGHTTP2=ON \
       -DNGHTTP2_INCLUDE_DIR="${nghttp2_source}/lib/includes" \
       -DNGHTTP2_LIBRARY="${nghttp2_build}/lib/libnghttp2.a" \
-      -DUSE_OPENSSL_QUIC=ON \
+      -DUSE_NGTCP2=ON \
+      -DNGTCP2_INCLUDE_DIR="${ngtcp2_prefix}/include" \
+      -DNGTCP2_LIBRARY="${ngtcp2_prefix}/lib/libngtcp2.a" \
+      -DNGTCP2_CRYPTO_OSSL_LIBRARY="${ngtcp2_prefix}/lib/libngtcp2_crypto_ossl.a" \
       -DNGHTTP3_INCLUDE_DIR="${nghttp3_prefix}/include" \
       -DNGHTTP3_LIBRARY="${nghttp3_prefix}/lib/libnghttp3.a" \
       -DUSE_LIBIDN2=OFF \
@@ -250,7 +293,7 @@ build_slice_arch() {
   # Mach-O archive references are pin-exact supplements. xcrun nm prefixes C
   # symbols with "_", so every symbol match is end-anchored.
   local define
-  for define in USE_NGHTTP2 USE_OPENSSL_QUIC USE_NGHTTP3; do
+  for define in USE_NGHTTP2 USE_NGTCP2 USE_NGHTTP3 OPENSSL_QUIC_API2; do
     if grep -q "#define ${define} 1" "$curl_build/lib/curl_config.h"; then
       echo "==> [${sdk}/${arch}] curl_config.h ${define}: ENABLED"
     else
@@ -271,8 +314,8 @@ build_slice_arch() {
   done <<'HTTP_FEATURE_SYMBOLS'
 HTTP/2 (nghttp2)|nghttp2_session_client_new3
 HTTP/3 (nghttp3)|nghttp3_conn_client_new_versioned
-HTTP/3 (OpenSSL stream)|SSL_new_stream
-HTTP/3 (OpenSSL QUIC method)|OSSL_QUIC_client_method
+HTTP/3 (ngtcp2 client)|ngtcp2_conn_client_new_versioned
+HTTP/3 (ngtcp2 ossl crypto)|ngtcp2_crypto_ossl_configure_client_session
 HTTP_FEATURE_SYMBOLS
 
   echo "==> [${sdk}/${arch}] pbcurlwrapper + merge"
@@ -305,6 +348,8 @@ HTTP_FEATURE_SYMBOLS
     "$curl_build/lib/libcurl.a" \
     "$nghttp2_build/lib/libnghttp2.a" \
     "$nghttp3_prefix/lib/libnghttp3.a" \
+    "$ngtcp2_prefix/lib/libngtcp2_crypto_ossl.a" \
+    "$ngtcp2_prefix/lib/libngtcp2.a" \
     "$openssl_prefix/lib/libssl.a" \
     "$openssl_prefix/lib/libcrypto.a"
   local wrapper_symbols

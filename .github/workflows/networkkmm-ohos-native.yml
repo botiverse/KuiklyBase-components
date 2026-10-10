@@ -236,6 +236,8 @@ jobs:
             NetworkKMM/ohosApp/entry/libs/arm64-v8a/libkn.so
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libcurl.a
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libnghttp3.a
+            NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libngtcp2.a
+            NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libngtcp2_crypto_ossl.a
             NetworkKMM/ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
 
   commit:
@@ -282,6 +284,8 @@ jobs:
             ohosApp/entry/libs/arm64-v8a/libkn.so
             ohosApp/pbcurlwrapper/libs/arm64-v8a/libcurl.a
             ohosApp/pbcurlwrapper/libs/arm64-v8a/libnghttp3.a
+            ohosApp/pbcurlwrapper/libs/arm64-v8a/libngtcp2.a
+            ohosApp/pbcurlwrapper/libs/arm64-v8a/libngtcp2_crypto_ossl.a
             ohosApp/pbcurlwrapper/libs/arm64-v8a/libopenssl.so
           )
           for file in "${files[@]}"; do

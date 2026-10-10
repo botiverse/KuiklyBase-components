@@ -11,15 +11,20 @@
 set -euo pipefail
 
 OPENSSL_VERSION="${OPENSSL_VERSION:-3.5.4}"
-CURL_VERSION="${CURL_VERSION:-8.16.0}"
+CURL_VERSION="${CURL_VERSION:-8.22.0}"
 # SHA-256 pins (task #24 carry-forward from the spike review: no unchecked
 # build-time downloads in the production line).
 OPENSSL_SHA256="${OPENSSL_SHA256:-967311f84955316969bdb1d8d4b983718ef42338639c621ec4c34fddef355e99}"
-CURL_SHA256="${CURL_SHA256:-a21e20476e39eca5a4fc5cfb00acf84bbc1f5d8443ec3853ad14c26b3c85b970}"
+CURL_SHA256="${CURL_SHA256:-d54dd598bf05927a726deb38df31c6a255ba83ff1de57c5d1464dac3ed8f44a1}"
 NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
 NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
-NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.17.0}"
-NGHTTP3_SHA256="${NGHTTP3_SHA256:-9635173e703174a41f9abd0d790e70562c74ec3805064403477db5a1ef94b8f5}"
+NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.18.0}"
+NGHTTP3_SHA256="${NGHTTP3_SHA256:-2812e9c06583fa24c8dc46bdb5291310a69196352ceaca8fbe98106ff36ae7d8}"
+# ngtcp2 is the QUIC transport (curl's only non-experimental HTTP/3 backend;
+# the OpenSSL-QUIC backend curl 8.16 could use was removed in curl 8.19).
+# Its ossl crypto module needs OpenSSL >= 3.5 and ngtcp2 >= 1.12.
+NGTCP2_VERSION="${NGTCP2_VERSION:-1.25.0}"
+NGTCP2_SHA256="${NGTCP2_SHA256:-1c0843076528a87b65e9a9d455100941f4cb65d44f96c5da6ae56df146043955}"
 ANDROID_API="${ANDROID_API:-23}"
 ANDROID_ABI="${ANDROID_ABI:-arm64-v8a}"
 NDK_VERSION="${NDK_VERSION:-28.0.13004108}"
@@ -70,10 +75,14 @@ NGHTTP3_SOURCE="${BUILD_ROOT}/nghttp3-${NGHTTP3_VERSION}"
 NGHTTP3_BUILD="${BUILD_ROOT}/nghttp3-build"
 NGHTTP3_PREFIX="${BUILD_ROOT}/nghttp3-out"
 NGHTTP3_STAMP="${NGHTTP3_PREFIX}/.android-build-config"
+NGTCP2_SOURCE="${BUILD_ROOT}/ngtcp2-${NGTCP2_VERSION}"
+NGTCP2_BUILD="${BUILD_ROOT}/ngtcp2-build"
+NGTCP2_PREFIX="${BUILD_ROOT}/ngtcp2-out"
+NGTCP2_STAMP="${NGTCP2_PREFIX}/.android-build-config"
 CURL_SOURCE="${BUILD_ROOT}/curl-${CURL_VERSION}"
 CURL_BUILD="${BUILD_ROOT}/curl-build"
 CURL_STAMP="${CURL_BUILD}/.android-build-config"
-BUILD_CONFIG="${NDK_VERSION}:${ANDROID_API}:${ANDROID_ABI}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}:source-date=${SOURCE_DATE_EPOCH}"
+BUILD_CONFIG="${NDK_VERSION}:${ANDROID_API}:${ANDROID_ABI}:${OPENSSL_VERSION}:${CURL_VERSION}:${NGHTTP2_VERSION}:${NGHTTP3_VERSION}:${NGTCP2_VERSION}:source-date=${SOURCE_DATE_EPOCH}"
 
 if [[ ! -f "$SHIM_SOURCE" ]]; then
   echo "JNI shim not found: $SHIM_SOURCE" >&2
@@ -196,6 +205,37 @@ if [[ ! -f "${NGHTTP3_PREFIX}/lib/libnghttp3.a" || "$(cat "$NGHTTP3_STAMP" 2>/de
   printf '%s' "$BUILD_CONFIG" > "$NGHTTP3_STAMP"
 fi
 
+echo "==> Building ngtcp2 ${NGTCP2_VERSION} for ${ANDROID_ABI}"
+fetch "https://github.com/ngtcp2/ngtcp2/releases/download/v${NGTCP2_VERSION}/ngtcp2-${NGTCP2_VERSION}.tar.gz" \
+  "${DOWNLOADS_DIR}/ngtcp2-${NGTCP2_VERSION}.tar.gz" "$NGTCP2_SHA256"
+if [[ ! -f "${NGTCP2_PREFIX}/lib/libngtcp2_crypto_ossl.a" || "$(cat "$NGTCP2_STAMP" 2>/dev/null)" != "$BUILD_CONFIG" ]]; then
+  rm -rf "$NGTCP2_SOURCE" "$NGTCP2_BUILD" "$NGTCP2_PREFIX"
+  tar -xzf "${DOWNLOADS_DIR}/ngtcp2-${NGTCP2_VERSION}.tar.gz" -C "$BUILD_ROOT"
+  # ENABLE_OPENSSL selects the crypto module; against OpenSSL 3.5 ngtcp2 builds
+  # libngtcp2_crypto_ossl (the QUIC TLS callback API), which is what curl's
+  # USE_NGTCP2 expects for an OpenSSL >= 3.5 TLS backend.
+  cmake -S "$NGTCP2_SOURCE" -B "$NGTCP2_BUILD" \
+    -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake" \
+    -DANDROID_ABI="$ANDROID_ABI" \
+    -DANDROID_PLATFORM="android-${ANDROID_API}" \
+    -DANDROID_STL=c++_static \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX="$NGTCP2_PREFIX" \
+    -DOPENSSL_ROOT_DIR="$OPENSSL_PREFIX" \
+    -DOPENSSL_USE_STATIC_LIBS=ON \
+    -DOPENSSL_INCLUDE_DIR="${OPENSSL_PREFIX}/include" \
+    -DOPENSSL_CRYPTO_LIBRARY="${OPENSSL_PREFIX}/lib/libcrypto.a" \
+    -DOPENSSL_SSL_LIBRARY="${OPENSSL_PREFIX}/lib/libssl.a" \
+    -DENABLE_OPENSSL=ON \
+    -DENABLE_LIB_ONLY=ON \
+    -DENABLE_SHARED_LIB=OFF \
+    -DENABLE_STATIC_LIB=ON \
+    -DBUILD_TESTING=OFF \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON >/dev/null
+  cmake --build "$NGTCP2_BUILD" -j"$JOBS" --target install >/dev/null
+  printf '%s' "$BUILD_CONFIG" > "$NGTCP2_STAMP"
+fi
+
 echo "==> Building curl ${CURL_VERSION} for ${ANDROID_ABI}"
 fetch "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
   "${DOWNLOADS_DIR}/curl-${CURL_VERSION}.tar.gz" "$CURL_SHA256"
@@ -232,7 +272,10 @@ if [[ ! -f "${CURL_BUILD}/lib/libcurl.a" || "$(cat "$CURL_STAMP" 2>/dev/null)" !
     -DUSE_NGHTTP2=ON \
     -DNGHTTP2_INCLUDE_DIR="${NGHTTP2_SOURCE}/lib/includes" \
     -DNGHTTP2_LIBRARY="${NGHTTP2_BUILD}/lib/libnghttp2.a" \
-    -DUSE_OPENSSL_QUIC=ON \
+    -DUSE_NGTCP2=ON \
+    -DNGTCP2_INCLUDE_DIR="${NGTCP2_PREFIX}/include" \
+    -DNGTCP2_LIBRARY="${NGTCP2_PREFIX}/lib/libngtcp2.a" \
+    -DNGTCP2_CRYPTO_OSSL_LIBRARY="${NGTCP2_PREFIX}/lib/libngtcp2_crypto_ossl.a" \
     -DNGHTTP3_INCLUDE_DIR="${NGHTTP3_PREFIX}/include" \
     -DNGHTTP3_LIBRARY="${NGHTTP3_PREFIX}/lib/libnghttp3.a" \
     -DUSE_LIBIDN2=OFF \
@@ -244,7 +287,7 @@ fi
 # HTTP/2 + HTTP/3 hard gates: curl's cmake can silently drop an optional
 # backend if cross-compilation detection wobbles. Treat generated config as
 # the stable primary gate and pin-exact archive references as supplements.
-for define in USE_NGHTTP2 USE_OPENSSL_QUIC USE_NGHTTP3; do
+for define in USE_NGHTTP2 USE_NGTCP2 USE_NGHTTP3 OPENSSL_QUIC_API2; do
   if grep -q "#define ${define} 1" "$CURL_BUILD/lib/curl_config.h"; then
     echo "curl_config.h ${define}: ENABLED"
   else
@@ -264,8 +307,8 @@ check_curl_reference() {
 }
 check_curl_reference "HTTP/2 (nghttp2)" "nghttp2_session_client_new3"
 check_curl_reference "HTTP/3 (nghttp3)" "nghttp3_conn_client_new_versioned"
-check_curl_reference "HTTP/3 (OpenSSL stream)" "SSL_new_stream"
-check_curl_reference "HTTP/3 (OpenSSL QUIC method)" "OSSL_QUIC_client_method"
+check_curl_reference "HTTP/3 (ngtcp2 client)" "ngtcp2_conn_client_new_versioned"
+check_curl_reference "HTTP/3 (ngtcp2 ossl crypto)" "ngtcp2_crypto_ossl_configure_client_session"
 
 echo "==> Linking libnetworkkmmcurl.so (${ANDROID_ABI})"
 "$CXX" \
@@ -291,6 +334,8 @@ echo "==> Linking libnetworkkmmcurl.so (${ANDROID_ABI})"
   "$CURL_BUILD/lib/libcurl.a" \
   "$NGHTTP2_BUILD/lib/libnghttp2.a" \
   "$NGHTTP3_PREFIX/lib/libnghttp3.a" \
+  "$NGTCP2_PREFIX/lib/libngtcp2_crypto_ossl.a" \
+  "$NGTCP2_PREFIX/lib/libngtcp2.a" \
   "$OPENSSL_PREFIX/lib/libssl.a" \
   "$OPENSSL_PREFIX/lib/libcrypto.a" \
   -llog \

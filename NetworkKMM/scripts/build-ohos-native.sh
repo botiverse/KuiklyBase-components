@@ -17,7 +17,7 @@ set -euo pipefail
 # inside ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image.
 
 OPENSSL_VERSION="${OPENSSL_VERSION:-3.5.4}"
-CURL_VERSION="${CURL_VERSION:-8.16.0}"
+CURL_VERSION="${CURL_VERSION:-8.22.0}"
 # Content-encoding codecs compiled into libcurl so the general-purpose network
 # service can decode any standard Content-Encoding (gzip/deflate/br/zstd). Built
 # without these, libcurl only understands "identity" and fails compressed
@@ -29,8 +29,13 @@ NGHTTP2_VERSION="${NGHTTP2_VERSION:-1.64.0}"
 # nghttp2 publishes no sibling .sha256 — hard-pinned (verified against the
 # real release download; same discipline as the android/ios lines).
 NGHTTP2_SHA256="${NGHTTP2_SHA256:-20e73f3cf9db3f05988996ac8b3a99ed529f4565ca91a49eb0550498e10621e8}"
-NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.17.0}"
-NGHTTP3_SHA256="${NGHTTP3_SHA256:-9635173e703174a41f9abd0d790e70562c74ec3805064403477db5a1ef94b8f5}"
+NGHTTP3_VERSION="${NGHTTP3_VERSION:-1.18.0}"
+NGHTTP3_SHA256="${NGHTTP3_SHA256:-2812e9c06583fa24c8dc46bdb5291310a69196352ceaca8fbe98106ff36ae7d8}"
+# ngtcp2 is the QUIC transport (curl's only non-experimental HTTP/3 backend;
+# the OpenSSL-QUIC backend curl 8.16 could use was removed in curl 8.19).
+# Its ossl crypto module needs OpenSSL >= 3.5 and ngtcp2 >= 1.12.
+NGTCP2_VERSION="${NGTCP2_VERSION:-1.25.0}"
+NGTCP2_SHA256="${NGTCP2_SHA256:-1c0843076528a87b65e9a9d455100941f4cb65d44f96c5da6ae56df146043955}"
 OHOS_ARCH="arm64-v8a"
 OHOS_TRIPLE="aarch64-linux-ohos"
 
@@ -253,6 +258,31 @@ else
   printf '%s' "$NGHTTP3_VERSION" > "$NGHTTP3_STAMP"
 fi
 
+NGTCP2_STAMP="$DEPS_PREFIX/.ngtcp2-version"
+if [[ -f "$DEPS_PREFIX/lib/libngtcp2_crypto_ossl.a" && "$(cat "$NGTCP2_STAMP" 2>/dev/null)" == "${NGTCP2_VERSION}:${OPENSSL_VERSION}" ]]; then
+  echo "==> ngtcp2 already built, reusing"
+else
+  echo "==> Fetching ngtcp2 ${NGTCP2_VERSION}"
+  fetch "https://github.com/ngtcp2/ngtcp2/releases/download/v${NGTCP2_VERSION}/ngtcp2-${NGTCP2_VERSION}.tar.gz" \
+    "ngtcp2-${NGTCP2_VERSION}.tar.gz"
+  echo "${NGTCP2_SHA256}  ngtcp2-${NGTCP2_VERSION}.tar.gz" | sha256sum -c -
+  rm -rf "ngtcp2-${NGTCP2_VERSION}" ngtcp2-build
+  tar xf "ngtcp2-${NGTCP2_VERSION}.tar.gz"
+  echo "==> Building ngtcp2 + ngtcp2_crypto_ossl (static)"
+  # ENABLE_OPENSSL against OpenSSL 3.5 builds libngtcp2_crypto_ossl (the QUIC
+  # TLS callback API), which curl's USE_NGTCP2 expects for OpenSSL >= 3.5.
+  cmake_cross "ngtcp2-${NGTCP2_VERSION}" ngtcp2-build \
+    -DOPENSSL_ROOT_DIR="$OPENSSL_PREFIX" \
+    -DOPENSSL_USE_STATIC_LIBS=ON \
+    -DOPENSSL_INCLUDE_DIR="$OPENSSL_PREFIX/include" \
+    -DOPENSSL_CRYPTO_LIBRARY="$OPENSSL_PREFIX/lib/libcrypto.a" \
+    -DOPENSSL_SSL_LIBRARY="$OPENSSL_PREFIX/lib/libssl.a" \
+    -DENABLE_OPENSSL=ON \
+    -DENABLE_LIB_ONLY=ON -DENABLE_SHARED_LIB=OFF -DENABLE_STATIC_LIB=ON -DBUILD_TESTING=OFF
+  rm -f "$DEPS_PREFIX"/lib/libngtcp2*.so*
+  printf '%s' "${NGTCP2_VERSION}:${OPENSSL_VERSION}" > "$NGTCP2_STAMP"
+fi
+
 echo "==> Fetching curl ${CURL_VERSION}"
 fetch_and_verify \
   "https://curl.se/download/curl-${CURL_VERSION}.tar.gz" \
@@ -293,7 +323,10 @@ cmake -S "curl-${CURL_VERSION}" -B curl-build \
   -DUSE_NGHTTP2=ON \
   -DNGHTTP2_INCLUDE_DIR="$DEPS_PREFIX/include" \
   -DNGHTTP2_LIBRARY="$DEPS_PREFIX/lib/libnghttp2.a" \
-  -DUSE_OPENSSL_QUIC=ON \
+  -DUSE_NGTCP2=ON \
+  -DNGTCP2_INCLUDE_DIR="$DEPS_PREFIX/include" \
+  -DNGTCP2_LIBRARY="$DEPS_PREFIX/lib/libngtcp2.a" \
+  -DNGTCP2_CRYPTO_OSSL_LIBRARY="$DEPS_PREFIX/lib/libngtcp2_crypto_ossl.a" \
   -DNGHTTP3_INCLUDE_DIR="$DEPS_PREFIX/include" \
   -DNGHTTP3_LIBRARY="$DEPS_PREFIX/lib/libnghttp3.a" \
   -DUSE_LIBIDN2=OFF \
@@ -323,7 +356,7 @@ if [[ -z "$CURL_STATIC_LIB" ]]; then
 fi
 
 echo "==> Checking libcurl HTTP/2 + HTTP/3 configuration"
-for define in USE_NGHTTP2 USE_OPENSSL_QUIC USE_NGHTTP3; do
+for define in USE_NGHTTP2 USE_NGTCP2 USE_NGHTTP3 OPENSSL_QUIC_API2; do
   if grep -q "#define ${define} 1" curl-build/lib/curl_config.h; then
     echo "curl_config.h ${define}: ENABLED"
   else
@@ -359,8 +392,8 @@ check_reference "brotli" "BrotliDecoderDecompressStream"
 check_reference "zstd" "ZSTD_decompressStream"
 check_reference "nghttp2 (HTTP/2)" "nghttp2_session_client_new3"
 check_reference "nghttp3 (HTTP/3)" "nghttp3_conn_client_new_versioned"
-check_reference "OpenSSL HTTP/3 stream" "SSL_new_stream"
-check_reference "OpenSSL QUIC method" "OSSL_QUIC_client_method"
+check_reference "ngtcp2 (HTTP/3 client)" "ngtcp2_conn_client_new_versioned"
+check_reference "ngtcp2 ossl crypto" "ngtcp2_crypto_ossl_configure_client_session"
 if [[ "$dependency_missing" -ne 0 ]]; then
   echo "One or more optional dependencies are missing from libcurl.a" >&2
   exit 1
@@ -373,7 +406,7 @@ cp -f "$BUILD_ROOT/libopenssl.so" "$WRAPPER_LIBS_DIR/libopenssl.so"
 # libcurl.a is static, so the content-encoding codecs it references must be
 # provided at the final libpbcurlwrapper.so link. Stage their static archives
 # next to libcurl.a; the wrapper CMakeLists links them.
-for codec in libz.a libbrotlidec.a libbrotlicommon.a libzstd.a libnghttp2.a libnghttp3.a; do
+for codec in libz.a libbrotlidec.a libbrotlicommon.a libzstd.a libnghttp2.a libnghttp3.a libngtcp2.a libngtcp2_crypto_ossl.a; do
   if [[ ! -f "$DEPS_PREFIX/lib/$codec" ]]; then
     echo "missing codec archive: $DEPS_PREFIX/lib/$codec" >&2
     exit 1

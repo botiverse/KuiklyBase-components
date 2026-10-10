@@ -323,7 +323,10 @@ connections after 90 s (`CURLOPT_MAXAGE_CONN`), so a connection a carrier NAT dr
 noticed by the kernel instead of failing the next request on first write.
 
 HTTP/3 is an explicit native curl gray gate. The current Android, iOS, and OHOS curl artifacts build
-curl 8.16.0 with OpenSSL 3.5.4 QUIC and nghttp3 1.17.0. Existing consumers can keep the process-wide
+curl 8.22.0 with the ngtcp2 1.25.0 QUIC transport (its `ossl` crypto module on OpenSSL 3.5.4) and
+nghttp3 1.18.0. Earlier carriers used curl's OpenSSL-QUIC backend, which curl kept experimental and
+removed in 8.19; on devices it showed long stalls ending in "QUIC connection has been shut down"
+rather than clean failures. Existing consumers can keep the process-wide
 default in the verified curl runtime configuration:
 
 ```kotlin
