@@ -22,7 +22,7 @@ class CurlDohFallbackTest {
 
     @AfterTest
     fun resetProcessPreference() {
-        curlDohPreference.clear()
+        curlDohPreference.reset()
     }
 
     private fun unresolved() = CurlNativeResponse(code = CURL_CODE_COULDNT_RESOLVE_HOST, errorMsg = "Could not resolve host")
@@ -134,6 +134,40 @@ class CurlDohFallbackTest {
         assertEquals(1, curlDohPreference.preferredProvider(listOf(1)))
         VBTransportCurl.onNetworkChanged()
         assertEquals(0, curlDohPreference.preferredProvider(listOf(1)))
+    }
+
+    @Test
+    fun aProviderThatJustFailedGoesToTheBackUntilTheWindowEnds() {
+        val attempts = mutableListOf<Int>()
+        // Provider 1 hangs/refuses (reported unresolved), provider 2 resolves.
+        run(unresolved(), 0, listOf(1, 2), mapOf(CURL_DOH_PROVIDER_STALE_ADDRESS to staleMiss(), 1 to unresolved(), 2 to ok()), attempts)
+        assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS, 1, 2), attempts)
+
+        // The preferred window is the shortcut for the next request; once it is dropped (e.g. the
+        // preferred provider failed too), the recently failed provider 1 still comes last.
+        preference.clear()
+        attempts.clear()
+        run(unresolved(), 0, listOf(1, 2), mapOf(CURL_DOH_PROVIDER_STALE_ADDRESS to staleMiss(), 1 to ok(), 2 to ok()), attempts)
+        assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS, 2), attempts, "the provider that just failed is not asked first")
+
+        now += 60_001
+        preference.clear()
+        attempts.clear()
+        run(unresolved(), 0, listOf(1, 2), mapOf(CURL_DOH_PROVIDER_STALE_ADDRESS to staleMiss(), 1 to ok()), attempts)
+        assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS, 1), attempts, "after the window the configured order is back")
+    }
+
+    @Test
+    fun aProviderThatResolvesIsForgivenAndANetworkChangeForgetsFailures() {
+        preference.onDohFailed(1)
+        assertEquals(listOf(2, 1), preference.orderByRecentFailures(listOf(1, 2)))
+        preference.onDohResolved(1)
+        assertEquals(listOf(1, 2), preference.orderByRecentFailures(listOf(1, 2)))
+
+        curlDohPreference.onDohFailed(1)
+        assertEquals(listOf(2, 1), curlDohPreference.orderByRecentFailures(listOf(1, 2)))
+        VBTransportCurl.onNetworkChanged()
+        assertEquals(listOf(1, 2), curlDohPreference.orderByRecentFailures(listOf(1, 2)))
     }
 
     @Test

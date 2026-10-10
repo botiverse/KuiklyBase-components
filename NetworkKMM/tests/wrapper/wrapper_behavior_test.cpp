@@ -13,7 +13,10 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <curl/curl.h>
 #include "curl_wrapper.h"
@@ -334,6 +337,65 @@ static void CheckStaleAddressCache(const std::string &base, const std::string &p
     CurClientHandle rejecting = CreateCurlClient("wrapper-stale-address-reject");
     CHECK(SetCurlDohFallbackProvider(rejecting, 99) == 0, "unknown provider ids are still rejected");
     DeleteCurlClient(rejecting);
+}
+
+// Raft task #153 (raft.45): a fallback attempt that never reached the server is reported as
+// unresolved so the routing layer moves on. A one-shot local server answers once (seeding the
+// stale-address cache for its port) and then closes, so the stale attempt's connect is refused.
+static void CheckFallbackAttemptUnreachableMovesOn() {
+    const int listener = socket(AF_INET, SOCK_STREAM, 0);
+    CHECK(listener >= 0, "one-shot server socket");
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    address.sin_port = 0;
+    CHECK(bind(listener, reinterpret_cast<sockaddr *>(&address), sizeof(address)) == 0, "one-shot server bind");
+    CHECK(listen(listener, 1) == 0, "one-shot server listen");
+    socklen_t length = sizeof(address);
+    getsockname(listener, reinterpret_cast<sockaddr *>(&address), &length);
+    const std::string port = std::to_string(ntohs(address.sin_port));
+    std::thread server([listener]() {
+        const int client = accept(listener, nullptr, nullptr);
+        if (client >= 0) {
+            char buffer[2048];
+            (void) recv(client, buffer, sizeof(buffer), 0);
+            const char *response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            (void) send(client, response, std::strlen(response), 0);
+            close(client);
+        }
+    });
+
+    const std::string fakeHost = "oneshot-host.invalid";
+    const std::string fakeUrl = "http://" + fakeHost + ":" + port + "/ok";
+    FlushCurlStaleAddressCache();
+    {
+        Captured seeded;
+        StringDic headers{};
+        CurlRequest request{};
+        request.url = fakeUrl.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+        CurlCallback callback{&seeded, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-oneshot-seed");
+        const std::string pin = fakeHost + ":" + port + ":127.0.0.1";
+        CHECK(SetCurlResolve(handle, pin.c_str()) == 1, "one-shot seed pins the fake host");
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+        DeleteCurlClient(handle);
+        CHECK(seeded.code == CURLE_OK && seeded.httpCode == 200, "one-shot seed reached the server");
+    }
+    server.join();
+    close(listener);
+
+    const auto started = std::chrono::steady_clock::now();
+    Captured refused = FetchWithProvider(fakeUrl, CURL_DOH_PROVIDER_STALE_ADDRESS, 30000);
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - started).count();
+    CHECK(refused.invoked, "refused stale attempt still delivers one terminal callback");
+    CHECK(refused.code == CURLE_COULDNT_RESOLVE_HOST,
+          "a fallback attempt whose connect is refused is reported as unresolved (the walk moves on)");
+    CHECK(elapsedMs < 4500, "a fallback attempt never outlives its resolve+connect budget");
+    FlushCurlStaleAddressCache();
 }
 
 static Captured FetchCapped(const std::string &url, int64_t maxBytes) {
@@ -1628,6 +1690,7 @@ int main(int argc, char **argv) {
     CheckDecodedContentEncoding(base, "/br", "brotli", supportsBrotli);
     CheckDecodedContentEncoding(base, "/zstd", "zstd", supportsZstd);
     CheckStaleAddressCache(base, base);
+    CheckFallbackAttemptUnreachableMovesOn();
 
     if (gFailures > 0) {
         std::fprintf(stderr, "\n%d failure(s)\n", gFailures);

@@ -1,5 +1,23 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
+
+Raft task #153 follow-up (artin 2026-10-10: optimise the fallback; Sentinel's survey of
+Firefox TRR, Chrome, Android/iOS and the Aliyun/Tencent HTTPDNS SDKs).
+
+- Each fallback resolution attempt (a DoH provider or the stale address) gets its own
+  resolve+connect budget of 4 s instead of the request's whole remaining timeout. If that
+  phase times out, or the connection is refused, before anything was sent, the attempt is
+  reported as unresolved (`CURLE_COULDNT_RESOLVE_HOST`, log `fallback_attempt_unreachable`)
+  and the next attempt runs. A provider that hangs no longer eats the request. Data transfer
+  keeps the request's timeouts; once a transfer started its real result stands. Same for the
+  Socket.IO WebSocket connect (`websocket_doh_attempt_unreachable`).
+- Failure memory: a DoH provider whose attempt failed goes to the back of the order for 60 s
+  (the same window as the preferred provider), so the next requests do not hit it first. A
+  provider that resolves is forgiven; `VBTransportCurl.onNetworkChanged()` and changing the
+  provider list forget all of it. The trigger is unchanged: only after the system resolver
+  failed.
+
 ## 0.1.0-raft.44 / 0.1.0-raft.44-ohos (Socket.IO events without arguments)
 
 - curl Socket.IO client: an event emitted without arguments (`42["name"]`,
