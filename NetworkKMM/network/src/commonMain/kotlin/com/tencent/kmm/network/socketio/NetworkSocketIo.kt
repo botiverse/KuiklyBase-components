@@ -46,7 +46,7 @@ interface NetworkSocketIoClient {
 }
 
 /**
- * Platform factory. V1 is implemented by the C++/libcurl runtime on OHOS.
+ * Platform factory. V1 is the C++/libcurl runtime on Android (JNI), iOS and OHOS (raft task #154).
  * Other targets report unsupported instead of silently selecting another
  * protocol stack.
  */
