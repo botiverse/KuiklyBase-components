@@ -70,6 +70,34 @@ the kernel and keeps normal reuse.
   last): each GET reaches the server at most twice at this layer, the GET with a status is not
   replayed and keeps its status (so the routing layer does not retry it), the POST exactly once.
 
+### Also in raft.46: HTTP/3 transport on ngtcp2 instead of OpenSSL-QUIC, curl 8.22.0
+
+Raft follow-up to the HTTP/3 field analysis (artin 2026-10-10: QUIC was on by default
+through 1.12 and stalled on many devices, especially behind proxies). The feedback logs
+showed the stall shape, not hard failures: on the same device 30-36 % of HTTP/3
+requests took over 5 s against 0-4 % over HTTP/2, and the slow ones ended in
+"QUIC connection has been shut down" after 17-26 s.
+
+- Root cause is the QUIC implementation we compiled in, not HTTP/3 itself. All three
+  carriers used curl's OpenSSL-QUIC backend (`USE_OPENSSL_QUIC`, OpenSSL 3.5's own QUIC
+  stack). curl kept that backend experimental because OpenSSL's QUIC API forces curl
+  to busy-loop (uploads at 100 % CPU, 2-4x slower, up to 25x the memory of ngtcp2)
+  and removed it in curl 8.19.0. curl's QUIC keep-alive fix for idle connections
+  (curl #17057) only exists for ngtcp2.
+- Android, iOS and OHOS curl builds now use ngtcp2 1.25.0 with its `ossl` crypto
+  module on the existing OpenSSL 3.5.4 (`USE_NGTCP2`, `OPENSSL_QUIC_API2`), nghttp3
+  1.18.0, and curl 8.22.0. TLS, certificate verification and the CA pin policy are
+  unchanged; OpenSSL is still the TLS backend. Each build hard-gates `USE_NGTCP2`,
+  `USE_NGHTTP3` and `OPENSSL_QUIC_API2` in `curl_config.h` and checks the
+  `ngtcp2_conn_client_new_versioned` / `ngtcp2_crypto_ossl_configure_client_session`
+  references so an h2-only artifact cannot pass silently.
+- OHOS stages `libngtcp2.a` and `libngtcp2_crypto_ossl.a` beside `libnghttp3.a` for
+  the pbcurlwrapper link; the paired-artifact manifest in the native workflow lists
+  them.
+- No Kotlin or wrapper API change. HTTP/3 stays off by default on all platforms
+  (mobile #2699); the device comparison has to be repeated on this stack before any
+  new HTTP/3 rollout.
+
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 
 Raft task #153 follow-up (artin 2026-10-10: optimise the fallback; Sentinel's survey of

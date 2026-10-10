@@ -46,5 +46,7 @@ target_link_libraries(pbcurlwrapper PUBLIC
         ${PB_LIBS_DIR}/libzstd.a
         ${PB_LIBS_DIR}/libnghttp2.a
         ${PB_LIBS_DIR}/libnghttp3.a
+        ${PB_LIBS_DIR}/libngtcp2_crypto_ossl.a
+        ${PB_LIBS_DIR}/libngtcp2.a
         ${PB_LIBS_DIR}/libopenssl.so
 )

@@ -240,8 +240,11 @@ val client = NetworkClient(
 开关。HTTPDNS 仍不可用，因为当前没有保留原始 host/SNI 的安全 resolver 合同；设置
 `httpDnsEnabled` 会以 `HTTPDNS_UNSUPPORTED` 使 curl ineligible。
 
-HTTP/3 是 native curl 的显式灰度 gate。当前 Android、iOS、OHOS curl 产物使用 curl 8.16.0、
-OpenSSL 3.5.4 QUIC 和 nghttp3 1.17.0；已有调用方可以继续用已验证 curl runtime 配置作为进程默认值：
+HTTP/3 是 native curl 的显式灰度 gate。当前 Android、iOS、OHOS curl 产物使用 curl 8.22.0、
+ngtcp2 1.25.0 QUIC 传输层（基于 OpenSSL 3.5.4 的 `ossl` crypto 模块）和 nghttp3 1.18.0。此前的产物
+使用 curl 自带的 OpenSSL-QUIC 后端，curl 一直将其标为实验性并在 8.19 中移除；真机上它表现为长时间
+卡住后以 "QUIC connection has been shut down" 结束，而不是干净地失败。已有调用方可以继续用已验证
+curl runtime 配置作为进程默认值：
 
 ```kotlin
 VBTransportCurl.configure(
