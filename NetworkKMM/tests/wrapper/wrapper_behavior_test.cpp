@@ -215,6 +215,127 @@ static Captured Fetch(const std::string &url, int64_t timeoutMs = 5000,
     return captured;
 }
 
+// Stale-address attempts (CURL_DOH_PROVIDER_STALE_ADDRESS): a buffered GET
+// issued with the pseudo provider set, optionally pinning nothing itself.
+static Captured FetchWithProvider(const std::string &url, int providerId, int64_t timeoutMs = 5000) {
+    Captured captured;
+    StringDic headers{};
+    CurlRequest request{};
+    request.url = url.c_str();
+    request.method = "GET";
+    request.headers = &headers;
+    request.timeout = timeoutMs;
+
+    CurlCallback callback{&captured, OnResponse};
+    CurClientHandle handle = CreateCurlClient("wrapper-stale-address-test");
+    CHECK(SetCurlDohFallbackProvider(handle, providerId) == 1, "provider id accepted by SetCurlDohFallbackProvider");
+    StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+    DeleteCurlClient(handle);
+    return captured;
+}
+
+// The stale-address cache remembers the address a transfer reached and lets a
+// later attempt for the same host:port skip the resolver entirely; a host that
+// was never reached fails fast as an unresolved host; a network-change flush
+// forgets everything. `base` is http://127.0.0.1:<port>: to prove the pinned
+// address (not the resolver) carried the retry, the second request names the
+// server by a hostname that does not resolve anywhere ("stale-host.invalid")
+// after the cache was seeded for that host:port through a resolve pin.
+static void CheckStaleAddressCache(const std::string &base, const std::string &proxyUrl) {
+    const std::string port = base.substr(base.rfind(':') + 1);
+    const std::string fakeHost = "stale-host.invalid";
+    const std::string fakeUrl = "http://" + fakeHost + ":" + port + "/ok";
+
+    FlushCurlStaleAddressCache();
+    Captured miss = FetchWithProvider(fakeUrl, CURL_DOH_PROVIDER_STALE_ADDRESS);
+    CHECK(miss.invoked, "stale miss still delivers exactly one terminal callback");
+    CHECK(miss.code == CURLE_COULDNT_RESOLVE_HOST, "stale miss is reported as CURLE_COULDNT_RESOLVE_HOST");
+    CHECK(miss.errorMsg == "stale_address_miss", "stale miss carries the stale_address_miss error message");
+
+    // Seed: reach the server under the fake hostname through an explicit resolve
+    // pin (the system resolver cannot resolve .invalid), as a real request would
+    // after a normal successful resolution.
+    {
+        Captured seeded;
+        StringDic headers{};
+        CurlRequest request{};
+        request.url = fakeUrl.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+        CurlCallback callback{&seeded, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-stale-address-seed");
+        const std::string pin = fakeHost + ":" + port + ":127.0.0.1";
+        CHECK(SetCurlResolve(handle, pin.c_str()) == 1, "seed request pins the fake host to 127.0.0.1");
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+        DeleteCurlClient(handle);
+        CHECK(seeded.code == CURLE_OK && seeded.httpCode == 200, "seed request reached the server");
+    }
+    // The seed's explicit pin lives on in the process-wide shared DNS cache
+    // (libcurl never expires CURLOPT_RESOLVE entries); drop it so the checks
+    // below exercise the stale cache, not that pin.
+    {
+        Captured unpin;
+        StringDic headers{};
+        CurlRequest request{};
+        request.url = fakeUrl.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 3000;
+        CurlCallback callback{&unpin, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-stale-address-unpin");
+        const std::string unpinEntry = "-" + fakeHost + ":" + port;
+        CHECK(SetCurlResolve(handle, unpinEntry.c_str()) == 1, "unpin entry accepted");
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+        DeleteCurlClient(handle);
+        CHECK(unpin.code == CURLE_COULDNT_RESOLVE_HOST, "after unpinning, the fake host no longer resolves from the shared cache");
+    }
+
+    Captured hit = FetchWithProvider(fakeUrl, CURL_DOH_PROVIDER_STALE_ADDRESS);
+    CHECK(hit.code == CURLE_OK, "stale hit connects without any resolver");
+    CHECK(hit.httpCode == 200, "stale hit completes the request on the remembered address");
+
+    Captured unresolved = FetchWithProvider(fakeUrl, CURL_DOH_PROVIDER_NONE, 3000);
+    CHECK(unresolved.code == CURLE_COULDNT_RESOLVE_HOST,
+          "a stale hit does not leak its pin into the shared DNS cache (plain request still unresolved)");
+
+    Captured otherPort = FetchWithProvider("http://" + fakeHost + ":1/ok", CURL_DOH_PROVIDER_STALE_ADDRESS);
+    CHECK(otherPort.code == CURLE_COULDNT_RESOLVE_HOST && otherPort.errorMsg == "stale_address_miss",
+          "stale entries are keyed by host:port, a different port is a miss");
+
+    CHECK(FlushCurlStaleAddressCache() == 1, "FlushCurlStaleAddressCache returns 1");
+    Captured flushed = FetchWithProvider(fakeUrl, CURL_DOH_PROVIDER_STALE_ADDRESS);
+    CHECK(flushed.code == CURLE_COULDNT_RESOLVE_HOST && flushed.errorMsg == "stale_address_miss",
+          "flush forgets the remembered address");
+
+    // A transfer that went through a proxy must not seed the cache: libcurl's
+    // primary IP is then the proxy's, and pinning the origin to it would only
+    // produce a TLS mismatch later. The proxy here is the server itself, which
+    // answers the absolute-URI GET like an origin would.
+    if (!proxyUrl.empty()) {
+        Captured viaProxy;
+        StringDic headers{};
+        CurlRequest request{};
+        request.url = fakeUrl.c_str();
+        request.method = "GET";
+        request.headers = &headers;
+        request.timeout = 5000;
+        CurlCallback callback{&viaProxy, OnResponse};
+        CurClientHandle handle = CreateCurlClient("wrapper-stale-address-proxy");
+        SetCurlProxy(handle, proxyUrl.c_str());
+        StartRequestV27(handle, &request, sizeof(request), CURL_WRAPPER_ABI_VERSION, &callback);
+        DeleteCurlClient(handle);
+        CHECK(viaProxy.httpCode > 0, "proxied request reached a server");
+        Captured afterProxy = FetchWithProvider(fakeUrl, CURL_DOH_PROVIDER_STALE_ADDRESS);
+        CHECK(afterProxy.code == CURLE_COULDNT_RESOLVE_HOST && afterProxy.errorMsg == "stale_address_miss",
+              "a proxied transfer does not seed the stale address cache");
+    }
+
+    CurClientHandle rejecting = CreateCurlClient("wrapper-stale-address-reject");
+    CHECK(SetCurlDohFallbackProvider(rejecting, 99) == 0, "unknown provider ids are still rejected");
+    DeleteCurlClient(rejecting);
+}
+
 static Captured FetchCapped(const std::string &url, int64_t maxBytes) {
     Captured captured;
     StringDic headers{};
@@ -1506,6 +1627,7 @@ int main(int argc, char **argv) {
     CheckDecodedContentEncoding(base, "/gzip", "gzip", supportsGzip);
     CheckDecodedContentEncoding(base, "/br", "brotli", supportsBrotli);
     CheckDecodedContentEncoding(base, "/zstd", "zstd", supportsZstd);
+    CheckStaleAddressCache(base, base);
 
     if (gFailures > 0) {
         std::fprintf(stderr, "\n%d failure(s)\n", gFailures);

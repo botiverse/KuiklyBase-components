@@ -18,3 +18,10 @@ package com.tencent.kmm.network.internal.platform
 
 /** True only when the linked curl artifact reports CURL_VERSION_HTTP3. */
 internal expect fun platformCurlSupportsHttp3(): Boolean
+
+/**
+ * Drops the native wrapper's remembered stale addresses (CURL_DOH_PROVIDER_STALE_ADDRESS).
+ * Called on network change: addresses reached on the previous network may be wrong on the new
+ * one. Must never throw; a missing native library is a no-op.
+ */
+internal expect fun platformFlushCurlStaleAddresses()

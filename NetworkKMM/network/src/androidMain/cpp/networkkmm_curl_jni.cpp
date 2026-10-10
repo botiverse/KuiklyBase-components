@@ -787,6 +787,10 @@ jboolean NativeSupportsHttp3(JNIEnv *, jclass) {
     return CurlSupportsHttp3() != 0 ? JNI_TRUE : JNI_FALSE;
 }
 
+void NativeFlushStaleAddresses(JNIEnv *, jclass) {
+    FlushCurlStaleAddressCache();
+}
+
 }  // namespace
 
 JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
@@ -825,6 +829,11 @@ JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
             const_cast<char *>("nativeSupportsHttp3"),
             const_cast<char *>("()Z"),
             reinterpret_cast<void *>(NativeSupportsHttp3)
+        },
+        {
+            const_cast<char *>("nativeFlushStaleAddresses"),
+            const_cast<char *>("()V"),
+            reinterpret_cast<void *>(NativeFlushStaleAddresses)
         }
     };
     const jint result = env->RegisterNatives(bridge_class, methods, sizeof(methods) / sizeof(methods[0]));

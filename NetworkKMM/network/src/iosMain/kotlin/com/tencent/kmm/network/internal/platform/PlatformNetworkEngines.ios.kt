@@ -16,9 +16,11 @@
  */
 package com.tencent.kmm.network.internal.platform
 
+import com.tencent.kmm.network.curl.native.FlushCurlStaleAddressCache
 import com.tencent.kmm.network.service.NetworkEngine
 import com.tencent.kmm.network.service.NetworkTransportEngine
 import com.tencent.kmm.network.service.VBTransportNetworkEngine
+import kotlinx.cinterop.ExperimentalForeignApi
 
 internal actual val platformDefaultNetworkTransportEngine: NetworkTransportEngine =
     NetworkTransportEngine.KTOR
@@ -31,3 +33,8 @@ internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine)
 
 internal actual fun platformCurlSupportsHttp3(): Boolean =
     IosCurlEngineProvider.nativeSupportsHttp3
+
+@OptIn(ExperimentalForeignApi::class)
+internal actual fun platformFlushCurlStaleAddresses() {
+    FlushCurlStaleAddressCache()
+}

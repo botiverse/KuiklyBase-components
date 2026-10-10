@@ -17,6 +17,7 @@
 package com.tencent.kmm.network.internal.platform
 
 import com.tencent.qqlive.kmm.native.libcurl.CurlSupportsHttp3
+import com.tencent.qqlive.kmm.native.libcurl.FlushCurlStaleAddressCache
 import com.tencent.kmm.network.service.NetworkEngine
 import com.tencent.kmm.network.service.NetworkTransportEngine
 import com.tencent.kmm.network.service.VBTransportNetworkEngine
@@ -33,3 +34,8 @@ internal actual fun resolvePlatformNetworkEngine(engine: NetworkTransportEngine)
 
 @OptIn(ExperimentalForeignApi::class)
 internal actual fun platformCurlSupportsHttp3(): Boolean = CurlSupportsHttp3() != 0
+
+@OptIn(ExperimentalForeignApi::class)
+internal actual fun platformFlushCurlStaleAddresses() {
+    FlushCurlStaleAddressCache()
+}

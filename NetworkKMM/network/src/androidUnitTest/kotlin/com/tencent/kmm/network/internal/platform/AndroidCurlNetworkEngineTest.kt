@@ -30,6 +30,7 @@ import com.tencent.kmm.network.export.NetworkRetryPolicy
 import com.tencent.kmm.network.export.NetworkStreamTimeoutPolicy
 import com.tencent.kmm.network.export.NetworkTransferProgress
 import com.tencent.kmm.network.export.NetworkCurlProxyConfiguration
+import com.tencent.kmm.network.curl.CURL_DOH_PROVIDER_STALE_ADDRESS
 import com.tencent.kmm.network.curl.curlDohPreference
 import com.tencent.kmm.network.export.NetworkCurlDohFallbackProvider
 import com.tencent.kmm.network.export.NetworkCurlRuntimeConfiguration
@@ -184,6 +185,7 @@ class AndroidCurlNetworkEngineTest {
         configureDohFallback(NetworkCurlDohFallbackProvider.ALIDNS)
         val bridge = FakeBridge().apply {
             executeResponses += CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
+            executeResponses += CurlNativeResponse(code = 6, errorMsg = "stale_address_miss")
             executeResponses += CurlNativeResponse(code = 0, httpCode = 200, data = "ok".encodeToByteArray())
         }
         // POST too: an unresolved host means nothing was sent.
@@ -197,7 +199,7 @@ class AndroidCurlNetworkEngineTest {
         val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
 
         assertEquals("ok", response.body.text())
-        assertEquals(listOf(0, 1), bridge.executeRequests.map { it.dohFallbackProvider })
+        assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS, 1), bridge.executeRequests.map { it.dohFallbackProvider })
         assertContentEquals("{}".encodeToByteArray(), bridge.executeRequests[1].body)
         assertTrue(response.timing.freshRetry)
         assertEquals("doh_fallback_success", response.timing.freshRetryResult)
@@ -228,7 +230,7 @@ class AndroidCurlNetworkEngineTest {
         }
         val request = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
         val response = AndroidCurlNetworkEngine(bothFail).execute(request, NetworkCall(request))
-        assertEquals(listOf(0, 2), bothFail.executeRequests.map { it.dohFallbackProvider })
+        assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS, 2), bothFail.executeRequests.map { it.dohFallbackProvider })
         assertEquals("doh_fallback_failure", response.timing.freshRetryResult)
     }
 
@@ -238,12 +240,13 @@ class AndroidCurlNetworkEngineTest {
         val unresolved = CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
         val bridge = FakeBridge().apply {
             executeResponses += unresolved // system
+            executeResponses += CurlNativeResponse(code = 6, errorMsg = "stale_address_miss") // nothing cached yet
             executeResponses += unresolved.copy() // alidns
             executeResponses += CurlNativeResponse(code = 0, httpCode = 200) // cloudflare
         }
         val first = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
         val firstResponse = AndroidCurlNetworkEngine(bridge).execute(first, NetworkCall(first))
-        assertEquals(listOf(0, 1, 2), bridge.executeRequests.map { it.dohFallbackProvider })
+        assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS, 1, 2), bridge.executeRequests.map { it.dohFallbackProvider })
         assertEquals("doh_fallback_success", firstResponse.timing.freshRetryResult)
 
         // The next request goes straight to the provider that worked: no system failure first.
@@ -268,6 +271,23 @@ class AndroidCurlNetworkEngineTest {
         val fourth = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
         AndroidCurlNetworkEngine(bridge).execute(fourth, NetworkCall(fourth))
         assertEquals(listOf(0), bridge.executeRequests.map { it.dohFallbackProvider })
+    }
+
+    @Test
+    fun aRememberedAddressAnswersBeforeAnyDohProviderIsAsked() = runBlocking {
+        configureDohFallback(NetworkCurlDohFallbackProvider.ALIDNS, NetworkCurlDohFallbackProvider.CLOUDFLARE)
+        val bridge = FakeBridge().apply {
+            executeResponses += CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
+            executeResponses += CurlNativeResponse(code = 0, httpCode = 200, data = "ok".encodeToByteArray())
+        }
+        val request = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test")
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals("ok", response.body.text())
+        assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS), bridge.executeRequests.map { it.dohFallbackProvider })
+        assertEquals("stale_address_success", response.timing.freshRetryResult)
+        assertEquals(0, curlDohPreference.preferredProvider(listOf(1, 2)), "a stale hit does not start a DoH window")
     }
 
     private fun configureDohFallback(vararg providers: NetworkCurlDohFallbackProvider) {
@@ -1011,7 +1031,7 @@ class AndroidCurlNetworkEngineTest {
     fun downloadStreamRetriesAnUnresolvedHostThroughDoh() = runBlocking {
         configureDohFallback(NetworkCurlDohFallbackProvider.ALIDNS)
         val bridge = FakeBridge().apply {
-            unresolvedStreamAttempts = 1
+            unresolvedStreamAttempts = 2 // system resolver, then the (empty) stale address cache
             streamStatus = 200
             streamHeaders = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n"
             streamChunks = listOf("abc".encodeToByteArray())
@@ -1027,7 +1047,7 @@ class AndroidCurlNetworkEngineTest {
             onChunk = chunks::add
         )
 
-        assertEquals(listOf(0, 1), bridge.streamRequests.map { it.dohFallbackProvider })
+        assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS, 1), bridge.streamRequests.map { it.dohFallbackProvider })
         assertEquals(listOf(200), starts, "the caller sees one response start, from the DoH attempt")
         assertContentEquals("abc".encodeToByteArray(), chunks.single())
         assertEquals("doh_fallback_success", response.timing.freshRetryResult)
@@ -1053,7 +1073,7 @@ class AndroidCurlNetworkEngineTest {
     fun uploadStreamRetriesAnUnresolvedHostThroughDohWithTheWholeBody() = runBlocking {
         configureDohFallback(NetworkCurlDohFallbackProvider.CLOUDFLARE)
         val bridge = FakeBridge().apply {
-            unresolvedUploadAttempts = 1
+            unresolvedUploadAttempts = 2 // system resolver, then the (empty) stale address cache
             uploadReadSize = 2
             uploadResponse = CurlNativeResponse(code = 0, httpCode = 200, data = "done".encodeToByteArray())
         }
@@ -1072,7 +1092,7 @@ class AndroidCurlNetworkEngineTest {
         val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
 
         assertEquals("done", response.body.text())
-        assertEquals(listOf(0, 2), bridge.uploadNativeRequests.map { it.dohFallbackProvider })
+        assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS, 2), bridge.uploadNativeRequests.map { it.dohFallbackProvider })
         assertContentEquals("abcdef".encodeToByteArray(), bridge.uploadedBytes)
         assertEquals("doh_fallback_success", response.timing.freshRetryResult)
     }

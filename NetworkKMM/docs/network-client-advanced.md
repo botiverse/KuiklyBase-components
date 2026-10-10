@@ -302,6 +302,25 @@ can never short-circuit the DoH attempt, and DoH answers never leak into system-
 All clients use a 20 s DNS cache timeout (libcurl default 60 s), so a negative entry lasts ~10 s
 after a DNS outage ends instead of ~30 s.
 
+#### Stale address before DoH
+
+Between the failed system resolver and the first DoH provider, the walk tries the **stale
+address**: the address the native wrapper last reached for the request's `host:port`, remembered
+from any transfer that received an HTTP status within the last 10 minutes (bounded to 64 hosts).
+That attempt makes no resolver round trip at all and also works where the DoH providers are
+unreachable; it is what Chrome calls StaleDNS. With nothing remembered it fails at once
+(`stale_address_miss`) and the DoH providers follow. The pinned address only decides where the TCP
+connection goes — the request keeps its hostname for SNI and certificate verification, and the pin
+lives in that attempt's private DNS cache, never in the shared one. A stale hit does not refresh
+the entry (its lifetime is bounded by the last real resolution) and does not start the DoH-first
+window. `VBTransportCurl.onNetworkChanged()` also forgets every remembered address. Diagnostics:
+`freshRetryResult = stale_address_success`; the attempt order is visible as `dohFallbackProvider`
+`0 → 3 → providers…` (3 is the stale-address pseudo provider, not configurable by hosts).
+
+All curl connections enable TCP keepalive (45 s idle / 45 s interval, as Chrome) and retire idle
+connections after 90 s (`CURLOPT_MAXAGE_CONN`), so a connection a carrier NAT dropped silently is
+noticed by the kernel instead of failing the next request on first write.
+
 HTTP/3 is an explicit native curl gray gate. The current Android, iOS, and OHOS curl artifacts build
 curl 8.16.0 with OpenSSL 3.5.4 QUIC and nghttp3 1.17.0. Existing consumers can keep the process-wide
 default in the verified curl runtime configuration:

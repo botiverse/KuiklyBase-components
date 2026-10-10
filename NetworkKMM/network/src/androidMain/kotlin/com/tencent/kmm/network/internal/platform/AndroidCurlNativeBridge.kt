@@ -79,6 +79,9 @@ internal interface AndroidCurlNativeBridge {
     val isAvailable: Boolean
     val supportsHttp3: Boolean
 
+    /** Forget the wrapper's remembered stale addresses (network changed). No-op when not linked. */
+    fun flushStaleAddresses() {}
+
     suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse
 
     /** Executes outside the process pooled CURLM engines on a new easy handle. */
@@ -113,6 +116,12 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
 
     override val supportsHttp3: Boolean
         get() = loaded && runCatching { nativeSupportsHttp3() }.getOrDefault(false)
+
+    override fun flushStaleAddresses() {
+        if (loaded) {
+            runCatching { nativeFlushStaleAddresses() }
+        }
+    }
 
     override suspend fun execute(request: AndroidCurlNativeRequest): CurlNativeResponse {
         if (!asyncSubmitAvailable.get()) {
@@ -305,6 +314,9 @@ internal object AndroidCurlJniBridge : AndroidCurlNativeBridge {
 
     @JvmStatic
     private external fun nativeSupportsHttp3(): Boolean
+
+    @JvmStatic
+    private external fun nativeFlushStaleAddresses()
 }
 
 internal class AndroidCurlJniCallback(

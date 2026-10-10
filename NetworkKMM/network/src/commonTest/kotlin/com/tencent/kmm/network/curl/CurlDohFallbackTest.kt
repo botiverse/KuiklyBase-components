@@ -27,6 +27,7 @@ class CurlDohFallbackTest {
 
     private fun unresolved() = CurlNativeResponse(code = CURL_CODE_COULDNT_RESOLVE_HOST, errorMsg = "Could not resolve host")
     private fun ok() = CurlNativeResponse(code = 0, httpCode = 200)
+    private fun staleMiss() = CurlNativeResponse(code = CURL_CODE_COULDNT_RESOLVE_HOST, errorMsg = "stale_address_miss")
 
     private fun run(
         first: CurlNativeResponse,
@@ -60,8 +61,8 @@ class CurlDohFallbackTest {
     @Test
     fun providersAreTriedInOrderAndTheWinnerBecomesPreferred() {
         val attempts = mutableListOf<Int>()
-        val result = run(unresolved(), 0, listOf(1, 2), mapOf(1 to unresolved(), 2 to ok()), attempts)
-        assertEquals(listOf(1, 2), attempts)
+        val result = run(unresolved(), 0, listOf(1, 2), mapOf(CURL_DOH_PROVIDER_STALE_ADDRESS to staleMiss(), 1 to unresolved(), 2 to ok()), attempts)
+        assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS, 1, 2), attempts, "the stale address is tried before any DoH provider")
         assertEquals("doh_fallback_success", result?.elapse?.freshRetryResult)
         assertTrue(result?.elapse?.freshRetry == true)
         assertEquals(2, preference.preferredProvider(listOf(1, 2)))
@@ -70,8 +71,8 @@ class CurlDohFallbackTest {
     @Test
     fun allProvidersFailingIsReportedAndLeavesNoPreference() {
         val attempts = mutableListOf<Int>()
-        val result = run(unresolved(), 0, listOf(1, 2), mapOf(1 to unresolved(), 2 to unresolved()), attempts)
-        assertEquals(listOf(1, 2), attempts)
+        val result = run(unresolved(), 0, listOf(1, 2), mapOf(CURL_DOH_PROVIDER_STALE_ADDRESS to staleMiss(), 1 to unresolved(), 2 to unresolved()), attempts)
+        assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS, 1, 2), attempts)
         assertEquals("doh_fallback_failure", result?.elapse?.freshRetryResult)
         assertEquals(0, preference.preferredProvider(listOf(1, 2)))
     }
@@ -85,9 +86,38 @@ class CurlDohFallbackTest {
 
         preference.onDohResolved(2)
         val result = run(unresolved(), 2, listOf(1, 2), mapOf(0 to ok()), attempts)
-        assertEquals(listOf(0), attempts)
+        assertEquals(listOf(0), attempts, "the system resolver comes first after a failed preferred provider")
         assertEquals("system_after_doh_failure", result?.elapse?.freshRetryResult)
         assertEquals(0, preference.preferredProvider(listOf(1, 2)), "a failed preferred provider is dropped")
+    }
+
+    @Test
+    fun aStaleAddressHitEndsTheWalkWithoutTouchingTheDohPreference() {
+        val attempts = mutableListOf<Int>()
+        val result = run(unresolved(), 0, listOf(1, 2), mapOf(CURL_DOH_PROVIDER_STALE_ADDRESS to ok()), attempts)
+        assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS), attempts, "no DoH provider is asked once the stale address connected")
+        assertEquals("stale_address_success", result?.elapse?.freshRetryResult)
+        assertTrue(result?.elapse?.freshRetry == true)
+        assertEquals(0, preference.preferredProvider(listOf(1, 2)), "a stale hit is not a DoH preference")
+    }
+
+    @Test
+    fun aStaleAddressMissDoesNotClearAnExistingDohPreferenceWindow() {
+        preference.onDohResolved(1)
+        val attempts = mutableListOf<Int>()
+        // Preferred provider 1 failed → system → stale miss → provider 2 resolves.
+        val result = run(unresolved(), 1, listOf(1, 2), mapOf(0 to unresolved(), CURL_DOH_PROVIDER_STALE_ADDRESS to staleMiss(), 2 to ok()), attempts)
+        assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS, 2), attempts)
+        assertEquals("doh_fallback_success", result?.elapse?.freshRetryResult)
+        assertEquals(2, preference.preferredProvider(listOf(1, 2)))
+    }
+
+    @Test
+    fun theStaleAddressIsNeverListedTwiceEvenIfAHostConfiguresIt() {
+        assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS, 1), curlDohFallbackAttempts(0, listOf(CURL_DOH_PROVIDER_STALE_ADDRESS, 1, CURL_DOH_PROVIDER_STALE_ADDRESS)))
+        assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS, 2), curlDohFallbackAttempts(1, listOf(1, 2)))
+        assertEquals(emptyList(), curlDohFallbackAttempts(0, emptyList()), "DoH off also turns the stale attempt off")
+        assertEquals(emptyList(), curlDohFallbackAttempts(0, listOf(CURL_DOH_PROVIDER_STALE_ADDRESS)))
     }
 
     @Test

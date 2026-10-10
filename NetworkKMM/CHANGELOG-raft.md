@@ -1,5 +1,23 @@
 # NetworkKMM Raft fork changelog
 
+## Unreleased (stale-address retry, keepalive)
+
+- Stale-address retry (raft task #150 follow-up; Hands 6604f4c4). After the
+  system resolver fails and before any DoH provider is asked, a request is
+  retried pinned to the address the wrapper last reached for the same
+  host:port (remembered from transfers that got an HTTP status, 10 minute
+  lifetime, 64 hosts, dropped by `VBTransportCurl.onNetworkChanged()`): no
+  resolver round trip, works where DoH is blocked. New native pseudo provider
+  `CURL_DOH_PROVIDER_STALE_ADDRESS` (3) and C API `FlushCurlStaleAddressCache`;
+  a stale attempt runs without the shared CURLSH so its `CURLOPT_RESOLVE` pin
+  never outlives the attempt. Diagnostics: `freshRetryResult =
+  stale_address_success`; attempt order `0 → 3 → providers`. Hostname and TLS
+  verification unchanged.
+- Native wrapper: TCP keepalive (45 s idle / interval) and
+  `CURLOPT_MAXAGE_CONN` 90 s on every connection. Native carriers refreshed
+  on all three platforms from this source (Android run 38023035063, OHOS run
+  38024086813, iOS run 38023036735).
+
 ## 0.1.0-raft.42 / 0.1.0-raft.42-ohos (DoH for downloads and uploads)
 
 - DNS-over-HTTPS fallback now also covers streaming downloads and uploads
