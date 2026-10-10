@@ -50,7 +50,7 @@ class CurlBufferedRecoveryTest {
     @Test
     fun dohFallbackAttemptOrder() {
         assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS, 1, 2), curlDohFallbackAttempts(0, listOf(1, 2)))
-        assertEquals(listOf(CURL_DOH_PROVIDER_STALE_ADDRESS), curlDohFallbackAttempts(0, emptyList()))
+        assertEquals(emptyList(), curlDohFallbackAttempts(0, emptyList()))
         // A preferred provider failed: the system resolver again, then the others.
         assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS, 2), curlDohFallbackAttempts(1, listOf(1, 2)))
         assertEquals(listOf(0, CURL_DOH_PROVIDER_STALE_ADDRESS), curlDohFallbackAttempts(1, listOf(1)))

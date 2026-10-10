@@ -58,6 +58,8 @@ internal fun shouldRetryCurlWithDohFallback(
  */
 internal fun curlDohFallbackAttempts(firstProvider: Int, configured: List<Int>): List<Int> {
     val providers = configured.distinct().filter { it != CURL_DOH_PROVIDER_STALE_ADDRESS }
+    // One gate: with DoH fallback off (no providers) nothing is retried, stale address included.
+    if (providers.isEmpty()) return emptyList()
     return if (firstProvider == 0) {
         listOf(CURL_DOH_PROVIDER_STALE_ADDRESS) + providers
     } else {
