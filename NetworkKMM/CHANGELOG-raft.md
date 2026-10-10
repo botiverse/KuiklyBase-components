@@ -1,7 +1,17 @@
 # NetworkKMM Raft fork changelog
 
-## Unreleased (stale-address retry, keepalive)
+## 0.1.0-raft.43 / 0.1.0-raft.43-ohos (curl Socket.IO on all platforms, stale-address retry)
 
+- curl Socket.IO client on Android, iOS and OHOS (raft task #154; #167,
+  #169, #170). `NetworkSocketIoFactory.isSupported` is now true on all three
+  (Android through new JNI natives, iOS through the existing cinterop; the
+  macOS behavior-test lane keeps an unsupported stub). The WebSocket connect
+  gets the same DNS-over-HTTPS fallback as HTTP requests: only when the
+  system-resolver connect fails with `CURLE_COULDNT_RESOLVE_HOST` is each
+  provider from `VBTransportCurl.setDohFallbackProviders` tried, through the
+  new additive C API `SetCurlSocketIoDohFallbackProviders` (the config struct
+  is unchanged). Android callbacks hand strings to Kotlin as UTF-8 bytes;
+  closing from inside a callback is safe.
 - Stale-address retry (raft task #150 follow-up; Hands 6604f4c4). After the
   system resolver fails and before any DoH provider is asked, a request is
   retried pinned to the address the wrapper last reached for the same
@@ -14,9 +24,10 @@
   stale_address_success`; attempt order `0 → 3 → providers`. Hostname and TLS
   verification unchanged.
 - Native wrapper: TCP keepalive (45 s idle / interval) and
-  `CURLOPT_MAXAGE_CONN` 90 s on every connection. Native carriers refreshed
-  on all three platforms from this source (Android run 38023035063, OHOS run
-  38024086813, iOS run 38023036735).
+  `CURLOPT_MAXAGE_CONN` 90 s on every connection.
+- Native carriers: iOS and OHOS from #168 (iOS run 38023036735, OHOS run
+  38024086813); Android re-refreshed for the Socket.IO JNI in #170 (run
+  38028449233). Freshness gates assert committed == rebuilt on master.
 
 ## 0.1.0-raft.42 / 0.1.0-raft.42-ohos (DoH for downloads and uploads)
 
