@@ -218,8 +218,9 @@ object VBTransportCurl {
 
     /**
      * DNS-over-HTTPS fallback, tried in order (empty = off, the default; raft task #153). When the
-     * system resolver fails to resolve a host (CURLE_COULDNT_RESOLVE_HOST), a buffered request is
-     * retried through each provider until one resolves it. A successful system resolution is never
+     * system resolver fails to resolve a host (CURLE_COULDNT_RESOLVE_HOST), the request is retried
+     * through each provider until one resolves it: buffered requests, and streaming downloads and
+     * uploads as long as nothing was transferred yet. A successful system resolution is never
      * replaced. After a system failure that DoH fixed, requests go to that provider first for a
      * short window instead of failing on the system resolver each time; [onNetworkChanged] drops
      * the window.

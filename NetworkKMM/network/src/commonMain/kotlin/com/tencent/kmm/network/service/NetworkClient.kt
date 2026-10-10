@@ -878,15 +878,47 @@ object VBTransportNetworkEngine : NetworkEngine {
         call: NetworkCall,
         onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
         onChunk: (ByteArray) -> Unit
-    ): NetworkResponse = suspendCancellableCoroutine { continuation ->
+    ): NetworkResponse {
         if (usesCurlPlatformDefault) {
             val availability = prepareCurlRuntime(request)
-            if (!availability.available) {
-                return@suspendCancellableCoroutine continuation.resume(
-                    curlRuntimeFailureResponse(request, availability)
-                )
-            }
+            if (!availability.available) return curlRuntimeFailureResponse(request, availability)
         }
+        val dohProviders = if (usesCurlPlatformDefault) preparedCurlDohFallbackProviders(request) else emptyList()
+        val preferredDohProvider = curlDohPreference.preferredProvider(dohProviders)
+        var responseStarted = false
+        var delivered = 0L
+        val trackedResponseStart: (Int, Long?, Map<String, List<String>>) -> Unit = { status, length, headers ->
+            responseStarted = true
+            onResponseStart(status, length, headers)
+        }
+        val trackedChunk: (ByteArray) -> Unit = { chunk ->
+            delivered += chunk.size
+            onChunk(chunk)
+        }
+        val first = downloadStreamAttempt(request, call, preferredDohProvider, trackedResponseStart, trackedChunk)
+        if (dohProviders.isEmpty()) return first
+        // Raft task #153 (OHOS curl through VBTransport): an unresolved host delivered nothing, so
+        // the stream can start over through DoH. Never once a response started or a byte arrived.
+        return runDohFallback(
+            first = first,
+            firstProvider = preferredDohProvider,
+            configuredProviders = dohProviders,
+            isUnresolved = { it.isCurlUnresolvedHost() && !responseStarted && delivered == 0L },
+            timing = { it.timing },
+            isCancelled = { call.isCancelled },
+            remainingTimeoutMillis = { null },
+        ) { provider, _ ->
+            downloadStreamAttempt(request, call, provider, trackedResponseStart, trackedChunk)
+        } ?: first
+    }
+
+    private suspend fun downloadStreamAttempt(
+        request: NetworkRequest,
+        call: NetworkCall,
+        dohFallbackProvider: Int,
+        onResponseStart: (statusCode: Int, contentLength: Long?, headers: Map<String, List<String>>) -> Unit,
+        onChunk: (ByteArray) -> Unit
+    ): NetworkResponse = suspendCancellableCoroutine { continuation ->
         val vbRequest = VBTransportRequest().apply {
             method = request.method
             url = request.resolvedUrl()
@@ -899,6 +931,7 @@ object VBTransportNetworkEngine : NetworkEngine {
             curlCaInfoPath = preparedCurlCaInfoPath(request)
             curlProxyUrl = preparedCurlProxyUrl(request)
             curlHttp3Enabled = preparedCurlHttp3Enabled(request)
+            curlDohFallbackProvider = dohFallbackProvider
         }
         val transportCancelArmed = atomic(true)
         fun cancelTransportOnce() {
@@ -932,6 +965,33 @@ object VBTransportNetworkEngine : NetworkEngine {
         call: NetworkCall,
         source: NetworkUploadStreamSource
     ): NetworkResponse {
+        val dohProviders = if (usesCurlPlatformDefault) preparedCurlDohFallbackProviders(request) else emptyList()
+        val preferredDohProvider = curlDohPreference.preferredProvider(dohProviders)
+        var bodyStarted = false
+        val first = executeStreamingAttempt(request, call, source, preferredDohProvider) { bodyStarted = true }
+        if (dohProviders.isEmpty()) return first
+        // Raft task #153: retry an unresolved host through DoH only if the transport never asked
+        // for the body; once the source was opened it cannot be replayed.
+        return runDohFallback(
+            first = first,
+            firstProvider = preferredDohProvider,
+            configuredProviders = dohProviders,
+            isUnresolved = { it.isCurlUnresolvedHost() && !bodyStarted },
+            timing = { it.timing },
+            isCancelled = { call.isCancelled },
+            remainingTimeoutMillis = { null },
+        ) { provider, _ ->
+            executeStreamingAttempt(request, call, source, provider) { bodyStarted = true }
+        } ?: first
+    }
+
+    private suspend fun executeStreamingAttempt(
+        request: NetworkRequest,
+        call: NetworkCall,
+        source: NetworkUploadStreamSource,
+        dohFallbackProvider: Int,
+        onBodyStarted: () -> Unit,
+    ): NetworkResponse {
         val uploadProgress = request.progress.uploadProgress
         return suspendCancellableCoroutine { continuation ->
             val vbRequest = VBTransportRequest().apply {
@@ -950,8 +1010,10 @@ object VBTransportNetworkEngine : NetworkEngine {
                 curlCaInfoPath = preparedCurlCaInfoPath(request)
                 curlProxyUrl = preparedCurlProxyUrl(request)
                 curlHttp3Enabled = preparedCurlHttp3Enabled(request)
+                curlDohFallbackProvider = dohFallbackProvider
             }
             val writeBody: suspend (NetworkByteStreamSink) -> Unit = { sink ->
+                onBodyStarted()
                 var sent = 0L
                 source.stream.readChunks(object : NetworkByteStreamSink {
                     override suspend fun write(bytes: ByteArray) {

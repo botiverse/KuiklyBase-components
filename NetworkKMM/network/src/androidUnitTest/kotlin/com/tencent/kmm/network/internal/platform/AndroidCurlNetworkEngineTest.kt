@@ -1008,6 +1008,76 @@ class AndroidCurlNetworkEngineTest {
     }
 
     @Test
+    fun downloadStreamRetriesAnUnresolvedHostThroughDoh() = runBlocking {
+        configureDohFallback(NetworkCurlDohFallbackProvider.ALIDNS)
+        val bridge = FakeBridge().apply {
+            unresolvedStreamAttempts = 1
+            streamStatus = 200
+            streamHeaders = "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n"
+            streamChunks = listOf("abc".encodeToByteArray())
+        }
+        val request = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test/file")
+        val starts = mutableListOf<Int>()
+        val chunks = mutableListOf<ByteArray>()
+
+        val response = AndroidCurlNetworkEngine(bridge).downloadStream(
+            request = request,
+            call = NetworkCall(request),
+            onResponseStart = { status, _, _ -> starts += status },
+            onChunk = chunks::add
+        )
+
+        assertEquals(listOf(0, 1), bridge.streamRequests.map { it.dohFallbackProvider })
+        assertEquals(listOf(200), starts, "the caller sees one response start, from the DoH attempt")
+        assertContentEquals("abc".encodeToByteArray(), chunks.single())
+        assertEquals("doh_fallback_success", response.timing.freshRetryResult)
+    }
+
+    @Test
+    fun downloadStreamWithoutDohReturnsTheUnresolvedHostAsIs() = runBlocking {
+        val bridge = FakeBridge().apply { unresolvedStreamAttempts = 1 }
+        val request = NetworkRequest(method = VBTransportMethod.GET, url = "https://example.test/file")
+
+        val response = AndroidCurlNetworkEngine(bridge).downloadStream(
+            request = request,
+            call = NetworkCall(request),
+            onResponseStart = { _, _, _ -> },
+            onChunk = {}
+        )
+
+        assertEquals(listOf(0), bridge.streamRequests.map { it.dohFallbackProvider })
+        assertEquals(6, response.error?.rawCode)
+    }
+
+    @Test
+    fun uploadStreamRetriesAnUnresolvedHostThroughDohWithTheWholeBody() = runBlocking {
+        configureDohFallback(NetworkCurlDohFallbackProvider.CLOUDFLARE)
+        val bridge = FakeBridge().apply {
+            unresolvedUploadAttempts = 1
+            uploadReadSize = 2
+            uploadResponse = CurlNativeResponse(code = 0, httpCode = 200, data = "done".encodeToByteArray())
+        }
+        val request = NetworkRequest(
+            method = VBTransportMethod.PUT,
+            url = "https://example.test/upload",
+            body = NetworkBody.Stream(
+                stream = NetworkByteStream.fromChunks(contentLength = 6) { sink ->
+                    sink.write("abc".encodeToByteArray())
+                    sink.write("def".encodeToByteArray())
+                },
+                contentType = "application/octet-stream"
+            )
+        )
+
+        val response = AndroidCurlNetworkEngine(bridge).execute(request, NetworkCall(request))
+
+        assertEquals("done", response.body.text())
+        assertEquals(listOf(0, 2), bridge.uploadNativeRequests.map { it.dohFallbackProvider })
+        assertContentEquals("abcdef".encodeToByteArray(), bridge.uploadedBytes)
+        assertEquals("doh_fallback_success", response.timing.freshRetryResult)
+    }
+
+    @Test
     fun uploadStreamPullsBoundedChunksAndReportsProgress() = runBlocking {
         val bridge = FakeBridge().apply {
             uploadReadSize = 2
@@ -1387,6 +1457,10 @@ class AndroidCurlNetworkEngineTest {
         var uploadedBytes = ByteArray(0)
         val uploadChunkSizes = mutableListOf<Int>()
         var uploadRequests = 0
+        val streamRequests = mutableListOf<AndroidCurlNativeRequest>()
+        val uploadNativeRequests = mutableListOf<AndroidCurlNativeRequest>()
+        var unresolvedStreamAttempts = 0
+        var unresolvedUploadAttempts = 0
         val cancelledIds = mutableListOf<Int>()
         var executeDelayMillis: Long = 0
         var onExecute: ((AndroidCurlNativeRequest, Int) -> Unit)? = null
@@ -1411,6 +1485,11 @@ class AndroidCurlNetworkEngineTest {
             onChunk: (ByteArray) -> Unit
         ): CurlNativeResponse {
             lastRequest = request
+            streamRequests += request
+            if (unresolvedStreamAttempts > 0) {
+                unresolvedStreamAttempts -= 1
+                return CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
+            }
             onResponseStart(streamStatus, streamHeaders)
             streamChunks.forEach(onChunk)
             return streamResponse
@@ -1422,6 +1501,12 @@ class AndroidCurlNetworkEngineTest {
         ): CurlNativeResponse {
             lastRequest = request
             uploadRequests += 1
+            uploadNativeRequests += request
+            if (unresolvedUploadAttempts > 0) {
+                // curl resolves before it pulls the body: nothing is read.
+                unresolvedUploadAttempts -= 1
+                return CurlNativeResponse(code = 6, errorMsg = "Could not resolve host: example.test")
+            }
             val chunks = mutableListOf<ByteArray>()
             while (true) {
                 val chunk = source.read(uploadReadSize) ?: error("Upload source aborted")
