@@ -97,6 +97,12 @@ requests took over 5 s against 0-4 % over HTTP/2, and the slow ones ended in
 - No Kotlin or wrapper API change. HTTP/3 stays off by default on all platforms
   (mobile #2699); the device comparison has to be repeated on this stack before any
   new HTTP/3 rollout.
+- Native carriers rebuilt on the ngtcp2 stack, in sequence on the rebased branch:
+  Android run 38055645100, iOS run 38055808686, OHOS run 38056837072; every build
+  reports `USE_NGTCP2`, `USE_NGHTTP3`, `OPENSSL_QUIC_API2` enabled and both ngtcp2
+  symbols referenced. The checked-in curl headers under
+  `ohosApp/pbcurlwrapper/src/main/cpp/include/curl` are the 8.22.0 set the OHOS
+  build copies in (the refresh workflow commits binaries only).
 
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 
