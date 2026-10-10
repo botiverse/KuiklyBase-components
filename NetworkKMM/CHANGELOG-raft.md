@@ -1,5 +1,16 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.42 / 0.1.0-raft.42-ohos (DoH for downloads and uploads)
+
+- DNS-over-HTTPS fallback now also covers streaming downloads and uploads
+  (raft task #153; #165). When the system resolver fails (CURLcode 6) before
+  anything was transferred, the stream starts again through the configured
+  providers with the same retry loop and 60 s preference window as buffered
+  requests: downloads only while no response started and no byte reached the
+  caller; Android/iOS uploads only while no body byte was read; OHOS uploads
+  only while the transport never opened the body source. Kotlin only; native
+  carriers are unchanged from raft.41.
+
 ## 0.1.0-raft.41 / 0.1.0-raft.41-ohos (DoH fallback, PIPEWAIT scope)
 
 - DNS-over-HTTPS fallback (raft task #153; #158, #159, #161, #164). Off unless
