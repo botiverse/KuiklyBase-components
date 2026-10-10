@@ -5,6 +5,7 @@
  */
 package com.tencent.kmm.network.socketio
 
+import com.tencent.kmm.network.export.VBTransportCurl
 import com.tencent.qqlive.kmm.native.libcurl.CURL_SOCKET_IO_ABI_VERSION
 import com.tencent.qqlive.kmm.native.libcurl.CURL_SOCKET_IO_CONNECTED
 import com.tencent.qqlive.kmm.native.libcurl.CURL_SOCKET_IO_CONNECTING
@@ -18,12 +19,14 @@ import com.tencent.qqlive.kmm.native.libcurl.CurlSocketIoCallbackV1
 import com.tencent.qqlive.kmm.native.libcurl.CurlSocketIoConfigV1
 import com.tencent.qqlive.kmm.native.libcurl.DeleteCurlSocketIoClientV1
 import com.tencent.qqlive.kmm.native.libcurl.EmitCurlSocketIoEventV1
+import com.tencent.qqlive.kmm.native.libcurl.SetCurlSocketIoDohFallbackProviders
 import com.tencent.qqlive.kmm.native.libcurl.StartCurlSocketIoClientV1
 import com.tencent.qqlive.kmm.native.libcurl.StringDic
 import com.tencent.qqlive.kmm.native.libcurl.StringPair
 import kotlinx.cinterop.COpaquePointer
 import kotlinx.cinterop.CPointer
 import kotlinx.cinterop.ExperimentalForeignApi
+import kotlinx.cinterop.IntVar
 import kotlinx.cinterop.StableRef
 import kotlinx.cinterop.alloc
 import kotlinx.cinterop.allocArray
@@ -34,6 +37,7 @@ import kotlinx.cinterop.memScoped
 import kotlinx.cinterop.ptr
 import kotlinx.cinterop.sizeOf
 import kotlinx.cinterop.staticCFunction
+import kotlinx.cinterop.set
 import kotlinx.cinterop.toKString
 import platform.posix.int8_tVar
 
@@ -53,7 +57,7 @@ private class OhosCurlSocketIoClient(
     listener: NetworkSocketIoListener,
 ) : NetworkSocketIoClient {
     private val callbacks = StableRef.create(OhosSocketIoCallbacks(listener))
-    private var handle: COpaquePointer? = createNative(config)
+    private var handle: COpaquePointer? = createNative(config)?.also(::applyDohFallbackProviders)
     private var closed = false
 
     override fun start(): Boolean =
@@ -80,6 +84,20 @@ private class OhosCurlSocketIoClient(
         }
         handle = null
         callbacks.dispose()
+    }
+
+    /**
+     * Raft task #153: the same DoH switch as HTTP requests ([VBTransportCurl.setDohFallbackProviders]);
+     * the native client tries these providers only when the system resolver cannot resolve the host.
+     */
+    private fun applyDohFallbackProviders(nativeHandle: COpaquePointer) {
+        val providerIds = VBTransportCurl.dohFallbackProviders.map { it.nativeId }
+        if (providerIds.isEmpty()) return
+        memScoped {
+            val ids = allocArray<IntVar>(providerIds.size)
+            providerIds.forEachIndexed { index, id -> ids[index] = id }
+            SetCurlSocketIoDohFallbackProviders(nativeHandle, ids, providerIds.size, CURL_SOCKET_IO_ABI_VERSION)
+        }
     }
 
     private fun createNative(config: NetworkSocketIoConfig): COpaquePointer? = memScoped {

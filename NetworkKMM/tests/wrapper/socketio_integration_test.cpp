@@ -34,6 +34,28 @@ static void OnEvent(void *ref, const char *name, const char *payload) {
 
 int main(int argc, char **argv) {
     assert(argc == 2);
+    {
+        // Raft task #153: the DoH provider setter is validated without a live socket: a closed
+        // provider set, rejected after Start.
+        Capture unused;
+        CurlSocketIoConfigV1 probe{};
+        probe.abiVersion = CURL_SOCKET_IO_ABI_VERSION;
+        probe.structSize = sizeof(probe);
+        probe.serverUrl = "http://127.0.0.1:9";
+        CurlSocketIoCallbackV1 probeCallback{&unused, OnState, OnEvent};
+        CurlSocketIoHandle handle = CreateCurlSocketIoClientV1(
+            &probe, sizeof(probe), CURL_SOCKET_IO_ABI_VERSION, &probeCallback);
+        assert(handle != nullptr);
+        const int unknownProvider[] = {99};
+        const int providers[] = {CURL_DOH_PROVIDER_ALIDNS, CURL_DOH_PROVIDER_CLOUDFLARE};
+        assert(SetCurlSocketIoDohFallbackProviders(handle, unknownProvider, 1, CURL_SOCKET_IO_ABI_VERSION) == 0);
+        assert(SetCurlSocketIoDohFallbackProviders(handle, nullptr, 1, CURL_SOCKET_IO_ABI_VERSION) == 0);
+        assert(SetCurlSocketIoDohFallbackProviders(handle, providers, 2, 0) == 0);
+        assert(SetCurlSocketIoDohFallbackProviders(handle, providers, 2, CURL_SOCKET_IO_ABI_VERSION) == 1);
+        assert(SetCurlSocketIoDohFallbackProviders(handle, nullptr, 0, CURL_SOCKET_IO_ABI_VERSION) == 1);
+        DeleteCurlSocketIoClientV1(handle, CURL_SOCKET_IO_ABI_VERSION);
+        std::fprintf(stdout, "ok:   socketio doh provider setter validates the closed provider set\n");
+    }
     const curl_version_info_data *version = curl_version_info(CURLVERSION_NOW);
     bool websocketAvailable = false;
     if (version != nullptr && version->protocols != nullptr) {
@@ -61,7 +83,12 @@ int main(int argc, char **argv) {
     CurlSocketIoHandle client = CreateCurlSocketIoClientV1(
         &config, sizeof(config), CURL_SOCKET_IO_ABI_VERSION, &callback);
     assert(client != nullptr);
+    // Raft task #153: with DoH providers configured, a host the system resolver handles
+    // (127.0.0.1 here) still connects directly.
+    const int providers[] = {CURL_DOH_PROVIDER_ALIDNS, CURL_DOH_PROVIDER_CLOUDFLARE};
+    assert(SetCurlSocketIoDohFallbackProviders(client, providers, 2, CURL_SOCKET_IO_ABI_VERSION) == 1);
     assert(StartCurlSocketIoClientV1(client, CURL_SOCKET_IO_ABI_VERSION) == 1);
+    assert(SetCurlSocketIoDohFallbackProviders(client, providers, 2, CURL_SOCKET_IO_ABI_VERSION) == 0);
 
     {
         std::unique_lock<std::mutex> lock(capture.mutex);

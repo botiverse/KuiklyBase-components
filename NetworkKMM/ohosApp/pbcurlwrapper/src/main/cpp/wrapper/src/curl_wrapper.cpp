@@ -131,6 +131,34 @@ static const char *CurlProtocolName(long httpVersion) {
     return "unknown";
 }
 
+// Built-in DoH providers (raft task #153). Addresses are public anycast
+// resolvers; refreshing them is a code change that ships with a release.
+struct DohProvider {
+    int id;
+    const char *name;
+    const char *url;
+    const char *resolveEntry;  // CURLOPT_RESOLVE "host:port:addr[,addr]"
+};
+
+static const DohProvider kDohProviders[] = {
+    {CURL_DOH_PROVIDER_ALIDNS, "alidns", "https://dns.alidns.com/dns-query",
+     "dns.alidns.com:443:223.5.5.5,223.6.6.6"},
+    {CURL_DOH_PROVIDER_CLOUDFLARE, "cloudflare", "https://cloudflare-dns.com/dns-query",
+     "cloudflare-dns.com:443:1.1.1.1,1.0.0.1"},
+};
+
+static const DohProvider *FindDohProvider(int id) {
+    for (const DohProvider &provider : kDohProviders) {
+        if (provider.id == id) {
+            return &provider;
+        }
+    }
+    return nullptr;
+}
+
+static CURLSH *GetCurlShare(bool http3Enabled, bool dohFallback);
+static constexpr long kWebSocketDnsCacheTimeoutSeconds = 20L;
+
 class CurlWebSocketClient {
  public:
     explicit CurlWebSocketClient(std::string logTag) : log_tag_(std::move(logTag)) {
@@ -144,8 +172,32 @@ class CurlWebSocketClient {
     }
 
     bool Connect(const char *url, const StringDic *headers, const char *caInfoPath,
-                 const char *proxyUrl, int64_t connectTimeoutMs) {
+                 const char *proxyUrl, int64_t connectTimeoutMs, int dohProviderId = 0) {
         if (curl_ == nullptr || url == nullptr || connected_) return false;
+        // Raft task #153: an attempt through a built-in DoH provider, used only after the system
+        // resolver could not resolve the host. Same setup as HTTP requests: the provider hostname
+        // is pinned with CURLOPT_RESOLVE in a dedicated DoH share, DoH TLS verification stays on.
+        if (dohProviderId != 0) {
+            const DohProvider *doh = FindDohProvider(dohProviderId);
+            CURLSH *share = GetCurlShare(false, true);
+            if (doh == nullptr || share == nullptr) {
+                last_error_ = CURLE_COULDNT_RESOLVE_HOST;
+                return false;
+            }
+            resolve_list_ = curl_slist_append(nullptr, doh->resolveEntry);
+            if (resolve_list_ == nullptr) {
+                last_error_ = CURLE_OUT_OF_MEMORY;
+                return false;
+            }
+            curl_easy_setopt(curl_, CURLOPT_SHARE, share);
+            curl_easy_setopt(curl_, CURLOPT_DNS_CACHE_TIMEOUT, kWebSocketDnsCacheTimeoutSeconds);
+            curl_easy_setopt(curl_, CURLOPT_RESOLVE, resolve_list_);
+            if (curl_easy_setopt(curl_, CURLOPT_DOH_URL, doh->url) != CURLE_OK) {
+                last_error_ = CURLE_COULDNT_RESOLVE_HOST;
+                return false;
+            }
+            logI(log_tag_, std::string("websocket_doh_fallback provider=") + doh->name);
+        }
         cancelled_.store(false, std::memory_order_relaxed);
         header_list_ = nullptr;
         if (headers != nullptr && headers->stringPairs != nullptr && headers->size > 0) {
@@ -268,10 +320,15 @@ class CurlWebSocketClient {
             curl_slist_free_all(header_list_);
             header_list_ = nullptr;
         }
+        if (resolve_list_ != nullptr) {
+            curl_slist_free_all(resolve_list_);
+            resolve_list_ = nullptr;
+        }
     }
 
     std::string log_tag_;
     CURL *curl_ = nullptr;
+    struct curl_slist *resolve_list_ = nullptr;
     curl_slist *header_list_ = nullptr;
     std::atomic<bool> cancelled_{false};
     bool connected_ = false;
@@ -309,6 +366,21 @@ class CurlSocketIoClient {
         started_ = true;
         stop_.store(false, std::memory_order_relaxed);
         owner_ = std::thread([this]() { Run(); });
+        return true;
+    }
+
+    /** Raft task #153: DoH providers tried in order when the system resolver fails; before Start. */
+    bool SetDohFallbackProviders(const int *providerIds, int count) {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (started_ || count < 0 || (count > 0 && providerIds == nullptr)) return false;
+        std::vector<int> next;
+        for (int index = 0; index < count; ++index) {
+            if (FindDohProvider(providerIds[index]) == nullptr) return false;
+            if (std::find(next.begin(), next.end(), providerIds[index]) == next.end()) {
+                next.push_back(providerIds[index]);
+            }
+        }
+        doh_providers_ = next;
         return true;
     }
 
@@ -500,9 +572,33 @@ class CurlSocketIoClient {
         std::vector<StringPair> nativeHeaders;
         StringDic dictionary = HeaderDictionary(&nativeHeaders);
         State(CURL_SOCKET_IO_CONNECTING);
-        if (!wire->Connect(WebSocketUrl(server_url_).c_str(), &dictionary,
-                           ca_info_path_.empty() ? nullptr : ca_info_path_.c_str(),
-                           proxy_url_.c_str(), connect_timeout_ms_)) {
+        const std::string wsUrl = WebSocketUrl(server_url_);
+        const char *caInfo = ca_info_path_.empty() ? nullptr : ca_info_path_.c_str();
+        bool wireConnected = wire->Connect(wsUrl.c_str(), &dictionary, caInfo, proxy_url_.c_str(),
+                                           connect_timeout_ms_);
+        // Raft task #153: only when the system resolver could not resolve the host, try the
+        // configured DoH providers in order, each on a fresh handle.
+        if (!wireConnected && wire->LastError() == CURLE_COULDNT_RESOLVE_HOST &&
+            !stop_.load(std::memory_order_relaxed)) {
+            std::vector<int> providers;
+            {
+                std::lock_guard<std::mutex> guard(mutex_);
+                providers = doh_providers_;
+            }
+            for (int providerId : providers) {
+                if (stop_.load(std::memory_order_relaxed)) break;
+                auto dohWire = std::make_unique<CurlWebSocketClient>("NetworkKMM-SocketIO");
+                {
+                    std::lock_guard<std::mutex> guard(mutex_);
+                    wire_ = dohWire.get();
+                }
+                wire = std::move(dohWire);
+                wireConnected = wire->Connect(wsUrl.c_str(), &dictionary, caInfo, proxy_url_.c_str(),
+                                              connect_timeout_ms_, providerId);
+                if (wireConnected || wire->LastError() != CURLE_COULDNT_RESOLVE_HOST) break;
+            }
+        }
+        if (!wireConnected) {
             State(CURL_SOCKET_IO_ERROR, wire->LastError(), "websocket_connect");
             ClearWire();
             return false;
@@ -593,6 +689,7 @@ class CurlSocketIoClient {
     int64_t reconnect_initial_delay_ms_;
     int64_t reconnect_max_delay_ms_;
     CurlSocketIoCallbackV1 callback_{};
+    std::vector<int> doh_providers_;
     std::vector<std::pair<std::string, std::string>> headers_;
     std::mutex mutex_;
     std::condition_variable wake_;
@@ -650,31 +747,6 @@ static void ShareUnlockCallback(CURL *handle, curl_lock_data data, void *userptr
 }
 
 static constexpr long kDnsCacheTimeoutSeconds = 20L;
-
-// Built-in DoH providers (raft task #153). Addresses are public anycast
-// resolvers; refreshing them is a code change that ships with a release.
-struct DohProvider {
-    int id;
-    const char *name;
-    const char *url;
-    const char *resolveEntry;  // CURLOPT_RESOLVE "host:port:addr[,addr]"
-};
-
-static const DohProvider kDohProviders[] = {
-    {CURL_DOH_PROVIDER_ALIDNS, "alidns", "https://dns.alidns.com/dns-query",
-     "dns.alidns.com:443:223.5.5.5,223.6.6.6"},
-    {CURL_DOH_PROVIDER_CLOUDFLARE, "cloudflare", "https://cloudflare-dns.com/dns-query",
-     "cloudflare-dns.com:443:1.1.1.1,1.0.0.1"},
-};
-
-static const DohProvider *FindDohProvider(int id) {
-    for (const DohProvider &provider : kDohProviders) {
-        if (provider.id == id) {
-            return &provider;
-        }
-    }
-    return nullptr;
-}
 
 static CURLSH *GetCurlShare(bool http3Enabled, bool dohFallback) {
     std::lock_guard<std::mutex> guard(gShareInitMutex);
@@ -2554,6 +2626,13 @@ CurlSocketIoHandle CreateCurlSocketIoClientV1(
         config->structSize != sizeof(CurlSocketIoConfigV1) ||
         config->serverUrl == nullptr) return nullptr;
     return new CurlSocketIoClient(*config, *callback);
+}
+
+int SetCurlSocketIoDohFallbackProviders(CurlSocketIoHandle handle, const int *providerIds,
+                                        int count, int abiVersion) {
+    if (handle == nullptr || abiVersion != CURL_SOCKET_IO_ABI_VERSION) return 0;
+    return reinterpret_cast<CurlSocketIoClient *>(handle)->SetDohFallbackProviders(providerIds, count)
+        ? 1 : 0;
 }
 
 int StartCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion) {
