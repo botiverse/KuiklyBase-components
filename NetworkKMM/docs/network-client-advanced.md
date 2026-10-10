@@ -257,10 +257,12 @@ is no SNI-safe custom resolver contract; setting `httpDnsEnabled` makes curl ine
 ### DNS-over-HTTPS fallback (curl: Android, iOS, OHOS)
 
 `VBTransportCurl.setDohFallbackProviders(listOf(ALIDNS, CLOUDFLARE))` (empty = off, the default)
-retries a buffered request through DNS-over-HTTPS, provider by provider, only when the
-system resolver failed (`CURLE_COULDNT_RESOLVE_HOST`). A successful system resolution is never
-replaced, and connect/TLS/timeout failures are not retried. Because no connection was made, any
-method may be retried. After a system failure that a provider fixed, requests resolve through that
+retries a request through DNS-over-HTTPS, provider by provider, only when the system resolver
+failed (`CURLE_COULDNT_RESOLVE_HOST`). A successful system resolution is never replaced, and
+connect/TLS/timeout failures are not retried. Because no connection was made, any method may be
+retried. This covers buffered requests, streaming downloads (only while no response has started and
+no byte reached the caller) and streaming uploads (only while no body byte was read; on OHOS, only
+while the transport has not opened the body source, which cannot be replayed). After a system failure that a provider fixed, requests resolve through that
 provider first for 60 s (instead of failing on the system resolver each time); if it fails, the
 system resolver is tried again and the preference is dropped. Call `VBTransportCurl.onNetworkChanged()`
 when the device switches networks or its DNS configuration changes to drop the window at once.
@@ -286,7 +288,7 @@ The DoH hostname is pinned with `CURLOPT_RESOLVE` (the DoH probe shares the clie
 the lookup does not depend on the failing system resolver, while TLS to the DoH server still
 verifies its hostname; `CURLOPT_DOH_SSL_VERIFYPEER/HOST` are never relaxed. Privacy: the provider
 sees the hostname being resolved. The addresses change only with a release. Android, iOS and OHOS
-all honour the setting (buffered requests).
+all honour the setting (buffered requests, streaming downloads and uploads).
 
 libcurl caches a failed resolve as a negative entry. DoH-fallback clients therefore use their own
 shared DNS cache, separate from system-resolver clients: a cached system failure for the API host

@@ -21,8 +21,10 @@ import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
 import com.tencent.kmm.network.curl.isCurlProxyHttp3Incompatibility
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
+import com.tencent.kmm.network.curl.CURL_CODE_COULDNT_RESOLVE_HOST
 import com.tencent.kmm.network.curl.curlDohPreference
 import com.tencent.kmm.network.curl.runCurlDohFallback
+import com.tencent.kmm.network.curl.runDohFallback
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlProxyHttp3Failure
 import com.tencent.kmm.network.curl.parseCurlHeaders
@@ -225,15 +227,18 @@ internal class AndroidCurlNetworkEngine(
             onRuntimeSnapshot = onRuntimeSnapshot
         )
         if (!availability.available) return curlRuntimeFailureResponse(request, availability)
+        val dohProviders = preparedCurlDohFallbackProviders(request)
+        val preferredDohProvider = curlDohPreference.preferredProvider(dohProviders)
         val owner = Any()
         val requestId = androidCurlRequestOwners.reserve(owner)
         val nativeRequest = try {
-            request.toNativeRequest(requestId = requestId)
+            request.toNativeRequest(requestId = requestId, dohFallbackProvider = preferredDohProvider)
         } catch (throwable: Throwable) {
             androidCurlRequestOwners.release(requestId, owner)
             throw throwable
         }
         var transferred = 0L
+        var responseStarted = false
         var responseLength: Long? = null
         call.addCancelHandler {
             nativeRequest.cancel()
@@ -243,10 +248,11 @@ internal class AndroidCurlNetworkEngine(
             androidCurlRequestOwners.release(requestId, owner)
             return cancelledResponse(request)
         }
-        return try {
-            val nativeResponse = bridge.downloadStream(
-                request = nativeRequest,
+        suspend fun downloadAttempt(attemptRequest: AndroidCurlNativeRequest): CurlNativeResponse =
+            bridge.downloadStream(
+                request = attemptRequest,
                 onResponseStart = { httpCode, headerText ->
+                    responseStarted = true
                     val headers = parseCurlHeaders(headerText)
                     responseLength = contentLength(headers)
                     onResponseStart(httpCode.toInt(), responseLength, headers)
@@ -261,6 +267,21 @@ internal class AndroidCurlNetworkEngine(
                     onChunk(chunk)
                 }
             )
+        return try {
+            val first = downloadAttempt(nativeRequest)
+            // Raft task #153: an unresolved host delivered nothing, so the stream can start over
+            // through DoH. Never once a response started or a byte reached the caller.
+            val nativeResponse = runDohFallback(
+                first = first,
+                firstProvider = preferredDohProvider,
+                configuredProviders = dohProviders,
+                isUnresolved = { it.code == CURL_CODE_COULDNT_RESOLVE_HOST && !responseStarted && transferred == 0L },
+                timing = { it.elapse },
+                isCancelled = { call.isCancelled },
+                remainingTimeoutMillis = { null },
+            ) { provider, _ ->
+                downloadAttempt(nativeRequest.copy(dohFallbackProvider = provider))
+            } ?: first
             nativeResponse.elapse.effectiveConnectTimeoutMillis = nativeRequest.streamConnectTimeoutMillis
             nativeResponse.toNetworkResponse(request)
         } finally {
@@ -281,11 +302,14 @@ internal class AndroidCurlNetworkEngine(
             throw throwable
         }
         val pullBridge = AndroidCurlUploadPullBridge()
+        val dohProviders = preparedCurlDohFallbackProviders(request)
+        val preferredDohProvider = curlDohPreference.preferredProvider(dohProviders)
         val nativeRequest = try {
             request.toNativeRequest(
                 requestId = requestId,
                 contentType = source.contentType,
-                uploadContentLength = source.contentLength
+                uploadContentLength = source.contentLength,
+                dohFallbackProvider = preferredDohProvider,
             )
         } catch (throwable: Throwable) {
             androidCurlRequestOwners.release(requestId, owner)
@@ -339,7 +363,21 @@ internal class AndroidCurlNetworkEngine(
                     }
                 }
             }
-            val nativeResponse = bridge.uploadStream(nativeRequest, uploadSource)
+            val first = bridge.uploadStream(nativeRequest, uploadSource)
+            // Raft task #153: curl resolves the host before it pulls any body bytes, so an
+            // unresolved host left the pull bridge untouched and the same source can be offered
+            // again through DoH. Never once a byte was sent.
+            val nativeResponse = runDohFallback(
+                first = first,
+                firstProvider = preferredDohProvider,
+                configuredProviders = dohProviders,
+                isUnresolved = { it.code == CURL_CODE_COULDNT_RESOLVE_HOST && sent == 0L },
+                timing = { it.elapse },
+                isCancelled = { call.isCancelled },
+                remainingTimeoutMillis = { null },
+            ) { provider, _ ->
+                bridge.uploadStream(nativeRequest.copy(dohFallbackProvider = provider), uploadSource)
+            } ?: first
             nativeResponse.elapse.effectiveConnectTimeoutMillis = nativeRequest.streamConnectTimeoutMillis
             if (nativeResponse.isBufferedBodyIdleTimeout()) {
                 nativeResponse.elapse.curlBodyStallDetected = true
