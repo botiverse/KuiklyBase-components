@@ -62,7 +62,10 @@ the kernel and keeps normal reuse.
   h2, Python `h2`) cover HTTP/2: multiplexed reuse, GOAWAY (next request on a new connection, sent
   once), REFUSED_STREAM (GET retried, POST refused, sent once), RST_STREAM INTERNAL_ERROR (fails,
   sent once; GET then retried by the routing layer), and a connection dying with 2 GET + 1 POST in
-  flight (GETs succeed or fail with a retryable connection code; the POST is never sent again).
+  flight (GETs succeed or fail with a retryable connection code; the POST is never sent again),
+  and four streams with per-request counters (first/middle GET, a GET whose status arrived, POST
+  last): each GET reaches the server at most twice at this layer, the GET with a status is not
+  replayed and keeps its status (so the routing layer does not retry it), the POST exactly once.
 
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 

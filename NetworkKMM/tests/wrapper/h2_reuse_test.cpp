@@ -226,6 +226,55 @@ int main(int argc, char **argv) {
         DeleteCurlMultiEngine(engine);
     }
 
+    // 6. Per-request accounting with four streams in flight on one connection when it dies: first,
+    //    middle and last GET, a GET whose response headers already arrived, and a POST (sent last).
+    //    Each request is counted on its own key. No request may reach the server more than twice
+    //    at this layer (original + libcurl's one replay); a GET with a status must not be replayed;
+    //    the POST exactly once. GETs without a status that fail end on a connection-failure code,
+    //    which the routing layer retries once on a fresh engine (Kotlin isConnectionFailureBeforeResponse).
+    {
+        CurlMultiEngineHandle engine = CreateCurlMultiEngine("h2-reuse-test");
+        Send(engine, base + "/h2/warm-four/ok", "GET");
+        struct Item {
+            const char *key;
+            const char *method;
+        };
+        const Item items[] = {{"four-get-first", "GET"}, {"four-get-middle", "GET"},
+                              {"four-get-headers", "GET"}, {"four-post-last", "POST"}};
+        std::vector<std::unique_ptr<Pending>> batch;
+        for (const Item &item : items) {
+            auto pending = std::make_unique<Pending>();
+            pending->url = base + "/h2/" + item.key + "/hold4-group";
+            pending->method = item.method;
+            if (std::strcmp(item.method, "POST") == 0) pending->body = "payload";
+            CHECK(Submit(engine, *pending), "four-stream request accepted");
+            batch.push_back(std::move(pending));
+        }
+        for (size_t index = 0; index < batch.size(); ++index) {
+            Outcome outcome = Await(*batch[index]);
+            int sent = 0;
+            Count(engine, base, items[index].key, &sent, &ignored);
+            std::fprintf(stderr, "info: four-stream %s code=%d http=%ld sent=%d error=%s\n", items[index].key,
+                         outcome.code, outcome.httpCode, sent, outcome.error.c_str());
+            if (std::strcmp(items[index].method, "POST") == 0) {
+                CHECK(outcome.code != 0 && sent == 1, "four-stream POST fails and reached the server exactly once");
+            } else if (std::strstr(items[index].key, "headers") != nullptr) {
+                // Normally the client has read the status (200 + error: the routing layer does not
+                // retry); if the drop wins the race the client never saw it (no status: retryable).
+                CHECK(outcome.code != 0 && sent == 1 &&
+                          (outcome.httpCode == 200 || (outcome.httpCode == 0 && outcome.code == 55)),
+                      "GET whose headers were sent fails, is not replayed by libcurl, and keeps its status when it arrived");
+            } else {
+                CHECK(sent <= 2, "four-stream GET reached the server at most twice at this layer");
+                CHECK(outcome.httpCode == 200 ||
+                          (outcome.httpCode == 0 && (outcome.code == 16 || outcome.code == 55 ||
+                                                     outcome.code == 56 || outcome.code == 92)),
+                      "four-stream GET succeeds or fails with a retryable connection-failure code and no status");
+            }
+        }
+        DeleteCurlMultiEngine(engine);
+    }
+
     if (gFailures > 0) {
         std::fprintf(stderr, "\n%d h2 reuse failure(s)\n", gFailures);
         return 1;

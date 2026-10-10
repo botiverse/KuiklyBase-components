@@ -11,12 +11,15 @@ can tell a replay from a new request and a reused connection from a new one.
   hold-kill-once   first connection: hold every stream until 3 are open, then drop the TCP
                    connection with no response (a connection dying with streams in flight);
                    later connections answer
+  hold4-<group>    like hold-kill-once, per <group>, for 4 streams with per-request keys; a key
+                   containing "headers" gets its response headers (no body) before the drop
 GET /h2-count/<key> -> "<requests> <connections>"
 """
 import argparse
 import socket
 import ssl
 import threading
+import time
 
 import h2.config
 import h2.connection
@@ -110,6 +113,23 @@ class Conn:
         if behaviour == "internal-once" and first:
             self.h2.reset_stream(stream_id, h2.errors.ErrorCodes.INTERNAL_ERROR)
             return False
+        if behaviour.startswith("hold4-"):
+            group = behaviour
+            with LOCK:
+                kill_this = group not in HOLD_KILLED
+            if kill_this:
+                self.held.append((stream_id, key))
+                if len(self.held) >= 4:
+                    with LOCK:
+                        HOLD_KILLED.add(group)
+                    for held_id, held_key in self.held:
+                        if "headers" in held_key:
+                            self.h2.send_headers(held_id, [(":status", "200"), ("content-length", "100")])
+                    self.flush()
+                    time.sleep(0.3)  # let the client read those headers before the drop
+                    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, b"\x01\x00\x00\x00\x00\x00\x00\x00")
+                    return True
+                return False
         if behaviour == "hold-kill-once":
             with LOCK:
                 kill_this = key not in HOLD_KILLED
