@@ -133,6 +133,11 @@ static const char *CurlProtocolName(long httpVersion) {
 
 // Built-in DoH providers (raft task #153). Addresses are public anycast
 // resolvers; refreshing them is a code change that ships with a release.
+// Raft task #153 (raft.45): the resolve+connect budget of one fallback resolution attempt (a DoH
+// provider or the stale address). A provider that hangs instead of refusing would otherwise eat the
+// whole request timeout before the next one is tried. Data transfer keeps the request's timeouts.
+static constexpr long kFallbackAttemptConnectTimeoutMs = 4000L;
+
 struct DohProvider {
     int id;
     const char *name;
@@ -211,10 +216,12 @@ class CurlWebSocketClient {
         curl_easy_setopt(curl_, CURLOPT_URL, url);
         curl_easy_setopt(curl_, CURLOPT_CONNECT_ONLY, 2L);
         curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, header_list_);
-        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS,
-                         static_cast<long>(std::max<int64_t>(1, connectTimeoutMs)));
-        curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS,
-                         static_cast<long>(std::max<int64_t>(1, connectTimeoutMs)));
+        // A DoH attempt gets its own short resolve+connect budget (kFallbackAttemptConnectTimeoutMs).
+        const int64_t attemptTimeoutMs = dohProviderId != 0
+            ? std::min<int64_t>(std::max<int64_t>(1, connectTimeoutMs), kFallbackAttemptConnectTimeoutMs)
+            : std::max<int64_t>(1, connectTimeoutMs);
+        curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, static_cast<long>(attemptTimeoutMs));
+        curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, static_cast<long>(attemptTimeoutMs));
         curl_easy_setopt(curl_, CURLOPT_NOPROGRESS, 0L);
         curl_easy_setopt(curl_, CURLOPT_XFERINFOFUNCTION, Progress);
         curl_easy_setopt(curl_, CURLOPT_XFERINFODATA, this);
@@ -225,6 +232,13 @@ class CurlWebSocketClient {
             curl_easy_setopt(curl_, CURLOPT_PROXY, proxyUrl);
         }
         last_error_ = curl_easy_perform(curl_);
+        // A DoH attempt that never got the upgrade through (resolve+connect timed out, or no
+        // connection) counts as unresolved so the caller moves on to the next provider.
+        if (dohProviderId != 0 && !cancelled_.load(std::memory_order_relaxed) &&
+            (last_error_ == CURLE_OPERATION_TIMEDOUT || last_error_ == CURLE_COULDNT_CONNECT)) {
+            logI(log_tag_, "websocket_doh_attempt_unreachable result=" + std::to_string(last_error_));
+            last_error_ = CURLE_COULDNT_RESOLVE_HOST;
+        }
         connected_ = last_error_ == CURLE_OK && !cancelled_.load(std::memory_order_relaxed);
         return connected_;
     }
@@ -1399,9 +1413,12 @@ class CurlClient {
         } else if (stream_mode_ && request.streamWholeTimeoutMs > 0) {
             curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, request.streamWholeTimeoutMs);
         }
-        const long connectTimeout = request.streamConnectTimeoutMs > 0
+        long connectTimeout = request.streamConnectTimeoutMs > 0
             ? static_cast<long>(request.streamConnectTimeoutMs)
             : 10000L;
+        if (doh_provider_ != 0) {
+            connectTimeout = std::min(connectTimeout, kFallbackAttemptConnectTimeoutMs);
+        }
         curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, connectTimeout);
         curl_easy_setopt(curl_, CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200L);
         // Mobile NATs drop idle flows silently; a reused connection then fails on
@@ -1814,10 +1831,25 @@ class CurlClient {
         RememberStaleAddress(request_host_port_, ip);
     }
 
+    // Raft task #153 (raft.45): a fallback resolution attempt (DoH provider or stale address) that
+    // never sent anything - its resolve+connect phase timed out or it could not connect - is
+    // reported as unresolved, so the routing layer tries the next attempt instead of ending the
+    // request. Once a transfer started (pretransfer time set) the real result stands.
+    int NormalizeFallbackAttemptResult(int res) {
+        if (doh_provider_ == 0 || cancel_flag_.load(std::memory_order_relaxed)) return res;
+        if (res != CURLE_OPERATION_TIMEDOUT && res != CURLE_COULDNT_CONNECT) return res;
+        curl_off_t pretransferUs = 0;
+        curl_easy_getinfo(curl_, CURLINFO_PRETRANSFER_TIME_T, &pretransferUs);
+        if (pretransferUs > 0) return res;
+        logI(log_tag_, "fallback_attempt_unreachable provider=" + std::to_string(doh_provider_) +
+            " result=" + std::to_string(res));
+        return CURLE_COULDNT_RESOLVE_HOST;
+    }
+
     // Shared post-perform tail of StartRequest/StartUploadRequest: build the
     // buffered CurlResponse and invoke the callback exactly once.
     void FinishBufferedRequest(CURLcode res, CurlCallback *callback) {
-        int errorCode = res;
+        int errorCode = NormalizeFallbackAttemptResult(res);
 
         char *ip = nullptr;
         curl_easy_getinfo(curl_, CURLINFO_PRIMARY_IP, &ip);
@@ -1915,7 +1947,7 @@ class CurlClient {
             return;
         }
         stream_terminal_ = true;
-        int errorCode = res;
+        int errorCode = NormalizeFallbackAttemptResult(res);
         long httpCode = 0;
         curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &httpCode);
         char *ip = nullptr;

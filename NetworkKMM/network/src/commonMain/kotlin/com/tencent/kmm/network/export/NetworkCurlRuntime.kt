@@ -233,7 +233,7 @@ object VBTransportCurl {
     fun setDohFallbackProviders(providers: List<NetworkCurlDohFallbackProvider>) {
         val next = providers.distinct()
         if (dohFallbackProvidersState.getAndSet(next) != next) {
-            com.tencent.kmm.network.curl.curlDohPreference.clear()
+            com.tencent.kmm.network.curl.curlDohPreference.reset()
         }
     }
 
@@ -242,10 +242,11 @@ object VBTransportCurl {
      * Drops the short DoH-first window so the system resolver is tried first again on the new
      * network, instead of sending names to the DoH provider for up to a minute, and forgets
      * the addresses the wrapper reached on the old network (stale-address retries would
-     * otherwise pin requests to them for up to ten minutes).
+     * otherwise pin requests to them for up to ten minutes). Which DoH providers failed on the
+     * old network is forgotten too (raft.45).
      */
     fun onNetworkChanged() {
-        com.tencent.kmm.network.curl.curlDohPreference.clear()
+        com.tencent.kmm.network.curl.curlDohPreference.reset()
         runCatching { com.tencent.kmm.network.internal.platform.platformFlushCurlStaleAddresses() }
     }
 

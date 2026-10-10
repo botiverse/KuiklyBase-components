@@ -83,6 +83,30 @@ internal class CurlDohPreference(
     private val lock = kotlinx.atomicfu.locks.SynchronizedObject()
     private var provider = 0
     private var until = 0L
+    // raft.45: providers whose last attempt failed, until when they go to the back of the order.
+    private val failedUntil = mutableMapOf<Int, Long>()
+
+    /**
+     * [configured] with providers that failed within the window moved to the back (order otherwise
+     * kept), so the next request does not spend its budget on a provider this network just failed.
+     */
+    fun orderByRecentFailures(configured: List<Int>): List<Int> =
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            val now = nowMillis()
+            failedUntil.entries.removeAll { it.value <= now }
+            val (failed, fine) = configured.partition { it in failedUntil }
+            fine + failed
+        }
+
+    fun onDohFailed(providerId: Int) {
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            failedUntil[providerId] = nowMillis() + windowMillis
+            if (provider == providerId) {
+                provider = 0
+                until = 0L
+            }
+        }
+    }
 
     /** The provider to try first, or 0 to use the system resolver first. */
     fun preferredProvider(configured: List<Int>): Int =
@@ -94,13 +118,24 @@ internal class CurlDohPreference(
         kotlinx.atomicfu.locks.synchronized(lock) {
             provider = providerId
             until = nowMillis() + windowMillis
+            failedUntil.remove(providerId)
         }
     }
 
+    /** Forgets the preferred provider (a preferred-provider failure). Failure memory stays. */
     fun clear() {
         kotlinx.atomicfu.locks.synchronized(lock) {
             provider = 0
             until = 0L
+        }
+    }
+
+    /** A new network: forget everything learned on the old one. */
+    fun reset() {
+        kotlinx.atomicfu.locks.synchronized(lock) {
+            provider = 0
+            until = 0L
+            failedUntil.clear()
         }
     }
 }
@@ -134,8 +169,11 @@ internal suspend fun <R> runDohFallback(
         timing(first).freshRetryResult = "doh_preferred"
         return null
     }
-    val attempts = curlDohFallbackAttempts(firstProvider, configuredProviders)
-    if (firstProvider != 0) preference.clear()
+    val attempts = curlDohFallbackAttempts(firstProvider, preference.orderByRecentFailures(configuredProviders))
+    if (firstProvider != 0) {
+        preference.clear()
+        if (isUnresolved(first)) preference.onDohFailed(firstProvider)
+    }
     var last = first
     var lastProvider = firstProvider
     var retried = false
@@ -145,6 +183,9 @@ internal suspend fun <R> runDohFallback(
         if (!canRetry) break
         val next = attempt(provider, remainingTimeout ?: 0L)
         timing(next).retainFirstAttemptCurlFacts(timing(first))
+        if (provider != 0 && provider != CURL_DOH_PROVIDER_STALE_ADDRESS && isUnresolved(next)) {
+            preference.onDohFailed(provider)
+        }
         last = next
         lastProvider = provider
         retried = true
