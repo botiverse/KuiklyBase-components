@@ -445,6 +445,22 @@ jobs:
           path: ${{ runner.temp }}/h3-runner-probe/
           if-no-files-found: warn
 
+      - name: Probe HTTP/3 from the hosted runner (after gate, diagnostic)
+        if: always()
+        continue-on-error: true
+        timeout-minutes: 5
+        shell: bash
+        run: NetworkKMM/scripts/probe-runner-http3.sh "$RUNNER_TEMP/h3-runner-probe" after-gate
+
+      - name: Upload HTTP/3 runner probe evidence
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: network-android-h3-runner-probe
+          path: ${{ runner.temp }}/h3-runner-probe/
+          if-no-files-found: warn
+
   darwin-behavior-tests:
     if: ${{ !inputs.android_h3_contract_only }}
     name: Darwin engine behavior tests (macosArm64)
