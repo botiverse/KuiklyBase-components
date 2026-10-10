@@ -748,6 +748,98 @@ static void ShareUnlockCallback(CURL *handle, curl_lock_data data, void *userptr
 
 static constexpr long kDnsCacheTimeoutSeconds = 20L;
 
+// Stale address cache (raft task #150 follow-up, Chrome "StaleDNS" equivalent).
+// After a transfer reaches the server we remember the address libcurl connected
+// to for its host:port. When the system resolver later fails for that host the
+// routing layer may retry with CURL_DOH_PROVIDER_STALE_ADDRESS, which pins the
+// remembered address via CURLOPT_RESOLVE: no resolver round trip at all, and it
+// works even where the DoH providers are unreachable. Entries age out after
+// kStaleAddressMaxAgeMs and are dropped on FlushCurlStaleAddressCache (the host
+// calls it on network change, when old addresses may no longer be reachable).
+// The hostname and TLS verification of the business request are untouched: a
+// stale address is just where the TCP connection goes, the certificate is still
+// checked against the URL's hostname.
+static constexpr int64_t kStaleAddressMaxAgeMs = 10 * 60 * 1000;
+static constexpr size_t kStaleAddressMaxEntries = 64;
+
+struct StaleAddressEntry {
+    std::string address;
+    int64_t recordedAtMs;
+};
+
+static std::mutex gStaleAddressMutex;
+static std::unordered_map<std::string, StaleAddressEntry> gStaleAddresses;
+
+static int64_t SteadyNowMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static void RememberStaleAddress(const std::string &hostPort, const char *address) {
+    if (hostPort.empty() || address == nullptr || address[0] == '\0') {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(gStaleAddressMutex);
+    if (gStaleAddresses.size() >= kStaleAddressMaxEntries &&
+        gStaleAddresses.find(hostPort) == gStaleAddresses.end()) {
+        // Bounded: drop the oldest entry rather than growing without limit.
+        auto oldest = gStaleAddresses.begin();
+        for (auto it = gStaleAddresses.begin(); it != gStaleAddresses.end(); ++it) {
+            if (it->second.recordedAtMs < oldest->second.recordedAtMs) {
+                oldest = it;
+            }
+        }
+        gStaleAddresses.erase(oldest);
+    }
+    gStaleAddresses[hostPort] = StaleAddressEntry{address, SteadyNowMs()};
+}
+
+// Returns the remembered address for host:port, or empty when there is none or
+// it is older than kStaleAddressMaxAgeMs. ageMs receives the entry age on a hit.
+static std::string LookupStaleAddress(const std::string &hostPort, int64_t *ageMs) {
+    std::lock_guard<std::mutex> guard(gStaleAddressMutex);
+    auto it = gStaleAddresses.find(hostPort);
+    if (it == gStaleAddresses.end()) {
+        return "";
+    }
+    const int64_t age = SteadyNowMs() - it->second.recordedAtMs;
+    if (age > kStaleAddressMaxAgeMs) {
+        gStaleAddresses.erase(it);
+        return "";
+    }
+    if (ageMs != nullptr) {
+        *ageMs = age;
+    }
+    return it->second.address;
+}
+
+static void FlushStaleAddresses() {
+    std::lock_guard<std::mutex> guard(gStaleAddressMutex);
+    gStaleAddresses.clear();
+}
+
+// "host:port" of a URL as CURLOPT_RESOLVE wants it (default port filled in),
+// or empty when libcurl cannot parse the URL. IPv6 literals keep their brackets.
+static std::string CurlUrlHostPort(const char *url) {
+    CURLU *parsed = curl_url();
+    if (parsed == nullptr) {
+        return "";
+    }
+    std::string result;
+    if (curl_url_set(parsed, CURLUPART_URL, url, 0) == CURLUE_OK) {
+        char *host = nullptr;
+        char *port = nullptr;
+        if (curl_url_get(parsed, CURLUPART_HOST, &host, 0) == CURLUE_OK && host != nullptr &&
+            curl_url_get(parsed, CURLUPART_PORT, &port, CURLU_DEFAULT_PORT) == CURLUE_OK && port != nullptr) {
+            result = std::string(host) + ":" + port;
+        }
+        curl_free(host);
+        curl_free(port);
+    }
+    curl_url_cleanup(parsed);
+    return result;
+}
+
 static CURLSH *GetCurlShare(bool http3Enabled, bool dohFallback) {
     std::lock_guard<std::mutex> guard(gShareInitMutex);
     CURLSH **slot = dohFallback
@@ -1231,6 +1323,9 @@ class CurlClient {
         }
         const char *url = request.url;
         request_scheme_ = CurlUrlScheme(url);
+        request_host_port_ = CurlUrlHostPort(url);
+        stale_address_used_ = false;
+        stale_address_miss_ = false;
         int64_t timeout = request.timeout;
         StringDic *headers = request.headers;
         int size = headers->size;
@@ -1302,11 +1397,43 @@ class CurlClient {
             : 10000L;
         curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, connectTimeout);
         curl_easy_setopt(curl_, CURLOPT_HAPPY_EYEBALLS_TIMEOUT_MS, 200L);
+        // Mobile NATs drop idle flows silently; a reused connection then fails on
+        // first write/read with nothing received. Keepalive probes at the interval
+        // Chrome uses keep the mapping alive and surface dead connections before a
+        // request is sent on them; MAXAGE retires idle connections before typical
+        // carrier NAT timeouts instead of libcurl's 118 s default.
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPALIVE, 1L);
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPIDLE, 45L);
+        curl_easy_setopt(curl_, CURLOPT_TCP_KEEPINTVL, 45L);
+        curl_easy_setopt(curl_, CURLOPT_MAXAGE_CONN, 90L);
         // Share DNS/TLS sessions across per-request easy handles. Connection
         // caches deliberately remain easy-owned; cross-thread sharing is not
         // supported by libcurl and does not provide multiplexing.
+        // A stale-address attempt needs no resolver: pin the remembered address for
+        // this host:port, or fail right away (CURLE_COULDNT_RESOLVE_HOST shaped, so the
+        // routing layer moves on to the DoH providers) when nothing usable is cached.
+        if (doh_provider_ == CURL_DOH_PROVIDER_STALE_ADDRESS) {
+            int64_t ageMs = 0;
+            const std::string staleAddress = LookupStaleAddress(request_host_port_, &ageMs);
+            if (staleAddress.empty()) {
+                std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", "stale_address_miss");
+                logI(log_tag_, "stale_address_miss host=" + request_host_port_);
+                stale_address_miss_ = true;
+                return false;
+            }
+            if (!AppendResolveEntry((request_host_port_ + ":" + staleAddress).c_str())) {
+                return false;
+            }
+            stale_address_used_ = true;
+            logI(log_tag_, "stale_address_hit host=" + request_host_port_ + " age_ms=" + std::to_string(ageMs));
+        }
         const DohProvider *doh = FindDohProvider(doh_provider_);
-        CURLSH *share = GetCurlShare(http3_enabled_, doh != nullptr);
+        // A stale-address attempt runs without the process-wide share: libcurl
+        // loads CURLOPT_RESOLVE pins into the DNS cache it is given and never
+        // expires them, so sharing would pin this host to the stale address for
+        // every later request in the process. Keeping the pin in this handle's
+        // private cache scopes it to the one attempt.
+        CURLSH *share = stale_address_used_ ? nullptr : GetCurlShare(http3_enabled_, doh != nullptr);
         if (share != nullptr) {
             curl_easy_setopt(curl_, CURLOPT_SHARE, share);
         }
@@ -1321,7 +1448,7 @@ class CurlClient {
             // closed (doh_fallback_failure), but say why.
             logE(log_tag_, std::string("doh_fallback_without_share provider=") + doh->name);
         }
-        if (!resolve_entry_.empty() || doh != nullptr) {
+        if (!resolve_entry_.empty() || doh != nullptr || stale_address_used_) {
             if (!resolve_entry_.empty() && !AppendResolveEntry(resolve_entry_.c_str())) {
                 return false;
             }
@@ -1487,6 +1614,14 @@ class CurlClient {
         }
         std::string method;
         if (!ConfigureRequest(request, method)) {
+            if (stale_address_miss_) {
+                // Nothing cached for this host: report it like a failed resolve
+                // so the routing layer continues with the next resolution attempt.
+                FinishBufferedRequest(CURLE_COULDNT_RESOLVE_HOST, callback);
+                if (terminalDelivered != nullptr) {
+                    *terminalDelivered = true;
+                }
+            }
             return false;
         }
         // Cancel may land in the publish→perform window (RFC D-5): honor a
@@ -1553,6 +1688,9 @@ class CurlClient {
         upload_source_ = source;
         std::string method;
         if (!ConfigureRequest(request, method)) {
+            if (stale_address_miss_) {
+                FinishBufferedRequest(CURLE_COULDNT_RESOLVE_HOST, callback);
+            }
             return;
         }
         if (cancel_flag_.load(std::memory_order_relaxed)) {
@@ -1651,6 +1789,24 @@ class CurlClient {
         return result;
     }
 
+    // A transfer that got an HTTP status reached the origin at `ip`: remember it
+    // for stale-address retries of this host:port. Attempts that themselves ran
+    // on a stale address do not refresh the entry, so the cache lifetime is
+    // bounded by the last real resolution, not by how long the stale address
+    // kept working.
+    void RecordStaleAddressIfReached(long httpCode, const char *ip) {
+        if (httpCode <= 0 || stale_address_used_ || request_host_port_.empty()) {
+            return;
+        }
+        // Through a proxy CURLINFO_PRIMARY_IP is the proxy, not the origin; a
+        // later direct stale attempt would pin the origin's hostname to the proxy
+        // address and fail TLS verification. Only remember direct connections.
+        if (!proxy_url_.empty()) {
+            return;
+        }
+        RememberStaleAddress(request_host_port_, ip);
+    }
+
     // Shared post-perform tail of StartRequest/StartUploadRequest: build the
     // buffered CurlResponse and invoke the callback exactly once.
     void FinishBufferedRequest(CURLcode res, CurlCallback *callback) {
@@ -1669,6 +1825,7 @@ class CurlClient {
         // transfer with a 401/500 must not look like a success to callers.
         long httpCode = 0;
         curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &httpCode);
+        RecordStaleAddressIfReached(httpCode, ip);
 
         curl_response_ = new CurlResponse();
         curl_response_->code = errorCode;
@@ -1714,7 +1871,7 @@ class CurlClient {
         std::string method;
         if (!ConfigureRequest(request, method)) {
             // Always deliver exactly one terminal callback (upstream #31 contract).
-            BuildStreamCompletion(CURLE_FAILED_INIT);
+            BuildStreamCompletion(stale_address_miss_ ? CURLE_COULDNT_RESOLVE_HOST : CURLE_FAILED_INIT);
             return;
         }
         if (cancel_flag_.load(std::memory_order_relaxed)) {
@@ -1758,6 +1915,7 @@ class CurlClient {
         curl_easy_getinfo(curl_, CURLINFO_PRIMARY_IP, &ip);
         logI(log_tag_, "stream ret code:" + std::to_string(errorCode) + ", httpCode:" + std::to_string(httpCode)
             + ", ip:" + (ip != nullptr ? ip : "") + ", redirect url:" + redirect_url_);
+        RecordStaleAddressIfReached(httpCode, ip);
 
         curl_response_ = new CurlResponse();
         curl_response_->code = errorCode;
@@ -2019,7 +2177,8 @@ class CurlClient {
     }
 
     bool SetDohFallbackProvider(int providerId) {
-        if (providerId != CURL_DOH_PROVIDER_NONE && FindDohProvider(providerId) == nullptr) {
+        if (providerId != CURL_DOH_PROVIDER_NONE && providerId != CURL_DOH_PROVIDER_STALE_ADDRESS &&
+            FindDohProvider(providerId) == nullptr) {
             return false;
         }
         doh_provider_ = providerId;
@@ -2105,6 +2264,10 @@ class CurlClient {
     struct curl_slist *header_list_ = nullptr;
     struct curl_slist *resolve_list_ = nullptr;
     int doh_provider_ = CURL_DOH_PROVIDER_NONE;
+    // Stale address cache state for the current request (see RememberStaleAddress).
+    std::string request_host_port_;
+    bool stale_address_used_ = false;
+    bool stale_address_miss_ = false;
     char curl_error_msg_[CURL_ERROR_SIZE];
     std::string headers_;
     std::string current_headers_;
@@ -2763,6 +2926,11 @@ int SetCurlDohFallbackProvider(CurClientHandle handle, int providerId) {
         return 0;
     }
     return reinterpret_cast<CurlClient *>(handle)->SetDohFallbackProvider(providerId) ? 1 : 0;
+}
+
+int FlushCurlStaleAddressCache(void) {
+    FlushStaleAddresses();
+    return 1;
 }
 
 int SetCurlResolve(CurClientHandle handle, const char *resolveEntry) {
