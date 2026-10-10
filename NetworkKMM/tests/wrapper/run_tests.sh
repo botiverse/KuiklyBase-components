@@ -188,6 +188,34 @@ g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
   -o "$BUILD_DIR/connection_reuse_test"
 "$BUILD_DIR/connection_reuse_test" "http://127.0.0.1:$PORT"
 
+# raft.46: HTTP/2 connection-reuse contract over TLS + ALPN h2 (Python h2 server).
+if ! python3 -c "import h2" >/dev/null 2>&1; then
+  python3 -m pip install --quiet --user h2 >/dev/null 2>&1 ||
+    python3 -m pip install --quiet --user --break-system-packages h2 >/dev/null 2>&1 || true
+fi
+if python3 -c "import h2" >/dev/null 2>&1; then
+  echo "==> HTTP/2 connection reuse contract"
+  g++ -std=c++17 -O1 -g -DNETWORKKMM_WRAPPER_TESTING \
+    -I "$CPP_ROOT" \
+    -I "$CPP_ROOT/wrapper/include" \
+    "$CPP_ROOT/wrapper/src/curl_wrapper.cpp" \
+    "$CPP_ROOT/wrapper/src/log/curl_log.cpp" \
+    "$CPP_ROOT/wrapper/src/utils/curl_utils.cpp" \
+    "$SCRIPT_DIR/h2_reuse_test.cpp" \
+    -lcurl -lz -pthread \
+    -o "$BUILD_DIR/h2_reuse_test"
+  H2_PORT="$((PORT + 7))"
+  python3 "$SCRIPT_DIR/h2_test_server.py" --port "$H2_PORT" --cert "$TLS_CERT" --key "$TLS_KEY" &
+  H2_SERVER_PID=$!
+  sleep 0.5
+  H2_STATUS=0
+  "$BUILD_DIR/h2_reuse_test" "https://127.0.0.1:$H2_PORT" "$TLS_CERT" || H2_STATUS=$?
+  kill "$H2_SERVER_PID" 2>/dev/null || true
+  [ "$H2_STATUS" -eq 0 ]
+else
+  echo "==> HTTP/2 connection reuse contract skipped (python h2 unavailable)"
+fi
+
 # raft.46: silently dead reused connections (iptables blackhole on loopback; needs root).
 if sudo -n iptables -L OUTPUT >/dev/null 2>&1; then
   echo "==> Dead reused connection probe"

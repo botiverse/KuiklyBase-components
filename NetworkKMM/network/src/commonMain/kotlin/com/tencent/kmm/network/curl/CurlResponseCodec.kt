@@ -38,6 +38,18 @@ internal fun CurlNativeResponse.isBufferedBodyIdleTimeout(): Boolean =
 internal fun CurlNativeResponse.isBufferedResponseHeadersTimeout(): Boolean =
     code == 28 && errorMsg.contains("buffered response headers timeout")
 
+/**
+ * raft.46: the connection failed before any response status arrived: CURLE_SEND_ERROR (55),
+ * CURLE_RECV_ERROR (56), CURLE_HTTP2 (16), CURLE_HTTP2_STREAM (92). libcurl replays such a request
+ * itself only for RECV_ERROR on a reused connection; when an HTTP/2 connection dies with several
+ * streams in flight, the others fail with SEND_ERROR and are not replayed. A replay-safe GET/HEAD
+ * then gets one fresh-connection retry, like OkHttp's retryOnConnectionFailure.
+ */
+internal fun CurlNativeResponse.isConnectionFailureBeforeResponse(): Boolean =
+    httpCode == 0 && code in CURL_CONNECTION_FAILURE_CODES
+
+internal val CURL_CONNECTION_FAILURE_CODES: Set<Int> = setOf(16, 55, 56, 92)
+
 internal data class CurlResponseFields(
     val code: Int = 0,
     val httpCode: Int = 0,

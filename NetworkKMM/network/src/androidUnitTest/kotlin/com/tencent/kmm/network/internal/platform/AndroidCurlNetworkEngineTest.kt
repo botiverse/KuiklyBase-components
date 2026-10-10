@@ -159,6 +159,55 @@ class AndroidCurlNetworkEngineTest {
     }
 
     @Test
+    fun connectionFailureBeforeResponseRetriesGetOnceOnFreshConnectionButNeverPost() = runBlocking {
+        // raft.46: an HTTP/2 connection dying with several streams in flight fails the other streams
+        // with CURLE_SEND_ERROR, which libcurl does not replay (h2_reuse_test case 5).
+        val bridge = FakeBridge().apply {
+            executeResponse = CurlNativeResponse(code = 55, errorMsg = "Send failure: Broken pipe")
+            freshExecuteResponse = CurlNativeResponse(code = 0, httpCode = 200, data = "ok".encodeToByteArray())
+        }
+        val get = NetworkRequest(url = "https://example.test/agents")
+        val response = AndroidCurlNetworkEngine(bridge).execute(get, NetworkCall(get))
+        assertEquals(200, response.statusCode)
+        assertEquals(1, bridge.freshExecuteRequests.size)
+        assertTrue(response.timing.freshRetry)
+        assertEquals("success", response.timing.freshRetryResult)
+        assertFalse(response.timing.curlBodyStallDetected)
+
+        for (code in listOf(16, 56, 92)) {
+            val retryBridge = FakeBridge().apply {
+                executeResponse = CurlNativeResponse(code = code, errorMsg = "connection failure $code")
+            }
+            val head = NetworkRequest(method = VBTransportMethod.HEAD, url = "https://example.test/health")
+            AndroidCurlNetworkEngine(retryBridge).execute(head, NetworkCall(head))
+            assertEquals(1, retryBridge.freshExecuteRequests.size, "code $code")
+        }
+
+        val postBridge = FakeBridge().apply {
+            executeResponse = CurlNativeResponse(
+                code = 56,
+                errorMsg = "connection died before any response byte; request not replayed (not GET/HEAD)",
+            )
+        }
+        val post = NetworkRequest(
+            method = VBTransportMethod.POST,
+            url = "https://example.test/messages",
+            body = NetworkBody.Json("{}"),
+        )
+        val failed = AndroidCurlNetworkEngine(postBridge).execute(post, NetworkCall(post))
+        assertNull(failed.statusCode)
+        assertEquals(0, postBridge.freshExecuteRequests.size)
+
+        // A status already arrived (body cut off): not a connection failure before the response.
+        val partialBridge = FakeBridge().apply {
+            executeResponse = CurlNativeResponse(code = 56, httpCode = 200, errorMsg = "Recv failure")
+        }
+        val partial = NetworkRequest(url = "https://example.test/partial")
+        AndroidCurlNetworkEngine(partialBridge).execute(partial, NetworkCall(partial))
+        assertEquals(0, partialBridge.freshExecuteRequests.size)
+    }
+
+    @Test
     fun networkChangeRetiresBothPooledEngines() {
         // raft.46: like Cronet on a mobile IP change, no new request goes out on a connection that
         // was opened on the previous network.

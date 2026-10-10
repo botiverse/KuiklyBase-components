@@ -29,6 +29,11 @@ the kernel and keeps normal reuse.
   redirected by 303 is replayed as the GET it became; a POST kept by 307 is not. This also stops
   the replay of POST/PUT/DELETE after a dropped or reset keep-alive connection, which raft.45 did
   (the server saw them twice).
+- A buffered GET/HEAD that fails on the connection before any response status (CURLE_SEND_ERROR
+  55, RECV_ERROR 56, HTTP2 16, HTTP2_STREAM 92) gets one fresh-connection retry on all three
+  platforms (OkHttp retryOnConnectionFailure / recoverFromOneHttp2ErrorRequiresNewConnection).
+  libcurl replays only RECV_ERROR itself; when an HTTP/2 connection dies with several streams in
+  flight, the others fail with SEND_ERROR and were not recovered. Other methods are never retried.
 - Idle reuse limit back to 90 s (`CURLOPT_MAXAGE_CONN`); dead connections are detected, not avoided.
 - Buffered GET/HEAD: once the request went out (PRETRANSFER) and no response headers arrived within
   the body-idle budget (7 s by default), the request aborts with `buffered response headers timeout`
@@ -53,7 +58,11 @@ the kernel and keeps normal reuse.
   connections for GET/HEAD (replayed, server sees 2) and POST/PUT/DELETE (refused, server sees 1;
   raft.45 failed 6 of these checks), a body cut mid-way (error, no replay), 303/307 redirect hops
   that drop, close-delimited bodies, 408 passthrough, and 1 KB/64 KB POSTs after a server-closed
-  idle connection (sent once).
+  idle connection (sent once). `tests/wrapper/h2_reuse_test.cpp` + `h2_test_server.py` (TLS + ALPN
+  h2, Python `h2`) cover HTTP/2: multiplexed reuse, GOAWAY (next request on a new connection, sent
+  once), REFUSED_STREAM (GET retried, POST refused, sent once), RST_STREAM INTERNAL_ERROR (fails,
+  sent once; GET then retried by the routing layer), and a connection dying with 2 GET + 1 POST in
+  flight (GETs succeed or fail with a retryable connection code; the POST is never sent again).
 
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 

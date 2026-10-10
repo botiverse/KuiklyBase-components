@@ -21,6 +21,7 @@ import com.tencent.kmm.network.curl.CurlNativeResponse
 import com.tencent.kmm.network.curl.curlPooledEngineRetirement
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
 import com.tencent.kmm.network.curl.isBufferedResponseHeadersTimeout
+import com.tencent.kmm.network.curl.isConnectionFailureBeforeResponse
 import com.tencent.kmm.network.curl.isCurlProxyHttp3Incompatibility
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.CURL_CODE_COULDNT_RESOLVE_HOST
@@ -185,10 +186,11 @@ internal class AndroidCurlNetworkEngine(
                 if (retried.code == 0) "proxy_h3_to_h2_success" else "proxy_h3_to_h2_failure"
             return retried.toNetworkResponse(request)
         }
-        if (!first.isBufferedBodyIdleTimeout()) {
+        val stalled = first.isBufferedBodyIdleTimeout()
+        if (!stalled && !first.isConnectionFailureBeforeResponse()) {
             return first.toNetworkResponse(request)
         }
-        first.elapse.curlBodyStallDetected = true
+        if (stalled) first.elapse.curlBodyStallDetected = true
         val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
         if (!shouldFreshRetryCurlBufferedStall(
                 method = request.method,
@@ -218,7 +220,7 @@ internal class AndroidCurlNetworkEngine(
             timeoutMillis = remainingTimeout ?: 0L,
             freshConnection = true,
         )
-        retried.elapse.curlBodyStallDetected = true
+        if (stalled) retried.elapse.curlBodyStallDetected = true
         retried.elapse.retainFirstAttemptCurlFacts(first.elapse)
         retried.elapse.freshRetry = true
         retried.elapse.freshRetryResult = if (retried.code == 0) "success" else "failure"

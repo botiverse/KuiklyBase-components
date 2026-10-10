@@ -25,6 +25,7 @@ import com.tencent.kmm.network.curl.runDohFallback
 import com.tencent.kmm.network.curl.curlPooledEngineRetirement
 import com.tencent.kmm.network.curl.isBufferedBodyIdleTimeout
 import com.tencent.kmm.network.curl.isBufferedResponseHeadersTimeout
+import com.tencent.kmm.network.curl.isConnectionFailureBeforeResponse
 import com.tencent.kmm.network.curl.retainFirstAttemptCurlFacts
 import com.tencent.kmm.network.curl.shouldFreshRetryCurlBufferedStall
 import com.tencent.kmm.network.curl.parseCurlHeaders
@@ -141,10 +142,11 @@ internal class IosCurlNetworkEngine(
                 dohFallbackProvider = provider,
             )
         }?.let { return it.toNetworkResponse(request) }
-        if (!first.isBufferedBodyIdleTimeout()) {
+        val stalled = first.isBufferedBodyIdleTimeout()
+        if (!stalled && !first.isConnectionFailureBeforeResponse()) {
             return first.toNetworkResponse(request)
         }
-        first.elapse.curlBodyStallDetected = true
+        if (stalled) first.elapse.curlBodyStallDetected = true
         val remainingTimeout = remainingCurlTimeoutMillis(request.policy.timeoutMillis, startedAt)
         if (!shouldFreshRetryCurlBufferedStall(
                 method = request.method,
@@ -171,7 +173,7 @@ internal class IosCurlNetworkEngine(
             timeoutMillis = remainingTimeout ?: 0L,
             freshConnection = true,
         )
-        retried.elapse.curlBodyStallDetected = true
+        if (stalled) retried.elapse.curlBodyStallDetected = true
         retried.elapse.retainFirstAttemptCurlFacts(first.elapse)
         retried.elapse.freshRetry = true
         retried.elapse.freshRetryResult = if (retried.code == 0) "success" else "failure"
