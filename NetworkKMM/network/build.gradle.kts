@@ -248,6 +248,7 @@ kotlin {
                 kotlin.exclude("com/tencent/kmm/network/internal/platform/IosCurlNativeBridge.kt")
                 kotlin.exclude("com/tencent/kmm/network/internal/platform/IosCurlNetworkEngine.kt")
                 kotlin.exclude("com/tencent/kmm/network/internal/platform/PlatformNetworkEngines.ios.kt")
+                kotlin.exclude("com/tencent/kmm/network/socketio/NetworkSocketIo.ios.kt")
                 dependencies {
                     implementation(libs.ktor.ktor.client.core)
                     implementation(libs.ktor.client.darwin)
