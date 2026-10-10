@@ -270,7 +270,8 @@ Privacy: during the window the provider sees every hostname resolved (up to 60 s
 doh_fallback_success | doh_fallback_failure | system_after_doh_failure`, and `doh_preferred` for a
 request that went to the preferred provider first.
 
-Socket.IO (`NetworkSocketIoFactory`, raft task #154): the curl WebSocket connect uses the same
+Socket.IO (`NetworkSocketIoFactory`, raft task #154; Android through JNI, iOS and OHOS through
+cinterop): the curl WebSocket connect uses the same
 providers. Only when the system-resolver connect fails with `CURLE_COULDNT_RESOLVE_HOST` is each
 provider tried in order on a fresh handle; any other failure stands. The native client receives the
 list through `SetCurlSocketIoDohFallbackProviders` before `Start` (additive C API; the config struct
