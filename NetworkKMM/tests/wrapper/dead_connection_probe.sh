@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # raft.46: reproduce a silently dead reused connection on loopback (needs sudo for iptables) and
 # check the wrapper recovers: an idle dead connection is found before reuse (the next GET opens a
-# new connection at once), and a request already on a dead connection fails over within the 10 s
-# unacked-data deadline instead of the 30 s request timeout. Usage:
+# new connection at once), and a POST already on a dead connection fails within the 10 s
+# unacked-data deadline instead of the 30 s request timeout, without ever being sent twice. Usage:
 #   dead_connection_probe.sh [wrapper.cpp]   (defaults to the working-tree wrapper; pass an older
 #                                             curl_wrapper.cpp to compare)
 # run_tests.sh runs it when passwordless sudo iptables is available (GitHub-hosted runners).
@@ -61,12 +61,11 @@ run() {
 }
 # Idle past keepalive (10 s) + unacked-data deadline (10 s): the kernel has failed the connection.
 run GET "${IDLE_GET:-25}" 3000
-# Dead right away: the request itself is the unacked data, it never reached the server, and libcurl
-# replays it on a new connection: the server sees the POST exactly once.
-run POST 0 15000 "" 1
-# Dead after the server took the POST and before its response: libcurl replays any request on a
-# reused connection that died before a response byte arrived (Curl_retry_request), so the server
-# sees this POST twice. Documented, not asserted: Chromium resends in the same case, and before
-# raft.46 the same request hung for the full request timeout instead.
-run POST 0 40000 slow
+# Dead right away (the POST never reached the server) and dead after the server took the POST
+# (held 4 s, then the path is cut before its response): libcurl would replay both on a new
+# connection (Curl_retry_request ignores the method), the second one as a duplicate. The wrapper
+# refuses any replay that is not GET/HEAD: both fail within the unacked-data deadline, and the
+# server sees the POST at most once.
+run POST 0 15000 "" 0
+run POST 0 40000 slow 1
 exit "$FAILED"

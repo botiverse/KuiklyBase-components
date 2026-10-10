@@ -3,6 +3,7 @@
 // stdin while the script silently drops that connection's packets (iptables DROP on its client
 // port, so neither side sees FIN/RST, like a NAT mapping that vanished). After an optional idle
 // period the second request goes out on the same engine; the probe prints its outcome and latency.
+// GET/HEAD must recover on a new connection; POST must fail (libcurl would otherwise replay it).
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
@@ -94,8 +95,14 @@ int main(int argc, char **argv) {
         method, idleSeconds, second.code, second.httpCode, static_cast<long long>(elapsed), second.error.c_str());
     DeleteCurlMultiEngine(engine);
     const long long budgetMs = argc > 4 ? std::atoll(argv[4]) : 0;
-    const bool ok = second.code == 0 && second.httpCode == 200 && (budgetMs <= 0 || elapsed <= budgetMs);
-    std::printf("%s: %s after %ds idle on a silently dead reused connection recovers within %lldms\n",
-        ok ? "ok" : "FAIL", method, idleSeconds, budgetMs);
+    // GET/HEAD recover on a new connection; any other method fails fast and is never sent twice.
+    const bool replayable = std::strcmp(method, "GET") == 0 || std::strcmp(method, "HEAD") == 0;
+    const bool outcome = replayable
+        ? second.code == 0 && second.httpCode == 200
+        : second.code == 56 && second.error.find("not replayed") != std::string::npos;
+    const bool ok = outcome && (budgetMs <= 0 || elapsed <= budgetMs);
+    std::printf("%s: %s after %ds idle on a silently dead reused connection %s within %lldms\n",
+        ok ? "ok" : "FAIL", method, idleSeconds,
+        replayable ? "recovers on a new connection" : "fails without a replay", budgetMs);
     return ok ? 0 : 1;
 }

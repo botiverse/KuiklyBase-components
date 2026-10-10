@@ -1370,6 +1370,26 @@ class CurlClient {
         return true;
     }
 
+    // Runs before every request libcurl sends on this handle: the first one, each redirect, and each
+    // transport-level replay. A second call without a new redirect is a replay.
+    static int PrereqCallback(void *clientp, char *, char *, int, int) {
+        auto *client = static_cast<CurlClient *>(clientp);
+        if (client == nullptr) {
+            return CURL_PREREQFUNC_OK;
+        }
+        long redirects = 0;
+        curl_easy_getinfo(client->curl_, CURLINFO_REDIRECT_COUNT, &redirects);
+        const bool replay = client->prereq_calls_ > 0 && redirects == client->prereq_redirect_count_;
+        client->prereq_calls_++;
+        client->prereq_redirect_count_ = redirects;
+        if (replay && !client->transport_replay_allowed_) {
+            client->transport_replay_blocked_ = true;
+            logE(client->log_tag_, "connection died before any response byte; request not replayed (not GET/HEAD)");
+            return CURL_PREREQFUNC_ABORT;
+        }
+        return CURL_PREREQFUNC_OK;
+    }
+
     bool StreamPhaseTimedOut() {
         const auto now = std::chrono::steady_clock::now();
         if (!final_headers_ready_ && stream_response_headers_timeout_ms_ > 0) {
@@ -1731,6 +1751,16 @@ class CurlClient {
         buffered_response_limit_reason_.clear();
         buffered_headers_deadline_eligible_ = method == "GET" || method == "HEAD";
         buffered_headers_phase_started_ = false;
+        // raft.46: libcurl replays a request whose reused connection died before any response byte
+        // (Curl_retry_request) whatever the method, also when the server already had it. Only
+        // GET/HEAD may go out twice; any other method fails instead (OkHttp's rule: no replay once
+        // the request may have been sent).
+        transport_replay_allowed_ = method == "GET" || method == "HEAD";
+        transport_replay_blocked_ = false;
+        prereq_calls_ = 0;
+        prereq_redirect_count_ = 0;
+        curl_easy_setopt(curl_, CURLOPT_PREREQFUNCTION, PrereqCallback);
+        curl_easy_setopt(curl_, CURLOPT_PREREQDATA, this);
         // Detection and replay eligibility are deliberately separate:
         // every buffered response (including POST/upload responses) must stop
         // on body-idle, while the routing layer may later replay only explicit
@@ -1909,6 +1939,11 @@ class CurlClient {
             // rewrite an already-completed success into a false cancellation.
             std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s", "cancelled by caller");
             return CURLE_ABORTED_BY_CALLBACK;
+        }
+        if (transport_replay_blocked_ && callbackAbort) {
+            std::snprintf(curl_error_msg_, sizeof(curl_error_msg_), "%s",
+                "connection died before any response byte; request not replayed (not GET/HEAD)");
+            return CURLE_RECV_ERROR;
         }
         if (!buffered_timeout_reason_.empty()) {
             // libcurl owns CURLOPT_ERRORBUFFER while perform is running and
@@ -2441,6 +2476,10 @@ class CurlClient {
     std::string buffered_timeout_reason_;
     bool buffered_headers_deadline_eligible_ = false;
     bool buffered_headers_phase_started_ = false;
+    bool transport_replay_allowed_ = true;
+    bool transport_replay_blocked_ = false;
+    int prereq_calls_ = 0;
+    long prereq_redirect_count_ = 0;
     std::chrono::steady_clock::time_point buffered_headers_phase_started_at_{};
     int64_t max_buffered_response_bytes_ = 0;
     int64_t connection_cache_id_ = 0;

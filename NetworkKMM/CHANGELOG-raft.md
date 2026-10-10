@@ -20,9 +20,12 @@ the kernel and keeps normal reuse.
   on a dead connection fails with `CURLE_RECV_ERROR` and libcurl replays it once on a new connection
   (`Curl_retry_request`: reused connection, no response byte received). One `socket liveness ...
   applied|failed errno=N` log line per process (every failure) records the option on the device.
-- Note: libcurl's replay does not look at the method. A POST whose connection dies after the server
-  took it but before any response byte is sent again (Chromium resends in the same case; before this
-  release the request hung for the full timeout, and a reset connection was already replayed).
+- Only GET/HEAD may be replayed. libcurl's replay (`Curl_retry_request`) ignores the method, so a
+  POST whose connection died after the server took it but before any response byte would go out
+  twice. `CURLOPT_PREREQFUNCTION` runs before every request libcurl sends; a second call that is not
+  a redirect is a replay, and for any method other than GET/HEAD it is refused: the request fails
+  with `CURLE_RECV_ERROR` "connection died before any response byte; request not replayed (not
+  GET/HEAD)". This also stops the replay of a POST after a connection reset, which raft.45 did.
 - Idle reuse limit back to 90 s (`CURLOPT_MAXAGE_CONN`); dead connections are detected, not avoided.
 - Buffered GET/HEAD: once the request went out (PRETRANSFER) and no response headers arrived within
   the body-idle budget (7 s by default), the request aborts with `buffered response headers timeout`
@@ -38,11 +41,11 @@ the kernel and keeps normal reuse.
   request goes out on a connection opened on the previous network (Cronet stops new streams on
   existing sessions on a mobile IP change).
 - Tests: `tests/wrapper/dead_connection_probe.sh` blackholes a pooled loopback connection with
-  iptables (run by `run_tests.sh` where passwordless sudo exists): after 25 s idle the next GET
-  succeeds at once on a new connection (raft.45: 30 s timeout); a POST on a just-died connection
-  succeeds in ~10 s and reaches the server once (raft.45: 30 s timeout); a POST held by the server
-  when the path dies reaches it twice (documented above). The behavior test reads
-  `TCP_USER_TIMEOUT` back from the kernel.
+  iptables (run by `run_tests.sh` where passwordless sudo exists) and counts POSTs on the server:
+  after 25 s idle the next GET succeeds at once on a new connection (raft.45: 30 s timeout); a POST
+  on a just-died connection fails in ~10 s and reaches the server 0 times (raft.45: 30 s timeout); a
+  POST the server took before the path died fails in ~15 s and reaches it exactly once. The behavior
+  test reads `TCP_USER_TIMEOUT` back from the kernel.
 
 ## 0.1.0-raft.45 / 0.1.0-raft.45-ohos (DoH fallback: per-attempt budget and failure memory)
 
