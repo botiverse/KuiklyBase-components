@@ -17,6 +17,7 @@ Firefox TRR, Chrome, Android/iOS and the Aliyun/Tencent HTTPDNS SDKs).
   provider that resolves is forgiven; `VBTransportCurl.onNetworkChanged()` and changing the
   provider list forget all of it. The trigger is unchanged: only after the system resolver
   failed.
+- Native carriers rebuilt: Android run 38042922825, iOS run 38043120314, OHOS run 38044036179.
 
 ## 0.1.0-raft.44 / 0.1.0-raft.44-ohos (Socket.IO events without arguments)
 
