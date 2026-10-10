@@ -264,6 +264,10 @@ typedef struct CurlSocketIoCallbackV1 {
 CurlSocketIoHandle CreateCurlSocketIoClientV1(
     const CurlSocketIoConfigV1 *config, size_t configSize, int abiVersion,
     const CurlSocketIoCallbackV1 *callback);
+// Raft task #153 (additive): built-in DoH provider ids (CURL_DOH_PROVIDER_*) tried in order when
+// the system resolver cannot resolve the Socket.IO host. Call before Start; 1 = accepted.
+int SetCurlSocketIoDohFallbackProviders(CurlSocketIoHandle handle, const int *providerIds,
+                                        int count, int abiVersion);
 int StartCurlSocketIoClientV1(CurlSocketIoHandle handle, int abiVersion);
 int EmitCurlSocketIoEventV1(CurlSocketIoHandle handle, const char *eventName,
                             const char *payloadJson, int abiVersion);
