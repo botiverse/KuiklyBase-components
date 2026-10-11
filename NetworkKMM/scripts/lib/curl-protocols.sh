@@ -55,7 +55,9 @@ curl_assert_websocket_symbol() {
   # A defined symbol: any type letter but U. Captured first: grep -q in a pipeline can SIGPIPE the
   # producer and pipefail turns that into a false negative.
   local defined
-  defined="$(grep -w "$CURL_WEBSOCKET_SYMBOL" <<<"$symbols" | grep -v ' U ' || true)"
+  # Mach-O (iOS) prefixes C symbols with '_', ELF (Android/OHOS) does not; -w would treat that '_'
+  # as part of the word and miss it, so match the last field with an optional leading underscore.
+  defined="$(grep -E "(^|[[:space:]])_?${CURL_WEBSOCKET_SYMBOL}\$" <<<"$symbols" | grep -v ' U ' || true)"
   if [[ -n "$defined" ]]; then
     echo "libcurl WebSocket (realtime): ENABLED (${CURL_WEBSOCKET_SYMBOL} defined)"
   else
