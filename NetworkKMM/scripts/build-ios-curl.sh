@@ -37,6 +37,8 @@ fi
 JOBS="$(sysctl -n hw.ncpu)"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/curl-protocols.sh
+source "${SCRIPT_DIR}/lib/curl-protocols.sh"
 NETWORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # Keep the OpenSSL build identity and every static-archive member header
 # independent of the runner clock. SOURCE_DATE_EPOCH is one audited repository
@@ -262,24 +264,7 @@ build_slice_arch() {
       -DBUILD_MISC_DOCS=OFF \
       -DENABLE_CURL_MANUAL=OFF \
       -DBUILD_TESTING=OFF \
-      # Not HTTP_ONLY: in curl 8.22 (not 8.16) its CMake branch also sets CURL_DISABLE_WEBSOCKETS,
-      # and the realtime Socket.IO client needs ws/wss (raft.46 shipped without them).
-      -DCURL_DISABLE_DICT=ON \
-      -DCURL_DISABLE_FILE=ON \
-      -DCURL_DISABLE_FTP=ON \
-      -DCURL_DISABLE_GOPHER=ON \
-      -DCURL_DISABLE_IMAP=ON \
-      -DCURL_DISABLE_IPFS=ON \
-      -DCURL_DISABLE_LDAP=ON \
-      -DCURL_DISABLE_LDAPS=ON \
-      -DCURL_DISABLE_MQTT=ON \
-      -DCURL_DISABLE_POP3=ON \
-      -DCURL_DISABLE_RTSP=ON \
-      -DCURL_DISABLE_SMB=ON \
-      -DCURL_DISABLE_SMTP=ON \
-      -DCURL_DISABLE_TELNET=ON \
-      -DCURL_DISABLE_TFTP=ON \
-      -DCURL_DISABLE_WEBSOCKETS=OFF \
+      "${CURL_PROTOCOL_CMAKE_FLAGS[@]}" \
       -DCURL_USE_OPENSSL=ON \
       -DOPENSSL_ROOT_DIR="$openssl_prefix" \
       -DOPENSSL_USE_STATIC_LIBS=ON \
@@ -310,12 +295,7 @@ build_slice_arch() {
   # Mach-O archive references are pin-exact supplements. xcrun nm prefixes C
   # symbols with "_", so every symbol match is end-anchored.
   local define
-  # WebSocket (wss://) carries the realtime Socket.IO connection; fail the build if it is off.
-  if grep -q "#define CURL_DISABLE_WEBSOCKETS 1" "$curl_build/lib/curl_config.h"; then
-    echo "[${sdk}/${arch}] curl_config.h CURL_DISABLE_WEBSOCKETS: SET (WebSocket support missing)" >&2
-    exit 2
-  fi
-  echo "==> [${sdk}/${arch}] curl_config.h WebSocket: ENABLED"
+  curl_assert_websocket_config "$curl_build/lib/curl_config.h" || exit 2
   for define in USE_NGHTTP2 USE_NGTCP2 USE_NGHTTP3 OPENSSL_QUIC_API2; do
     if grep -q "#define ${define} 1" "$curl_build/lib/curl_config.h"; then
       echo "==> [${sdk}/${arch}] curl_config.h ${define}: ENABLED"
@@ -340,6 +320,7 @@ HTTP/3 (nghttp3)|nghttp3_conn_client_new_versioned
 HTTP/3 (ngtcp2 client)|ngtcp2_conn_client_new_versioned
 HTTP/3 (ngtcp2 ossl crypto)|ngtcp2_crypto_ossl_configure_client_session
 HTTP_FEATURE_SYMBOLS
+  curl_assert_websocket_symbol "$curl_syms" || exit 2
 
   echo "==> [${sdk}/${arch}] pbcurlwrapper + merge"
   local common_flags=(

@@ -40,6 +40,8 @@ OHOS_ARCH="arm64-v8a"
 OHOS_TRIPLE="aarch64-linux-ohos"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib/curl-protocols.sh
+source "${SCRIPT_DIR}/lib/curl-protocols.sh"
 NETWORK_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # OpenSSL otherwise embeds the runner wall clock and changes libopenssl.so on
 # every rebuild. Consume the same audited repository epoch as Android/iOS and
@@ -330,8 +332,7 @@ cmake -S "curl-${CURL_VERSION}" -B curl-build \
   -DNGHTTP3_INCLUDE_DIR="$DEPS_PREFIX/include" \
   -DNGHTTP3_LIBRARY="$DEPS_PREFIX/lib/libnghttp3.a" \
   -DUSE_LIBIDN2=OFF \
-  -DCURL_DISABLE_LDAP=ON \
-  -DCURL_DISABLE_WEBSOCKETS=OFF \
+  "${CURL_PROTOCOL_CMAKE_FLAGS[@]}" \
   -DENABLE_THREADED_RESOLVER=OFF \
   -DHAVE_SENDMMSG=0 \
   -DCURL_CA_BUNDLE=/etc/ssl/certs/cacert.pem \
@@ -356,6 +357,7 @@ if [[ -z "$CURL_STATIC_LIB" ]]; then
 fi
 
 echo "==> Checking libcurl HTTP/2 + HTTP/3 configuration"
+curl_assert_websocket_config curl-build/lib/curl_config.h || exit 2
 for define in USE_NGHTTP2 USE_NGTCP2 USE_NGHTTP3 OPENSSL_QUIC_API2; do
   if grep -q "#define ${define} 1" curl-build/lib/curl_config.h; then
     echo "curl_config.h ${define}: ENABLED"
@@ -394,6 +396,7 @@ check_reference "nghttp2 (HTTP/2)" "nghttp2_session_client_new3"
 check_reference "nghttp3 (HTTP/3)" "nghttp3_conn_client_new_versioned"
 check_reference "ngtcp2 (HTTP/3 client)" "ngtcp2_conn_client_new_versioned"
 check_reference "ngtcp2 ossl crypto" "ngtcp2_crypto_ossl_configure_client_session"
+curl_assert_websocket_symbol "$CURL_SYMBOLS" || dependency_missing=1
 if [[ "$dependency_missing" -ne 0 ]]; then
   echo "One or more optional dependencies are missing from libcurl.a" >&2
   exit 1
