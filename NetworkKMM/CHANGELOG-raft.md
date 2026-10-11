@@ -1,5 +1,37 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.47 / 0.1.0-raft.47-ohos (WebSocket back in the Android/iOS libcurl)
+
+HuaTuo (device QA, 1.13.1 / 11301003) and artin (Hands a9971638): with the curl realtime stack on, the
+app opened no realtime connection at all and received no events; the legacy stack worked and raft.44
+(curl 8.16) worked. Cause: in curl 8.22 the CMake `HTTP_ONLY` branch also sets
+`CURL_DISABLE_WEBSOCKETS` (8.16 did not), and the Android and iOS builds passed `-DHTTP_ONLY=ON`, so
+raft.46's libcurl had no ws/wss and every Socket.IO connect failed. OHOS was not affected (its build
+disabled only LDAP and set `CURL_DISABLE_WEBSOCKETS=OFF`).
+
+- One protocol policy for all three platforms (artin: "these keys are the same on all three"):
+  `NetworkKMM/scripts/lib/curl-protocols.sh`, sourced by the Android, iOS and OHOS builds. It
+  disables DICT FILE FTP GOPHER IMAP IPFS LDAP LDAPS MQTT POP3 RTSP SMB SMTP TELNET TFTP and sets
+  `CURL_DISABLE_WEBSOCKETS=OFF`. Not `HTTP_ONLY`: in 8.22 its `set()` is a plain variable that
+  shadows any `-DCURL_DISABLE_WEBSOCKETS=OFF`. OHOS used to disable only LDAP and now drops the same
+  unused protocols as the others.
+- Two build gates on every platform:
+  - `curl_config.h` must exist and must not define `CURL_DISABLE_WEBSOCKETS`.
+  - `libcurl.a` must define `Curl_protocol_ws`, which curl compiles only with WebSocket on. The gate
+    accepts the Mach-O leading `_`. `curl_ws_recv`/`curl_ws_send` are no evidence: curl defines
+    `CURLE_NOT_BUILT_IN` stubs for them when WebSocket is off. The old OHOS check relied on them and
+    is removed.
+- Verified on host builds of curl 8.22.0. With `HTTP_ONLY` plus `-DCURL_DISABLE_WEBSOCKETS=OFF`,
+  WebSocket stays off and `curl_ws_recv` is still a defined symbol. With the shared policy,
+  WebSocket is on and `Curl_protocol_ws` is defined.
+- No source change. Native libraries rebuilt sequentially, with both gates passing, from the shared
+  gh account:
+  - Android run 38142106935 → `8d0b529`
+  - iOS run 38142582313 → `04621de`. The earlier iOS run 38142314271 was stopped by the symbol gate
+    before the underscore fix.
+  - OHOS run 38143782240 → `40d2901`
+  - The cancelled Android run 38141441356 is not used.
+
 ## 0.1.0-raft.46 / 0.1.0-raft.46-ohos (dead reused connections: Cronet-style liveness and recovery)
 
 Hands 79db9fe6 / f717ac6f (artin, Android 1.13.1): the server and ALB answered in milliseconds, but
