@@ -262,7 +262,24 @@ build_slice_arch() {
       -DBUILD_MISC_DOCS=OFF \
       -DENABLE_CURL_MANUAL=OFF \
       -DBUILD_TESTING=OFF \
-      -DHTTP_ONLY=ON \
+      # Not HTTP_ONLY: in curl 8.22 (not 8.16) its CMake branch also sets CURL_DISABLE_WEBSOCKETS,
+      # and the realtime Socket.IO client needs ws/wss (raft.46 shipped without them).
+      -DCURL_DISABLE_DICT=ON \
+      -DCURL_DISABLE_FILE=ON \
+      -DCURL_DISABLE_FTP=ON \
+      -DCURL_DISABLE_GOPHER=ON \
+      -DCURL_DISABLE_IMAP=ON \
+      -DCURL_DISABLE_IPFS=ON \
+      -DCURL_DISABLE_LDAP=ON \
+      -DCURL_DISABLE_LDAPS=ON \
+      -DCURL_DISABLE_MQTT=ON \
+      -DCURL_DISABLE_POP3=ON \
+      -DCURL_DISABLE_RTSP=ON \
+      -DCURL_DISABLE_SMB=ON \
+      -DCURL_DISABLE_SMTP=ON \
+      -DCURL_DISABLE_TELNET=ON \
+      -DCURL_DISABLE_TFTP=ON \
+      -DCURL_DISABLE_WEBSOCKETS=OFF \
       -DCURL_USE_OPENSSL=ON \
       -DOPENSSL_ROOT_DIR="$openssl_prefix" \
       -DOPENSSL_USE_STATIC_LIBS=ON \
@@ -293,6 +310,12 @@ build_slice_arch() {
   # Mach-O archive references are pin-exact supplements. xcrun nm prefixes C
   # symbols with "_", so every symbol match is end-anchored.
   local define
+  # WebSocket (wss://) carries the realtime Socket.IO connection; fail the build if it is off.
+  if grep -q "#define CURL_DISABLE_WEBSOCKETS 1" "$curl_build/lib/curl_config.h"; then
+    echo "[${sdk}/${arch}] curl_config.h CURL_DISABLE_WEBSOCKETS: SET (WebSocket support missing)" >&2
+    exit 2
+  fi
+  echo "==> [${sdk}/${arch}] curl_config.h WebSocket: ENABLED"
   for define in USE_NGHTTP2 USE_NGTCP2 USE_NGHTTP3 OPENSSL_QUIC_API2; do
     if grep -q "#define ${define} 1" "$curl_build/lib/curl_config.h"; then
       echo "==> [${sdk}/${arch}] curl_config.h ${define}: ENABLED"

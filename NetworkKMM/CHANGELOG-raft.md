@@ -1,5 +1,19 @@
 # NetworkKMM Raft fork changelog
 
+## 0.1.0-raft.47 / 0.1.0-raft.47-ohos (WebSocket back in the Android/iOS libcurl)
+
+HuaTuo (device QA, 1.13.1 / 11301003) and artin (Hands a9971638): with the curl realtime stack on, the
+app opened no realtime connection at all and received no events; the legacy stack worked and raft.44
+(curl 8.16) worked. Cause: in curl 8.22 the CMake `HTTP_ONLY` branch also sets
+`CURL_DISABLE_WEBSOCKETS` (8.16 did not), and the Android and iOS builds passed `-DHTTP_ONLY=ON`, so
+raft.46's libcurl had no ws/wss and every Socket.IO connect failed. OHOS was not affected (its build
+disables protocols one by one and sets `CURL_DISABLE_WEBSOCKETS=OFF`).
+
+- Android and iOS builds disable the non-HTTP protocols one by one, the same list `HTTP_ONLY`
+  covers, and set `CURL_DISABLE_WEBSOCKETS=OFF`.
+- New build gate on both: the build fails when `curl_config.h` defines `CURL_DISABLE_WEBSOCKETS`.
+- No source change; the Android and iOS native libraries are rebuilt.
+
 ## 0.1.0-raft.46 / 0.1.0-raft.46-ohos (dead reused connections: Cronet-style liveness and recovery)
 
 Hands 79db9fe6 / f717ac6f (artin, Android 1.13.1): the server and ALB answered in milliseconds, but
