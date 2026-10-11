@@ -28,12 +28,18 @@ done
 CURL_PROTOCOL_CMAKE_FLAGS+=("-DCURL_DISABLE_WEBSOCKETS=OFF")
 unset _proto
 
-# A public WebSocket entry point; present in libcurl.a only when ws/wss are built.
-CURL_WEBSOCKET_SYMBOL="curl_ws_recv"
+# curl's WebSocket protocol handler. Not curl_ws_recv/curl_ws_send: curl 8.22's ws.c defines those as
+# CURLE_NOT_BUILT_IN stubs when CURL_DISABLE_WEBSOCKETS is set, so they are in libcurl.a either way.
+# Curl_protocol_ws exists only inside `#ifndef CURL_DISABLE_WEBSOCKETS` (lib/ws.c).
+CURL_WEBSOCKET_SYMBOL="Curl_protocol_ws"
 
 # Fails when the configured curl has WebSocket disabled.
 curl_assert_websocket_config() {
   local config_h="$1"
+  if [[ ! -f "$config_h" ]]; then
+    echo "curl_config.h not found at $config_h" >&2
+    return 1
+  fi
   if grep -q '#define CURL_DISABLE_WEBSOCKETS 1' "$config_h"; then
     echo "curl_config.h CURL_DISABLE_WEBSOCKETS is set: the realtime client needs wss://" >&2
     return 1
@@ -46,7 +52,11 @@ curl_assert_websocket_config() {
 # grep -q short-circuiting a producer trips pipefail into a false negative).
 curl_assert_websocket_symbol() {
   local symbols="$1"
-  if grep -qw "$CURL_WEBSOCKET_SYMBOL" <<<"$symbols"; then
+  # A defined symbol: any type letter but U. Captured first: grep -q in a pipeline can SIGPIPE the
+  # producer and pipefail turns that into a false negative.
+  local defined
+  defined="$(grep -w "$CURL_WEBSOCKET_SYMBOL" <<<"$symbols" | grep -v ' U ' || true)"
+  if [[ -n "$defined" ]]; then
     echo "libcurl WebSocket (realtime): ENABLED (${CURL_WEBSOCKET_SYMBOL} defined)"
   else
     echo "libcurl WebSocket (realtime): MISSING — ${CURL_WEBSOCKET_SYMBOL} not defined" >&2

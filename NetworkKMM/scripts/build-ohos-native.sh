@@ -460,24 +460,9 @@ for dir in "$ENTRY_LIBS_DIR" "$NETWORK_LIBS_DIR"; do
   cp -f "$LIBCXX_SHARED" "$dir/libc++_shared.so"
 done
 
-# WebSocket readiness: the definitive check is whether the built libcurl.a
-# exports the curl_ws_* API, so the planned curl-ws realtime transport won't
-# require another native rebuild. Match any DEFINED symbol type (the API can be
-# emitted as a weak symbol 'W', not just text 'T'), not a hard-coded "T " prefix.
-echo "==> Checking libcurl WebSocket support"
-# A DEFINED symbol has a type letter other than 'U' (undefined). --defined-only
-# isn't supported by every llvm-nm build, so filter out the ' U ' lines instead.
-# Reuse the captured symbol table (see the codec check) to avoid the pipefail +
-# grep -q SIGPIPE pitfall.
-WS_DEFINED="$(grep -w "curl_ws_send" <<<"$CURL_SYMBOLS" | grep -v ' U ' || true)"
-if [[ -n "$WS_DEFINED" ]]; then
-  echo "libcurl WebSocket: ENABLED (curl_ws_send/curl_ws_recv present)"
-else
-  echo "libcurl WebSocket: MISSING — curl-ws realtime would need a rebuild" >&2
-  echo "  curl_ws symbols found:" >&2
-  "$LLVM_BIN/llvm-nm" "$CURL_STATIC_LIB" 2>/dev/null | grep -i "curl_ws" >&2 || echo "  (none)" >&2
-  exit 1
-fi
+# WebSocket readiness is checked above by curl_assert_websocket_symbol (Curl_protocol_ws). The
+# curl_ws_send/curl_ws_recv API is no evidence: curl defines CURLE_NOT_BUILT_IN stubs for it when
+# WebSocket is disabled, which is how the old check here would have passed a WS-less libcurl.
 
 echo "==> Result"
 echo "openssl: ${OPENSSL_VERSION}"
