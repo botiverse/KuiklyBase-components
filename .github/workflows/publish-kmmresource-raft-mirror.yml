@@ -1,0 +1,162 @@
+# One-way mirror of the published KmmResource authority bytes to Raft Artifacts.
+#
+# publish-kmmresource-github-packages.yml writes only to GitHub Packages. Mobile
+# CI resolves com.tencent.kuiklybase from maven.artifacts.botiverse.dev, so each
+# released KmmResource version must also be mirrored (the raft.4 precedent).
+# This workflow re-fetches the published bytes read-only from GitHub Packages,
+# plans against the Raft side (fail-closed unless the lane is fully absent or
+# already fully identical), uploads only missing primaries, and reads every
+# file back byte-compared. It never rebuilds, never overwrites different remote
+# bytes, and never touches GitHub Packages for write.
+name: KmmResource Raft mirror (publish + readback)
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact 40-character landed master SHA this dispatch must run from
+        required: true
+        type: string
+      version:
+        description: KmmResource version to mirror, must equal KmmResource/gradle.properties mavenVersion
+        required: true
+        type: string
+      confirmation:
+        description: Type "mirror kmmresource <version> to raft"
+        required: true
+        type: string
+
+# Read from GitHub only; the Raft credential comes from the protected
+# environment below, never from a repository secret a PR could print.
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  # One writer per coordinate: two dispatches can never interleave a mirror.
+  group: kmmresource-raft-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: Mirror KmmResource authority bytes to Raft Artifacts
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    steps:
+      # Refuse anything but a landed-master dispatch with the exact spoken
+      # confirmation -- before any checkout, credential or network use.
+      - name: Admission (repository, landed master, confirmation)
+        env:
+          EVENT_REPO: ${{ github.repository }}
+          EVENT_REF: ${{ github.ref }}
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+          REQUESTED_CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT_REPO" = "botiverse/KuiklyBase-components" ] \
+            || { echo "refusing dispatch from repository $EVENT_REPO" >&2; exit 1; }
+          [ "$EVENT_REF" = "refs/heads/master" ] \
+            || { echo "refusing dispatch from ref $EVENT_REF (master only)" >&2; exit 1; }
+          [[ "$REQUESTED_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
+            || { echo "source_sha is not a 40-hex SHA" >&2; exit 1; }
+          [[ "$REQUESTED_VERSION" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] \
+            && [[ "$REQUESTED_VERSION" != *SNAPSHOT* ]] \
+            || { echo "version is not an immutable Maven version" >&2; exit 1; }
+          [ "$REQUESTED_CONFIRMATION" = "mirror kmmresource $REQUESTED_VERSION to raft" ] \
+            || { echo "confirmation string mismatch" >&2; exit 1; }
+          echo "admission ok: $EVENT_REPO $EVENT_REF $REQUESTED_SOURCE_SHA $REQUESTED_VERSION"
+
+      - name: Checkout mirror exact (runnable scripts)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Bind dispatch to landed current master
+        env:
+          REQUESTED_SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [ "$(git rev-parse HEAD)" = "$REQUESTED_SOURCE_SHA" ] \
+            || { echo "checked-out HEAD is not the requested source_sha" >&2; exit 1; }
+          git fetch --quiet origin master
+          [ "$(git rev-parse origin/master)" = "$REQUESTED_SOURCE_SHA" ] \
+            || { echo "requested source_sha is not current landed master" >&2; exit 1; }
+          [ -z "$(git status --porcelain=v1 --untracked-files=all)" ] \
+            || { echo "workspace is not clean" >&2; exit 1; }
+          echo "dispatch bound to landed master $REQUESTED_SOURCE_SHA"
+
+      - name: Bind version to landed gradle.properties
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          landed="$(sed -n 's/^mavenVersion=//p' KmmResource/gradle.properties | tail -n 1)"
+          [ -n "$landed" ] || { echo "landed mavenVersion is empty" >&2; exit 1; }
+          [ "$landed" = "$REQUESTED_VERSION" ] \
+            || { echo "requested version $REQUESTED_VERSION != landed mavenVersion $landed" >&2; exit 1; }
+          echo "version bound: $REQUESTED_VERSION"
+
+      - name: Snapshot exact required primaries
+        env:
+          MAVEN_VERSION: ${{ inputs.version }}
+          KMMRESOURCE_REQUIRED_TASKS: >-
+            :resource-generator:publishAllPublicationsToGithubPackagesRepository
+            :resource-core:publishAndroidPublicationToGithubPackagesRepository
+            :resource-core:publishOhosArm64PublicationToGithubPackagesRepository
+            :resource-core:publishIosX64PublicationToGithubPackagesRepository
+            :resource-core:publishIosArm64PublicationToGithubPackagesRepository
+            :resource-core:publishIosSimulatorArm64PublicationToGithubPackagesRepository
+            :resource-core:publishKotlinMultiplatformPublicationToGithubPackagesRepository
+        run: python3 KmmResource/scripts/kmmresource-raft-mirror.py snapshot-required --output /tmp/kmmresource-required.json
+
+      - name: Fetch authority bytes (read-only, GitHub Packages)
+        env:
+          MAVEN_VERSION: ${{ inputs.version }}
+          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
+          GITHUB_PACKAGES_TOKEN: ${{ github.token }}
+          KMMRESOURCE_REQUIRED_PATHS_FILE: /tmp/kmmresource-required.json
+          KMMRESOURCE_ARTIFACT_SOURCE_SHA: ${{ github.sha }}
+        run: python3 KmmResource/scripts/kmmresource-raft-mirror.py authority --bytes-dir /tmp/kmmresource-authority --receipt /tmp/kmmresource-authority.json
+
+      - name: Plan against Raft (all-absent, partial-identical, or stop)
+        id: plan
+        env:
+          KMMRESOURCE_REQUIRED_PATHS_FILE: /tmp/kmmresource-required.json
+        run: |
+          set -euo pipefail
+          set +e
+          python3 KmmResource/scripts/kmmresource-raft-mirror.py plan --receipt /tmp/kmmresource-authority.json --output /tmp/kmmresource-raft-plan.json
+          rc=$?
+          set -e
+          [ "$rc" -eq 0 ] || { echo "plan refused (hold-conflict or error), rc=$rc" >&2; exit "$rc"; }
+          decision="$(python3 -c 'import json; print(json.load(open("/tmp/kmmresource-raft-plan.json"))["remote"]["decision"])')"
+          echo "decision=$decision" >> "$GITHUB_OUTPUT"
+
+      # Gated on the plan: noop-complete issues zero PUTs by construction.
+      - name: Upload only planned missing bytes
+        if: steps.plan.outputs.decision == 'publish-all-absent' || steps.plan.outputs.decision == 'resume-partial-exact'
+        env:
+          RAFT_ARTIFACTS_USERNAME: raft-ci
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+          KMMRESOURCE_REQUIRED_PATHS_FILE: /tmp/kmmresource-required.json
+        run: python3 KmmResource/scripts/kmmresource-raft-mirror.py publish --receipt /tmp/kmmresource-authority.json --bytes-dir /tmp/kmmresource-authority --plan /tmp/kmmresource-raft-plan.json --output /tmp/kmmresource-writer.json
+
+      # Runs on every plan decision: the full byte readback is the terminal
+      # proof for a fresh publish AND for an idempotent repeat.
+      - name: Read back exact bytes from Raft Artifacts
+        env:
+          KMMRESOURCE_REQUIRED_PATHS_FILE: /tmp/kmmresource-required.json
+        run: python3 KmmResource/scripts/kmmresource-raft-mirror.py verify --receipt /tmp/kmmresource-authority.json --output /tmp/kmmresource-terminal.json
+
+      - name: Upload mirror receipts
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmmresource-raft-mirror-${{ inputs.version }}
+          # Receipts and the plan only: paths, digests and provenance. No
+          # bytes (immutable at both ends), no headers, no credentials.
+          path: /tmp/kmmresource-authority.json
+          if-no-files-found: error
+          retention-days: 90
