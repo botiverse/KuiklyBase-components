@@ -1,5 +1,13 @@
 # KmmResource Raft changelog
 
+## 0.1.0-raft.6
+
+- resource-generator builds and runs under Kotlin 2.4: drop the iOS klib
+  resource copy's use of `KotlinLibraryLayoutImpl` / `zipDirAs` (removed in
+  Kotlin 2.4, `NoClassDefFoundError` at framework link) and the references to
+  the two Kotlin/Native targets Kotlin 2.4 no longer has. Needed by the mobile
+  Compose Multiplatform 1.11.1 / Kotlin 2.4 upgrade.
+
 ## 0.1.0-raft.5
 
 - Give the ohosArm64 `StringDesc.localeType` actual real storage (was a stub

@@ -260,25 +260,11 @@ class MultiplatformResourcesPlugin : Plugin<Project> {
         settings: MRGenerator.MRSettings,
         features: List<ResourceGeneratorFeature<out MRGenerator.Generator>>
     ) {
-        when (target.konanTarget) {
-            KonanTarget.IOS_ARM32,
-            KonanTarget.IOS_ARM64,
-            KonanTarget.IOS_SIMULATOR_ARM64,
-            KonanTarget.IOS_X64,
-
-            KonanTarget.MACOS_ARM64,
-            KonanTarget.MACOS_X64,
-
-            KonanTarget.TVOS_ARM64,
-            KonanTarget.TVOS_SIMULATOR_ARM64,
-            KonanTarget.TVOS_X64,
-
-            KonanTarget.WATCHOS_ARM32,
-            KonanTarget.WATCHOS_ARM64,
-            KonanTarget.WATCHOS_DEVICE_ARM64,
-            KonanTarget.WATCHOS_SIMULATOR_ARM64,
-            KonanTarget.WATCHOS_X64,
-            KonanTarget.WATCHOS_X86 -> {
+        // Matched by name, not by `KonanTarget.*` objects: Kotlin removes retired targets
+        // (IOS_ARM32 and WATCHOS_X86 are gone since 2.2), and a compiled reference to a removed
+        // object fails project configuration with NoClassDefFoundError on newer KGP.
+        when (target.konanTarget.name) {
+            in APPLE_KONAN_TARGET_NAMES -> {
 
                 setupExecutableResources(target = target)
                 setupTestsResources(target = target)
@@ -308,3 +294,11 @@ class MultiplatformResourcesPlugin : Plugin<Project> {
         }
     }
 }
+
+private val APPLE_KONAN_TARGET_NAMES: Set<String> = setOf(
+    "ios_arm32", "ios_arm64", "ios_simulator_arm64", "ios_x64",
+    "macos_arm64", "macos_x64",
+    "tvos_arm64", "tvos_simulator_arm64", "tvos_x64",
+    "watchos_arm32", "watchos_arm64", "watchos_device_arm64", "watchos_simulator_arm64",
+    "watchos_x64", "watchos_x86",
+)

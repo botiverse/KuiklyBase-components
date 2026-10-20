@@ -9,7 +9,7 @@ import org.gradle.api.file.ConfigurableFileCollection
 import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.TaskAction
 import org.jetbrains.kotlin.konan.properties.Properties
-import org.jetbrains.kotlin.library.impl.KotlinLibraryLayoutImpl
+import com.tencent.tmm.kmmgradle.utils.klibResourcesDir
 import java.io.File
 import java.io.FileFilter
 import java.io.FileInputStream
@@ -42,15 +42,8 @@ abstract class CopyExecutableResourcesToApp : DefaultTask() {
             .filter { library -> library.extension == "klib" }
             .filter(File::exists)
             .forEach { inputFile ->
-                val klibKonan = org.jetbrains.kotlin.konan.file.File(inputFile.path)
-                val klib = KotlinLibraryLayoutImpl(klib = klibKonan, component = "default")
-                val layout = klib.extractingToTemp
-
                 // extracting bundles
-                layout
-                    .resourcesDir
-                    .absolutePath
-                    .let(::File)
+                inputFile.klibResourcesDir()
                     .listFiles(FileFilter { it.extension == "bundle" })
                     // copying bundles to app
                     ?.forEach {

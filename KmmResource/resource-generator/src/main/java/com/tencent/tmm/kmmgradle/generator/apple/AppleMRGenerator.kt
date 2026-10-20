@@ -120,7 +120,7 @@ class AppleMRGenerator(
         val kotlinTarget: KotlinNativeTarget = compilation.target as KotlinNativeTarget
 
         kotlinTarget.binaries.matching { it.compilation == compilation }.configureEach { binary ->
-            val linkTask = binary.linkTask
+            val linkTask = binary.linkTaskProvider.get()
             val mergeResTask =
                 linkTask.project.tasks.getByName(MergeAppleResourcesTask.TASK_NAME) as MergeAppleResourcesTask
             mergeResTask.linkTask = linkTask
@@ -131,7 +131,7 @@ class AppleMRGenerator(
     }
 
     private fun setupKLibResources(generationTask: Task) {
-        val compileTask: KotlinNativeCompile = compilation.compileKotlinTask
+        val compileTask = compilation.compileTaskProvider.get() as KotlinNativeCompile
         compileTask.dependsOn(generationTask)
 
         // tasks like compileIosMainKotlinMetadata when only one target enabled
@@ -159,7 +159,7 @@ class AppleMRGenerator(
             .configureEach { binary ->
                 val framework = binary as Framework
 
-                val linkTask = framework.linkTask
+                val linkTask = framework.linkTaskProvider.get()
 
                 val taskName = CopyResourcesFromKLibsToDirTask.TASK_NAME + "_" + linkTask.name
 

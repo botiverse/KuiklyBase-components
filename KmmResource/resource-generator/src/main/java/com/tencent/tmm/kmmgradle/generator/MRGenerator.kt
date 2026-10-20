@@ -16,7 +16,7 @@ import org.gradle.api.Project
 import org.gradle.api.Task
 import org.gradle.jvm.tasks.Jar
 import org.gradle.kotlin.dsl.withType
-import org.jetbrains.kotlin.gradle.dsl.KotlinCompile
+import org.jetbrains.kotlin.gradle.tasks.KotlinCompilationTask
 import org.jetbrains.kotlin.gradle.plugin.KotlinSourceSet
 import java.io.File
 
@@ -122,7 +122,7 @@ abstract class MRGenerator(
             .configureEach { it.dependsOn(genTask) }
 
         project.tasks
-            .withType<KotlinCompile<*>>()
+            .withType<KotlinCompilationTask<*>>()
             .configureEach { it.dependsOn(genTask) }
 
 
