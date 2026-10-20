@@ -5,7 +5,7 @@ import org.gradle.api.DefaultTask
 import org.gradle.api.Project
 import org.jetbrains.kotlin.gradle.plugin.mpp.Framework
 import org.jetbrains.kotlin.gradle.tasks.KotlinNativeLink
-import org.jetbrains.kotlin.library.impl.KotlinLibraryLayoutImpl
+import com.tencent.tmm.kmmgradle.utils.klibResourcesDir
 import java.io.File
 
 internal abstract class CopyResourcesFromKLibsTask : DefaultTask() {
@@ -44,12 +44,10 @@ internal abstract class CopyResourcesFromKLibsTask : DefaultTask() {
                 .filter { it.exists() }
                 .forEach { inputFile ->
                     println("copy resources from $inputFile into $outputDir")
-                    val klibKonan = org.jetbrains.kotlin.konan.file.File(inputFile.path)
-                    val klib = KotlinLibraryLayoutImpl(klib = klibKonan, component = "default")
-                    val layout = klib.extractingToTemp
+                    val resourcesDir = inputFile.klibResourcesDir()
 
                     try {
-                        File(layout.resourcesDir.path).copyRecursively(
+                        resourcesDir.copyRecursively(
                             target = outputDir,
                             overwrite = true
                         )

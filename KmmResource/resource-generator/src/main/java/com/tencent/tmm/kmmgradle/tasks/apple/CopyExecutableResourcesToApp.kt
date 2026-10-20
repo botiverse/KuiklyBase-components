@@ -7,13 +7,9 @@ import org.gradle.api.tasks.Classpath
 import org.gradle.api.tasks.InputFiles
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.TaskAction
-import org.jetbrains.kotlin.library.KotlinLibraryLayout
-import org.jetbrains.kotlin.library.impl.KotlinLibraryLayoutImpl
+import com.tencent.tmm.kmmgradle.utils.klibResourcesDir
 import java.io.File
 import java.io.FileFilter
-
-internal fun File.toKonanFile(): org.jetbrains.kotlin.konan.file.File =
-    org.jetbrains.kotlin.konan.file.File(this.path)
 
 abstract class CopyExecutableResourcesToApp : DefaultTask() {
 
@@ -36,15 +32,8 @@ abstract class CopyExecutableResourcesToApp : DefaultTask() {
             .filter { library -> library.extension == "klib" }
             .filter(File::exists)
             .forEach { inputFile ->
-                val klibKonan: org.jetbrains.kotlin.konan.file.File = inputFile.toKonanFile()
-                val klib = KotlinLibraryLayoutImpl(klib = klibKonan, component = "default")
-                val layout: KotlinLibraryLayout = klib.extractingToTemp
-
                 // extracting bundles
-                layout
-                    .resourcesDir
-                    .absolutePath
-                    .let(::File)
+                inputFile.klibResourcesDir()
                     .listFiles(FileFilter { it.extension == "bundle" })
                     // copying bundles to app
                     ?.forEach {

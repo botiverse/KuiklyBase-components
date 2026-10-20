@@ -5,7 +5,7 @@ import org.gradle.api.DefaultTask
 import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.TaskAction
 import org.jetbrains.kotlin.gradle.tasks.KotlinNativeCompile
-import org.jetbrains.kotlin.konan.file.zipDirAs
+import com.tencent.tmm.kmmgradle.utils.zipDirectoryTo
 import java.io.File
 
 open class PackageKLibResourcesTask : DefaultTask() {
@@ -36,12 +36,10 @@ open class PackageKLibResourcesTask : DefaultTask() {
             overwrite = true
         )
 
-        val repackKonan = org.jetbrains.kotlin.konan.file.File(repackDir.path)
-        val klibKonan = org.jetbrains.kotlin.konan.file.File(klibFile.path)
         klibFile.delete()
 
         // 打包
-        repackKonan.zipDirAs(klibKonan)
+        repackDir.zipDirectoryTo(klibFile)
         repackDir.deleteRecursively()
     }
 

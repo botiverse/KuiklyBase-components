@@ -79,7 +79,7 @@ class OhosMRGenerator(
         kotlinTarget.binaries
             .matching { it.compilation == compilation }
             .configureEach { binary ->
-                val linkTask = binary.linkTask
+                val linkTask = binary.linkTaskProvider.get()
                 val mergeResTask =
                     linkTask.project.tasks.getByName(MergeOhosResourcesTask.TASK_NAME) as MergeOhosResourcesTask
                 mergeResTask.linkTask = linkTask

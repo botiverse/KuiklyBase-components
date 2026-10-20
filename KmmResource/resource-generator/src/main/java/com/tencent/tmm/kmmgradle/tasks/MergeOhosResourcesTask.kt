@@ -11,7 +11,7 @@ import org.gradle.api.Project
 import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.TaskAction
 import org.jetbrains.kotlin.gradle.tasks.KotlinNativeLink
-import org.jetbrains.kotlin.library.impl.KotlinLibraryLayoutImpl
+import com.tencent.tmm.kmmgradle.utils.klibResourcesDir
 import java.io.File
 
 open class MergeOhosResourcesTask : DefaultTask() {
@@ -53,12 +53,9 @@ open class MergeOhosResourcesTask : DefaultTask() {
         if (inputFile.exists().not()) return
 
         project.logger.info("copy resources from $inputFile into $outputDir")
-        val klibKonan = org.jetbrains.kotlin.konan.file.File(inputFile.path)
-        val klib = KotlinLibraryLayoutImpl(klib = klibKonan, component = "default")
-        val layout = klib.extractingToTemp
 
         try {
-            val resDir = File(layout.resourcesDir.path, "tmm-resources-ohos")
+            val resDir = File(inputFile.klibResourcesDir(), "tmm-resources-ohos")
             if (resDir.exists()) {
                 resDir.copyAndMergeDirectory(outputDir) { srcFile, destFile ->
                     // 合并string资源

@@ -11,7 +11,7 @@ import com.tencent.tmm.kmmgradle.utils.unzipTo
 import org.gradle.api.Action
 import org.gradle.api.Task
 import org.jetbrains.kotlin.gradle.tasks.KotlinNativeCompile
-import org.jetbrains.kotlin.konan.file.zipDirAs
+import com.tencent.tmm.kmmgradle.utils.zipDirectoryTo
 import java.io.File
 import java.util.Properties
 
@@ -87,11 +87,8 @@ internal class PackResourcesToKLibAction(
             overwrite = true
         )
 
-        val repackKonan = org.jetbrains.kotlin.konan.file.File(repackDir.path)
-        val klibKonan = org.jetbrains.kotlin.konan.file.File(klibFile.path)
-
         klibFile.delete()
-        repackKonan.zipDirAs(klibKonan)
+        repackDir.zipDirectoryTo(klibFile)
 
         repackDir.deleteRecursively()
     }

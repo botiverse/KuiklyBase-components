@@ -39,3 +39,31 @@ private fun unzipEntryTo(
 
 private fun InputStream.copyTo(file: File): Long =
     file.outputStream().use { copyTo(it) }
+
+/**
+ * Kotlin-version-independent replacement for
+ * `KotlinLibraryLayoutImpl(klib, component = "default").extractingToTemp.resourcesDir`.
+ * Kotlin 2.3.20+ removed `KotlinLibraryLayoutImpl`/`KotlinLibraryLayout` (and
+ * `org.jetbrains.kotlin.konan.file.zipDirAs`), so the generator reads the klib layout itself:
+ * `<klib>/default/resources`. Packed `.klib` files are extracted to a temp directory first.
+ */
+internal fun File.klibResourcesDir(): File {
+    if (isDirectory) return File(this, "default/resources")
+    val tempDir = kotlin.io.path.createTempDirectory("tmm-klib-").toFile()
+    tempDir.deleteOnExit()
+    unzipTo(outputDirectory = tempDir, zipFile = this)
+    return File(tempDir, "default/resources")
+}
+
+/** Replacement for `org.jetbrains.kotlin.konan.file.File.zipDirAs` (removed in Kotlin 2.3.20+). */
+internal fun File.zipDirectoryTo(zipFile: File) {
+    val root = this
+    java.util.zip.ZipOutputStream(zipFile.outputStream().buffered()).use { zip ->
+        root.walkTopDown().filter { it != root }.forEach { file ->
+            val name = file.relativeTo(root).invariantSeparatorsPath + if (file.isDirectory) "/" else ""
+            zip.putNextEntry(ZipEntry(name))
+            if (file.isFile) file.inputStream().use { it.copyTo(zip) }
+            zip.closeEntry()
+        }
+    }
+}

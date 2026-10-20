@@ -7,7 +7,7 @@ import org.gradle.api.Project
 import org.gradle.api.tasks.Internal
 import org.gradle.api.tasks.TaskAction
 import org.jetbrains.kotlin.gradle.tasks.KotlinNativeLink
-import org.jetbrains.kotlin.library.impl.KotlinLibraryLayoutImpl
+import com.tencent.tmm.kmmgradle.utils.klibResourcesDir
 import java.io.File
 
 open class MergeAppleResourcesTask : DefaultTask() {
@@ -49,12 +49,9 @@ open class MergeAppleResourcesTask : DefaultTask() {
         if (inputFile.exists().not()) return
 
         project.logger.info("copy resources from $inputFile into $outputDir")
-        val klibKonan = org.jetbrains.kotlin.konan.file.File(inputFile.path)
-        val klib = KotlinLibraryLayoutImpl(klib = klibKonan, component = "default")
-        val layout = klib.extractingToTemp
 
         try {
-            val resDir = File(layout.resourcesDir.path, "tmm-resources-apple")
+            val resDir = File(inputFile.klibResourcesDir(), "tmm-resources-apple")
             if (resDir.exists()) {
                 resDir.copyDirectory(outputDir)
             }

@@ -22,7 +22,6 @@ internal object AppleSdk {
             platform.startsWith("iphoneos") -> targets.addAll(archs.map { arch ->
                 when (arch) {
                     "arm64", "arm64e" -> KonanTarget.IOS_ARM64
-                    "armv7", "armv7s" -> KonanTarget.IOS_ARM32
                     else -> throw UnknownArchitectureException(platform, arch)
                 }
             })
@@ -47,7 +46,6 @@ internal object AppleSdk {
             platform.startsWith("watchsimulator") -> targets.addAll(archs.map { arch ->
                 when (arch) {
                     "arm64", "arm64e" -> KonanTarget.WATCHOS_SIMULATOR_ARM64
-                    "i386" -> KonanTarget.WATCHOS_X86
                     "x86_64" -> KonanTarget.WATCHOS_X64
                     else -> throw UnknownArchitectureException(platform, arch)
                 }
