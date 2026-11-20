@@ -40,6 +40,9 @@ jobs:
   release:
     name: Resolve Maven version
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
     outputs:
       version: ${{ steps.resolve.outputs.version }}
     steps:
@@ -58,6 +61,12 @@ jobs:
           fi
           [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]
           printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+      - name: Check downloads from both repositories for an existing release
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+        env:
+          MAVEN_VERSION: ${{ steps.resolve.outputs.version }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 KmmResource/scripts/test-publish-staged.py downloads "$MAVEN_VERSION"
 
   publish-android-ohos-plugin:
     name: Stage Android, OHOS and the generator
@@ -309,8 +318,8 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           artifact-ids: ${{ needs.publish-android-ohos-plugin.outputs.artifact }},${{ needs.publish-ios.outputs.artifact }},${{ needs.publish-kmp-metadata.outputs.artifact }}
-          path: staged
+          path: build-artifacts
       - name: Verify dual upload and interrupted delivery with these build artifacts
         env:
           MAVEN_VERSION: ${{ needs.release.outputs.version }}
-        run: python3 KmmResource/scripts/test-publish-staged.py staged "$MAVEN_VERSION" --require-standard
+        run: python3 KmmResource/scripts/test-publish-staged.py staged build-artifacts "$MAVEN_VERSION" --require-standard

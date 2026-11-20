@@ -31,16 +31,16 @@ class DownloadRedirect(urllib.request.HTTPRedirectHandler):
 
 
 class Repository:
-    def __init__(self, name, url, username, password, public_reads=False):
-        require(username and password, f"Missing {name} publishing credentials")
+    def __init__(self, name, url, username=None, password=None, public_reads=False):
         self.name, self.url, self.public_reads = name, url, public_reads
-        self.auth = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode()
+        self.auth = "Basic " + base64.b64encode(f"{username}:{password}".encode()).decode() if username and password else None
         self.http = urllib.request.build_opener(DownloadRedirect())
 
     def request(self, key, data=None):
         method = "GET" if data is None else "PUT"
         headers = {"User-Agent": "KmmResource-Publisher"}
         if method == "PUT" or not self.public_reads:
+            require(self.auth, f"Missing {self.name} credentials for {method}")
             headers["Authorization"] = self.auth
         if method == "PUT":
             suffix = Path(key).suffix
@@ -71,7 +71,6 @@ def staged_release(directories, version):
             parts = key.split("/")
             require(all(SEGMENT.fullmatch(part) for part in parts) and not path.is_symlink()
                     and key.startswith("com/tencent/kuiklybase/"), f"Unexpected staged path: {key}")
-            filename = parts[-1]
             suffix = path.suffix if path.suffix in CHECKSUMS else ""
             primary = key[:-len(suffix)] if suffix else key
             if primary.endswith("/" + METADATA):
@@ -84,6 +83,24 @@ def staged_release(directories, version):
             files[key] = path
 
     require(files and indexes, "No staged Maven release found")
+    # Gradle module metadata keeps logical SNAPSHOT URLs. Maven resolves each
+    # classifier and extension to its timestamped file using the version index.
+    snapshot_files = {}
+    for key, path in indexes.items():
+        folder = key.rsplit("/", 1)[0]
+        if not folder.endswith("/" + version):
+            continue
+        doc = XML.fromstring(path.read_bytes())
+        artifact = doc.findtext("artifactId")
+        for entry in doc.findall("versioning/snapshotVersions/snapshotVersion"):
+            value = entry.findtext("value", "")
+            ext = entry.findtext("extension", "")
+            classifier = entry.findtext("classifier")
+            tail = ("-" + classifier if classifier else "") + "." + ext
+            actual = f"{folder}/{artifact}-{value}{tail}"
+            require(SEGMENT.fullmatch(value) and SEGMENT.fullmatch(ext) and actual in files,
+                    f"Missing timestamped file in {key}")
+            snapshot_files[f"{folder}/{artifact}-{version}{tail}"] = files[actual]
     for key, path in files.items():
         suffix = path.suffix
         if suffix in CHECKSUMS:
@@ -95,7 +112,8 @@ def staged_release(directories, version):
                 for item in variant.get("files", []):
                     filename = item["url"]
                     require(SEGMENT.fullmatch(filename), f"Unexpected variant URL in {key}")
-                    source = files.get(key.rsplit("/", 1)[0] + "/" + filename)
+                    relative = key.rsplit("/", 1)[0] + "/" + filename
+                    source = files.get(relative) or snapshot_files.get(relative)
                     require(source and source.stat().st_size == item["size"]
                             and hashlib.sha256(source.read_bytes()).hexdigest() == item["sha256"],
                             f"Missing or mismatched variant in {key}: {filename}")
@@ -181,9 +199,20 @@ def publish(directories, version, destinations):
         for key, path in indexes.items():
             merged_index(key, repo.request(key), path.read_bytes(), version)
 
+    uploaded = {}
     for repo in destinations:
+        count = 0
         for key in sorted(missing[repo], key=upload_order):
-            repo.request(key, files[key].read_bytes())
+            data = files[key].read_bytes()
+            # Some Maven repositories materialize checksums on the primary PUT.
+            if key.endswith(CHECKSUMS):
+                current = repo.request(key)
+                if current is not None:
+                    require(matches(key, current, data), f"{repo.name} generated a different checksum: {key}")
+                    continue
+            repo.request(key, data)
+            count += 1
+        uploaded[repo.name] = count
         for key, path in files.items():
             require(matches(key, repo.request(key), path.read_bytes()), f"{repo.name} readback failed: {key}")
 
@@ -204,7 +233,7 @@ def publish(directories, version, destinations):
                     repo.request(companion, digest)
                     require(matches(companion, repo.request(companion), digest), f"{repo.name} readback failed: {companion}")
 
-    return {"version": version, "uploaded": {repo.name: len(keys) for repo, keys in missing.items()},
+    return {"version": version, "uploaded": uploaded,
             "files": {key: {"size": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
                       for key, path in sorted(files.items()) if not key.endswith(CHECKSUMS)}}
 
@@ -217,6 +246,7 @@ def main():
     args = parser.parse_args()
     repository = os.environ["GITHUB_REPOSITORY"]
     require(repository.lower() == "botiverse/kuiklybase-components", "Unexpected package repository")
+    require(os.environ.get("RAFT_ARTIFACTS_PUBLISH_TOKEN"), "Missing Raft publishing credentials")
     destinations = [Repository("GitHub Packages", f"https://maven.pkg.github.com/{repository}",
                                os.environ["GITHUB_ACTOR"], os.environ["GITHUB_TOKEN"]),
                     Repository("Raft", "https://maven.artifacts.botiverse.dev", "raft-ci",

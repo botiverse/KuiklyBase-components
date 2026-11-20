@@ -22,16 +22,18 @@ The KMM resource manager fundamentally exposes platform-specific resource identi
 
 ## Gradle Integration
 
-### GitHub Packages
+### Maven repositories
 
-The bytemain fork publishes `resource-core` and the
-`com.tencent.kuiklybase.resource.generator` Gradle plugin to GitHub Packages.
-GitHub Packages Maven requires credentials even for public packages:
+Raft publishes `resource-core` and the `com.tencent.kuiklybase.resource.generator`
+Gradle plugin to Raft Artifacts and GitHub Packages. For anonymous downloads,
+add `maven("https://maven.artifacts.botiverse.dev")` to both
+`pluginManagement.repositories` and `dependencyResolutionManagement.repositories`.
+To use GitHub Packages, configure credentials in both places as shown below.
 
 ```kotlin
 pluginManagement {
     repositories {
-        maven("https://maven.pkg.github.com/bytemain/KuiklyBase-components") {
+        maven("https://maven.pkg.github.com/botiverse/KuiklyBase-components") {
             credentials {
                 username = providers.gradleProperty("githubPackagesUsername")
                     .orElse(providers.environmentVariable("GITHUB_ACTOR"))
@@ -50,7 +52,7 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
-        maven("https://maven.pkg.github.com/bytemain/KuiklyBase-components") {
+        maven("https://maven.pkg.github.com/botiverse/KuiklyBase-components") {
             credentials {
                 username = providers.gradleProperty("githubPackagesUsername")
                     .orElse(providers.environmentVariable("GITHUB_ACTOR"))

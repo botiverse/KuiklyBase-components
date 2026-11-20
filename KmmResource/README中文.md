@@ -17,16 +17,17 @@ bundle+name，鸿蒙是 name），需要使用者在不同平台实现对应的�
 
 ## gradle集成
 
-### GitHub Packages
+### Maven 仓库
 
-bytemain fork 会把 `resource-core` 和
-`com.tencent.kuiklybase.resource.generator` Gradle 插件发布到 GitHub
-Packages。GitHub Packages Maven 即使是 public package 也需要 credentials：
+Raft 会把 `resource-core` 和 `com.tencent.kuiklybase.resource.generator` Gradle 插件
+发布到 Raft Artifacts 和 GitHub Packages。匿名下载时，在 `pluginManagement.repositories`
+和 `dependencyResolutionManagement.repositories` 中各添加
+`maven("https://maven.artifacts.botiverse.dev")` 即可。使用 GitHub Packages 时，按下面的示例给两个仓库配置凭据。
 
 ```kotlin
 pluginManagement {
     repositories {
-        maven("https://maven.pkg.github.com/bytemain/KuiklyBase-components") {
+        maven("https://maven.pkg.github.com/botiverse/KuiklyBase-components") {
             credentials {
                 username = providers.gradleProperty("githubPackagesUsername")
                     .orElse(providers.environmentVariable("GITHUB_ACTOR"))
@@ -45,7 +46,7 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositories {
-        maven("https://maven.pkg.github.com/bytemain/KuiklyBase-components") {
+        maven("https://maven.pkg.github.com/botiverse/KuiklyBase-components") {
             credentials {
                 username = providers.gradleProperty("githubPackagesUsername")
                     .orElse(providers.environmentVariable("GITHUB_ACTOR"))
