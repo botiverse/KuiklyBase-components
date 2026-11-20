@@ -40,6 +40,12 @@ fun MavenPom.configureMavenCentralMetadata(project: Project) {
 }
 
 fun configureMavenPublication(rh: RepositoryHandler, project: Project) {
+    System.getenv("KMMRESOURCE_STAGING_DIR")?.let { directory ->
+        rh.maven {
+            name = "releaseStaging"
+            url = project.file(directory).toURI()
+        }
+    }
     rh.maven {
         val releasesRepoUrl = "https://oss.sonatype.org/service/local/staging/deploy/maven2"
         val snapshotsRepoUrl = "https://oss.sonatype.org/content/repositories/snapshots"

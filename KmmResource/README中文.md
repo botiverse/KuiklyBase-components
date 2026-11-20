@@ -110,7 +110,7 @@ multiplatformResources {
 `resource-compose` 不是 MR 生成和 `resource-core` 运行时的必需依赖。已经有自定义 UI wrapper 的工程可以只依赖
 `resource-core`。当前 `resource-compose` 是标准 Compose wrapper：源码导入的是 `androidx.compose.*` API；
 OHOS 路径里的 `org.jetbrains.compose.runtime/foundation` 仍保留在 `1.6.1-KBA-001`，因为纯 JetBrains
-`1.7.3` artifact 没有 `ohos_arm64` native variant。默认 GitHub Packages workflow 仍只发布
+`1.7.3` artifact 没有 `ohos_arm64` native variant。默认发版流程会向 GitHub Packages 和 Raft 同时发布
 `resource-core` 和 generator plugin。只有明确要为新版本发布这组标准 Compose wrapper artifact 时，才打开
 `KMMRESOURCE_INCLUDE_COMPOSE=true` 和 `-PkmmResourcePublishCompose=true`。
 

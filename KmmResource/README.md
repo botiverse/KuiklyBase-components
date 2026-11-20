@@ -113,10 +113,12 @@ The current `resource-compose` module is a standard Compose wrapper: its source
 imports `androidx.compose.*` APIs and its OHOS path still uses
 `org.jetbrains.compose.runtime/foundation` `1.6.1-KBA-001`, because plain
 JetBrains `1.7.3` artifacts do not publish an `ohos_arm64` native variant.
-The default GitHub Packages workflow still publishes only `resource-core` and
-the generator plugin. Set `KMMRESOURCE_INCLUDE_COMPOSE=true` and
-`-PkmmResourcePublishCompose=true` only when intentionally publishing these
-standard Compose wrapper artifacts for a new version.
+The release workflow builds `resource-core` and the generator plugin once and uploads
+the saved Maven files directly to GitHub Packages and Raft Artifacts. Push a
+`kmmresource-v<version>` tag matching `mavenVersion`, or run the existing workflow
+on `master`. Select `publish_resource_compose` to include the standard Compose wrapper.
+If delivery is interrupted, rerun the failed job in that run to reuse its saved
+build artifacts. The publication receipt lists the verified files and their SHA-256 hashes.
 
 ### Kuikly Compose compatibility
 

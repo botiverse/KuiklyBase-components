@@ -1,4 +1,4 @@
-name: Publish KmmResource to GitHub Packages
+name: Publish KmmResource to GitHub Packages and Raft
 
 on:
   workflow_dispatch:
@@ -24,31 +24,62 @@ on:
         description: "Optional KMP metadata publish task override"
         required: false
         type: string
+  pull_request:
+    paths:
+      - '.github/workflows/publish-kmmresource-github-packages.yml'
+      - 'KmmResource/buildSrc/src/main/kotlin/Publishing.kt'
+      - 'KmmResource/scripts/*publish*'
   push:
     tags:
       - "kmmresource-v*"
 
 permissions:
   contents: read
-  packages: write
 
 jobs:
+  release:
+    name: Resolve Maven version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: resolve
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          project_version=$(sed -n 's/^mavenVersion=//p' KmmResource/gradle.properties)
+          version=${REQUESTED_VERSION:-$project_version}
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            [[ "$GITHUB_REF_NAME" == "kmmresource-v$project_version" && "$version" == "$project_version" ]]
+          fi
+          [[ "$version" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
   publish-android-ohos-plugin:
-    name: Publish Android, OHOS, and generator plugin
+    name: Stage Android, OHOS and the generator
+    needs: release
     runs-on: ubuntu-latest
     container:
       image: ghcr.io/bytemain/harmony-next-pipeline-docker/harmonyos-ci-image:v6.1.1.280
+    outputs:
+      artifact: ${{ steps.archive.outputs.artifact-id }}
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
-      KMMRESOURCE_REQUIRE_TASKS: "true"
-      KMMRESOURCE_PUBLISH_TASKS: >-
-        :resource-generator:publishAllPublicationsToGithubPackagesRepository
-        :resource-core:publishAndroidPublicationToGithubPackagesRepository
-        :resource-core:publishOhosArm64PublicationToGithubPackagesRepository
+      KMMRESOURCE_REQUIRE_TASKS: 'true'
+      KMMRESOURCE_STAGE_LANE: linux
+      KMMRESOURCE_INCLUDE_COMPOSE: ${{ inputs.publish_resource_compose || 'false' }}
+      KMMRESOURCE_PUBLISH_TASKS: ${{ inputs.android_ohos_publish_tasks }}
+      MAVEN_VERSION: ${{ needs.release.outputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Install Android SDK
         shell: bash
@@ -96,56 +127,6 @@ jobs:
           echo "$ohos_sdk_home/toolchains" >> "$GITHUB_PATH"
           echo "$ohos_sdk_home/native/llvm/bin" >> "$GITHUB_PATH"
 
-      - name: Resolve publish inputs
-        shell: bash
-        env:
-          REQUESTED_VERSION: ${{ github.event.inputs.version }}
-          REQUESTED_COMPOSE: ${{ github.event.inputs.publish_resource_compose }}
-          REQUESTED_TASKS: ${{ github.event.inputs.android_ohos_publish_tasks }}
-        run: |
-          set -euo pipefail
-          project_version="$(sed -n 's/^mavenVersion=//p' KmmResource/gradle.properties | tail -n 1)"
-          if [[ -n "${REQUESTED_VERSION:-}" ]]; then
-            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
-          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == kmmresource-v* ]]; then
-            tag_version="${GITHUB_REF_NAME#kmmresource-v}"
-            if [[ "$project_version" != "$tag_version" ]]; then
-              echo "Tag version $tag_version does not match KmmResource mavenVersion $project_version." >&2
-              exit 1
-            fi
-            echo "MAVEN_VERSION=$tag_version" >> "$GITHUB_ENV"
-          fi
-
-          if [[ -n "${REQUESTED_TASKS:-}" ]]; then
-            echo "KMMRESOURCE_PUBLISH_TASKS=$REQUESTED_TASKS" >> "$GITHUB_ENV"
-          elif [[ "${REQUESTED_COMPOSE:-false}" == "true" ]]; then
-            echo "KMMRESOURCE_INCLUDE_COMPOSE=true" >> "$GITHUB_ENV"
-            echo "KMMRESOURCE_PUBLISH_TASKS=:resource-generator:publishAllPublicationsToGithubPackagesRepository :resource-core:publishAndroidPublicationToGithubPackagesRepository :resource-core:publishOhosArm64PublicationToGithubPackagesRepository :resource-compose:publishAndroidPublicationToGithubPackagesRepository :resource-compose:publishOhosArm64PublicationToGithubPackagesRepository" >> "$GITHUB_ENV"
-          fi
-
-      - name: Check existing KmmResource version
-        shell: bash
-        env:
-          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${MAVEN_VERSION:-}" ]]; then
-            exit 0
-          fi
-          metadata_url="https://maven.pkg.github.com/${GITHUB_REPOSITORY}/com/tencent/kuiklybase/resource-core/maven-metadata.xml"
-          metadata_file="$(mktemp)"
-          if curl -fsSL -u "$GITHUB_PACKAGES_USERNAME:$GITHUB_PACKAGES_TOKEN" "$metadata_url" -o "$metadata_file" \
-            && grep -F "<version>$MAVEN_VERSION</version>" "$metadata_file" >/dev/null; then
-            echo "KmmResource version $MAVEN_VERSION already exists; skipping publish."
-            echo "KMMRESOURCE_SKIP_PUBLISH=true" >> "$GITHUB_ENV"
-          fi
-
-      - name: Skip existing KmmResource version
-        if: env.KMMRESOURCE_SKIP_PUBLISH == 'true'
-        shell: bash
-        run: echo "KmmResource version $MAVEN_VERSION already exists in GitHub Packages."
-
       - name: Validate string lookup contracts
         shell: bash
         run: |
@@ -156,33 +137,39 @@ jobs:
             :resource-core:testDebugUnitTest \
             :resource-core:compileTestKotlinOhosArm64
 
-      - name: Publish KmmResource Android/OHOS/plugin publications
-        if: env.KMMRESOURCE_SKIP_PUBLISH != 'true'
+      - name: Stage selected Maven publications
         shell: bash
-        env:
-          GITHUB_PACKAGES_OWNER: ${{ github.repository_owner }}
-          GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
-          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          set -euo pipefail
-          cd KmmResource
-          ./scripts/publish-github-packages.sh
+          export KMMRESOURCE_STAGING_DIR="$GITHUB_WORKSPACE/staged-maven"
+          KmmResource/scripts/publish-github-packages.sh
+
+      - name: Save the Maven files for this build
+        id: archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmmresource-linux-${{ github.run_attempt }}
+          path: staged-maven/
+          if-no-files-found: error
 
   publish-ios:
-    name: Publish iOS
+    name: Stage iOS
+    needs: release
     runs-on: macos-latest
+    outputs:
+      artifact: ${{ steps.archive.outputs.artifact-id }}
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
-      KMMRESOURCE_REQUIRE_TASKS: "true"
-      KMMRESOURCE_PUBLISH_TASKS: >-
-        :resource-core:publishIosX64PublicationToGithubPackagesRepository
-        :resource-core:publishIosArm64PublicationToGithubPackagesRepository
-        :resource-core:publishIosSimulatorArm64PublicationToGithubPackagesRepository
+      KMMRESOURCE_REQUIRE_TASKS: 'true'
+      KMMRESOURCE_STAGE_LANE: ios
+      KMMRESOURCE_INCLUDE_COMPOSE: ${{ inputs.publish_resource_compose || 'false' }}
+      KMMRESOURCE_PUBLISH_TASKS: ${{ inputs.ios_publish_tasks }}
+      MAVEN_VERSION: ${{ needs.release.outputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -207,60 +194,39 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-      - name: Resolve publish inputs
+      - name: Stage selected Maven publications
         shell: bash
-        env:
-          REQUESTED_VERSION: ${{ github.event.inputs.version }}
-          REQUESTED_COMPOSE: ${{ github.event.inputs.publish_resource_compose }}
-          REQUESTED_TASKS: ${{ github.event.inputs.ios_publish_tasks }}
         run: |
-          set -euo pipefail
-          project_version="$(sed -n 's/^mavenVersion=//p' KmmResource/gradle.properties | tail -n 1)"
-          if [[ -n "${REQUESTED_VERSION:-}" ]]; then
-            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
-          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == kmmresource-v* ]]; then
-            tag_version="${GITHUB_REF_NAME#kmmresource-v}"
-            if [[ "$project_version" != "$tag_version" ]]; then
-              echo "Tag version $tag_version does not match KmmResource mavenVersion $project_version." >&2
-              exit 1
-            fi
-            echo "MAVEN_VERSION=$tag_version" >> "$GITHUB_ENV"
-          fi
+          export KMMRESOURCE_STAGING_DIR="$GITHUB_WORKSPACE/staged-maven"
+          KmmResource/scripts/publish-github-packages.sh
 
-          if [[ -n "${REQUESTED_TASKS:-}" ]]; then
-            echo "KMMRESOURCE_PUBLISH_TASKS=$REQUESTED_TASKS" >> "$GITHUB_ENV"
-          elif [[ "${REQUESTED_COMPOSE:-false}" == "true" ]]; then
-            echo "KMMRESOURCE_INCLUDE_COMPOSE=true" >> "$GITHUB_ENV"
-            echo "KMMRESOURCE_PUBLISH_TASKS=:resource-core:publishIosX64PublicationToGithubPackagesRepository :resource-core:publishIosArm64PublicationToGithubPackagesRepository :resource-core:publishIosSimulatorArm64PublicationToGithubPackagesRepository :resource-compose:publishIosX64PublicationToGithubPackagesRepository :resource-compose:publishIosArm64PublicationToGithubPackagesRepository :resource-compose:publishIosSimulatorArm64PublicationToGithubPackagesRepository" >> "$GITHUB_ENV"
-          fi
-
-      - name: Publish KmmResource iOS publications
-        shell: bash
-        env:
-          GITHUB_PACKAGES_OWNER: ${{ github.repository_owner }}
-          GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
-          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd KmmResource
-          ./scripts/publish-github-packages.sh
+      - name: Save the Maven files for this build
+        id: archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmmresource-ios-${{ github.run_attempt }}
+          path: staged-maven/
+          if-no-files-found: error
 
   publish-kmp-metadata:
-    name: Publish KMP metadata
-    needs:
-      - publish-android-ohos-plugin
-      - publish-ios
+    name: Stage KMP metadata
+    needs: release
     runs-on: macos-latest
+    outputs:
+      artifact: ${{ steps.archive.outputs.artifact-id }}
     env:
       ANDROID_HOME: /tmp/android-sdk
       ANDROID_SDK_ROOT: /tmp/android-sdk
-      KMMRESOURCE_REQUIRE_TASKS: "true"
-      KMMRESOURCE_PUBLISH_TASKS: >-
-        :resource-core:publishKotlinMultiplatformPublicationToGithubPackagesRepository
+      KMMRESOURCE_REQUIRE_TASKS: 'true'
+      KMMRESOURCE_STAGE_LANE: metadata
+      KMMRESOURCE_INCLUDE_COMPOSE: ${{ inputs.publish_resource_compose || 'false' }}
+      KMMRESOURCE_PUBLISH_TASKS: ${{ inputs.metadata_publish_tasks }}
+      MAVEN_VERSION: ${{ needs.release.outputs.version }}
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up JDK
         uses: actions/setup-java@v4
@@ -285,41 +251,66 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT" >> "$GITHUB_ENV"
           echo "$ANDROID_SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
 
-      - name: Resolve publish inputs
+      - name: Stage selected Maven publications
         shell: bash
-        env:
-          REQUESTED_VERSION: ${{ github.event.inputs.version }}
-          REQUESTED_COMPOSE: ${{ github.event.inputs.publish_resource_compose }}
-          REQUESTED_TASKS: ${{ github.event.inputs.metadata_publish_tasks }}
         run: |
-          set -euo pipefail
-          project_version="$(sed -n 's/^mavenVersion=//p' KmmResource/gradle.properties | tail -n 1)"
-          if [[ -n "${REQUESTED_VERSION:-}" ]]; then
-            echo "MAVEN_VERSION=$REQUESTED_VERSION" >> "$GITHUB_ENV"
-          elif [[ "${GITHUB_REF_TYPE:-}" == "tag" && "${GITHUB_REF_NAME:-}" == kmmresource-v* ]]; then
-            tag_version="${GITHUB_REF_NAME#kmmresource-v}"
-            if [[ "$project_version" != "$tag_version" ]]; then
-              echo "Tag version $tag_version does not match KmmResource mavenVersion $project_version." >&2
-              exit 1
-            fi
-            echo "MAVEN_VERSION=$tag_version" >> "$GITHUB_ENV"
-          fi
+          export KMMRESOURCE_STAGING_DIR="$GITHUB_WORKSPACE/staged-maven"
+          KmmResource/scripts/publish-github-packages.sh
 
-          if [[ -n "${REQUESTED_TASKS:-}" ]]; then
-            echo "KMMRESOURCE_PUBLISH_TASKS=$REQUESTED_TASKS" >> "$GITHUB_ENV"
-          elif [[ "${REQUESTED_COMPOSE:-false}" == "true" ]]; then
-            echo "KMMRESOURCE_INCLUDE_COMPOSE=true" >> "$GITHUB_ENV"
-            echo "KMMRESOURCE_PUBLISH_TASKS=:resource-core:publishKotlinMultiplatformPublicationToGithubPackagesRepository :resource-compose:publishKotlinMultiplatformPublicationToGithubPackagesRepository" >> "$GITHUB_ENV"
-          fi
+      - name: Save the Maven files for this build
+        id: archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmmresource-metadata-${{ github.run_attempt }}
+          path: staged-maven/
+          if-no-files-found: error
 
-      - name: Publish KmmResource metadata publication
-        shell: bash
+  publish:
+    name: Upload and verify both Maven repositories
+    if: github.event_name != 'pull_request'
+    needs: [release, publish-android-ohos-plugin, publish-ios, publish-kmp-metadata]
+    runs-on: ubuntu-latest
+    environment: raft-artifacts-production
+    concurrency:
+      group: kmmresource-maven-publish
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.publish-android-ohos-plugin.outputs.artifact }},${{ needs.publish-ios.outputs.artifact }},${{ needs.publish-kmp-metadata.outputs.artifact }}
+          path: staged
+      - name: Publish the staged files and check each destination
         env:
-          GITHUB_PACKAGES_OWNER: ${{ github.repository_owner }}
-          GITHUB_PACKAGES_REPOSITORY: ${{ github.event.repository.name }}
-          GITHUB_PACKAGES_USERNAME: ${{ github.actor }}
-          GITHUB_PACKAGES_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd KmmResource
-          ./scripts/publish-github-packages.sh
+          MAVEN_VERSION: ${{ needs.release.outputs.version }}
+          GITHUB_TOKEN: ${{ github.token }}
+          RAFT_ARTIFACTS_PUBLISH_TOKEN: ${{ secrets.RAFT_ARTIFACTS_PUBLISH_TOKEN }}
+        run: python3 KmmResource/scripts/publish-staged.py staged "$MAVEN_VERSION" --receipt publication.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmmresource-publication-${{ github.run_attempt }}
+          path: publication.json
+          if-no-files-found: error
+
+  verify-staging:
+    name: Check the staged KmmResource release
+    if: github.event_name == 'pull_request'
+    needs: [release, publish-android-ohos-plugin, publish-ios, publish-kmp-metadata]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          artifact-ids: ${{ needs.publish-android-ohos-plugin.outputs.artifact }},${{ needs.publish-ios.outputs.artifact }},${{ needs.publish-kmp-metadata.outputs.artifact }}
+          path: staged
+      - name: Verify dual upload and interrupted delivery with these build artifacts
+        env:
+          MAVEN_VERSION: ${{ needs.release.outputs.version }}
+        run: python3 KmmResource/scripts/test-publish-staged.py staged "$MAVEN_VERSION" --require-standard

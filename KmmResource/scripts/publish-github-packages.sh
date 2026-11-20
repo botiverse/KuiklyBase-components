@@ -9,63 +9,56 @@ cd "$PROJECT_DIR"
 GITHUB_PACKAGES_USERNAME="${GITHUB_PACKAGES_USERNAME:-${GITHUB_ACTOR:-}}"
 GITHUB_PACKAGES_TOKEN="${GITHUB_PACKAGES_TOKEN:-${GITHUB_TOKEN:-${GH_TOKEN:-}}}"
 
-if [[ -z "$GITHUB_PACKAGES_USERNAME" ]]; then
-  echo "GITHUB_PACKAGES_USERNAME or GITHUB_ACTOR is required." >&2
-  exit 1
+# CI stages the selected publications in a file-backed Maven repository.
+# A standalone invocation retains the existing GitHub Packages interface.
+lane="${KMMRESOURCE_STAGE_LANE:-all}"
+publications=()
+case "$lane" in
+  linux) publications=(Android OhosArm64) ;;
+  ios) publications=(IosX64 IosArm64 IosSimulatorArm64) ;;
+  metadata) publications=(KotlinMultiplatform) ;;
+  all) publications=(Android OhosArm64 IosX64 IosArm64 IosSimulatorArm64 KotlinMultiplatform) ;;
+  *) echo "Unknown publication lane: $lane" >&2; exit 1 ;;
+esac
+publish_tasks=()
+if [[ "$lane" == linux || "$lane" == all ]]; then
+  publish_tasks+=(":resource-generator:publishAllPublicationsToGithubPackagesRepository")
 fi
-
-if [[ -z "$GITHUB_PACKAGES_TOKEN" ]]; then
-  echo "GITHUB_PACKAGES_TOKEN, GITHUB_TOKEN, or GH_TOKEN is required." >&2
-  exit 1
+modules=(resource-core)
+if [[ "${KMMRESOURCE_INCLUDE_COMPOSE:-false}" == true ]]; then
+  modules+=(resource-compose)
 fi
-
-default_publish_tasks=(
-  ":resource-generator:publishAllPublicationsToGithubPackagesRepository"
-  ":resource-core:publishAndroidPublicationToGithubPackagesRepository"
-  ":resource-core:publishIosX64PublicationToGithubPackagesRepository"
-  ":resource-core:publishIosArm64PublicationToGithubPackagesRepository"
-  ":resource-core:publishIosSimulatorArm64PublicationToGithubPackagesRepository"
-  ":resource-core:publishOhosArm64PublicationToGithubPackagesRepository"
-  ":resource-core:publishKotlinMultiplatformPublicationToGithubPackagesRepository"
-)
-if [[ "${KMMRESOURCE_INCLUDE_COMPOSE:-false}" == "true" ]]; then
-  default_publish_tasks+=(
-    ":resource-compose:publishAndroidPublicationToGithubPackagesRepository"
-    ":resource-compose:publishIosX64PublicationToGithubPackagesRepository"
-    ":resource-compose:publishIosArm64PublicationToGithubPackagesRepository"
-    ":resource-compose:publishIosSimulatorArm64PublicationToGithubPackagesRepository"
-    ":resource-compose:publishOhosArm64PublicationToGithubPackagesRepository"
-    ":resource-compose:publishKotlinMultiplatformPublicationToGithubPackagesRepository"
-  )
+for module in "${modules[@]}"; do
+  for publication in "${publications[@]}"; do
+    publish_tasks+=(":$module:publish${publication}PublicationToGithubPackagesRepository")
+  done
+done
+if [[ -n "${KMMRESOURCE_PUBLISH_TASKS:-}" ]]; then
+  read -r -a publish_tasks <<< "$KMMRESOURCE_PUBLISH_TASKS"
 fi
-DEFAULT_KMMRESOURCE_PUBLISH_TASKS="${default_publish_tasks[*]}"
-KMMRESOURCE_PUBLISH_TASKS="${KMMRESOURCE_PUBLISH_TASKS:-$DEFAULT_KMMRESOURCE_PUBLISH_TASKS}"
-IFS=' ' read -r -a publish_tasks <<< "$KMMRESOURCE_PUBLISH_TASKS"
 KMMRESOURCE_REQUIRE_TASKS="${KMMRESOURCE_REQUIRE_TASKS:-false}"
 KMMRESOURCE_DRY_RUN="${KMMRESOURCE_DRY_RUN:-false}"
+gradle_args=(--no-daemon --console=plain -PkmmResourcePublishOnly=true)
 
-gradle_args=(
-  "--no-daemon"
-  "--console=plain"
-  "-PkmmResourcePublishOnly=true"
-  "-PgithubPackagesUsername=$GITHUB_PACKAGES_USERNAME"
-  "-PgithubPackagesToken=$GITHUB_PACKAGES_TOKEN"
-)
-
-if [[ "${KMMRESOURCE_INCLUDE_COMPOSE:-false}" == "true" ]]; then
+if [[ -n "${KMMRESOURCE_STAGING_DIR:-}" ]]; then
+  for i in "${!publish_tasks[@]}"; do
+    task="${publish_tasks[$i]}"
+    case "$task" in
+      *ToGithubPackagesRepository) publish_tasks[$i]="${task%ToGithubPackagesRepository}ToReleaseStagingRepository" ;;
+      *ToReleaseStagingRepository) ;;
+      *) echo "Select a Maven publication task to stage: $task" >&2; exit 1 ;;
+    esac
+  done
+else
+  : "${GITHUB_PACKAGES_USERNAME:?GitHub Packages username is required}"
+  : "${GITHUB_PACKAGES_TOKEN:?GitHub Packages token is required}"
+  export GITHUB_PACKAGES_USERNAME GITHUB_PACKAGES_TOKEN
+fi
+if [[ "${KMMRESOURCE_INCLUDE_COMPOSE:-false}" == true ]]; then
   gradle_args+=("-PkmmResourcePublishCompose=true")
 fi
-
 if [[ -n "${MAVEN_VERSION:-}" ]]; then
   gradle_args+=("-Pversion=$MAVEN_VERSION" "-PmavenVersion=$MAVEN_VERSION")
-fi
-
-if [[ -n "${GITHUB_PACKAGES_OWNER:-}" ]]; then
-  gradle_args+=("-PgithubPackagesOwner=$GITHUB_PACKAGES_OWNER")
-fi
-
-if [[ -n "${GITHUB_PACKAGES_REPOSITORY:-}" ]]; then
-  gradle_args+=("-PgithubPackagesRepository=$GITHUB_PACKAGES_REPOSITORY")
 fi
 
 task_cache_dir="$(mktemp -d)"
@@ -119,7 +112,7 @@ if (( ${#available_publish_tasks[@]} == 0 )); then
   exit 1
 fi
 
-echo "Publishing KmmResource publications to GitHub Packages:"
+echo "Selected KmmResource Maven publications:"
 printf '  %s\n' "${available_publish_tasks[@]}"
 
 if [[ "$KMMRESOURCE_DRY_RUN" == "true" ]]; then
