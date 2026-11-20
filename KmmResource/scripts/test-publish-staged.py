@@ -75,7 +75,16 @@ def expect_failure(operation, message):
 
 
 def test_release(artifacts, version, require_standard):
-    directories = sorted(artifacts.iterdir())
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        for name in ("linux-1", "ios-1"):
+            (root / ("kmmresource-" + name)).mkdir()
+        expect_failure(lambda: publisher.build_directories(root), "each of the three jobs")
+        (root / "kmmresource-metadata-2").mkdir()
+        assert set(publisher.build_directories(root)) == set(root.iterdir())
+        (root / "kmmresource-linux-2").mkdir()
+        expect_failure(lambda: publisher.build_directories(root), "each of the three jobs")
+    directories = publisher.build_directories(artifacts) if require_standard else sorted(artifacts.iterdir())
     files, indexes = publisher.staged_release(directories, version)
     primaries = {k: v for k, v in files.items() if not k.endswith(publisher.CHECKSUMS)}
     if require_standard:

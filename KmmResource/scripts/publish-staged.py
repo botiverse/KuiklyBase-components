@@ -238,6 +238,17 @@ def publish(directories, version, destinations):
                       for key, path in sorted(files.items()) if not key.endswith(CHECKSUMS)}}
 
 
+def build_directories(root):
+    directories = sorted(root.iterdir())
+    lanes = []
+    for directory in directories:
+        match = re.fullmatch(r"kmmresource-(linux|ios|metadata)-[1-9][0-9]*", directory.name)
+        require(directory.is_dir() and match, f"Unexpected build artifact: {directory.name}")
+        lanes.append(match[1])
+    require(sorted(lanes) == ["ios", "linux", "metadata"], "Expected one build artifact from each of the three jobs")
+    return directories
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("artifacts", type=Path)
@@ -251,7 +262,7 @@ def main():
                                os.environ["GITHUB_ACTOR"], os.environ["GITHUB_TOKEN"]),
                     Repository("Raft", "https://maven.artifacts.botiverse.dev", "raft-ci",
                                os.environ["RAFT_ARTIFACTS_PUBLISH_TOKEN"], public_reads=True)]
-    receipt = publish(sorted(args.artifacts.iterdir()), args.version, destinations)
+    receipt = publish(build_directories(args.artifacts), args.version, destinations)
     receipt.update(source=os.environ["GITHUB_SHA"], run=os.environ["GITHUB_RUN_ID"])
     args.receipt.write_text(json.dumps(receipt, indent=2) + "\n")
     print(f"Verified {len(receipt['files'])} Maven files at both destinations for {args.version}.")
